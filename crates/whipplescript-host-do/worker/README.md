@@ -31,10 +31,17 @@ placement identifiers, full host lifecycle, and signed private-Home grants.
 
 `contracts/production-canaries.json` maps every critical deployed-evidence gap
 exactly once. The public Session lifecycle uses the immutable GaugeWright Cloud
-Panels runner. `scripts/production-wiring-canary.mjs` supplies the managed-host
-and private-Home journeys with exact credential contracts, bounded synthetic
-identities, authority denials, and cleanup. A suite names its journey as the
-runner's `#marker`, and `scripts/run-production-wiring-canaries.mjs` starts each
+Panels runner. `scripts/production-wiring-canary.mjs` supplies the managed-host,
+live-model-context, and private-Home journeys with exact credential contracts,
+bounded synthetic identities, authority denials, and cleanup. The Raw context
+journey uses a separate signed policy restricted to the bounded synthetic
+provider. It reads the exact body while that provider holds its response,
+checks public and missing-token denial, then confirms erasure after cancellation.
+`scripts/mint-canary-governance-root.mjs` can sign that separate policy with
+`--raw-context-provider-origin` and `--raw-context-credential-ref`; it verifies
+both envelopes with the runtime's own policy verifier before writing either.
+A suite names its journey as the runner's `#marker`, and
+`scripts/run-production-wiring-canaries.mjs` starts each
 journey once by that marker: placement forwarding is proved by the managed-host
 journey, which forwards through the placement root, so it names
 `#managed-host-lifecycle` rather than a journey of its own.

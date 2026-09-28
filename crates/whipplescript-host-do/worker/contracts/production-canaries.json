@@ -147,17 +147,27 @@
     },
     {
       "id": "live-model-context",
-      "state": "runner-needed",
-      "runner": null,
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#live-model-context",
       "executionBoundary": "managed-workflow-placement",
       "contracts": [
         "runtime.host.live-model-context"
       ],
       "requiredInfrastructure": [
-        "Dedicated synthetic placement with a controlled provider request that can be held in flight",
+        "Dedicated synthetic placement and signed policy bound only to the model authority's bounded synthetic OpenAI provider with its Raw context delayed-body marker",
+        "Harness Worker with pinned governance root and authenticated model-broker transport resolving only a fresh synthetic canary credential",
         "Runtime control credential and a separate public-session credential for denial checks"
       ],
-      "cleanup": "Release or stop the synthetic model call, restore the placement baseline, and verify the transient request body is no longer readable.",
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN",
+        "GW_SYNTHETIC_WHIP_CONTROL_TOKEN",
+        "GW_SYNTHETIC_WHIP_PUBLIC_TOKEN",
+        "GW_SYNTHETIC_WHIP_TENANT",
+        "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PLACEMENT",
+        "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN",
+        "GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY"
+      ],
+      "cleanup": "Cancel the synthetic model call, verify the transient request body is no longer readable, restore the placement baseline, and remove synced files. The synthetic provider releases a held body after twenty seconds even when cancellation is interrupted.",
       "surfaces": [
         "whip-runtime"
       ]

@@ -9,6 +9,7 @@ import {
   canonicalJson,
   composeSignedPolicy,
   keyIdFrom,
+  rawContextCanaryPolicy,
   signingBytesV2,
   verifyWithRuntime,
 } from "./mint-canary-governance-root.mjs";
@@ -64,6 +65,24 @@ test("every field of the preimage changes the bytes", () => {
 test("key_id is the uncompressed SEC1 point", () => {
   const keyId = keyIdFrom(createPublicKey(keyPair().privateKey));
   assert.match(keyId, /^04[0-9a-f]{128}$/);
+});
+
+test("Raw context policy can name only the closed synthetic provider", () => {
+  const policy = rawContextCanaryPolicy(
+    "https://models.example.test/", "synthetic-raw-context",
+  );
+  assert.deepEqual(Object.keys(policy.provider_bindings), ["model"]);
+  assert.deepEqual(Object.keys(policy.placements), ["do"]);
+  assert.deepEqual(policy.placements.do.provider_bindings, ["model"]);
+  assert.deepEqual(policy.provider_bindings.model, {
+    base_url: "https://models.example.test/_canary/openai",
+    credential_ref: "synthetic-raw-context",
+    model: "gaugewright-canary-model-v1",
+    provider: "openai",
+  });
+  assert.throws(() => rawContextCanaryPolicy("http://models.example.test/", "synthetic-key"), /HTTPS/);
+  assert.throws(() => rawContextCanaryPolicy("https://models.example.test/other", "synthetic-key"), /path/);
+  assert.throws(() => rawContextCanaryPolicy("https://models.example.test/", "bad key"));
 });
 
 test("the signature is raw r‖s over the v2 preimage, not DER", () => {
@@ -162,6 +181,14 @@ test("the runtime accepts what this composes, and refuses every corruption of it
     verifyWithRuntime({ text, signer: s, keyId: k, pkgPath: PKG });
 
   assert.equal(check(signed.text).epoch, 1);
+  const raw = composeSignedPolicy({
+    privateKey, keyId, signer, epoch: 1, authority: "gaugedesk",
+    policy: rawContextCanaryPolicy("https://models.example.test/", "synthetic-raw-context"),
+  });
+  assert.equal(check(raw.text).epoch, 1);
+  const redirected = JSON.parse(raw.text);
+  redirected.provider_bindings.model.base_url = "https://api.openai.com";
+  assert.throws(() => check(JSON.stringify(redirected)), "a redirected Raw context provider was accepted");
 
   // Without these the acceptance above proves nothing: a verifier that accepts
   // everything would pass the positive case just as well.

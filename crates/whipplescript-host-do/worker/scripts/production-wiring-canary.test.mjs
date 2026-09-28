@@ -9,6 +9,7 @@ import {
   NORM_EVIDENCE_ROUTES,
   NORM_LEDGER_ROUTES,
   normLedgerRequests,
+  runLiveModelContext,
   runManagedHost,
   runNormEvidence,
   runNormLedger,
@@ -136,6 +137,105 @@ test("managed canary crosses placement forwarding and restores its baseline", as
     calls.filter((call) => call.headers.has("authorization"))
       .every((call) => call.headers.get("authorization") === "Bearer control-token"),
   );
+});
+
+test("Raw context canary reads only the held synthetic request and proves erasure", async () => {
+  const policy = JSON.stringify({
+    ...JSON.parse(signedPolicy),
+    provider_bindings: {
+      model: {
+        base_url: "https://models.example.test/_canary/openai",
+        credential_ref: "synthetic-provider-key",
+        model: "gaugewright-canary-model-v1",
+        provider: "openai",
+      },
+    },
+  });
+  const environment = {
+    GW_SYNTHETIC_WHIP_MANAGED_ORIGIN: "https://runtime.example.test",
+    GW_SYNTHETIC_WHIP_CONTROL_TOKEN: "control-token",
+    GW_SYNTHETIC_WHIP_PUBLIC_TOKEN: "public-token",
+    GW_SYNTHETIC_WHIP_TENANT: "synthetic-tenant",
+    GW_SYNTHETIC_WHIP_RAW_CONTEXT_PLACEMENT: "raw-placement",
+    GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN: "https://models.example.test",
+    GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY: policy,
+  };
+  const calls = [];
+  let turnStarted = false;
+  let turnFinished = false;
+  let finishTurn;
+  const heldTurn = new Promise((resolve) => { finishTurn = resolve; });
+  const fetchImpl = async (url, init = {}) => {
+    const path = new URL(url).pathname.replace(
+      "/v1/tenants/synthetic-tenant/placements/raw-placement", "",
+    );
+    const headers = new Headers(init.headers);
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ path, method: init.method ?? "GET", authorization: headers.get("authorization"), body });
+    if (headers.get("authorization") !== "Bearer control-token") {
+      return json({ error: "unauthorized" }, 401);
+    }
+    if (path === "/host/policy") {
+      return json({ envelope_hash: "a".repeat(64) }, 201);
+    }
+    if (path === "/host/instances/open") {
+      return json({ instance_ref: "instance:raw" }, 201);
+    }
+    if (path.endsWith("/checkpoint") || path.endsWith("/restore")) {
+      return json({ ok: true });
+    }
+    if (path.endsWith("/files/sync")) return json({ synced: 0 });
+    if (path === "/host/turns") {
+      turnStarted = true;
+      await heldTurn;
+      return json({ admitted: true, command_id: body.command.command_id });
+    }
+    if (path.endsWith("/model-context")) {
+      return turnStarted && !turnFinished
+        ? json({
+          calls: [{ ordinal: 0, body: { input: "gaugewright-raw-context-canary-hold-v1" } }],
+          incomplete: false,
+        }, 200, { "cache-control": "no-store" })
+        : json({ error: "unavailable" }, 404, { "cache-control": "no-store" });
+    }
+    if (path.endsWith("/cancel")) {
+      turnFinished = true;
+      finishTurn();
+      return json({ status: "requested" }, 202);
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+  const result = await runLiveModelContext(environment, fetchImpl);
+  assert.deepEqual(result, {
+    instance: "instance:raw", command: "production-wiring-canary-raw-context-turn-v1",
+  });
+  assert(calls.some((call) => call.path.endsWith("/model-context") && call.authorization === null));
+  assert(calls.some((call) => call.path.endsWith("/model-context") && call.authorization === "Bearer public-token"));
+  assert(calls.some((call) => call.path.endsWith("/cancel")));
+  assert(calls.some((call) => call.path.endsWith("/restore")));
+  assert.equal(calls.at(-1).path.endsWith("/files/sync"), true);
+  assert.equal(
+    calls.filter((call) => call.path.endsWith("/model-context") && call.authorization === "Bearer control-token").at(-1).method,
+    "GET",
+  );
+
+  let touched = false;
+  await assert.rejects(
+    runLiveModelContext({
+      ...environment,
+      GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY: JSON.stringify({
+        ...JSON.parse(policy),
+        provider_bindings: {
+          model: {
+            ...JSON.parse(policy).provider_bindings.model,
+            base_url: "https://api.openai.com",
+          },
+        },
+      }),
+    }, async () => { touched = true; throw new Error("unexpected network call"); }),
+    /base_url/,
+  );
+  assert.equal(touched, false, "a non-synthetic provider policy reached the network");
 });
 
 test("Private Home canary denies missing and tampered grants before forwarding", async () => {

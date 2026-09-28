@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import WebSocket from "ws";
 
 const encoder = new TextEncoder();
@@ -113,13 +114,13 @@ function defaultLiveSocket(url, token) {
   });
 }
 
-function managedPolicy(environment) {
-  const signedEnvelope = required(environment, "GW_SYNTHETIC_WHIP_SIGNED_POLICY");
+function managedPolicy(environment, key = "GW_SYNTHETIC_WHIP_SIGNED_POLICY") {
+  const signedEnvelope = required(environment, key);
   let envelope;
   try {
     envelope = JSON.parse(signedEnvelope);
   } catch {
-    assert.fail("GW_SYNTHETIC_WHIP_SIGNED_POLICY is not JSON");
+    assert.fail(`${key} is not JSON`);
   }
   const attestation = envelope?.attestation;
   assert.match(attestation?.envelope_hash ?? "", /^[0-9a-f]{64}$/);
@@ -142,6 +143,7 @@ function managedPolicy(environment) {
     },
     providerBindingRef,
     credentialRef: provider.credential_ref,
+    provider,
     placementRef: placements[0],
   };
 }
@@ -382,6 +384,190 @@ export async function runManagedHost(
     throw new AggregateError(
       [...(primaryError ? [primaryError] : []), ...cleanupErrors],
       "managed WhippleScript production wiring or cleanup failed",
+    );
+  }
+  return result;
+}
+
+/** Capture one exact provider body while the closed synthetic provider holds
+ * its response bytes, then prove the privileged view disappears on settlement.
+ * The policy must name only that synthetic provider; the runner never sends a
+ * customer turn or prints the captured body. */
+export async function runLiveModelContext(environment = process.env, fetchImpl = fetch) {
+  const origin = exactOrigin(environment, "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN");
+  const providerOrigin = exactOrigin(environment, "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN");
+  const token = required(environment, "GW_SYNTHETIC_WHIP_CONTROL_TOKEN");
+  const publicToken = required(environment, "GW_SYNTHETIC_WHIP_PUBLIC_TOKEN");
+  assert.notEqual(publicToken, token, "public and control credentials must differ");
+  const tenant = boundedId(environment, "GW_SYNTHETIC_WHIP_TENANT", "synthetic-wiring");
+  const placement = boundedId(
+    environment,
+    "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PLACEMENT",
+    "production-raw-context-canary-v1",
+  );
+  const policy = managedPolicy(environment, "GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY");
+  const policyDocument = JSON.parse(policy.signedEnvelope);
+  assert.deepEqual(
+    Object.keys(policyDocument.provider_bindings),
+    [policy.providerBindingRef],
+    "Raw context canary policy must have only one provider binding",
+  );
+  assert.deepEqual(
+    Object.keys(policyDocument.placements),
+    [policy.placementRef],
+    "Raw context canary policy must have only one placement",
+  );
+  assert.deepEqual(
+    policyDocument.placements[policy.placementRef]?.provider_bindings,
+    [policy.providerBindingRef],
+    "Raw context canary placement must bind only the synthetic provider",
+  );
+  assert.equal(policy.provider.provider, "openai", "Raw context canary policy must use OpenAI wire");
+  assert.equal(policy.provider.model, "gaugewright-canary-model-v1");
+  assert.equal(
+    policy.provider.base_url,
+    `${providerOrigin}/_canary/openai`,
+    "Raw context canary policy has a non-synthetic base_url",
+  );
+  const packageDocs = await packageDocuments();
+  const placementRoot = `/v1/tenants/${encodeURIComponent(tenant)}`
+    + `/placements/${encodeURIComponent(placement)}`;
+  const route = async (path, init = {}, accepted = [200]) => {
+    const headers = new Headers(init.headers);
+    headers.set("authorization", `Bearer ${token}`);
+    headers.set("accept", "application/json");
+    if (init.body !== undefined) headers.set("content-type", "application/json");
+    const response = await fetchImpl(`${origin}${placementRoot}${path}`, {
+      ...init,
+      headers,
+      signal: init.signal ?? AbortSignal.timeout(90_000),
+    });
+    assertStatus(response, accepted, `${init.method ?? "GET"} ${path}`);
+    return response;
+  };
+  const policyResponse = await route("/host/policy", {
+    method: "POST",
+    body: JSON.stringify({ epoch: policy.epoch, signed_envelope: policy.signedEnvelope }),
+  }, [200, 201]);
+  const installed = await responseJson(policyResponse, "Raw context policy");
+  assert.equal(installed?.envelope_hash, policy.ref.envelope_hash);
+  const opened = await responseJson(await route("/host/instances/open", {
+    method: "POST",
+    body: JSON.stringify({
+      command: {
+        protocol: hostProtocol,
+        request_id: "production-wiring-canary:raw-context:open:v1",
+        package_version_ref: packageDocs.version_ref,
+        policy: policy.ref,
+      },
+      package: packageDocs,
+    }),
+  }, [200, 201]), "Raw context instance open");
+  assert.equal(typeof opened?.instance_ref, "string");
+  const instancePath = `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
+  const baseline = "production-wiring-canary-raw-context-clean-v1";
+  await responseJson(await route(`${instancePath}/checkpoint`, {
+    method: "POST", body: JSON.stringify({ cut_id: baseline }),
+  }), "Raw context baseline");
+
+  const commandId = "production-wiring-canary-raw-context-turn-v1";
+  const contextPath = `${instancePath}/turns/${encodeURIComponent(commandId)}/model-context`;
+  let turnPromise;
+  let cancelRequested = false;
+  let primaryError;
+  let result;
+  try {
+    const marker = "gaugewright-raw-context-canary-hold-v1";
+    turnPromise = route("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          protocol: hostProtocol,
+          command_id: commandId,
+          run_ref: `gaugewright:production-wiring:${commandId}`,
+          instance_ref: opened.instance_ref,
+          package_version_ref: packageDocs.version_ref,
+          policy: policy.ref,
+          actor_ref: "synthetic-wiring",
+          input: { text: marker, images: [] },
+          resources: [],
+          provider_binding: {
+            binding_id: policy.providerBindingRef,
+            credential: { credential_id: policy.credentialRef },
+          },
+          placement_ceiling_ref: policy.placementRef,
+        },
+        package: packageDocs,
+        image_bodies: [],
+      }),
+    });
+    // The model call may finish with a cancellation status. Observe its
+    // settlement without leaving an unhandled rejection during the live poll.
+    let settled = false;
+    void turnPromise.then(() => { settled = true; }, () => { settled = true; });
+    const deadline = Date.now() + 45_000;
+    let capture;
+    while (Date.now() < deadline) {
+      const response = await route(contextPath, {}, [200, 404]);
+      if (response.status === 200) {
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        capture = await responseJson(response, "live model context");
+        break;
+      }
+      if (settled) break;
+      await delay(100);
+    }
+    assert(capture, "the synthetic provider never exposed an in-flight model request");
+    assert.equal(capture.incomplete, false);
+    assert(
+      capture.calls?.some((call) => JSON.stringify(call.body).includes(marker)),
+      "the live view omitted the exact synthetic provider body",
+    );
+    for (const authorization of [undefined, `Bearer ${publicToken}`]) {
+      const headers = authorization ? { authorization } : {};
+      const denied = await fetchImpl(`${origin}${placementRoot}${contextPath}`, {
+        headers, signal: AbortSignal.timeout(30_000),
+      });
+      assert.equal(denied.status, 401, "non-control identity read live model context");
+    }
+    const cancellation = await route(`${instancePath}/turns/${encodeURIComponent(commandId)}/cancel`, {
+      method: "POST", body: "{}",
+    }, [202, 409]);
+    cancelRequested = true;
+    await responseJson(cancellation, "Raw context cancellation");
+    await turnPromise.catch(() => null);
+    const erased = await route(contextPath, {}, [404]);
+    assert.equal(erased.headers.get("cache-control"), "no-store");
+    result = { instance: opened.instance_ref, command: commandId };
+  } catch (error) {
+    primaryError = error;
+  }
+
+  const cleanupErrors = [];
+  if (turnPromise) {
+    if (!cancelRequested) {
+      try {
+        await route(`${instancePath}/turns/${encodeURIComponent(commandId)}/cancel`, {
+          method: "POST", body: "{}",
+        }, [202, 409]);
+      } catch (error) { cleanupErrors.push(error); }
+    }
+    await turnPromise.catch(() => null);
+  }
+  try {
+    await route(`${instancePath}/restore`, {
+      method: "POST", body: JSON.stringify({ cut_id: baseline }),
+    });
+  } catch (error) { cleanupErrors.push(error); }
+  try {
+    await route(`${instancePath}/files/sync`, {
+      method: "POST", body: JSON.stringify({ files: [], delete_missing: true }),
+    });
+  } catch (error) { cleanupErrors.push(error); }
+  if (primaryError || cleanupErrors.length) {
+    throw new AggregateError(
+      [...(primaryError ? [primaryError] : []), ...cleanupErrors],
+      "live model context production canary or cleanup failed",
     );
   }
   return result;
@@ -1014,6 +1200,7 @@ export async function runNormEvidence(environment = process.env, fetchImpl = fet
 /// root, so it names `#managed-host-lifecycle` and has no key of its own.
 export const runners = {
   "managed-host-lifecycle": runManagedHost,
+  "live-model-context": runLiveModelContext,
   "private-home-forwarding": runPrivateHome,
   "norm-ledger": runNormLedger,
 };

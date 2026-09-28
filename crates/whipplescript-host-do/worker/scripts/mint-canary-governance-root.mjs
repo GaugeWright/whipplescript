@@ -4,6 +4,9 @@
 //!
 //!   node scripts/mint-canary-governance-root.mjs --out-dir <dir>
 //!   node scripts/mint-canary-governance-root.mjs --out-dir <dir> --private-key <path>
+//!   node scripts/mint-canary-governance-root.mjs --out-dir <dir> \
+//!     --raw-context-provider-origin https://models.example \
+//!     --raw-context-credential-ref synthetic-raw-context
 //!
 //! `managed-host-lifecycle` and `placement-forwarding` present
 //! `GW_SYNTHETIC_WHIP_SIGNED_POLICY` to `POST /host/policy`, and the Durable
@@ -109,6 +112,25 @@ export function canaryPolicy() {
   };
 }
 
+/** The same canary root signs a second policy whose only provider is the
+ * closed synthetic service. The signed base URL ends before `/v1/responses`:
+ * WhippleScript appends that wire path at the final-fetch boundary. */
+export function rawContextCanaryPolicy(providerOrigin, credentialRef) {
+  const origin = new URL(providerOrigin);
+  assert.equal(origin.protocol, "https:", "Raw context provider origin must use HTTPS");
+  assert.equal(origin.pathname, "/", "Raw context provider origin cannot have a path");
+  assert(!origin.username && !origin.password && !origin.search && !origin.hash);
+  assert.match(credentialRef, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+  const policy = canaryPolicy();
+  policy.provider_bindings.model = {
+    base_url: `${origin.origin}/_canary/openai`,
+    credential_ref: credentialRef,
+    model: "gaugewright-canary-model-v1",
+    provider: "openai",
+  };
+  return policy;
+}
+
 /// Compose and sign, returning the envelope text and everything to pin.
 ///
 /// `signature` is raw `r ‖ s`, not DER. `Signature::from_slice` on the
@@ -193,6 +215,12 @@ function main() {
   const epoch = Number(flag(argv, "epoch", "1"));
   assert(Number.isSafeInteger(epoch) && epoch > 0, "epoch must be a positive integer");
   const existing = flag(argv, "private-key");
+  const rawProviderOrigin = flag(argv, "raw-context-provider-origin");
+  const rawCredentialRef = flag(argv, "raw-context-credential-ref");
+  assert.equal(
+    Boolean(rawProviderOrigin), Boolean(rawCredentialRef),
+    "Raw context policy needs both --raw-context-provider-origin and --raw-context-credential-ref",
+  );
   const pkgPath = resolve(
     flag(argv, "pkg", resolve(import.meta.dirname, "..", "pkg-node", "whipplescript_host_do.js")),
   );
@@ -219,11 +247,30 @@ function main() {
   // Before anything is written. A file on disk is a thing somebody will paste.
   const verified = verifyWithRuntime({ text, signer, keyId, pkgPath });
   assert.equal(verified?.epoch, epoch, "the runtime read a different epoch than was signed");
+  let rawContext;
+  if (rawProviderOrigin) {
+    rawContext = composeSignedPolicy({
+      privateKey,
+      signer,
+      keyId,
+      epoch,
+      authority,
+      policy: rawContextCanaryPolicy(rawProviderOrigin, rawCredentialRef),
+    });
+    const rawVerified = verifyWithRuntime({ text: rawContext.text, signer, keyId, pkgPath });
+    assert.equal(rawVerified?.epoch, epoch, "the runtime refused the Raw context policy epoch");
+  }
 
   mkdirSync(outDir, { recursive: true });
   const policyFile = resolve(outDir, "canary-signed-policy.json");
   writeFileSync(policyFile, text, { mode: 0o600 });
   chmodSync(policyFile, 0o600);
+  let rawPolicyFile;
+  if (rawContext) {
+    rawPolicyFile = resolve(outDir, "raw-context-signed-policy.json");
+    writeFileSync(rawPolicyFile, rawContext.text, { mode: 0o600 });
+    chmodSync(rawPolicyFile, 0o600);
+  }
   let keyFile;
   if (generated) {
     keyFile = resolve(outDir, "canary-governance-root.pem");
@@ -237,6 +284,7 @@ function main() {
   console.log(`envelope_hash  ${envelopeHash}`);
   console.log(`authority      ${authority}`);
   console.log(`\nwrote ${policyFile}`);
+  if (rawPolicyFile) console.log(`wrote ${rawPolicyFile}`);
   if (keyFile) console.log(`wrote ${keyFile}  (private — never commit, never paste)`);
   console.log(`
 Pin the Worker to this root, or the policy is refused with 503 whatever it says:
@@ -250,6 +298,20 @@ Store the envelope where the canary reads it:
 "$(cat ${policyFile})" --path /synthetics/wiring --env prod
 
 Then project it, with the other ten, into the lane's environment.`);
+  if (rawPolicyFile) {
+    console.log(`
+Store the separately bounded Raw context envelope and its provider origin:
+
+  infisical secrets set GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY=\
+"$(cat ${rawPolicyFile})" --path /synthetics/wiring --env prod
+
+  GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN=${rawProviderOrigin}
+
+The referenced provider credential must resolve to a fresh
+gw-canary-v1.<64 lowercase hex> key at that synthetic endpoint. The runtime
+canary also needs its own placement and a public-session token distinct from
+the control token; it will not call a customer provider.`);
+  }
   if (keyFile) {
     console.log(`
 Keep the private half so a later epoch can be re-signed. It belongs in
