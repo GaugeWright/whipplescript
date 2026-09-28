@@ -13,6 +13,17 @@ readme.workspace = true
 [package.metadata.dist]
 dist = false
 
+[package.metadata.native-tests]
+# What this crate's tests read at run time beyond the crate and what its
+# sources name by relative path, for the native test runs (GaugeWright BUILD.md
+# stages 5 and 6). The ignored tests run a real Buck2 over examples/buck2-tests,
+# which the sources reach by joining path components, so it is named here, and
+# its dotfiles by name besides, because a glob never matches one: they make it
+# a project of its own and pin the Buck2 it records. A run's mount holds
+# only declared files, so a missing entry fails the test instead of caching a
+# pass it never earned.
+data = ["examples/buck2-tests", "examples/buck2-tests/.buck2-version", "examples/buck2-tests/.buckconfig", "examples/buck2-tests/.buckroot", "examples/buck2-tests/inner/.buckconfig"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

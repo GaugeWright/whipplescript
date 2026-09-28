@@ -1,0 +1,20 @@
+load ../recovery-admission.maude
+--- A bad candidate is refused, and then a justified repair is admitted.
+search [1] in RECOVERY-ADMISSION : { main(bad) cand(regress, bad) cand(repair, good) } =>* { main(good) refused(regress) } .
+--- A mainline undo that restores the requirement is admitted.
+search [1] in RECOVERY-ADMISSION : { main(bad) cand(undo, good) } =>* { main(good) } .
+--- With no ordinary recovery, a scoped exception admits the effect and records its residual obligation.
+search [1] in RECOVERY-ADMISSION : { main(bad) cand(regress, bad) exception } =>* { main(bad) residual(regress) C:Cfg } .
+--- An undo that does not restore the requirement is never admitted; bypassing the gate admits it.
+search in RECOVERY-ADMISSION : { main(good) cand(undo, bad) } =>* { main(bad) C:Cfg } .
+search [1] in RECOVERY-ADMISSION-WEAK-UNDO-BYPASS : { main(good) cand(undo, bad) } =>* { main(bad) C:Cfg } .
+--- No permanent deadlock where an undo is the recovery; a forward-only policy deadlocks.
+search in RECOVERY-ADMISSION : { main(bad) cand(undo, good) } =>! { main(bad) C:Cfg } .
+search [1] in RECOVERY-ADMISSION-WEAK-FORWARD-ONLY : { main(bad) cand(undo, good) } =>! { main(bad) C:Cfg } .
+--- An exception never makes the requirement read as holding; a laundering exception does.
+search in RECOVERY-ADMISSION : { main(bad) cand(regress, bad) exception } =>* { main(good) C:Cfg } .
+search [1] in RECOVERY-ADMISSION-WEAK-EXCEPTION-LAUNDERS : { main(bad) cand(regress, bad) exception } =>* { main(good) C:Cfg } .
+--- Once the exception has expired nothing unsupported is admitted; ignoring expiry admits it.
+search in RECOVERY-ADMISSION : { main(bad) cand(regress, bad) expired } =>* { residual(regress) C:Cfg } .
+search [1] in RECOVERY-ADMISSION-WEAK-EXPIRY-IGNORED : { main(bad) cand(regress, bad) expired } =>* { residual(regress) C:Cfg } .
+quit

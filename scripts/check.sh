@@ -399,7 +399,17 @@ else
 fi
 
 echo "== buck2 test executor =="
-section buck2-test-executor
+# Natively, the ignored tests these runs make are cached native runs of the
+# same test binaries the tests section builds, read from the cargo test lines
+# of section.sh's buck2-test-executor case (GaugeWright BUILD.md stage 6); the
+# ordinary tests among what nextest's filter selects already ran there. Every
+# Linux fleet host has buck2, which is the prerequisite the cargo path checks.
+if [ -n "$native" ]; then
+    buck2 build //:native-ignored-tests -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites"
+else
+    section buck2-test-executor
+fi
 
 # What a release compiles, which is more than what it distributes: every
 # workspace member for every target in dist-workspace.toml. The command lives in

@@ -1,0 +1,74 @@
+--- norm-plane §5 and slice G1: recovery is specified positively.
+---
+--- The gate judges every candidate onto a gated ref at its proposed result,
+--- so a repair that restores the violated requirement is admitted like any
+--- other candidate, and so is an undo of the mainline that restores it. An
+--- undo that does not restore it is refused like any other. When no ordinary
+--- candidate can restore it, an authorized exception admits a scoped effect:
+--- the requirement still reads violated, the effect leaves a residual
+--- obligation for its accountable holder, and once the exception expires the
+--- gate admits nothing it does not support.
+---
+--- One gated ref and its requirement are modelled. A candidate carries its
+--- kind and whether the requirement holds at its proposed result.
+fmod RECOVERY-SIGNATURE is
+  sorts Kind Prop Fact Cfg State .
+  ops repair regress undo : -> Kind [ctor] .
+  ops good bad : -> Prop [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- The gated ref, by whether its requirement holds there.
+  op main : Prop -> Fact [ctor] .
+  --- A candidate and whether the requirement holds at its proposed result.
+  op cand : Kind Prop -> Fact [ctor] .
+  op refused : Kind -> Fact [ctor] .
+  --- An authorized exception: scoped, accountable, and expiring.
+  ops exception expired : -> Fact [ctor] .
+  --- The obligation an excepted effect leaves behind.
+  op residual : Kind -> Fact [ctor] .
+endfm
+mod RECOVERY-EXCEPTION is
+  including RECOVERY-SIGNATURE .
+  var K : Kind . var P : Prop . var C : Cfg .
+  --- The exception admits the effect and records what it still owes; it
+  --- never relabels the requirement as holding.
+  rl [except] : { main(P) cand(K, bad) exception C } => { main(bad) residual(K) exception C } .
+  rl [expire] : { exception C } => { expired C } .
+endm
+mod RECOVERY-ADMISSION is
+  including RECOVERY-EXCEPTION .
+  var K : Kind . var P : Prop . var C : Cfg .
+  --- Every kind of candidate, an undo included, is judged at its result.
+  rl [admit] : { main(P) cand(K, good) C } => { main(good) C } .
+  rl [refuse] : { main(P) cand(K, bad) C } => { main(P) refused(K) C } .
+endm
+--- A forward-only policy never admits an undo, even one that restores the
+--- requirement: where the undo is the only recovery, the ref stays violated.
+mod RECOVERY-ADMISSION-WEAK-FORWARD-ONLY is
+  including RECOVERY-EXCEPTION .
+  var P : Prop . var Q : Prop . var C : Cfg .
+  rl [admit-forward] : { main(P) cand(repair, good) C } => { main(good) C } .
+  rl [refuse-regress] : { main(P) cand(regress, Q) C } => { main(P) refused(regress) C } .
+  rl [refuse-repair] : { main(P) cand(repair, bad) C } => { main(P) refused(repair) C } .
+  rl [refuse-undo] : { main(P) cand(undo, Q) C } => { main(P) refused(undo) C } .
+endm
+--- An undo that bypasses the gate is applied whatever its result.
+mod RECOVERY-ADMISSION-WEAK-UNDO-BYPASS is
+  including RECOVERY-ADMISSION .
+  var P : Prop . var Q : Prop . var C : Cfg .
+  rl [undo-bypass] : { main(P) cand(undo, Q) C } => { main(Q) C } .
+endm
+--- An exception that relabels the requirement as holding.
+mod RECOVERY-ADMISSION-WEAK-EXCEPTION-LAUNDERS is
+  including RECOVERY-ADMISSION .
+  var K : Kind . var P : Prop . var C : Cfg .
+  rl [except-launders] : { main(P) cand(K, bad) exception C } => { main(good) exception C } .
+endm
+--- An exception that outlives its expiry.
+mod RECOVERY-ADMISSION-WEAK-EXPIRY-IGNORED is
+  including RECOVERY-ADMISSION .
+  var K : Kind . var P : Prop . var C : Cfg .
+  rl [except-expired] : { main(P) cand(K, bad) expired C } => { main(bad) residual(K) expired C } .
+endm

@@ -34,6 +34,7 @@ readme = "README.md"
 cell = "whipplescript"
 checkout = "whipplescript-src"
 feature-checks = "feature-builds"
+ignored-tests = "buck2-test-executor"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -829,6 +829,22 @@ mod tests {
             current.effective_records[&record].fields,
             json!({"title":"repair authorization"})
         );
+        // NP-02: the new content needs its own acceptance. One prepared
+        // against the content before the edit is refused, and the owner's
+        // acceptance of the new head is admitted.
+        let stale = keys.sign(
+            "owner",
+            "accept-before-edit",
+            NormAct::Transition {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: current.records[&record].vocabulary.clone(),
+                record: record.clone(),
+                previous: noop_id.clone(),
+                status: "accepted".into(),
+            },
+        );
+        assert!(store.append_norm_event(&stale, &keys).is_err());
         assert!(
             matches!(current.effective_revision(&current.records[&record]),
             EffectiveRevision::Active { record: active, .. } if active.content_head == record && active.status == "accepted")

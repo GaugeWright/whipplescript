@@ -19278,6 +19278,203 @@ mod norm_admission_tests {
         ));
     }
 
+    /// The V0 audit's hosted rows (norm-plane admission fixtures NP-01,
+    /// NP-02, NP-21, NC-05 and NC-06), on the object's own store: the genesis
+    /// binds the owner and a refused acceptance names the missing authority;
+    /// history without its genesis and a replacement genesis authorize
+    /// nothing, and a new root is a different ledger; a still-valid key cannot
+    /// act at the epoch a rotation closed; and a successor may co-sign only
+    /// the rotation that names it.
+    #[test]
+    fn norm_do_answers_the_v0_audit_rows() {
+        let keys: Vec<SigningKey> = [1, 3, 2]
+            .into_iter()
+            .map(|n| SigningKey::from_slice(&[n; 32]).unwrap())
+            .collect();
+        let owner = actor("owner", &keys[0]);
+        let successor = actor("owner", &keys[1]);
+        let worker = actor("worker", &keys[2]);
+        let roots: Vec<_> = [&owner, &successor, &worker]
+            .into_iter()
+            .map(|a| crate::governance::GaugeDeskGovernanceRoot::new(&a.principal, &a.key_id))
+            .collect();
+        let verifier = NormGovernanceVerifier::new(
+            [&owner, &successor, &worker]
+                .into_iter()
+                .zip(&roots)
+                .map(|(actor, root)| NormPrincipalBinding {
+                    actor: actor.clone(),
+                    verifier: root,
+                })
+                .collect(),
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let conflict = |result: StoreResult<String>| match result {
+            Err(StoreError::Conflict(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &keys[0],
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let ledger = hosted.append_norm_event(&bootstrap, &verifier).unwrap();
+        // NP-01: the genesis binds the owner, never the worker who created it.
+        assert_eq!(hosted.norm_view(&verifier).unwrap().owner, owner);
+        let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
+            .unwrap()
+            .reference()
+            .clone();
+        let record = hosted
+            .append_norm_event(
+                &signed(
+                    worker.clone(),
+                    &keys[2],
+                    "D0",
+                    NormAct::Create {
+                        authority: None,
+                        ledger: ledger.clone(),
+                        vocabulary: vocabulary.clone(),
+                        fields_json: r#"{"title":"repair"}"#.into(),
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        // NP-02: the worker's acceptance is refused naming the authority it lacks.
+        let acceptance = |ledger: &str, authority: Option<String>| NormAct::Transition {
+            authority,
+            ledger: ledger.to_owned(),
+            vocabulary: vocabulary.clone(),
+            record: record.clone(),
+            previous: record.clone(),
+            status: "accepted".into(),
+        };
+        let refused = conflict(hosted.append_norm_event(
+            &signed(
+                worker.clone(),
+                &keys[2],
+                "worker-accept",
+                acceptance(&ledger, None),
+            ),
+            &verifier,
+        ));
+        assert!(
+            refused.contains("lacks the charter's authenticated governance authority"),
+            "{refused}"
+        );
+        // NP-21: a pinned object refuses history that lacks its genesis, and a
+        // replacement genesis for the same owner authorizes nothing here.
+        let history = hosted.export_events().unwrap();
+        let mut pinned = test_support::store();
+        pinned.pin_norm_ledger(&ledger).unwrap();
+        let missing = pinned.import_norm_events(&history[1..], &verifier);
+        assert!(
+            matches!(&missing, Err(StoreError::Conflict(message)) if message.contains("pinned norm genesis is missing")),
+            "{missing:?}"
+        );
+        assert!(pinned.export_events().unwrap().is_empty());
+        let replacement = signed(
+            owner.clone(),
+            &keys[0],
+            "replacement-genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let replaced = hosted.append_norm_event(&replacement, &verifier);
+        assert!(replaced.is_err(), "{replaced:?}");
+        assert!(pinned.append_norm_event(&replacement, &verifier).is_err());
+        // A new root is a different ledger: its own identity, none of L's records.
+        let mut other = test_support::store();
+        let other_ledger = other.append_norm_event(&replacement, &verifier).unwrap();
+        assert_ne!(other_ledger, ledger);
+        assert!(other.norm_view(&verifier).unwrap().records.is_empty());
+        assert_eq!(
+            pinned.import_norm_events(&history, &verifier).unwrap(),
+            history.len()
+        );
+        // NC-06: a successor may co-sign only the rotation that names it: a
+        // cosignature on an ordinary act is refused, and the successor key
+        // cannot act as the owner before the rotation binds it.
+        let mut cosigned = signed(
+            worker.clone(),
+            &keys[2],
+            "cosigned-create",
+            NormAct::Create {
+                authority: None,
+                ledger: ledger.clone(),
+                vocabulary: vocabulary.clone(),
+                fields_json: r#"{"title":"cosigned"}"#.into(),
+            },
+        );
+        let cosignature: Signature = keys[1].sign(&cosigned.statement.signing_bytes().unwrap());
+        cosigned.successor_signature = Some(hex::encode(cosignature.to_bytes()));
+        let refused = conflict(hosted.append_norm_event(&cosigned, &verifier));
+        assert!(
+            refused.contains("rotation alone requires a successor signature"),
+            "{refused}"
+        );
+        let early = conflict(hosted.append_norm_event(
+            &signed(
+                successor.clone(),
+                &keys[1],
+                "successor-early",
+                acceptance(&ledger, None),
+            ),
+            &verifier,
+        ));
+        assert!(
+            early.contains("lacks the charter's authenticated governance authority"),
+            "{early}"
+        );
+        // NC-05: after the rotation, even the successor's still-valid key
+        // cannot act at the epoch the rotation closed.
+        let view = hosted.norm_view(&verifier).unwrap();
+        let mut rotation = signed(
+            owner.clone(),
+            &keys[0],
+            "rotation",
+            NormAct::Rotate {
+                ledger: view.ledger.clone(),
+                previous: view.authority_head.clone(),
+                successor: successor.clone(),
+                frontier: view.frontier.iter().cloned().collect(),
+            },
+        );
+        let cosignature: Signature = keys[1].sign(&rotation.statement.signing_bytes().unwrap());
+        rotation.successor_signature = Some(hex::encode(cosignature.to_bytes()));
+        let rotated = hosted.append_norm_event(&rotation, &verifier).unwrap();
+        let stale = conflict(hosted.append_norm_event(
+            &signed(
+                successor.clone(),
+                &keys[1],
+                "stale-epoch",
+                acceptance(&ledger, None),
+            ),
+            &verifier,
+        ));
+        assert!(stale.contains("stale authority epoch"), "{stale}");
+        hosted
+            .append_norm_event(
+                &signed(
+                    successor,
+                    &keys[1],
+                    "current-epoch",
+                    acceptance(&ledger, Some(rotated)),
+                ),
+                &verifier,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn norm_native_and_do_admit_the_same_authenticated_history() {
         let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();

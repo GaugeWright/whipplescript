@@ -6,6 +6,7 @@ This is a content-only abstraction; it does not implement VCS reconciliation.
 """
 
 from dataclasses import dataclass, replace
+from hashlib import sha256
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,91 @@ class State:
     branch_cut: str = "empty"
     trunk: tuple[tuple[str, int], ...] = ()
     receipts: tuple[Receipt, ...] = ()
+
+
+@dataclass(frozen=True)
+class DeclaredUnit:
+    identity: str
+    source_cut: str
+    pin: str
+    changes: tuple[Change, ...]
+
+
+@dataclass(frozen=True)
+class HandoffCandidate:
+    target_branch: str
+    parent_cut: str
+    target_before: tuple[tuple[str, int], ...]
+    target_after: tuple[tuple[str, int], ...]
+    target_cut: str
+    recorded_manifest_hash: str
+
+
+@dataclass(frozen=True)
+class HandoffReceipt:
+    unit: str
+    source_changes: tuple[str, ...]
+    target_cut: str
+    target_before: tuple[tuple[str, int], ...]
+    target_after: tuple[tuple[str, int], ...]
+
+
+def manifest_hash(entries: tuple[tuple[str, int], ...]) -> str:
+    return sha256(repr(entries).encode()).hexdigest()
+
+
+def candidate(before: tuple[tuple[str, int], ...],
+              after: tuple[tuple[str, int], ...], cut: str) -> HandoffCandidate:
+    return HandoffCandidate("branch", "branch-base", before, after, cut,
+                            manifest_hash(after))
+
+
+def handoff(
+    unit: DeclaredUnit,
+    candidate: HandoffCandidate,
+    twig_changes: tuple[Change, ...],
+    target_head: tuple[tuple[str, int], ...],
+    defect: str = "",
+) -> HandoffReceipt:
+    """Check an exact source selection and its target content before transfer.
+
+    The real planner must derive `unit.changes` from retained source provenance;
+    a caller-provided list is not a valid production witness.
+    """
+    if target_head != candidate.target_before:
+        raise ValueError("stale target")
+    if (candidate.target_branch != "branch"
+            or candidate.parent_cut != "branch-base"
+            or candidate.recorded_manifest_hash != manifest_hash(candidate.target_after)):
+        raise ValueError("target cut metadata mismatch")
+    if not unit.changes or any(change not in twig_changes for change in unit.changes):
+        raise ValueError("missing source identity")
+    if len({change.identity for change in unit.changes}) != len(unit.changes):
+        raise ValueError("duplicate source identity")
+    if defect != "cut_metadata_only":
+        by_path: dict[str, list[Change]] = {}
+        for change in unit.changes:
+            by_path.setdefault(change.path, []).append(change)
+        expected = dict(candidate.target_before)
+        for path, writes in by_path.items():
+            before, after = writes[0].before, writes[-1].after
+            if any(left.after != right.before for left, right in zip(writes, writes[1:])):
+                raise ValueError("incoherent selected source path")
+            current = expected.get(path, 0)
+            if current == after:
+                continue  # An equivalent result still needs its receipt.
+            if current != before:
+                raise ValueError("conflicting target")
+            expected[path] = after
+        if tuple(sorted(expected.items())) != candidate.target_after:
+            raise ValueError("target cut omitted or changed selected content")
+    return HandoffReceipt(
+        unit.identity,
+        tuple(change.identity for change in unit.changes),
+        candidate.target_cut,
+        candidate.target_before,
+        candidate.target_after,
+    )
 
 
 def add(state: State, change: Change, cut: str) -> State:
@@ -198,6 +284,29 @@ def scenarios():
     replayed, _ = admit(broken_cut, submit(broken_cut, "op2", "cut_as_frontier"))
     assert invariant(replayed) == "source change was accounted for twice"
     print("raw-cut-id-only counterexample: rewrite selects a and b again")
+
+    # Two declarations share one retained cut. Moving the first unit must
+    # leave the second owed, even though the cut and pin are the same.
+    unit_a = DeclaredUnit("u-a", "twig-cut-ab", "pin-ab", (ab.changes[0],))
+    unit_b = DeclaredUnit("u-b", "twig-cut-ab", "pin-ab", (ab.changes[1],))
+    candidate_a = candidate((), (("x", 1),), "branch-cut-a")
+    receipt_a = handoff(unit_a, candidate_a, ab.changes, ())
+    assert receipt_a.source_changes == ("a",)
+    assert unit_b.identity != receipt_a.unit
+    candidate_b = candidate(candidate_a.target_after,
+                            (("x", 1), ("y", 1)), "branch-cut-b")
+    assert handoff(unit_b, candidate_b, ab.changes, candidate_a.target_after).source_changes == ("b",)
+    omitted = candidate((), (), "branch-cut-empty")
+    assert omitted.recorded_manifest_hash == manifest_hash(omitted.target_after)
+    try:
+        handoff(unit_a, omitted, ab.changes, ())
+    except ValueError as error:
+        assert "omitted" in str(error)
+    else:
+        raise AssertionError("a cut with the right metadata cannot omit the unit")
+    defective = handoff(unit_a, omitted, ab.changes, (), "cut_metadata_only")
+    assert defective.target_after == () and defective.source_changes == ("a",)
+    print("cut-metadata-only counterexample: handoff accounts a while target omits x")
     print("frontier scenarios: passed")
 
 

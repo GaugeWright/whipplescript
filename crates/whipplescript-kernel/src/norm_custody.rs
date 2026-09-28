@@ -370,43 +370,64 @@ mod tests {
     }
     #[test]
     fn norm_custody_does_not_substitute_success_for_transport_or_reply_failures() {
-        for outcome in [
-            Err(TransportError::Unavailable("offline".into())),
-            Ok(CustodyReply {
-                use_id: "denied".into(),
-                rung: Rung::Process,
-                degraded: false,
-                outcome: Err(whipplescript_custody::CustodyError::Revoked {
-                    credential: credential(),
+        // NC-04: every failure names where it failed, and none is replaced by
+        // a synthetic signature.
+        for (outcome, signing, verifying) in [
+            (
+                Err(TransportError::Unavailable("offline".into())),
+                "norm custodian unreachable: custodian unavailable: offline",
+                "norm custodian unreachable: custodian unavailable: offline",
+            ),
+            (
+                Ok(CustodyReply {
+                    use_id: "denied".into(),
+                    rung: Rung::Process,
+                    degraded: false,
+                    outcome: Err(whipplescript_custody::CustodyError::Revoked {
+                        credential: credential(),
+                    }),
                 }),
-            }),
-            Ok(CustodyReply {
-                use_id: "wrong".into(),
-                rung: Rung::Process,
-                degraded: false,
-                outcome: Ok(CustodyOk::Verified { valid: false }),
-            }),
-            Ok(CustodyReply {
-                use_id: "wrong".into(),
-                rung: Rung::Process,
-                degraded: false,
-                outcome: Ok(CustodyOk::Signed {
-                    signature_b64: "sig".into(),
-                    key_version: Some(2),
+                "norm custodian refused signing: credential norm/owner is revoked",
+                "norm custodian refused verification: credential norm/owner is revoked",
+            ),
+            (
+                Ok(CustodyReply {
+                    use_id: "wrong".into(),
+                    rung: Rung::Process,
+                    degraded: false,
+                    outcome: Ok(CustodyOk::Verified { valid: false }),
                 }),
-            }),
+                "norm custodian returned a non-signature",
+                "norm custody signature is invalid",
+            ),
+            (
+                Ok(CustodyReply {
+                    use_id: "wrong".into(),
+                    rung: Rung::Process,
+                    degraded: false,
+                    outcome: Ok(CustodyOk::Signed {
+                        signature_b64: "sig".into(),
+                        key_version: Some(2),
+                    }),
+                }),
+                "norm signing key version changed; prepare again",
+                "norm custodian returned a non-verification",
+            ),
         ] {
             let transport = BrokenTransport(outcome);
             let key =
                 NormCustodyKey::new("owner".into(), credential(), version(1), &transport).unwrap();
             let stmt = statement(key.actor(), "one");
-            assert!(key.sign(&stmt).is_err());
-            assert!(key
-                .verify(
+            assert_eq!(key.sign(&stmt).err().as_deref(), Some(signing));
+            assert_eq!(
+                key.verify(
                     &stmt.signing_bytes().unwrap(),
                     &attestation(&key, "sig".into())
                 )
-                .is_err());
+                .err()
+                .as_deref(),
+                Some(verifying)
+            );
         }
     }
 

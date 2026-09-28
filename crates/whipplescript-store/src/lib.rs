@@ -42,6 +42,7 @@ pub mod norm_activation;
 pub mod norm_artifact;
 pub mod norm_commands;
 pub mod norm_correspondence;
+pub mod norm_enforcement;
 pub mod norm_history;
 pub mod norm_inventory;
 pub mod norm_manifests;

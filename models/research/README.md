@@ -129,6 +129,40 @@ every source unit. In particular, the probe assumes canonical source change
 identities and a linear per-path effect history; actual merge, selective undo,
 partial transport, and cross-target receipts need a broader model.
 
+The same probe now checks twig-to-branch handoff of two distinct declared
+units sharing one retained source cut. It transfers one unit while the other
+remains owed, and refuses a target cut that omits the selected content even
+when that cut's branch, parent and manifest metadata are internally valid.
+A deliberately defective metadata-only check accounts the omitted unit and
+prints the counterexample. The positive check still assumes that a trusted
+planner derived each unit's exact constituent changes from immutable source
+provenance. Production must supply that derivation and bind it to the
+declaration; accepting an arbitrary caller-provided change list would move
+the same defect one layer earlier.
+
+`revision_lineage.py` probes the other half of that boundary: every
+acknowledged mutation of a selected unit's meaning must advance the ref-owned
+source epoch before the topology head changes. It models eight mutation
+classes, a later unrelated tail, and mixed transport from branch A through B
+with A retained in the unit's source lineage:
+
+```sh
+python3 models/research/revision_lineage.py
+```
+
+Its explorer reaches 328 safe states through eight transitions. An old passed
+candidate is refused after each mutation class; a tail leaves its exact prefix
+eligible. A Hold on A blocks a later manual admission through B, while an undo
+of already-accounted trunk content is a new trunk obligation. Weakening each
+mutation fence, dropping A from mixed-output lineage, or ignoring Hold/epoch
+lets a forbidden history land. This model treats the ref's epoch as the
+atomic guard because the ref CAS cannot atomically read a topology-owned
+head. It does not prove that the real store takes that guard on every path.
+The production inventory must cover `commit_write_with_evidence`,
+`advance_head`, `rebase_branch`, and `retarget_branch` in both branch stores,
+plus the VCS transport, undo, import, repair, and future revision doors that
+can reach them. Terminal v1 promotion of a flowing incarnation must refuse.
+
 ## Collaboration versus native target settlement
 
 `target_settlement.py` adds two independent external targets. It models both

@@ -752,3 +752,45 @@ fn norm_charter_activation_migrates_live_records_and_keeps_history_replayable() 
         assert_eq!(store.export_events().unwrap(), original);
     }
 }
+
+/// Enforcement (norm-plane §4): every gated ref is a wired phase that
+/// evaluates every effective requirement, a line the charter declares gated is
+/// one more, and deployment is reported as unwired rather than left out.
+#[test]
+fn norm_enforcement_names_every_phase_and_the_unwired_one() {
+    use whipplescript_store::norm_enforcement::PhaseKind;
+    let Ledger {
+        keys,
+        store,
+        duty: requirement,
+        ..
+    } = ledger();
+    let mut view = store.norm_view(&keys).unwrap();
+    let phases = |view: &NormView| {
+        view.enforcement()
+            .unwrap()
+            .phases
+            .into_iter()
+            .map(|phase| (phase.phase, phase.kind, phase.wired))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        phases(&view),
+        vec![
+            ("ref:main".to_owned(), PhaseKind::GatedRef, true),
+            ("deployment".to_owned(), PhaseKind::Deployment, false),
+        ]
+    );
+    let enforcement = view.enforcement().unwrap();
+    assert_eq!(
+        enforcement.requirements,
+        BTreeMap::from([(requirement.clone(), vec!["ref:main".to_owned()])]),
+        "only the effective requirement is enforced, and only where a door evaluates it"
+    );
+    view.charter.gated_refs = vec!["release".into()];
+    assert_eq!(
+        view.enforcement().unwrap().requirements[&requirement],
+        vec!["ref:main".to_owned(), "ref:release".to_owned()]
+    );
+    assert!(phases(&view).contains(&("ref:release".to_owned(), PhaseKind::GatedRef, true)));
+}

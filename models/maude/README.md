@@ -120,6 +120,19 @@ refusals each with the weakening that reaches it: checking only the map
 effectiveness), dropping unplanned records, and self-authorization by the
 proposed charter.
 
+`recovery-admission.maude` models norm-plane §5 for slice G1: recovery is
+specified positively. The gate judges every candidate onto a gated ref at its
+proposed result, so a justified repair is admitted after a bad candidate is
+refused, and so is a mainline undo that restores the requirement. An undo
+that does not restore it is refused like any other candidate. When no
+ordinary candidate can restore it, a scoped, authorized exception admits the
+effect: the requirement still reads violated, the effect leaves a residual
+obligation, and nothing is excepted once the exception has expired. Eleven
+searches; four refusals each with the weakening that reaches it: an undo
+that bypasses the gate, a forward-only policy that deadlocks where an undo
+is the only recovery, an exception that launders the requirement, and one
+that outlives its expiry.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

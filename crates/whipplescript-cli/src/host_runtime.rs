@@ -392,6 +392,9 @@ pub struct NativeWorkspaceResolver {
     /// drained by the harness loop. Behind a lock because the resolver surface
     /// takes `&self`.
     workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
+    /// The exact bytes successful `read` tools saw, keyed by their call IDs.
+    /// A batch may execute several tools before the next model request.
+    model_read_witnesses: std::sync::Mutex<HashMap<String, ModelReadWitness>>,
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
@@ -403,6 +406,12 @@ pub struct NativeWorkspaceResolver {
     /// is a reserved hook for a future native-OS command tool (see
     /// spec/native-command-tool-tracker.md).
     witness: std::sync::Mutex<WitnessState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelReadWitness {
+    pub path: String,
+    pub content_hash: String,
 }
 
 #[derive(Default)]
@@ -419,6 +428,13 @@ struct AdmittedFileScope {
 }
 
 impl NativeWorkspaceResolver {
+    pub fn take_model_read_witness(&self, call_id: &str) -> Option<ModelReadWitness> {
+        self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(call_id)
+    }
+
     fn witness_write(&self, path: &str, existed: bool, content: &[u8]) {
         let mut state = self.witness.lock().expect("witness lock");
         state.writes.push(WitnessedWrite {
@@ -471,6 +487,7 @@ impl NativeWorkspaceResolver {
         }
         Ok(Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
+            model_read_witnesses: std::sync::Mutex::new(HashMap::new()),
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
@@ -578,7 +595,12 @@ impl NativeWorkspaceResolver {
         )
     }
 
-    fn read(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn read(
+        &self,
+        call_id: &str,
+        arguments: &Value,
+        scopes: &[AdmittedFileScope],
+    ) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
         let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
@@ -601,6 +623,16 @@ impl NativeWorkspaceResolver {
             .map(|(index, line)| format!("{}: {line}", offset + index))
             .collect::<Vec<_>>()
             .join("\n");
+        self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                call_id.to_owned(),
+                ModelReadWitness {
+                    path: path.to_owned(),
+                    content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
+                },
+            );
         Ok(self.cap(lines))
     }
 
@@ -927,10 +959,12 @@ impl ResourceResolver for NativeWorkspaceResolver {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String> {
+        // Reusing an ID cannot inherit a prior read, even if this call fails.
+        self.take_model_read_witness(&call.id);
         let scopes = self.admitted_file_scopes(admitted_resources)?;
         let scopes = scopes.as_slice();
         match call.name.as_str() {
-            "read" => self.read(&call.arguments, scopes),
+            "read" => self.read(&call.id, &call.arguments, scopes),
             "write" => self.write(&call.arguments, scopes),
             "edit" => self.edit(&call.arguments, scopes),
             "ls" => self.list(&call.arguments, scopes),
@@ -950,6 +984,10 @@ impl ResourceResolver for NativeWorkspaceResolver {
     }
 
     fn take_turn_witness(&self) -> TurnWitness {
+        self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let state = std::mem::take(&mut *self.witness.lock().expect("witness lock"));
         match state.taint {
             Some(reason) => TurnWitness::Unwitnessed { reason },
@@ -5020,6 +5058,7 @@ workflow UnsafeHostChat {
         ));
         fs::create_dir_all(root.join(".pi")).expect("dirs");
         fs::write(root.join("note.txt"), "alpha\nbeta\n").expect("note");
+        fs::write(root.join("other.txt"), "separate\n").expect("other");
         fs::write(root.join(".pi/SYSTEM.md"), "protected").expect("method");
         let resolver = NativeWorkspaceResolver::new(&root)
             .expect("resolver")
@@ -5047,6 +5086,16 @@ workflow UnsafeHostChat {
             .execute_tool(
                 &resources,
                 &ToolCall {
+                    id: "read-2".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({ "path": "other.txt" }),
+                },
+            )
+            .expect("read again");
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
                     id: "edit-1".to_owned(),
                     name: "edit".to_owned(),
                     arguments: json!({
@@ -5056,6 +5105,36 @@ workflow UnsafeHostChat {
                 },
             )
             .expect("edit");
+        // An intervening edit does not discard a prior read in the same batch
+        // or acquire its source identity under its own call ID.
+        assert!(resolver.take_model_read_witness("edit-1").is_none());
+        assert_eq!(
+            resolver.take_model_read_witness("read-1"),
+            Some(ModelReadWitness {
+                path: "note.txt".to_owned(),
+                content_hash: whipplescript_store::stable_hash_bytes_hex(b"alpha\nbeta\n"),
+            })
+        );
+        assert_eq!(
+            resolver.take_model_read_witness("read-2"),
+            Some(ModelReadWitness {
+                path: "other.txt".to_owned(),
+                content_hash: whipplescript_store::stable_hash_bytes_hex(b"separate\n"),
+            })
+        );
+        assert!(resolver.take_model_read_witness("read-1").is_none());
+        assert_eq!(
+            resolver.execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "unknown-1".to_owned(),
+                    name: "unknown".to_owned(),
+                    arguments: json!({}),
+                },
+            ),
+            Err("tool has no native workspace implementation".to_owned())
+        );
+        assert!(resolver.take_model_read_witness("unknown-1").is_none());
         assert_eq!(
             fs::read_to_string(root.join("note.txt")).expect("edited note"),
             "alpha\ngamma\n"

@@ -400,4 +400,31 @@ mod tests {
             "a pin does not fabricate evidence"
         );
     }
+
+    /// NC-01 on the hosted command route: a request cannot carry host
+    /// configuration. Bindings, creation grants and a restoration checkpoint
+    /// in a command body are refused before anything is admitted.
+    #[test]
+    fn norm_hosted_commands_refuse_request_supplied_host_configuration() {
+        let trust = json!({"bindings":[], "creation_grants":[]}).to_string();
+        let mut store = crate::do_store::test_support::store();
+        for injected in [
+            json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"snapshot"},
+                "creation_grants":[{"creator":"worker","owner":"owner"}]}),
+            json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"snapshot"},
+                "bindings":[]}),
+            json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"import","events":[],
+                "checkpoint":{"ledger":"a".repeat(64),"authority_head":"a".repeat(64)}}}),
+        ] {
+            let refused = execute_hosted_norm_command(&mut store, &trust, &injected.to_string());
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.contains("unknown field")),
+                "{injected}: {refused:?}"
+            );
+        }
+        assert_eq!(store.norm_checkpoint().unwrap(), None);
+        assert!(store.export_events().unwrap().is_empty());
+    }
 }

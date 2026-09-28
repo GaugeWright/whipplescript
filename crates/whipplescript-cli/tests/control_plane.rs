@@ -11458,7 +11458,9 @@ fn reactive_ticket_review_fixture_composes_and_recovers_one_named_coercion() {
         .expect("ticket-review fixture runs");
     assert!(
         output.status.success(),
-        "{}",
+        "ticket-review fixture exited {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");

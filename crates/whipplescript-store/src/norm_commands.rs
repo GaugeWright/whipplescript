@@ -221,6 +221,10 @@ pub struct NormSnapshot {
     /// admitting no act again.
     #[serde(default)]
     pub retired: BTreeSet<String>,
+    /// Where each requirement blocks, and which phases are unwired
+    /// (norm-plane §4).
+    #[serde(default)]
+    pub enforcement: crate::norm_enforcement::EnforcementView,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +314,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             });
         }
         Ok(NormSnapshot {
+            enforcement: view.enforcement()?,
             retired: view.retired_records().clone(),
             reservations: view.reservations_view(),
             manifests: self.manifest_judgments(&view, None)?,
