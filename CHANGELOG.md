@@ -19,6 +19,10 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- The native host verifies the exact registered skill catalogue before asking
+  an embedding resolver for its system-prompt source labels. Missing or changed
+  skill bodies keep that model request's provenance incomplete.
+
 ## [0.8.0] — 2026-09-28
 
 A minor release because three published crates changed public types that a

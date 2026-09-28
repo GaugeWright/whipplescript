@@ -22,7 +22,9 @@ use whipplescript_kernel::harness_loop::{
     ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
-use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
+use whipplescript_kernel::sansio::{
+    HostDriver, HttpResponse, IoRequest, IoResult, ModelContentProvenance, TransportError,
+};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_kernel::world_state::{
     AgentTopology, ComputeResources, EffectiveTurnEnvelope, EnvironmentState, ExecutionIdentity,
@@ -32,8 +34,8 @@ use whipplescript_kernel::{
     idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_store::{
-    EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore,
-    StoreError,
+    EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SkillView,
+    SqliteStore, StoreError,
 };
 
 use crate::host_protocol::{
@@ -234,6 +236,14 @@ pub enum TurnWitness {
 pub trait ResourceResolver {
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String>;
 
+    /// Attest the exact skill catalogue this turn puts in the system prompt.
+    /// The runtime reads one registry snapshot and verifies each body against
+    /// that snapshot before asking the embedding host for source identities.
+    /// A resolver that cannot classify those skills leaves provenance unknown.
+    fn model_skill_catalogue_provenance(&self, _skills: &[SkillView]) -> ModelContentProvenance {
+        ModelContentProvenance::default()
+    }
+
     /// Files the governed virtual bash read since the last drain (G2 of the
     /// output-attribution note). Defaulted, so a resolver with no virtual
     /// workspace is unaffected.
@@ -285,6 +295,36 @@ pub trait ResourceResolver {
     /// replaces whatever was projected. Reasoning deltas are never offered.
     /// The default observes nothing.
     fn observe_text_delta(&self, _delta: &str) {}
+}
+
+fn attested_skill_catalogue_provenance<R: ResourceResolver + ?Sized>(
+    store: &SqliteStore,
+    resources: &R,
+    skills: &[SkillView],
+) -> ModelContentProvenance {
+    if skills.is_empty() {
+        return ModelContentProvenance {
+            source_handles: Vec::new(),
+            complete: true,
+        };
+    }
+    for skill in skills {
+        let Ok(Some(body)) = store.skill_body(&skill.source_path) else {
+            return ModelContentProvenance::default();
+        };
+        let Ok(frontmatter) =
+            whipplescript_store::skill_frontmatter::parse_skill_frontmatter(&body)
+        else {
+            return ModelContentProvenance::default();
+        };
+        if whipplescript_store::stable_hash_hex(&body) != skill.content_hash
+            || frontmatter.name != skill.name
+            || frontmatter.description != skill.description
+        {
+            return ModelContentProvenance::default();
+        }
+    }
+    resources.model_skill_catalogue_provenance(skills)
 }
 
 fn hosted_model_visible_world<R: ResourceResolver + ?Sized>(
@@ -2700,11 +2740,14 @@ impl GovernedHostRuntime {
         };
         let world = hosted_model_visible_world(command, &package, resources)
             .map_err(HostRuntimeError::Resolver)?;
-        let skills = self
+        let registered_skills = self
             .kernel
             .store()
             .list_skills()
-            .map_err(HostRuntimeError::Store)?
+            .map_err(HostRuntimeError::Store)?;
+        let skill_sources =
+            attested_skill_catalogue_provenance(self.kernel.store(), resources, &registered_skills);
+        let skills = registered_skills
             .into_iter()
             .map(|skill| SkillCatalogueEntry {
                 name: skill.name,
@@ -2713,8 +2756,11 @@ impl GovernedHostRuntime {
             })
             .collect::<Vec<_>>();
         let context = package.context_for_model_with_skills(&skills);
+        let mut model_provenance = inspection.model_provenance.clone();
+        model_provenance.system =
+            ModelContentProvenance::derived_from([&model_provenance.system, &skill_sources]);
         let input = BrokeredTurnInput {
-            model_provenance: inspection.model_provenance.clone(),
+            model_provenance,
             system: context.system_prompt,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
@@ -4256,6 +4302,81 @@ workflow UnsafeHostChat {
             self.calls.set(self.calls.get() + 1);
             Ok("governed file body".to_owned())
         }
+    }
+
+    #[test]
+    fn skill_catalogue_attestation_uses_the_exact_registry_snapshot() {
+        struct SkillSource;
+        impl ResourceResolver for SkillSource {
+            fn resolve_image(&self, _image: &ResourceRef) -> Result<ResolvedImage, String> {
+                Err("no image".into())
+            }
+            fn execute_tool(
+                &self,
+                _resources: &[ResourceRef],
+                _call: &ToolCall,
+            ) -> Result<String, String> {
+                Err("no tool".into())
+            }
+            fn model_skill_catalogue_provenance(
+                &self,
+                skills: &[SkillView],
+            ) -> ModelContentProvenance {
+                ModelContentProvenance {
+                    source_handles: skills
+                        .iter()
+                        .map(|skill| format!("skill:{}", skill.content_hash))
+                        .collect(),
+                    complete: true,
+                }
+            }
+        }
+        let store = SqliteStore::open(temp_store()).unwrap();
+        let body = "---\nname: triage\ndescription: Inspect reports\n---\nRead the report.\n";
+        let register = |body: &str, description: &str| {
+            store
+                .register_skill(whipplescript_store::SkillRegistration {
+                    skill_id: "skill:triage",
+                    name: "triage",
+                    version: "1.0.0",
+                    source: "gaugedesk-agent",
+                    source_path: "agent/skills/triage/SKILL.md",
+                    body,
+                    description,
+                    required_capabilities_json: "[]",
+                    metadata_json: "{}",
+                })
+                .unwrap();
+        };
+        register(body, "Inspect reports");
+        let snapshot = store.list_skills().unwrap();
+        let known = attested_skill_catalogue_provenance(&store, &SkillSource, &snapshot);
+        assert!(known.complete);
+        assert_eq!(
+            known.source_handles,
+            [format!("skill:{}", snapshot[0].content_hash)]
+        );
+        assert!(
+            !attested_skill_catalogue_provenance(
+                &store,
+                &Resources {
+                    calls: Cell::new(0)
+                },
+                &snapshot
+            )
+            .complete
+        );
+        register(body, "forged description");
+        assert!(
+            !attested_skill_catalogue_provenance(
+                &store,
+                &SkillSource,
+                &store.list_skills().unwrap()
+            )
+            .complete
+        );
+        register("changed body", "Inspect reports");
+        assert!(!attested_skill_catalogue_provenance(&store, &SkillSource, &snapshot).complete);
     }
 
     struct ScriptedDriver {
