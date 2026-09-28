@@ -33,6 +33,29 @@ export function partition(suites) {
   };
 }
 
+/// A suite's identifiers live in its contract, as `configuration`; its secrets
+/// come from the store the job reads (GaugeWright DR-0163). The two are merged
+/// here, and a name found in both is refused: a value placed in the wrong store
+/// is the mistake that resolves to an empty string elsewhere and is found late.
+export function suiteEnvironment(suites, environment) {
+  const merged = { ...environment };
+  const problems = [];
+  const configured = {};
+  for (const suite of suites) {
+    for (const [name, value] of Object.entries(suite.configuration ?? {})) {
+      if (typeof environment[name] === "string" && environment[name].trim() !== "") {
+        problems.push(`${name} is configured by ${suite.id}'s contract and also supplied by the store`);
+      } else if (Object.hasOwn(configured, name) && configured[name] !== value) {
+        problems.push(`${name} is configured differently by two suites`);
+      } else {
+        configured[name] = value;
+        merged[name] = value;
+      }
+    }
+  }
+  return { environment: merged, problems };
+}
+
 export function missingEnvironment(suites, environment) {
   return [...new Set(suites.flatMap((suite) => suite.requiredEnvironment ?? []))]
     .filter((name) => typeof environment[name] !== "string" || environment[name].trim() === "")
@@ -107,6 +130,11 @@ export async function runProductionWiringCanaries({
     );
   }
 
+  const configured = suiteEnvironment(suites, environment);
+  if (configured.problems.length > 0) {
+    throw new Error(`production wiring configuration is misplaced: ${configured.problems.join("; ")}`);
+  }
+  environment = configured.environment;
   const missing = missingEnvironment(suites, environment);
   if (missing.length > 0) {
     throw new Error(`production wiring credentials are incomplete: ${missing.join(", ")}`);

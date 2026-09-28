@@ -80,6 +80,14 @@ export function validateProductionCanaries(manifest, canaries, localJourneys = [
     if (suite.state === "ready-awaiting-identity") {
       ready += suite.contracts.length;
       assert(Array.isArray(suite.requiredEnvironment) && suite.requiredEnvironment.length > 0);
+      // Identifiers may be configured in the contract; secrets never are
+      // (GaugeWright DR-0163). A configured name must be one the suite requires.
+      for (const [name, value] of Object.entries(suite.configuration ?? {})) {
+        assert(suite.requiredEnvironment.includes(name), `${suite.id} configures ${name}, which it does not require`);
+        assert(!/TOKEN|SECRET|PASSWORD|PASSPHRASE|SEED|JWK|PRIVATE|CREDENTIAL|_KEY$/.test(name),
+          `${suite.id} configures ${name} in the contract, but a secret belongs in the store`);
+        assert(typeof value === "string" && value.trim() !== "", `${suite.id} configures an empty ${name}`);
+      }
       for (const name of suite.requiredEnvironment) {
         assert.match(name, /^GW_SYNTHETIC_[A-Z0-9_]+$/);
       }

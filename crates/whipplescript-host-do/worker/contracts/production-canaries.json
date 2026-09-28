@@ -182,6 +182,12 @@
         "GW_SYNTHETIC_NORM_PLACEMENT",
         "GW_SYNTHETIC_NORM_SIGNED_ACT"
       ],
+      "configuration": {
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN": "https://whipplescript-runtime.jack-168.workers.dev",
+        "GW_SYNTHETIC_WHIP_TENANT": "synthetic-wiring",
+        "GW_SYNTHETIC_NORM_PLACEMENT": "production-norm-ledger-canary-v1",
+        "GW_SYNTHETIC_NORM_SIGNED_ACT": "{\"statement\":{\"protocol\":\"whipplescript.norm/v1\",\"actor\":{\"principal\":\"norm-canary-worker\",\"algorithm\":\"ed25519-custodian\",\"key_id\":\"credential:norm/canary-worker#local\"},\"nonce\":\"e5df63a9b07ef3cf792609499cfdc9fc7c771a392b303538cc558144857e71f8\",\"created_at\":\"unix:1790617724\",\"action\":{\"act\":\"create\",\"ledger\":\"2b323b0a7c16a088c0a7f073361a48184c03ee9da80aa66c7c3e8aee5c0ae79f\",\"authority\":\"2b323b0a7c16a088c0a7f073361a48184c03ee9da80aa66c7c3e8aee5c0ae79f\",\"vocabulary\":{\"name\":\"canary-note\",\"version\":\"1\",\"digest\":\"05ea0f6d0ccb5200e881f5776bfea1472981b93061e8e14aa8128e3cb9a2eb2a\"},\"fields_json\":\"{\\\"title\\\": \\\"production norm-ledger canary\\\"}\"}},\"signature\":\"BvY8/zrEuy9EniKXNSpivd3SWjM9X//suQzqMhZmI+zNujpeAGbtsIrOSlR+rIsPtqn4xtTpuAaKbYucaOtsAg==\"}"
+      },
       "cleanup": "Reuse only the dedicated synthetic ledger and its one stable signed act, so every run after the first is an exact retry that adds nothing. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup, and the runner calls no delete, discard, restore or rollback route. The runner fails once the synthetic history exceeds 256 events.",
       "surfaces": [
         "whip-runtime"

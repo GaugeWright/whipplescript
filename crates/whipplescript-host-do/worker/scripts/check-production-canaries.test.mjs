@@ -79,3 +79,28 @@ test("a suite that shares another suite's journey is dispatchable by its marker"
   assert.equal(Object.hasOwn(runners, "placement-forwarding"), false);
   assert.equal(Object.hasOwn(runners, "managed-host-lifecycle"), true);
 });
+
+test("a contract configures identifiers it requires, never a secret", () => {
+  const ready = canaries.suites.find((suite) => suite.id === "norm-ledger");
+  const withConfiguration = (configuration) => ({
+    ...canaries,
+    suites: canaries.suites.map((suite) => (suite === ready ? { ...suite, configuration } : suite)),
+  });
+  assert.doesNotThrow(() => validateProductionCanaries(
+    manifest, withConfiguration({ GW_SYNTHETIC_WHIP_TENANT: "synthetic-wiring" }), journeys));
+  assert.throws(
+    () => validateProductionCanaries(
+      manifest, withConfiguration({ GW_SYNTHETIC_WHIP_CONTROL_TOKEN: "leaked" }), journeys),
+    /a secret belongs in the store/,
+  );
+  assert.throws(
+    () => validateProductionCanaries(
+      manifest, withConfiguration({ GW_SYNTHETIC_UNREQUIRED: "x" }), journeys),
+    /which it does not require/,
+  );
+  assert.throws(
+    () => validateProductionCanaries(
+      manifest, withConfiguration({ GW_SYNTHETIC_WHIP_TENANT: " " }), journeys),
+    /configures an empty/,
+  );
+});

@@ -11,6 +11,7 @@ import {
   missingEnvironment,
   partition,
   runProductionWiringCanaries,
+  suiteEnvironment,
 } from "./run-production-wiring-canaries.mjs";
 
 function childThatCloses(code) {
@@ -168,7 +169,11 @@ test("every ready local suite in the inventory starts a journey the runner has",
   const spawned = [];
   const environment = Object.fromEntries(
     partition(inventory.suites).local
+      // The store supplies only what no suite's contract configures: an
+      // identifier one contract names is the run's, for every suite in it.
       .flatMap((suite) => suite.requiredEnvironment)
+      .filter((name) => !partition(inventory.suites).local
+        .some((suite) => Object.hasOwn(suite.configuration ?? {}, name)))
       .map((name) => [name, "synthetic"]),
   );
   const result = await runProductionWiringCanaries({
@@ -183,4 +188,45 @@ test("every ready local suite in the inventory starts a journey the runner has",
   assert.deepEqual(spawned, ["managed-host-lifecycle", "private-home-forwarding", "norm-ledger"]);
   assert(result.executed.includes("norm-ledger"));
   assert(result.executed.includes("placement-forwarding"));
+});
+
+test("a suite's contract configures its identifiers and the store supplies only secrets", async () => {
+  const configured = {
+    suites: [{
+      id: "configured-one",
+      state: "ready-awaiting-identity",
+      runner: "scripts/production-wiring-canary.mjs#local-one",
+      requiredEnvironment: ["GW_SYNTHETIC_WHIP_TENANT", "GW_SYNTHETIC_WHIP_CONTROL_TOKEN"],
+      configuration: { GW_SYNTHETIC_WHIP_TENANT: "synthetic-wiring" },
+      surfaces: ["whip-runtime"],
+    }],
+  };
+  const seen = [];
+  const run = (environment) => runProductionWiringCanaries({
+    canaries: configured,
+    root: "/repo",
+    environment,
+    spawnImpl: (command, args, options) => {
+      seen.push(options.env);
+      return childThatCloses(0);
+    },
+  });
+  await run({ GW_SYNTHETIC_WHIP_CONTROL_TOKEN: "secret" });
+  assert.equal(seen[0].GW_SYNTHETIC_WHIP_TENANT, "synthetic-wiring");
+  assert.equal(seen[0].GW_SYNTHETIC_WHIP_CONTROL_TOKEN, "secret");
+  // A name the store also supplies is a value placed in the wrong store.
+  await assert.rejects(
+    run({ GW_SYNTHETIC_WHIP_CONTROL_TOKEN: "secret", GW_SYNTHETIC_WHIP_TENANT: "stray" }),
+    /GW_SYNTHETIC_WHIP_TENANT is configured by configured-one's contract and also supplied by the store/,
+  );
+  // A secret the store does not supply is missing, whatever the contract says.
+  await assert.rejects(run({}), /credentials are incomplete: GW_SYNTHETIC_WHIP_CONTROL_TOKEN/);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(
+    suiteEnvironment([
+      { id: "a", configuration: { GW_SYNTHETIC_X: "1" } },
+      { id: "b", configuration: { GW_SYNTHETIC_X: "2" } },
+    ], {}).problems,
+    ["GW_SYNTHETIC_X is configured differently by two suites"],
+  );
 });
