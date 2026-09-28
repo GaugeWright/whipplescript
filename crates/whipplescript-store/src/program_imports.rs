@@ -35,6 +35,79 @@ pub struct ProgramImportAdmissionRecord {
     pub witness_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramImportOperationKind {
+    Checked,
+    Unwitnessed,
+    LegacyGap,
+}
+
+impl TryFrom<&str> for ProgramImportOperationKind {
+    type Error = StoreError;
+
+    fn try_from(value: &str) -> StoreResult<Self> {
+        match value {
+            "checked" => Ok(Self::Checked),
+            "unwitnessed" => Ok(Self::Unwitnessed),
+            "legacy-gap" => Ok(Self::LegacyGap),
+            other => Err(StoreError::Conflict(format!(
+                "unknown program import operation kind {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramImportOperation {
+    pub sequence: i64,
+    pub operation_id: String,
+    pub version_id: String,
+    pub witness_digest: Option<String>,
+    pub kind: ProgramImportOperationKind,
+}
+
+impl ProgramImportOperation {
+    /// Decode persisted evidence without turning malformed rows into a
+    /// checked operation. Both store backends use this read boundary.
+    pub fn from_stored_row(
+        sequence: i64,
+        operation_id: String,
+        version_id: String,
+        witness_digest: Option<String>,
+        kind: &str,
+    ) -> StoreResult<Self> {
+        let kind = kind.try_into()?;
+        if sequence <= 0
+            || operation_id.is_empty()
+            || version_id.is_empty()
+            || (kind == ProgramImportOperationKind::Checked) != witness_digest.is_some()
+            || witness_digest
+                .as_deref()
+                .is_some_and(|digest| !is_digest(digest))
+        {
+            return Err(StoreError::Conflict(
+                "malformed program import operation row".into(),
+            ));
+        }
+        Ok(Self {
+            sequence,
+            operation_id,
+            version_id,
+            witness_digest,
+            kind,
+        })
+    }
+}
+
+/// One store's observed operation population at a monotone sequence frontier.
+/// This read does not establish that every Home accepting path writes the
+/// ledger, or that a checked witness still matches current source inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramImportOperationRoster {
+    pub frontier: i64,
+    pub operations: Vec<ProgramImportOperation>,
+}
+
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS program_import_admissions (
     version_id TEXT NOT NULL REFERENCES program_versions(version_id),
     witness_digest TEXT NOT NULL,
@@ -136,6 +209,50 @@ mod tests {
     const LOCK: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const NEXT_LOCK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const COMPILER: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    #[test]
+    fn operation_roster_refuses_an_unknown_kind() {
+        assert!(matches!(
+            ProgramImportOperationKind::try_from("future-kind"),
+            Err(StoreError::Conflict(message)) if message.contains("unknown program import operation kind future-kind")
+        ));
+    }
+
+    #[test]
+    fn operation_roster_refuses_malformed_persisted_evidence() {
+        assert!(ProgramImportOperation::from_stored_row(
+            0,
+            "op".into(),
+            "version".into(),
+            None,
+            "unwitnessed",
+        )
+        .is_err());
+        assert!(ProgramImportOperation::from_stored_row(
+            1,
+            "op".into(),
+            "version".into(),
+            None,
+            "checked",
+        )
+        .is_err());
+        assert!(ProgramImportOperation::from_stored_row(
+            1,
+            "op".into(),
+            "version".into(),
+            Some(LOCK.into()),
+            "unwitnessed",
+        )
+        .is_err());
+        assert!(ProgramImportOperation::from_stored_row(
+            1,
+            "op".into(),
+            "version".into(),
+            Some("not-a-digest".into()),
+            "checked",
+        )
+        .is_err());
+    }
 
     fn version(name: &'static str) -> NewProgramVersion<'static> {
         NewProgramVersion {
@@ -267,36 +384,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 3);
-        let operations: Vec<(i64, String, Option<String>)> = store
-            .connection
-            .prepare(
-                "SELECT sequence, kind, witness_digest FROM program_import_operations \
-                 WHERE version_id = ?1 ORDER BY sequence",
-            )
-            .unwrap()
-            .query_map([&first.version_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.frontier, roster.operations.last().unwrap().sequence);
+        let operations: Vec<_> = roster
+            .operations
+            .iter()
+            .filter(|operation| operation.version_id == first.version_id)
             .collect();
         assert_eq!(operations.len(), 4);
-        assert!(operations.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(operations
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
         assert_eq!(
             operations
                 .iter()
-                .filter(|(_, kind, _)| kind == "checked")
+                .filter(|operation| operation.kind == ProgramImportOperationKind::Checked)
                 .count(),
             3
         );
         assert_eq!(
             operations
                 .iter()
-                .filter(|(_, kind, digest)| { kind == "unwitnessed" && digest.is_none() })
+                .filter(|operation| {
+                    operation.kind == ProgramImportOperationKind::Unwitnessed
+                        && operation.witness_digest.is_none()
+                })
                 .count(),
             1
         );
@@ -362,31 +474,30 @@ mod tests {
             )
             .unwrap();
         crate::initialize_runtime_schema_on(&store.connection).unwrap();
-        let kinds: Vec<String> = store
-            .connection
-            .prepare("SELECT kind FROM program_import_operations ORDER BY sequence")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(kinds, ["legacy-gap"]);
+        let prior = store.program_import_operation_roster().unwrap();
+        assert_eq!(prior.operations.len(), 1);
+        assert_eq!(
+            prior.operations[0].kind,
+            ProgramImportOperationKind::LegacyGap
+        );
         store
             .create_program_version_with_import_witness(version("old"), &witness(LOCK))
             .unwrap();
-        let rows: Vec<(String, String)> = store
-            .connection
-            .prepare("SELECT version_id, kind FROM program_import_operations ORDER BY sequence")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
+        let current = store.program_import_operation_roster().unwrap();
+        assert!(current.frontier > prior.frontier);
+        let rows: Vec<_> = current
+            .operations
+            .into_iter()
+            .map(|operation| (operation.version_id, operation.kind))
             .collect();
         assert_eq!(
             rows,
             [
-                (first.version_id.clone(), "legacy-gap".into()),
-                (first.version_id, "checked".into())
+                (
+                    first.version_id.clone(),
+                    ProgramImportOperationKind::LegacyGap
+                ),
+                (first.version_id, ProgramImportOperationKind::Checked)
             ]
         );
     }

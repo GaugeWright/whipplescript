@@ -191,6 +191,12 @@ impl RuntimeStore for NativeStores {
             .program_import_witness(version_id, witness_digest)
     }
 
+    fn program_import_operation_roster(
+        &self,
+    ) -> StoreResult<crate::program_imports::ProgramImportOperationRoster> {
+        self.runtime.program_import_operation_roster()
+    }
+
     fn reattest_instance_program(
         &mut self,
         instance_id: &str,

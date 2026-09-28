@@ -5409,6 +5409,41 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .transpose()
     }
 
+    fn program_import_operation_roster(
+        &self,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportOperationRoster> {
+        use whipplescript_store::program_imports::{
+            ProgramImportOperation, ProgramImportOperationRoster,
+        };
+
+        let rows = self
+            .sql
+            .query(
+                "SELECT sequence, operation_id, version_id, witness_digest, kind \
+                 FROM program_import_operations ORDER BY sequence",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let mut operations = Vec::with_capacity(rows.len());
+        for row in rows {
+            operations.push(ProgramImportOperation::from_stored_row(
+                as_i64(&row[0]),
+                as_text(&row[1]),
+                as_text(&row[2]),
+                match &row[3] {
+                    SqlValue::Null => None,
+                    value => Some(as_text(value)),
+                },
+                &as_text(&row[4]),
+            )?);
+        }
+        let frontier = operations.last().map_or(0, |row| row.sequence);
+        Ok(ProgramImportOperationRoster {
+            frontier,
+            operations,
+        })
+    }
+
     fn reattest_instance_program(
         &mut self,
         instance_id: &str,
@@ -14655,30 +14690,34 @@ pub(crate) mod tests {
         assert_ne!(second.witness_digest, first.witness_digest);
         let unwitnessed = store.create_program_version(version("paint")).unwrap();
         assert_eq!(unwitnessed.version_id, first.version_id);
-        let operations = store
-            .sql
-            .query(
-                "SELECT sequence, kind, witness_digest FROM program_import_operations \
-                 WHERE version_id = ?1 ORDER BY sequence",
-                &[text(&first.version_id)],
-            )
-            .unwrap();
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.frontier, roster.operations.last().unwrap().sequence);
+        let operations: Vec<_> = roster
+            .operations
+            .iter()
+            .filter(|operation| operation.version_id == first.version_id)
+            .collect();
         assert_eq!(operations.len(), 3);
         assert!(operations
             .windows(2)
-            .all(|pair| { as_i64(&pair[0][0]) < as_i64(&pair[1][0]) }));
+            .all(|pair| pair[0].sequence < pair[1].sequence));
         assert_eq!(
             operations
                 .iter()
-                .filter(|row| as_text(&row[1]) == "checked")
+                .filter(|operation| {
+                    operation.kind
+                        == whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+                })
                 .count(),
             2
         );
         assert_eq!(
             operations
                 .iter()
-                .filter(|row| {
-                    as_text(&row[1]) == "unwitnessed" && matches!(row[2], SqlValue::Null)
+                .filter(|operation| {
+                    operation.kind
+                        == whipplescript_store::program_imports::ProgramImportOperationKind::Unwitnessed
+                        && operation.witness_digest.is_none()
                 })
                 .count(),
             1

@@ -2018,6 +2018,40 @@ impl SqliteStore {
         .transpose()
     }
 
+    pub fn program_import_operation_roster(
+        &self,
+    ) -> StoreResult<program_imports::ProgramImportOperationRoster> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, operation_id, version_id, witness_digest, kind \
+             FROM program_import_operations ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut operations = Vec::new();
+        for row in rows {
+            let (sequence, operation_id, version_id, witness_digest, kind) = row?;
+            operations.push(program_imports::ProgramImportOperation::from_stored_row(
+                sequence,
+                operation_id,
+                version_id,
+                witness_digest,
+                &kind,
+            )?);
+        }
+        let frontier = operations.last().map_or(0, |row| row.sequence);
+        Ok(program_imports::ProgramImportOperationRoster {
+            frontier,
+            operations,
+        })
+    }
+
     fn create_program_version_retained(
         &mut self,
         version: NewProgramVersion<'_>,
@@ -8498,6 +8532,9 @@ pub trait RuntimeStore {
         version_id: &str,
         witness_digest: &str,
     ) -> StoreResult<Option<program_imports::ProgramImportWitness>>;
+    fn program_import_operation_roster(
+        &self,
+    ) -> StoreResult<program_imports::ProgramImportOperationRoster>;
     /// Re-attest an instance's program under the current compiler: same
     /// authored identity, new IR (see `SqliteStore::reattest_instance_program`).
     fn reattest_instance_program(
@@ -8961,6 +8998,11 @@ impl RuntimeStore for SqliteStore {
         witness_digest: &str,
     ) -> StoreResult<Option<program_imports::ProgramImportWitness>> {
         self.program_import_witness(version_id, witness_digest)
+    }
+    fn program_import_operation_roster(
+        &self,
+    ) -> StoreResult<program_imports::ProgramImportOperationRoster> {
+        self.program_import_operation_roster()
     }
     fn reattest_instance_program(
         &mut self,
