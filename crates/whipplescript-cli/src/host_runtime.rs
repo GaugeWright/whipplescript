@@ -392,7 +392,8 @@ pub struct NativeWorkspaceResolver {
     /// drained by the harness loop. Behind a lock because the resolver surface
     /// takes `&self`.
     workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
-    /// The exact bytes successful `read` tools saw, keyed by their call IDs.
+    /// The exact bytes successful single-file `read` and `grep` tools saw,
+    /// keyed by their call IDs.
     /// A batch may execute several tools before the next model request.
     model_read_witnesses: std::sync::Mutex<HashMap<String, ModelReadWitness>>,
     root: PathBuf,
@@ -713,7 +714,12 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(matches.join("\n")))
     }
 
-    fn grep(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn grep(
+        &self,
+        call_id: &str,
+        arguments: &Value,
+        scopes: &[AdmittedFileScope],
+    ) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
         let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
@@ -741,6 +747,10 @@ impl NativeWorkspaceResolver {
         let matcher = crate::workspace_grep::GrepMatcher::new(pattern, ignore_case);
         let mut matches = Vec::new();
         let mut matches_found = 0usize;
+        // A directory search also reveals its traversal and negative matches.
+        // Only an explicit file search can be attributed to one retained cut.
+        let single_file = fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_file());
+        let mut exact_witness = None;
         walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
             if matches_found >= limit {
                 return false;
@@ -748,6 +758,12 @@ impl NativeWorkspaceResolver {
             let Ok(text) = fs::read_to_string(absolute) else {
                 return true;
             };
+            if single_file && absolute == resolved {
+                exact_witness = Some(ModelReadWitness {
+                    path: relative.to_owned(),
+                    content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
+                });
+            }
             crate::workspace_grep::grep_file_into(
                 relative,
                 &text,
@@ -759,6 +775,12 @@ impl NativeWorkspaceResolver {
             );
             true
         })?;
+        if let Some(witness) = exact_witness {
+            self.model_read_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(call_id.to_owned(), witness);
+        }
         Ok(self.cap(matches.join("\n")))
     }
 
@@ -969,7 +991,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
             "edit" => self.edit(&call.arguments, scopes),
             "ls" => self.list(&call.arguments, scopes),
             "find" => self.find(&call.arguments, scopes),
-            "grep" => self.grep(&call.arguments, scopes),
+            "grep" => self.grep(&call.id, &call.arguments, scopes),
             "bash" => {
                 if !admitted_resources
                     .iter()
@@ -5092,6 +5114,38 @@ workflow UnsafeHostChat {
                 },
             )
             .expect("read again");
+        let grep = resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "grep-file".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": "note.txt", "pattern": "alpha" }),
+                },
+            )
+            .expect("single-file grep");
+        assert!(grep.contains("alpha"));
+        let no_matches = resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "grep-empty".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": "other.txt", "pattern": "absent" }),
+                },
+            )
+            .expect("single-file grep with no matches");
+        assert!(no_matches.is_empty());
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "grep-directory".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "alpha" }),
+                },
+            )
+            .expect("directory grep");
         resolver
             .execute_tool(
                 &resources,
@@ -5122,6 +5176,21 @@ workflow UnsafeHostChat {
                 content_hash: whipplescript_store::stable_hash_bytes_hex(b"separate\n"),
             })
         );
+        assert_eq!(
+            resolver.take_model_read_witness("grep-file"),
+            Some(ModelReadWitness {
+                path: "note.txt".to_owned(),
+                content_hash: whipplescript_store::stable_hash_bytes_hex(b"alpha\nbeta\n"),
+            })
+        );
+        assert_eq!(
+            resolver.take_model_read_witness("grep-empty"),
+            Some(ModelReadWitness {
+                path: "other.txt".to_owned(),
+                content_hash: whipplescript_store::stable_hash_bytes_hex(b"separate\n"),
+            })
+        );
+        assert!(resolver.take_model_read_witness("grep-directory").is_none());
         assert!(resolver.take_model_read_witness("read-1").is_none());
         assert_eq!(
             resolver.execute_tool(

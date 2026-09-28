@@ -365,3 +365,21 @@ The model assumes production parsers and accepting operations cannot bypass
 the registry; that is the central implementation obligation, not a property
 this Python probe establishes. The current admitted fields, constructs and
 provider bindings still need a real exact-cut inventory before RC-1 closes.
+
+## Checked-program import coverage
+
+`program_import_coverage.py` probes RC-2's narrow local-package claim:
+
+```sh
+python3 models/research/program_import_coverage.py
+```
+
+An admission captures every non-`std.` `use`, resolves each against the exact
+local lock, and binds its edge set to the program source, lock and compiler
+revisions. The probe checks every examined subset of two imports and shows
+that an unresolved or omitted import refuses admission. A second admitted
+program without a witness, a changed package source under the same name, or
+an unclosed Home population makes broader coverage unknown. The model assumes
+the admitted-program roster is authoritative and the production accepting
+operation captures the witness atomically; neither property follows from an
+on-demand `whip compile` report.
