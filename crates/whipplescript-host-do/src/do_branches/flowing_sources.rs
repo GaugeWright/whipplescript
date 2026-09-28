@@ -10,7 +10,7 @@ use whipplescript_store::branches::flowing_sources::{
 use whipplescript_store::branches::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
 use whipplescript_store::{StoreError, StoreResult};
 
-fn exact_atomic<S: DoSql, T>(
+pub(super) fn exact_atomic<S: DoSql, T>(
     sql: &S,
     subject: &str,
     mut body: impl FnMut() -> StoreResult<T>,

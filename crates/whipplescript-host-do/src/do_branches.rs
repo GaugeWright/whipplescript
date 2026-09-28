@@ -14,6 +14,7 @@
 //! table (the one checkpoint manifests already live in), created
 //! defensively for stores that predate it.
 
+mod flowing_fence;
 mod flowing_sources;
 mod resolution_batch;
 mod resolution_origin;
@@ -195,6 +196,9 @@ impl<S: DoSql> DoBranches<S> {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_sources::SCHEMA {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_fence::SCHEMA {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         // Provenance columns arrived with Phase 2 (exactly as native):

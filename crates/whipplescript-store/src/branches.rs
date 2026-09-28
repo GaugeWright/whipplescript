@@ -15,6 +15,7 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod flowing_fence;
 pub mod flowing_sources;
 pub mod resolution_batch;
 pub mod resolution_origin;
@@ -1018,8 +1019,9 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// and could reclaim an undeclared twig draft. Version 6 gives declared
 /// units an optional, immutable source-atom basis with unique atom ownership.
 /// Version 7 records atomic twig-to-branch holder transfers; older writers
-/// cannot tell which authority owns an already shared unit.
-const SATELLITE_SCHEMA_VERSION: i64 = 7;
+/// cannot tell which authority owns an already shared unit. Version 8 adds
+/// ref-owned flowing source fences and their exact operation receipts.
+const SATELLITE_SCHEMA_VERSION: i64 = 8;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1031,6 +1033,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(resolution_batch::CREATE)?;
     connection.execute_batch(resolution_origin::CREATE)?;
     for statement in flowing_sources::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_fence::SCHEMA {
         connection.execute(statement, [])?;
     }
     connection.execute_batch(
