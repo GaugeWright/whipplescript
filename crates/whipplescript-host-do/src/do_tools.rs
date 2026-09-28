@@ -137,6 +137,9 @@ pub struct DoToolExecutor<Sql: DoSql> {
     /// drained by the harness loop (G2 of the output-attribution note). Behind a
     /// lock because the tool surface takes `&self`.
     workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
+    /// Full bytes seen by successful native-hosted `read` calls, keyed by tool
+    /// call ID until the next model request consumes their source labels.
+    model_read_witnesses: std::sync::Mutex<BTreeMap<String, (String, String)>>,
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
@@ -158,6 +161,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn new(sql: Rc<Sql>) -> Self {
         Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
+            model_read_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: String::new(),
             file_scopes: None,
@@ -170,6 +174,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn for_instance(sql: Rc<Sql>, instance_id: &str) -> Self {
         Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
+            model_read_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
@@ -259,7 +264,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     fn dispatch(&self, call: &ToolCall) -> Result<String, String> {
         let args = &call.arguments;
         match call.name.as_str() {
-            TOOL_READ => self.read(args),
+            TOOL_READ => self.read(&call.id, args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
             TOOL_GREP => self.grep(args),
@@ -463,7 +468,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         }
     }
 
-    fn read(&self, args: &Value) -> Result<String, String> {
+    fn read(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let path = self.path_access(str_arg(args, "path")?, false)?;
         let content = self
             .file_content(&path)?
@@ -476,7 +481,18 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         }
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");
-        read_line_window(&content, offset, limit)
+        let window = read_line_window(&content, offset, limit)?;
+        self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                call_id.to_owned(),
+                (
+                    path,
+                    whipplescript_store::stable_hash_bytes_hex(content.as_bytes()),
+                ),
+            );
+        Ok(window)
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
@@ -850,6 +866,24 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
         &self,
         call: &ToolCall,
     ) -> whipplescript_kernel::sansio::ModelContentProvenance {
+        if call.name == TOOL_READ {
+            let witness = self
+                .model_read_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&call.id);
+            if let (Some((path, digest)), Some(chat_id)) = (
+                witness,
+                self.workspace_source
+                    .as_deref()
+                    .and_then(|source| source.strip_prefix("workspace:")),
+            ) {
+                return whipplescript_kernel::sansio::ModelContentProvenance {
+                    source_handles: vec![format!("workspace-file:{chat_id}:{digest}:{path}")],
+                    complete: true,
+                };
+            }
+        }
         if matches!(
             call.name.as_str(),
             TOOL_READ | TOOL_WRITE | TOOL_EDIT | TOOL_GREP | TOOL_FIND | TOOL_LS | TOOL_BASH
@@ -882,6 +916,11 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
     }
 
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        // A reused ID cannot inherit an earlier file source if this call fails.
+        self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&call.id);
         // The kernel runs tools without yielding to the shell, so this is the
         // only point at which "a tool is running, and it is this one" is true
         // and reportable (DR 0061). The name is the whole value: a turn that
@@ -1068,6 +1107,69 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn hosted_read_source_names_its_exact_file_and_clears_reused_ids() {
+        let executor = executor().with_workspace_source(Some("workspace:chat-one".to_owned()));
+        assert_eq!(
+            executor
+                .execute(&call(
+                    "write",
+                    json!({"path": "targets/t-one/notes.txt", "content": "private notes\n"})
+                ))
+                .status,
+            ToolStatus::Ok
+        );
+        let read = ToolCall {
+            id: "read-one".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "targets/t-one/notes.txt", "limit": 1}),
+        };
+        assert_eq!(executor.execute(&read).status, ToolStatus::Ok);
+        assert_eq!(
+            executor.model_output_provenance(&read).source_handles,
+            [format!(
+                "workspace-file:chat-one:{}:targets/t-one/notes.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"private notes\n")
+            )]
+        );
+        assert_eq!(
+            executor.model_output_provenance(&read).source_handles,
+            ["workspace:chat-one"],
+            "the exact source is consumed once"
+        );
+        assert_eq!(executor.execute(&read).status, ToolStatus::Ok);
+        let failed = ToolCall {
+            arguments: json!({"path": "targets/t-one/missing.txt"}),
+            ..read.clone()
+        };
+        assert_eq!(executor.execute(&failed).status, ToolStatus::Error);
+        assert_eq!(
+            executor.model_output_provenance(&failed).source_handles,
+            ["workspace:chat-one"],
+            "a failed call with the same ID cannot inherit a prior witness"
+        );
+        assert_eq!(
+            executor
+                .execute(&call(
+                    "write",
+                    json!({"path": "targets/t-one/binary.txt", "content": "\u{0}binary"})
+                ))
+                .status,
+            ToolStatus::Ok
+        );
+        let binary = ToolCall {
+            id: "binary-read".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "targets/t-one/binary.txt"}),
+        };
+        assert_eq!(executor.execute(&binary).status, ToolStatus::Error);
+        assert_eq!(
+            executor.model_output_provenance(&binary).source_handles,
+            ["workspace:chat-one"],
+            "binary content cannot acquire a readable file witness"
+        );
     }
 
     /// Build an executor over a fresh schema-applied DO SQLite (the same test
