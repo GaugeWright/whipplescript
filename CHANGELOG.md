@@ -5,6 +5,10 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-09-28
+
+A patch release: nothing it adds breaks what 0.7.0 accepted.
+
 ### Added
 
 - **`whip issue label <id> <label>...` and `whip issue unlabel <id>
