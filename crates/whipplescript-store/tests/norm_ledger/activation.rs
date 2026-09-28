@@ -794,3 +794,124 @@ fn norm_enforcement_names_every_phase_and_the_unwired_one() {
     );
     assert!(phases(&view).contains(&("ref:release".to_owned(), PhaseKind::GatedRef, true)));
 }
+
+/// Running effects live in the runtime store; the host lists them and the
+/// command host judges them (norm-plane §10). A prepared publication names
+/// the epoch an activation closes, so the activation is refused at the door,
+/// appending nothing, until it is submitted.
+#[test]
+fn norm_activation_door_refuses_to_strand_a_prepared_publication() {
+    use whipplescript_store::norm_commands::{
+        NormCommand, NormCommandHost, NormCommandRequest, NormCommandResult,
+    };
+    use whipplescript_store::norm_publication::RunningNormEffect;
+    let keys = Keys::new();
+    let mut store = WorkItemStore::open_in_memory().unwrap();
+    let charter = governed(vec![duty("1", true)]);
+    store
+        .append_norm_event(
+            &keys.sign(
+                "owner",
+                "genesis",
+                NormAct::Bootstrap {
+                    creator: "worker".into(),
+                    charter: charter.clone(),
+                },
+            ),
+            &keys,
+        )
+        .unwrap();
+    let requirement = create(
+        &keys,
+        &mut store,
+        &duty("1", true),
+        json!({"name":"custody","proposition":"denied","domain":"src/","subject":"src/auth.py"}),
+        "duty",
+    );
+    let view = store.norm_view(&keys).unwrap();
+    store
+        .append_norm_event(
+            &transition(&keys, &view, "owner", &requirement, "accepted", "accept"),
+            &keys,
+        )
+        .unwrap();
+    let view = store.norm_view(&keys).unwrap();
+    let migration = vec![VocabularyMigration {
+        from: reference(&duty("1", true)),
+        plan: MigrationPlan::Retain {},
+    }];
+    let running = |prepared: Option<&str>| RunningNormEffect {
+        ledger: view.ledger.clone(),
+        instance: "instance".into(),
+        effect: "observe".into(),
+        status: "completed".into(),
+        requirement: requirement.clone(),
+        prepared: prepared.map(str::to_owned),
+    };
+    let stranding = || Ok(vec![running(Some("run"))]);
+    let planned = NormCommandHost::new(&mut store, &keys)
+        .with_running_effects(&stranding)
+        .execute(NormCommandRequest::new(NormCommand::PlanActivation {
+            proposal: ActivationProposal {
+                charter: charter.clone(),
+                migration: migration.clone(),
+                changes: Vec::new(),
+            },
+        }))
+        .unwrap();
+    let NormCommandResult::ActivationPlanned {
+        obstructions,
+        effects,
+        ..
+    } = planned.result
+    else {
+        panic!("an activation plan")
+    };
+    assert_eq!(obstructions.len(), 1);
+    assert_eq!(obstructions[0].rule.as_deref(), Some("effect observe run run"));
+    assert_eq!(effects.unwrap()[0].late, LateOutcome::Kept {});
+    let act = activation(&keys, &view, "owner", "activate", charter, migration, Vec::new());
+    let refused = NormCommandHost::new(&mut store, &keys)
+        .with_running_effects(&stranding)
+        .execute(NormCommandRequest::new(NormCommand::append(act.clone())))
+        .expect_err("a stranding activation");
+    assert!(format!("{refused:?}").contains("stranded"), "{refused:?}");
+    assert_eq!(store.norm_view(&keys).unwrap().authority_head, view.authority_head);
+    // Another ledger's prepared publication is not this activation's.
+    let elsewhere = || {
+        Ok(vec![RunningNormEffect {
+            ledger: "another-ledger".into(),
+            ..running(Some("run"))
+        }])
+    };
+    let planned = NormCommandHost::new(&mut store, &keys)
+        .with_running_effects(&elsewhere)
+        .execute(NormCommandRequest::new(NormCommand::PlanActivation {
+            proposal: ActivationProposal {
+                charter: governed(vec![duty("1", true)]),
+                migration: vec![VocabularyMigration {
+                    from: reference(&duty("1", true)),
+                    plan: MigrationPlan::Retain {},
+                }],
+                changes: Vec::new(),
+            },
+        }))
+        .unwrap();
+    let NormCommandResult::ActivationPlanned {
+        obstructions,
+        effects,
+        ..
+    } = planned.result
+    else {
+        panic!("an activation plan")
+    };
+    assert!(obstructions.is_empty());
+    assert_eq!(effects, Some(Vec::new()));
+    let submitted = || Ok(vec![running(None)]);
+    // Submitted, it no longer obstructs, and the same act is admitted.
+    NormCommandHost::new(&mut store, &keys)
+        .with_running_effects(&submitted)
+        .execute(NormCommandRequest::new(NormCommand::append(act)))
+        .unwrap();
+    assert_ne!(store.norm_view(&keys).unwrap().authority_head, view.authority_head);
+}

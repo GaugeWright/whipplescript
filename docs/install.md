@@ -78,8 +78,8 @@ whip doctor
 whip check examples/minimal-noop.whip   # from a checkout
 ```
 
-The `whip --version` command prints the version of the package. An example is
-`whipplescript 0.2.1`. The `whip --help` command also prints the label of the
+The `whip --version` command prints the version of the package, in the form
+`whipplescript X.Y.Z`. The `whip --help` command also prints the label of the
 implementation stage in parentheses. That label is for the tracking of the
 project. That label does not replace the version of the package.
 

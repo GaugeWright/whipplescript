@@ -26,6 +26,14 @@ data = ["Cargo.toml", "scripts", "examples/buck2-tests", "examples/buck2-tests/.
 # cargo builds every workspace binary into one directory.
 "target/whip-test-executor" = "//:rust-bin-whip-test-executor"
 
+[package.metadata.native-tests.exports.norm_commands]
+# The norm vectors the hosted worker's tests check against: norm_commands'
+# norm_cli_ tests write each to the file its variable names, and the native
+# run keeps them (GaugeWright BUILD.md stage 6), as
+# worker/scripts/generate-norm-vector.mjs has cargo test do.
+filter = "norm_cli_"
+env = { WHIPPLESCRIPT_NORM_VECTOR_OUT = "norm-portable-vector.json", WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT = "norm-publication-vector.json", WHIPPLESCRIPT_NORM_IMPACT_VECTOR_OUT = "norm-impact-vector.json" }
+
 [dependencies]
 # Native executor controller authority lives on its Docker-owned volume.
 rusqlite = { version = "0.40.1", features = ["bundled"] }

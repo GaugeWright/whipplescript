@@ -208,6 +208,21 @@ fn observe(
     run: &str,
     wrong: &[&str],
 ) -> String {
+    settle(fixture, host, hosted, requirement, cut, run, wrong);
+    publish(fixture, run)
+}
+
+/// Run Q0 on a stored cut and settle the run in both hosts' runtime
+/// journals, publishing nothing.
+fn settle(
+    fixture: &Fixture,
+    host: &Host,
+    hosted: &Hosted,
+    requirement: &str,
+    cut: &str,
+    run: &str,
+    wrong: &[&str],
+) {
     let prepared = with_view(fixture, |ledger, view, verifier| {
         let history = CapturedNormHistory::capture(
             view,
@@ -265,6 +280,26 @@ fn observe(
         &format!("instance-{run}"),
         &format!("run-{run}"),
     ));
+}
+
+/// A norm command on the host whose runtime journal the demo's runs settle
+/// in, so an activation plans and judges them.
+fn run_with_runtime(fixture: &Fixture, args: &[&str]) -> Value {
+    let output = fixture
+        .command(args)
+        .env("WHIPPLESCRIPT_STORE", fixture.root.join("runtime.sqlite"))
+        .output()
+        .expect("norm command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("norm JSON")
+}
+
+/// Publish a settled run's observation through the native door.
+fn publish(fixture: &Fixture, run: &str) -> String {
     let published = fixture
         .command(&[
             "publish-observation",
@@ -410,6 +445,7 @@ impl Hosted {
             &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"import","events":events}}).to_string(),
             None,
             Some(&mut lease),
+            None,
         )
         .expect("the object admits the native history");
     }
@@ -457,11 +493,29 @@ impl Hosted {
             .expect("hosted read")
     }
 
+    /// Plan an activation on the object, from its own runtime journal's
+    /// running norm effects.
+    fn plan_activation(&self, proposal: &Value) -> Value {
+        let runtime = DoSqliteStore::new(self.sql.clone());
+        let running = || whipplescript_store::norm_publication::running_norm_effects(&runtime);
+        let answer = execute_hosted_norm_command_with_artifacts(
+            &mut DoSqliteStore::new(self.sql.clone()),
+            &self.trust,
+            &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"plan_activation","proposal":proposal}}).to_string(),
+            None,
+            None,
+            Some(&running),
+        )
+        .expect("hosted activation plan");
+        serde_json::from_str::<Value>(&answer).expect("plan JSON")["result"].clone()
+    }
+
     fn snapshot_at(&self, frontier: &Value) -> Value {
         let answer = execute_hosted_norm_command_with_artifacts(
             &mut DoSqliteStore::new(self.sql.clone()),
             &self.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"snapshot_at","frontier":frontier}}).to_string(),
+            None,
             None,
             None,
         )
@@ -1318,7 +1372,37 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         .find(|entry| entry.definition.name == "reservation")
         .expect("C0 declares reservations");
     migration.push(json!({"from": reference(reservation), "plan": {"plan": "retire"}}));
-    fixture.write("c1.json", &json!({"charter": c1, "migration": migration}));
+    let c1_proposal = json!({"charter": c1, "migration": migration});
+    fixture.write("c1.json", &c1_proposal);
+    // A run of Q0 still in flight is planned too. Settled on both hosts and
+    // not yet published, its late outcome is kept, because C1 keeps the
+    // requirement's vocabulary; each host reads that from its own runtime
+    // journal, and neither is obstructed by it.
+    settle(&fixture, &host, &hosted, &requirement, "a2", "late", &[]);
+    hosted.sync(&fixture);
+    let in_flight = |plan: &Value| -> Vec<Value> {
+        assert_eq!(plan["obstructions"], json!([]), "{plan}");
+        plan["effects"]
+            .as_array()
+            .expect("the host plans its running effects")
+            .iter()
+            .filter(|planned| planned["effect"]["effect"] == "observe-late")
+            .cloned()
+            .collect()
+    };
+    let native_plan = in_flight(
+        &run_with_runtime(&fixture, &["plan-activation", "--proposal", "c1.json"])["result"],
+    );
+    assert_eq!(native_plan.len(), 1, "{native_plan:?}");
+    assert_eq!(
+        native_plan[0]["effect"]["requirement"],
+        requirement.as_str()
+    );
+    assert_eq!(native_plan[0]["late"], json!({"outcome": "kept"}));
+    assert_eq!(
+        in_flight(&hosted.plan_activation(&c1_proposal)),
+        native_plan
+    );
     let by_worker = fixture.refuse(&["activate", "--as", "worker", "--proposal", "c1.json"]);
     assert!(
         String::from_utf8_lossy(&by_worker.stderr)
@@ -1332,8 +1416,10 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         "a refused activation changes nothing"
     );
     assert_eq!(release_lease(), None, "nor gates the line it declares");
-    let activated = fixture.run(&["activate", "--as", "owner", "--proposal", "c1.json"])["result"]
-        ["event_id"]
+    let activated = run_with_runtime(
+        &fixture,
+        &["activate", "--as", "owner", "--proposal", "c1.json"],
+    )["result"]["event_id"]
         .as_str()
         .expect("activation")
         .to_owned();
@@ -1465,8 +1551,163 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
     let hosted_excepted = hosted.promote_stream("next", "excepted", &[]);
     assert_eq!(hosted_excepted["promoted"], "next", "{hosted_excepted}");
 
+    // The run in flight across C1 publishes under the kept requirement.
+    publish(&fixture, "late");
+
+    // U1 on the example (norm-plane §11). R0 gains a typed part; a second
+    // requirement over the same domain contradicts it. The joint check finds
+    // the two incompatible on both hosts, and a checker's verdict enters the
+    // ledger only as an observation that settles nothing. The UPROAR export
+    // grades every slot from what it carries, and the ledger's share of the
+    // workspace's acts stays an unknown denominator.
+    let typed = |name: &str, requirement: &str, formula: &str| {
+        fixture.write(
+            name,
+            &json!({"requirement": requirement, "declarations": ["worker_deny: bool"], "formula": formula}),
+        );
+        let constraint =
+            fixture.run(&["create", "constraint@1", "--as", "worker", "--fields", name])["result"]
+                ["event_id"]
+                .as_str()
+                .expect("constraint")
+                .to_owned();
+        fixture.run(&["transition", &constraint, "accepted", "--as", "owner"]);
+    };
+    typed("typed-r0.json", &requirement, "worker_deny = true");
+    fixture.write(
+        "r1.json",
+        &json!({
+            "name": "legacy-allow",
+            "proposition": "the legacy worker may act under a denying grant",
+            "domain": "authorization",
+            "subject": "src/auth.py",
+            "applicability": "the authorization domain",
+            "owner": "owner",
+        }),
+    );
+    let legacy = fixture.run(&[
+        "create",
+        "requirement@1",
+        "--as",
+        "owner",
+        "--fields",
+        "r1.json",
+    ])["result"]["event_id"]
+        .as_str()
+        .expect("R1")
+        .to_owned();
+    fixture.run(&["transition", &legacy, "accepted", "--as", "owner"]);
+    typed("typed-r1.json", &legacy, "worker_deny = false");
+    let native_check = fixture.run(&["compatibility"])["result"]["compatibility"].clone();
+    let mut core = vec![requirement.clone(), legacy.clone()];
+    core.sort();
+    let component = native_check["components"]
+        .as_array()
+        .and_then(|components| {
+            components
+                .iter()
+                .find(|component| component["norms"].as_array().is_some_and(|n| n.len() == 2))
+        })
+        .expect("the two typed requirements are one component")
+        .clone();
+    assert_eq!(component["outcome"], "incompatible", "{native_check}");
+    assert_eq!(component["core"], json!(core));
+    hosted.sync(&fixture);
+    let hosted_command = |command: Value| -> Value {
+        let answer = execute_hosted_norm_command_with_artifacts(
+            &mut DoSqliteStore::new(hosted.sql.clone()),
+            &hosted.trust,
+            &json!({"protocol":"whipplescript.norm.commands/v1","command": command}).to_string(),
+            None,
+            None,
+            None,
+        )
+        .expect("hosted norm command");
+        serde_json::from_str::<Value>(&answer).expect("hosted JSON")["result"].clone()
+    };
+    assert_eq!(
+        hosted_command(json!({"kind":"compatibility"}))["compatibility"],
+        native_check,
+        "both hosts check the same ledger the same way"
+    );
+    let statuses = |snapshot: &Value| -> Vec<(Value, Value)> {
+        snapshot["records"]
+            .as_array()
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry["record"]["id"].clone(),
+                            entry["record"]["status"].clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before_verdict = statuses(&snapshot(&fixture, None)["result"]["snapshot"]);
+    fixture.write(
+        "verdict.json",
+        &json!({
+            "family": "norm-compatibility",
+            "subject": core,
+            "outcome": "incompatible",
+            "basis": "the ledger frontier the check read",
+            "mode": "bounded-exhaustive",
+        }),
+    );
+    fixture.run(&[
+        "create",
+        "verdict@1",
+        "--as",
+        "worker",
+        "--fields",
+        "verdict.json",
+    ]);
+    let after_verdict = statuses(&snapshot(&fixture, None)["result"]["snapshot"]);
+    for record in &before_verdict {
+        assert!(
+            after_verdict.contains(record),
+            "a verdict moves no lifecycle: {record:?}"
+        );
+    }
+    let repository = "urn:gaugenet:repo:authorization-demo";
+    let native_export =
+        fixture.run(&["export-uproar", "--repository", repository])["result"]["export"].clone();
+    hosted.sync(&fixture);
+    let hosted_export = hosted_command(json!({"kind":"export_uproar","repository": repository}));
+    assert_eq!(hosted_export["export"], native_export);
+    assert_eq!(
+        native_export["binding"],
+        "whipplescript.norm.uproar-binding/1"
+    );
+    assert!(
+        native_export["opacity"]["population"].is_null(),
+        "{}",
+        native_export["opacity"]
+    );
+    let grade = |slot: &str| {
+        native_export["slots"]
+            .as_array()
+            .and_then(|slots| slots.iter().find(|entry| entry["slot"] == slot))
+            .map(|entry| entry["grade"].clone())
+    };
+    assert_eq!(grade("principal"), Some(json!("self_declared")));
+    assert_eq!(grade("flux"), Some(json!("absent")));
+    assert_eq!(
+        native_export["records"].as_array().map(Vec::len),
+        snapshot(&fixture, None)["result"]["snapshot"]["checkpoint"]
+            .is_object()
+            .then(|| fixture.run(&["export"])["result"]["events"]
+                .as_array()
+                .map(Vec::len))
+            .flatten(),
+        "one record for every admitted event"
+    );
+
     // The failure and its fixing cut stay inspectable: both observations
-    // and the passing one are in the ledger, the counterexample located at
+    // and the passing ones are in the ledger, the counterexample located at
     // worker-deny, and `work` holds the fixing cut after the failing one.
     let observations: Vec<String> = snapshot(&fixture, None)["result"]["snapshot"]["records"]
         .as_array()
@@ -1484,8 +1725,9 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
                 .collect()
         })
         .unwrap_or_default();
-    // A0, the failing A1, the repair's A2, and the policy's three runs of A2.
-    assert_eq!(observations.len(), 6, "{observations:?}");
+    // A0, the failing A1, the repair's A2, the policy's three runs of A2, and
+    // the run in flight across C1.
+    assert_eq!(observations.len(), 7, "{observations:?}");
     assert!(observations
         .iter()
         .any(|observation| observation.contains("worker-deny")

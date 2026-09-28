@@ -83,6 +83,18 @@ pub enum NormCommand {
     PlanActivation {
         proposal: crate::norm_activation::ActivationProposal,
     },
+    /// Project the ledger through the UPROAR binding profile (norm-plane
+    /// §11.2): graded slots and wire v1 records for `repository`.
+    ExportUproar {
+        repository: String,
+    },
+    /// Check the typed parts of effective requirements jointly, within a
+    /// bound, at a frontier (norm-plane §11.1). A read: the verdicts it
+    /// returns enter the ledger only as an actor's observation.
+    Compatibility {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frontier: Option<Vec<String>>,
+    },
     /// Evaluate a typed query (§8, `norm_query`) at a frontier; a query that
     /// reaches the artifact names the cut it is read at.
     Query {
@@ -124,6 +136,21 @@ fn declared_gates<'s>(
 /// Configured only by a host with whole-workspace read authority. The request
 /// cannot supply file bytes, store paths, a trusted cut row, or larger limits.
 pub type NormArtifactCapture<'a> = dyn Fn(&str) -> StoreResult<CapturedArtifact> + 'a;
+
+/// A host's running norm effects, read from its runtime store (norm-plane
+/// §10). The ledger never reads that store itself.
+pub type NormRunningEffects<'a> =
+    dyn Fn() -> StoreResult<Vec<crate::norm_publication::RunningNormEffect>> + 'a;
+
+fn running_of(
+    running: &NormRunningEffects<'_>,
+    ledger: &str,
+) -> StoreResult<Vec<crate::norm_publication::RunningNormEffect>> {
+    Ok(running()?
+        .into_iter()
+        .filter(|effect| effect.ledger == ledger)
+        .collect())
+}
 
 impl NormCommand {
     pub fn append(event: SignedNormEvent) -> Self {
@@ -191,9 +218,21 @@ pub enum NormCommandResult {
         captured: NormReadAnchor,
         result: Box<crate::norm_query::QueryResult>,
     },
+    Compatible {
+        captured: NormReadAnchor,
+        compatibility: Box<crate::norm_constraints::CompatibilityView>,
+    },
+    UproarExported {
+        captured: NormReadAnchor,
+        export: Box<crate::norm_uproar::UproarExport>,
+    },
     ActivationPlanned {
         captured: NormReadAnchor,
         obstructions: Vec<crate::norm_activation::ActivationObstruction>,
+        /// What the activation makes of each running norm effect's late
+        /// outcome; absent where the host keeps no runtime store.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effects: Option<Vec<crate::norm_activation::RunningEffectPlan>>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,6 +300,7 @@ pub struct NormCommandHost<'a, S: NormCommandStore> {
     verifier: &'a dyn NormVerifier,
     artifacts: Option<&'a NormArtifactCapture<'a>>,
     gated_refs: Option<&'a mut GatedRefLease<'a>>,
+    running: Option<&'a NormRunningEffects<'a>>,
 }
 impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     pub fn new(store: &'a mut S, verifier: &'a dyn NormVerifier) -> Self {
@@ -269,7 +309,16 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             verifier,
             artifacts: None,
             gated_refs: None,
+            running: None,
         }
+    }
+
+    /// The host's running norm effects. With them, planning an activation
+    /// plans every late outcome, and an activation that would strand a
+    /// prepared publication is refused before it is appended.
+    pub fn with_running_effects(mut self, running: &'a NormRunningEffects<'a>) -> Self {
+        self.running = Some(running);
+        self
     }
 
     /// The host's way to lease its gated refs (norm-plane §5): the mainline
@@ -497,6 +546,15 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                         &event.tracker_event()?,
                         self.verifier,
                     )?;
+                    if let (Some(running), crate::norm::NormAct::Activate { migration, .. }) =
+                        (self.running, &event.statement.action)
+                    {
+                        let (_, stranded) = view
+                            .plan_running_effects(migration, &running_of(running, &view.ledger)?);
+                        if !stranded.is_empty() {
+                            return Err(crate::norm_activation::obstruction_refusal(&stranded));
+                        }
+                    }
                 }
             }
             if let Some(lease) = self.gated_refs.as_mut() {
@@ -647,13 +705,43 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             NormCommand::PlanActivation { proposal } => {
                 let history = self.history()?;
                 let view = history.project(None, self.verifier)?;
+                let mut obstructions = view.activation_obstructions(
+                    &proposal.charter,
+                    &proposal.migration,
+                    &proposal.changes,
+                )?;
+                let effects = match self.running {
+                    Some(running) => {
+                        let (plans, stranded) = view.plan_running_effects(
+                            &proposal.migration,
+                            &running_of(running, &view.ledger)?,
+                        );
+                        obstructions.extend(stranded);
+                        Some(plans)
+                    }
+                    None => None,
+                };
                 NormCommandResult::ActivationPlanned {
                     captured: history.anchor(),
-                    obstructions: view.activation_obstructions(
-                        &proposal.charter,
-                        &proposal.migration,
-                        &proposal.changes,
-                    )?,
+                    obstructions,
+                    effects,
+                }
+            }
+            NormCommand::ExportUproar { repository } => {
+                let history = self.history()?;
+                let view = history.project(None, self.verifier)?;
+                let events: Vec<TrackerEvent> = history.events().cloned().collect();
+                NormCommandResult::UproarExported {
+                    captured: history.anchor(),
+                    export: Box::new(view.uproar_export(&events, &repository)?),
+                }
+            }
+            NormCommand::Compatibility { frontier } => {
+                let history = self.history()?;
+                let view = history.project(frontier.as_deref(), self.verifier)?;
+                NormCommandResult::Compatible {
+                    captured: history.anchor(),
+                    compatibility: Box::new(view.compatibility()?),
                 }
             }
             NormCommand::Explain { record, frontier } => {

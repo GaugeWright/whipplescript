@@ -101,6 +101,10 @@ pub struct NormVocabulary {
     /// revisions on two sides and a claim from a closed set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correspondence: Option<CorrespondenceDeclaration>,
+    /// Declares this vocabulary's records as typed constraints on
+    /// requirements (norm-plane §11.1). None means they constrain nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<crate::norm_constraints::ConstraintDeclaration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -572,6 +576,7 @@ pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegis
         crate::norm_inventory::validate_inventory_role(entry)?;
         crate::norm_relations::validate_relation_declaration(entry, charter)?;
         crate::norm_manifests::validate_manifest_declaration(entry)?;
+        crate::norm_constraints::validate_constraint_declaration(entry)?;
         crate::norm_correspondence::validate_correspondence_declaration(entry)?;
         let mut effect_statuses = BTreeSet::new();
         for rule in entry.effectiveness.iter().flatten() {

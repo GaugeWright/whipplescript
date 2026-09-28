@@ -105,3 +105,61 @@ fn the_registry_keys_each_path_by_its_file_class() {
     drop(vcs);
     std::fs::remove_dir_all(&root).expect("scratch");
 }
+
+#[test]
+fn renaming_a_local_is_not_a_declaration_change() {
+    let root = std::env::temp_dir().join(format!(
+        "whipplescript-canon-registry-locals-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("scratch");
+    let mut vcs =
+        NativeWorkspaceVcs::open(root.join("branches.sqlite"), root.join("content.sqlite"))
+            .expect("workspace");
+    vcs.register_decl_canonicalizer("rs", Box::new(RustItems));
+    vcs.register_decl_canonicalizer("ts", Box::new(TypeScriptItems::typescript()));
+    vcs.init("t0").expect("init");
+    let write = |vcs: &mut NativeWorkspaceVcs, path: &str, body: &str, cut: &str| {
+        vcs.write(MAINLINE_BRANCH_ID, path, Some(body), cut, "t1")
+            .expect("write");
+    };
+    let rust = "pub fn total(bonus: u32) -> u32 { let sum = bonus + 1; sum }\n";
+    let typescript =
+        "export function total(bonus: number) { const sum = bonus + 1; return sum; }\n";
+    write(&mut vcs, "crates/auth/src/lib.rs", rust, "c1");
+    write(&mut vcs, "web/src/auth.ts", typescript, "c2");
+    let renamed = |source: &str| source.replace("bonus", "extra").replace("sum", "acc");
+    write(&mut vcs, "crates/auth/src/lib.rs", &renamed(rust), "c3");
+    write(&mut vcs, "web/src/auth.ts", &renamed(typescript), "c4");
+    // Using the parameter where the local was is a change.
+    write(
+        &mut vcs,
+        "crates/auth/src/lib.rs",
+        &renamed(rust).replace("; acc }", "; extra }"),
+        "c5",
+    );
+    let units = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+    let decls = |cut: &str| -> Vec<String> {
+        units
+            .iter()
+            .find(|unit| unit.cut_id == cut)
+            .map(|unit| {
+                unit.decls
+                    .iter()
+                    .map(|decl| decl.identity.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        decls("c3").is_empty(),
+        "a Rust local rename is not a change"
+    );
+    assert!(
+        decls("c4").is_empty(),
+        "a TypeScript local rename is not a change"
+    );
+    assert_eq!(decls("c5"), ["fn crates/auth::total"]);
+    drop(vcs);
+    std::fs::remove_dir_all(&root).expect("scratch");
+}

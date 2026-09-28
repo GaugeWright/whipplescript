@@ -1975,6 +1975,8 @@ impl ParityWorlds {
         };
         let do_door = whipplescript_host_do::do_workstreams::DoVcsPromoteCapabilityProvider {
             sql: self.do_sql.clone(),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         use whipplescript_kernel::effect_handlers::CapabilityProvider;
         (
@@ -2002,6 +2004,8 @@ impl ParityWorlds {
         let do_door = whipplescript_host_do::do_workstreams::DoVcsSelectiveCapabilityProvider {
             sql: self.do_sql.clone(),
             instance_id: "ins-parity".to_owned(),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         use whipplescript_kernel::effect_handlers::CapabilityProvider;
         (

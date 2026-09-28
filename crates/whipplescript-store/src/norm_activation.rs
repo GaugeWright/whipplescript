@@ -559,3 +559,85 @@ impl NormView {
         Ok(())
     }
 }
+
+/// How an activation leaves a running norm effect's late outcome
+/// (norm-plane §10). The run is pinned to the requirement revision it was
+/// prepared against; the requirement's own migration decides what that
+/// revision still means.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LateOutcome {
+    /// The activation leaves the requirement's revision in force, so the
+    /// outcome supports or refutes it as it would have.
+    Kept {},
+    /// The requirement moves to a successor vocabulary, and a successor is a
+    /// new revision: the outcome evidences the pinned revision only, and the
+    /// successor needs a run of its own.
+    Pinned { successor: VocabularyRef },
+    /// The requirement is retired: the outcome stays in the runtime journal
+    /// and is not published.
+    Retired {},
+}
+
+/// One running effect and what the activation makes of its late outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningEffectPlan {
+    pub effect: crate::norm_publication::RunningNormEffect,
+    pub late: LateOutcome,
+}
+
+impl NormView {
+    /// Plan every running norm effect into a proposed migration: each late
+    /// outcome is kept, pinned or retired with its requirement. A publication
+    /// already prepared is an obstruction, because its envelope names the
+    /// authority epoch the activation closes and is never signed again, so
+    /// activating first would strand it.
+    pub fn plan_running_effects(
+        &self,
+        migration: &[VocabularyMigration],
+        running: &[crate::norm_publication::RunningNormEffect],
+    ) -> (Vec<RunningEffectPlan>, Vec<ActivationObstruction>) {
+        let mut plans = Vec::new();
+        let mut obstructions = Vec::new();
+        for effect in running {
+            let Some(record) = self.records.get(&effect.requirement) else {
+                obstructions.push(ActivationObstruction {
+                    vocabulary: "runtime".into(),
+                    record: Some(effect.requirement.clone()),
+                    rule: Some(format!("effect {}", effect.effect)),
+                    reason: "a running effect names a requirement this ledger does not hold".into(),
+                });
+                continue;
+            };
+            if let Some(run) = &effect.prepared {
+                obstructions.push(ActivationObstruction {
+                    vocabulary: label(&record.vocabulary),
+                    record: Some(record.id.clone()),
+                    rule: Some(format!("effect {} run {run}", effect.effect)),
+                    reason: "a publication prepared under the authority epoch this activation closes would be stranded; submit it first".into(),
+                });
+            }
+            let step = migration.iter().find(|step| step.from == record.vocabulary);
+            let late = match step.map(|step| &step.plan) {
+                Some(MigrationPlan::Successor { vocabulary, .. })
+                    if self.record_is_live(record) =>
+                {
+                    LateOutcome::Pinned {
+                        successor: vocabulary.clone(),
+                    }
+                }
+                Some(MigrationPlan::Retire {}) if self.record_is_live(record) => {
+                    LateOutcome::Retired {}
+                }
+                _ if self.is_retired(&record.id) => LateOutcome::Retired {},
+                _ => LateOutcome::Kept {},
+            };
+            plans.push(RunningEffectPlan {
+                effect: effect.clone(),
+                late,
+            });
+        }
+        (plans, obstructions)
+    }
+}

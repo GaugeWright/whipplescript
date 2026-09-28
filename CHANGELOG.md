@@ -1,9 +1,33 @@
 # Changelog
 
-All notable changes to WhippleScript are recorded here. This project aims to
-follow [Semantic Versioning](https://semver.org). Dates are UTC.
+All notable changes to WhippleScript are recorded here. Dates are UTC.
+
+Versions follow [Semantic Versioning](https://semver.org) as Cargo reads a
+`0.y.z` version (GaugeWright DR-0170). Before 1.0, the middle number rises for a
+release that breaks something a user or a dependent relies on — stored data, a
+protocol, the command line, configuration, or a published crate's interface —
+and the last number rises for everything else. A dependency on `0.7` accepts any
+`0.7.x`, so a break is never numbered in the last place. The entry for a release
+that raises the middle number says what broke and what you must do. Every crate
+a release publishes carries the same version; the one exception is a
+maintenance release, listed under [Maintenance releases](#maintenance-releases)
+rather than in the sequence.
+
+The rule was adopted after 0.7.0, so the entries up to and including 0.7.0
+predate it. Where an older entry read its numbers another way — 0.2.1 took the
+next free number rather than a patch — it says so.
 
 ## [Unreleased]
+
+### Added
+
+- **The misuse log.** Each invocation whip refuses with exit status 2 — an
+  unknown command, an unknown option, a missing argument — adds one JSON line
+  to `~/.local/state/whipplescript/misuse.jsonl`, so the commands people and
+  agents expect can be counted and the command surface improved from them.
+  Arguments that can hold a secret are written as `<redacted>`, and the log
+  never leaves the machine. `WHIPPLESCRIPT_MISUSE_LOG` names another path, or
+  `off` keeps no log.
 
 ## [0.7.1] — 2026-09-28
 

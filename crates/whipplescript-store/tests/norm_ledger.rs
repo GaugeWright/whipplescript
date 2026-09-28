@@ -13,6 +13,11 @@ mod tests {
     use whipplescript_store::StoreError;
 
     #[cfg(test)]
+    mod compatibility {
+        use super::*;
+        include!("norm_ledger/compatibility.rs");
+    }
+    #[cfg(test)]
     mod activation {
         use super::*;
         include!("norm_ledger/activation.rs");
@@ -233,6 +238,7 @@ mod tests {
                 relation: None,
                 manifest: None,
                 correspondence: None,
+                constraint: None,
                 editing: None,
                 effectiveness: None,
                 inventory_role: None,
@@ -1201,7 +1207,9 @@ mod tests {
                 "artifact",
                 "quarantine",
                 "sampling-policy",
-                "exception"
+                "exception",
+                "constraint",
+                "verdict"
             ]
         );
         let keys = Keys::new();
@@ -1228,6 +1236,7 @@ mod tests {
             if entry.relation.is_some()
                 || entry.manifest.is_some()
                 || entry.correspondence.is_some()
+                || entry.constraint.is_some()
                 || entry.definition.name == "artifact"
             {
                 continue;
@@ -1257,6 +1266,9 @@ mod tests {
                     "scope":"main","effects":"promote","residual":"check it","accountable":"owner",
                     "expires_at":"2999-01-01T00:00:00Z"
                 }),
+                "verdict" => {
+                    json!({"family":"norm-compatibility","subject":["req-a"],"outcome":"unresolved","basis":"no typed part","mode":"unresolved"})
+                }
                 _ => panic!("uncovered bundled declaration"),
             };
             // A quarantine is the owner's `evidence.quarantine` act; every other
@@ -1325,7 +1337,7 @@ mod tests {
         );
         assert!(store.append_norm_event(&granted, &keys).is_err());
         // One record for each bundled vocabulary created above.
-        assert_eq!(store.norm_aliases().unwrap().len(), 8);
+        assert_eq!(store.norm_aliases().unwrap().len(), 9);
     }
     /// DR-0122 §13.2 and §13.4, the runtime half of
     /// `models/maude/relation-validation-scope.maude`: an act that makes an

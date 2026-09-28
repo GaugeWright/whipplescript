@@ -230,7 +230,9 @@ scripts above covers the example.
 ## Version scope
 
 The Markdown in this repository applies to the most recent released line of the
-CLI. The published CLI version is `0.2.1`. If the exact CLI flags or the exact
+CLI. The
+[releases page](https://github.com/GaugeWright/whipplescript/releases/latest)
+names the most recent release. If the exact CLI flags or the exact
 JSON fields are important, read the documents from the applicable Git tag. The
 `whip --help` command prints an implementation-stage label. That label is an
 internal marker of progress. It is not a different compatibility version.

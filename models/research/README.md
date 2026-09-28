@@ -226,6 +226,25 @@ a parked obligation from the close receipt. The gate and CAS are abstracted;
 not prove real cut retention, rehome/abandonment, dependency repair, external
 settlement, or native and hosted storage transactions.
 
+`flowing_full_seam.py` synchronizes the private-pin model's selected-unit
+accounting with the norm/ref model's trunk CAS, and synchronizes closure's
+disable with the ref-owned Hold epoch:
+
+```sh
+python3 models/research/flowing_full_seam.py
+```
+
+It explores 13,470 safe states through twelve transitions for one selected
+unit, a second member twig, two coordinators and one candidate. Scenarios
+show a CAS winning before close disable, a second member's unit parked at
+close, disable blocking a passed candidate, and a later member handoff making
+that candidate's branch cut stale. Four
+weakenings admit a CAS without unit accounting, omit the ref fence at disable,
+trust the stale branch cut, or close before recovering an accepted receipt.
+The product still abstracts content reconciliation, dependency coverage,
+physical lock scheduling and independently failing stores; it does not prove
+the native or hosted transactions implement these synchronized transitions.
+
 `contribution_lifecycle.py` probes one branch with two declared contributions,
 where `u1` depends on `u0`. It separates the durable holder of each unit from
 a disposable gate attempt. Ready declaration, twig-to-branch sharing, bounded

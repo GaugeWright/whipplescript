@@ -51,6 +51,26 @@ pub(crate) fn fields(execution: &VerifiedNormExecution) -> Result<Value, String>
     }))
 }
 
+/// A charter activation that retires a requirement retires its running
+/// effects with it (norm-plane §10): a late outcome is not published.
+fn refuse_retired(
+    execution: &VerifiedNormExecution,
+    history: &CapturedNormHistory,
+    verifier: &dyn NormVerifier,
+) -> Result<(), String> {
+    let requirement = &execution.intent().requirement.name;
+    if history
+        .project(None, verifier)
+        .map_err(|e| format!("{e:?}"))?
+        .is_retired(requirement)
+    {
+        return Err(format!(
+            "requirement {requirement} was retired by a charter activation; its run's outcome stays in the runtime journal"
+        ));
+    }
+    Ok(())
+}
+
 impl PreparedObservationPublication {
     fn statement(
         execution: &VerifiedNormExecution,
@@ -90,6 +110,7 @@ impl PreparedObservationPublication {
         verifier: &dyn NormVerifier,
         signing: ObservationSigning<'_>,
     ) -> Result<ObservationPublicationDraft, String> {
+        refuse_retired(execution, history, verifier)?;
         let statement = Self::statement(execution, &signing)?;
         let slot = PublicationSlot {
             ledger: execution.intent().anchor.checkpoint.ledger.clone(),
@@ -179,6 +200,7 @@ impl PreparedObservationPublication {
         {
             Some(retained) => retained,
             None => {
+                refuse_retired(execution, history, verifier)?;
                 let statement = Self::statement(execution, &signing)?;
                 let signature = sign(&statement)?;
                 let event = SignedNormEvent {

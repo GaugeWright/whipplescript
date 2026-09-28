@@ -7,7 +7,8 @@
 //! - identity is kind plus qualified name, reconstructed from the path,
 //!   inline nesting and the package directory;
 //! - the canonical print drops comments and whitespace, so a reformat and a
-//!   comment edit are not changes;
+//!   comment edit are not changes, and alpha-renames locals wherever their
+//!   scoping is resolved exactly, so renaming a local is not a change either;
 //! - the rename hash is the print with the unit's own name erased, so a pure
 //!   rename, or a move between files with an identical body, is recognisable;
 //! - whatever cannot be keyed exactly (macro-generated items, path
@@ -17,6 +18,7 @@
 //! - the canonicalizer's version rides in both hashes, so a grammar or
 //!   normalizer bump re-keys every unit once, deliberately.
 
+mod alpha;
 mod markdown;
 mod syntax;
 

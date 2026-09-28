@@ -1,5 +1,6 @@
 use super::*;
 use crate::norm_execution::fixtures::{self as f, Boundary};
+use crate::norm_runner::candidate_identity;
 use serde_json::json;
 use whipplescript_core::norm_evidence::*;
 use whipplescript_core::norm_preservation::*;

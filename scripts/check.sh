@@ -236,16 +236,20 @@ echo "== workflow action pins =="
 # and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
 section workflow-action-pins
 
-echo "== intra-workspace version pins =="
-# Every crate here pins its sibling with `version = "X", path = "../…"`. The
-# version half is what crates.io consumers resolve against; the path half is what
-# the workspace builds. Cargo has no inheritance for that field — `version =
-# { workspace = true }` inside a dependency entry is "invalid type: map, expected
-# a string" — so the pins are 24 hand-maintained copies of one number, and
-# nothing compared them to `[workspace.package] version`. They had drifted: the
-# workspace was 0.5.6 and all 24 still said 0.5.5. Caret semantics hid it (a
-# `0.5.5` requirement accepts 0.5.6), which is exactly why it could sit there.
-section version-pins
+echo "== version declarations =="
+# WhippleScript has one version, declared once in `[workspace.package]`, and
+# every other place it is stated must agree with it on every change, not only
+# when a release is cut (GaugeWright DR-0170). Most of those places inherit it.
+# The ones that cannot are the intra-workspace pins, `version = "X", path =
+# "../…"`: the version half is what crates.io consumers resolve against, and
+# cargo has no inheritance for it — `version = { workspace = true }` inside a
+# dependency entry is "invalid type: map, expected a string" — so they are
+# hand-maintained copies. They had drifted before: the workspace was 0.5.6 and
+# all 24 still said 0.5.5, which caret semantics hid (a `0.5.5` requirement
+# accepts 0.5.6). The same section holds Cargo.lock, every package.json, and
+# every manifest that releases nothing to the rule, and admits a maintenance
+# release's detached crates only where the branch declares them.
+section version-declarations
 
 # DR-0066: the shared digest/verification cores must stay free of ambient time,
 # randomness, and IO, or deterministic simulation stops being available and the
@@ -575,7 +579,7 @@ echo "== hosted runtime contracts =="
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then
     echo "skipped: WHIPPLESCRIPT_CHECK_SKIP_HOSTED is set (a separate job owns these)"
 else
-    section hosted-runtime
+    if [ -n "$native" ]; then section native-hosted-runtime; else section hosted-runtime; fi
 fi
 
 echo "== whipplescript green bar PASSED =="

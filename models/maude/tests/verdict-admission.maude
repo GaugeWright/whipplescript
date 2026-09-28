@@ -1,0 +1,17 @@
+load ../verdict-admission.maude
+--- A scoped verdict enters as an advisory observation with its grade.
+search [1] in VERDICT-ADMISSION : { verdict(compatible, 2, present) } =>* { observed(compatible, present) C:Cfg } .
+--- An empty court is never universal equivalence; reading it as one is.
+search in VERDICT-ADMISSION : { verdict(compatible, 0, present) } =>* { observed(universal, G:Grade) C:Cfg } .
+search [1] in VERDICT-ADMISSION-WEAK-EMPTY-UNIVERSAL : { verdict(compatible, 0, present) } =>* { observed(universal, G:Grade) C:Cfg } .
+--- It is indeterminate.
+search [1] in VERDICT-ADMISSION : { verdict(compatible, 0, present) } =>* { observed(indeterminate, present) C:Cfg } .
+--- An absent slot supports no proof; taking it as support does.
+search in VERDICT-ADMISSION : { verdict(compatible, 2, absent) } =>* { proof C:Cfg } .
+search [1] in VERDICT-ADMISSION-WEAK-ABSENT-PROOF : { verdict(compatible, 2, absent) } =>* { proof C:Cfg } .
+--- No verdict settles a lifecycle; a verdict that settles directly does.
+search in VERDICT-ADMISSION : { verdict(compatible, 2, present) requirement(open) } =>* { requirement(settled) C:Cfg } .
+search [1] in VERDICT-ADMISSION-WEAK-DIRECT-SETTLE : { verdict(compatible, 2, present) requirement(open) } =>* { requirement(settled) C:Cfg } .
+--- An authorized act settles it, verdict or not.
+search [1] in VERDICT-ADMISSION : { verdict(compatible, 2, present) requirement(open) authorized } =>* { requirement(settled) C:Cfg } .
+quit

@@ -1,6 +1,5 @@
 //! Complete pure impact planning. No job execution or ref admission authority.
 use crate::norm_projection::{EvidenceProjection, ExecutionSelectionPolicy, ProjectionGap};
-use crate::norm_runner::candidate_identity;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use whipplescript_core::norm_evidence::EvidenceVersion;
@@ -80,6 +79,11 @@ pub struct RequirementImpact {
     pub requirement: Option<EvidenceVersion>,
     pub selection: Option<EvidenceSelection>,
     pub work: ImpactWork,
+    /// For a protected run staged its requirement's domain, that domain and
+    /// every change outside it: the witness that support carried across
+    /// those changes (norm-plane §3.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<crate::norm_staging::SupportCeiling>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
@@ -213,7 +217,22 @@ fn plan_with_selection(
             .authority_actions
             .insert(ImpactAuthorityAction::AuthorityChanged);
     }
-    let artifact = candidate_identity(input.candidate.files());
+    // What each requirement's run is staged at the candidate: its domain for
+    // a protected method, the whole cut otherwise (norm_staging).
+    let staging = |record: &InventoryRequirement, inventory: &ResourceInventory, id: &str| {
+        let method = crate::norm_execution::PreparedNormExecution::requirement_method(record).ok();
+        match method {
+            Some(method) => crate::norm_staging::stage(
+                &method.runtime.engine,
+                inventory.bindings.get(id),
+                input.candidate.files(),
+            ),
+            None => crate::norm_staging::Staging {
+                files: input.candidate.files().clone(),
+                ceiling: None,
+            },
+        }
+    };
     let mut evaluated = 0usize;
     for id in &result.resources.requirements {
         let before = result.resources.before.inventory.requirements.get(id);
@@ -252,6 +271,7 @@ fn plan_with_selection(
                     "impact planning exceeds its evaluation budget".into(),
                 ));
             }
+            let staged = staging(record, inventory, id);
             let selection = record
                 .requirement
                 .as_ref()
@@ -259,7 +279,7 @@ fn plan_with_selection(
                     select(
                         &SelectionQuery {
                             requirement: requirement.clone(),
-                            artifact: artifact.clone(),
+                            artifact: staged.identity(),
                             policy: input.policy.clone(),
                             time_basis: input.time_basis.into(),
                             frontier: input.after.frontier.clone(),
@@ -297,11 +317,34 @@ fn plan_with_selection(
                 },
                 _ => ImpactWork::ResourceGap,
             };
+            // Every change outside what the run is staged, which is what a
+            // supported requirement's support carried across.
+            let ceiling = staged
+                .ceiling
+                .map(|domain| crate::norm_staging::SupportCeiling {
+                    domain,
+                    outside: result
+                        .resources
+                        .changes
+                        .keys()
+                        .filter(|path| {
+                            !staged.files.contains_key(*path)
+                                && !result
+                                    .resources
+                                    .before
+                                    .bindings
+                                    .get(id)
+                                    .is_some_and(|before| before.resources.contains(*path))
+                        })
+                        .cloned()
+                        .collect(),
+                });
             entries.push(RequirementImpact {
                 bases: [basis].into(),
                 requirement: record.requirement.clone(),
                 selection,
                 work,
+                ceiling,
             });
         }
         result.requirements.insert(id.clone(), entries);

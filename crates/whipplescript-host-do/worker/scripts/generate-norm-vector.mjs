@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
@@ -12,16 +12,26 @@ await mkdir(resolve(root, "target"), { recursive: true });
 await rm(output, { force: true });
 await rm(publicationOutput, { force: true });
 await rm(impactOutput, { force: true });
-const result = spawnSync("cargo", [
-  "test", "-p", "whipplescript", "--test", "norm_commands",
-  "norm_cli_",
-], {
-  cwd: root,
-  env: { ...process.env, WHIPPLESCRIPT_NORM_VECTOR_OUT: output, WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT: publicationOutput, WHIPPLESCRIPT_NORM_IMPACT_VECTOR_OUT: impactOutput },
-  stdio: "inherit",
-});
-if (result.error) throw result.error;
-if (result.status !== 0) throw new Error(`native norm vector producer failed (${result.status ?? result.signal})`);
+// Where the bar hands them over (GaugeWright BUILD.md stage 6): the vectors
+// the native run of those same tests wrote, from the fleet's cache when their
+// inputs did not change. Checked below exactly as a fresh cargo run's are.
+const prebuilt = process.env.WHIPPLESCRIPT_NORM_VECTORS;
+if (prebuilt) {
+  await copyFile(resolve(prebuilt, "norm-portable-vector.json"), output);
+  await copyFile(resolve(prebuilt, "norm-publication-vector.json"), publicationOutput);
+  await copyFile(resolve(prebuilt, "norm-impact-vector.json"), impactOutput);
+} else {
+  const result = spawnSync("cargo", [
+    "test", "-p", "whipplescript", "--test", "norm_commands",
+    "norm_cli_",
+  ], {
+    cwd: root,
+    env: { ...process.env, WHIPPLESCRIPT_NORM_VECTOR_OUT: output, WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT: publicationOutput, WHIPPLESCRIPT_NORM_IMPACT_VECTOR_OUT: impactOutput },
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`native norm vector producer failed (${result.status ?? result.signal})`);
+}
 const vector = JSON.parse(await readFile(output, "utf8"));
 assert.equal(vector.protocol, "whipplescript.norm.test-vector/v1");
 assert.equal(vector.events.length, 12);

@@ -1,0 +1,14 @@
+load ../norm-compatibility.maude
+--- Overlapping norms that agree are compatible, with a witness.
+search [1] in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z)) =>* judged(N:Norms, compatible) .
+search [1] in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z)) =>* witnessed(N:Norms, A:Assignment) .
+--- The pairwise-compatible inconsistent triple is never compatible; a pairwise checker calls it so.
+search in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z) ne(x, z)) =>* judged(N:Norms, compatible) .
+search [1] in NORM-COMPATIBILITY-WEAK-PAIRWISE : check(eq(x, y) eq(y, z) ne(x, z)) =>* judged(N:Norms, compatible) .
+--- The triple is judged incompatible, and has no witness.
+search [1] in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z) ne(x, z)) =>* judged(N:Norms, incompatible) .
+search in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z) ne(x, z)) =>* witnessed(N:Norms, A:Assignment) .
+--- Overlap alone is never a conflict; a checker that treats it as one does.
+search in NORM-COMPATIBILITY : check(eq(x, y) eq(y, z)) =>* judged(N:Norms, incompatible) .
+search [1] in NORM-COMPATIBILITY-WEAK-OVERLAP : check(eq(x, y) eq(y, z)) =>* judged(N:Norms, incompatible) .
+quit

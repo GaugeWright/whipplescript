@@ -96,25 +96,14 @@ case "${1:-}" in
     node scripts/check-cargo-test-guarded.mjs --selftest
     node scripts/check-cargo-test-guarded.mjs ;;
   workflow-action-pins) scripts/check-actions-pinned.sh ;;
-  version-pins)
-    # Every crate pins its sibling with `version = "X", path = "../…"`; cargo
-    # cannot inherit that field, so the pins are hand-maintained copies of
-    # [workspace.package] version, and they had drifted (0.5.5 against 0.5.6,
-    # hidden by caret semantics). Compare each to the one number.
-    ws_version="$(awk -F'"' '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^version *= *"/{print $2;exit}' Cargo.toml)"
-    if [ -z "$ws_version" ]; then
-        echo "could not read [workspace.package] version out of Cargo.toml" >&2
-        exit 1
-    fi
-    pin_drift="$(grep -n 'path = "\.\./whipplescript-' crates/*/Cargo.toml \
-        | grep 'version = "' \
-        | grep -v "version = \"$ws_version\"" || true)"
-    if [ -n "$pin_drift" ]; then
-        echo "intra-workspace pins disagree with [workspace.package] version $ws_version:" >&2
-        echo "$pin_drift" >&2
-        echo "Bump each to \"$ws_version\"; cargo cannot inherit this field." >&2
-        exit 1
-    fi ;;
+  version-declarations)
+    # Every place the version is stated agrees with [workspace.package]
+    # (GaugeWright DR-0170): the crates inherit it, the intra-workspace pins
+    # cargo cannot inherit name it, Cargo.lock records it, and what releases
+    # nothing says 0.0.0. The script's header has the rules and the one
+    # declared exception, a maintenance release off a support branch.
+    node scripts/check-version-declarations.mjs --selftest
+    node scripts/check-version-declarations.mjs ;;
   sansio-purity)        scripts/check-sansio-purity.sh ;;
   do-schema)
     node scripts/check-do-schema-consistency.mjs --selftest

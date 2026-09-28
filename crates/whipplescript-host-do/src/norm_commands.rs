@@ -41,19 +41,28 @@ pub fn execute_hosted_norm_command<S: NormCommandStore>(
     trusted_configuration: &str,
     command: &str,
 ) -> Result<String, String> {
-    execute_hosted_norm_command_with_artifacts(store, trusted_configuration, command, None, None)
+    execute_hosted_norm_command_with_artifacts(
+        store,
+        trusted_configuration,
+        command,
+        None,
+        None,
+        None,
+    )
 }
 
 /// The embedding additionally authorizes whole-workspace artifact reads. The
 /// callback chooses the store and limits; neither is supplied by a command.
 /// `gated_refs` leases the workspace's gated refs before a ledger's first
-/// event lands (norm-plane §5).
+/// event lands (norm-plane §5), and `running` lists the object's running norm
+/// effects for an activation to plan (§10).
 pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
     store: &mut S,
     trusted_configuration: &str,
     command: &str,
     artifacts: Option<&NormArtifactCapture<'_>>,
     gated_refs: Option<&mut whipplescript_store::norm_commands::GatedRefLease<'_>>,
+    running: Option<&whipplescript_store::norm_commands::NormRunningEffects<'_>>,
 ) -> Result<String, String> {
     let trust: HostedNormTrust =
         serde_json::from_str(trusted_configuration).map_err(|error| error.to_string())?;
@@ -64,6 +73,9 @@ pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
         }
         if let Some(gated_refs) = gated_refs {
             host = host.with_gated_refs(gated_refs);
+        }
+        if let Some(running) = running {
+            host = host.with_running_effects(running);
         }
         host.execute_json(command)
             .map_err(|error| format!("norm command refused: {error:?}"))
@@ -110,6 +122,38 @@ pub use impact::{
 #[path = "norm_commands/promotion.rs"]
 mod promotion;
 pub use promotion::execute_installed_hosted_norm_promotion;
+
+/// The deployment's norm planning configuration for the object's in-language
+/// doors onto the mainline (norm-plane §5): the trust document and the
+/// installed planning premises `/host/norm/promotions` receives, without a
+/// clock. Each evaluation takes its time basis and `now` from the step it runs
+/// in, so the gate a door asks is the one the promotion route asks.
+#[derive(Clone, Debug)]
+pub struct HostedNormGate {
+    pub trust: String,
+    /// `planning`, `runtime`, `image_binding` and `deployed_image`, as the
+    /// promotion route's deployment carries them.
+    pub deployment: String,
+}
+
+impl HostedNormGate {
+    /// Evaluate with the admission host this configuration installs at the
+    /// step's injected clock (`now_unix_ms`), never wall time.
+    pub(crate) fn with_admission_host<Sql: crate::do_store::DoSql + Clone, T>(
+        &self,
+        sql: &Sql,
+        now_unix_ms: i64,
+        evaluate: impl FnOnce(
+            whipplescript_kernel::norm_admission::AdmissionHost<
+                '_,
+                crate::do_store::DoSqliteStore<Sql>,
+            >,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let deployment = impact::Deployment::at_step(&self.deployment, now_unix_ms)?;
+        promotion::with_admission_host(sql, &self.trust, &deployment, evaluate)
+    }
+}
 
 const ENQUEUE_PROTOCOL: &str = "whipplescript.norm.enqueue/v1";
 

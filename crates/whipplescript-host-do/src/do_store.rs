@@ -8034,6 +8034,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .collect())
     }
 
+    fn list_effect_instances(&self) -> StoreResult<Vec<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT DISTINCT instance_id FROM effects ORDER BY instance_id",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
         let rows = self
             .sql
@@ -19224,6 +19235,7 @@ mod norm_admission_tests {
     }
     fn charter() -> NormCharter {
         NormCharter {resource_domains:None,vocabularies:vec![NormVocabulary {
+            constraint: None,
             relation: None,
             manifest: None,
             correspondence: None,
@@ -19238,9 +19250,9 @@ mod norm_admission_tests {
     }
 
     /// The hosted promote door runs the mainline gate over the object's own
-    /// ledger (norm-plane §5). Until the door receives the deployment's
-    /// planning inputs, a governed workspace is refused with the reason named
-    /// and the mainline unmoved, never promoted unevaluated.
+    /// ledger (norm-plane §5). On an object whose deployment installs no
+    /// planning configuration, a governed workspace is refused with the reason
+    /// named and the mainline unmoved, never promoted unevaluated.
     #[test]
     fn the_hosted_mainline_gate_refuses_a_governed_workspace_it_cannot_evaluate() {
         use std::rc::Rc;
@@ -19294,6 +19306,8 @@ mod norm_admission_tests {
             .unwrap();
         let provider = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
             sql: Rc::clone(&sql),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         let outcome = provider.produce(
             &whipplescript_store::ClaimableEffect {
@@ -19318,10 +19332,8 @@ mod norm_admission_tests {
         assert_eq!(error_kind, "norm_gate_refused");
         assert_eq!(
             message,
-            format!(
-                "the mainline's gated requirements cannot be evaluated: {}",
-                crate::do_workstreams::HOSTED_ADMISSION_UNCONFIGURED
-            )
+            "the mainline's gated requirements cannot be evaluated: \
+             the deployment installs no norm planning configuration for the hosted doors"
         );
         assert_eq!(
             branches
@@ -19340,6 +19352,8 @@ mod norm_admission_tests {
         let selective = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
             sql: Rc::clone(&sql),
             instance_id: "inst-1".into(),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         let CapabilityOutcome::Failed {
             error_kind,
@@ -19366,19 +19380,21 @@ mod norm_admission_tests {
         assert_eq!(transported, message);
         let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Restore;
-        let restored = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, &[], |gate| {
-            vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate)
-        })
-        .unwrap();
+        let restored =
+            crate::do_workstreams::with_hosted_mainline_gate(&sql, None, 0, door, &[], |gate| {
+                vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate)
+            })
+            .unwrap();
         assert!(
             matches!(&restored, whipplescript_store::vcs::RestoreOutcome::GateRefused(refusal) if refusal.reason == message),
             "{restored:?}"
         );
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Undo;
-        let undone = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, &[], |gate| {
-            vcs.undo_op("op-cut_0", "undo-main", "t6", gate)
-        })
-        .unwrap();
+        let undone =
+            crate::do_workstreams::with_hosted_mainline_gate(&sql, None, 0, door, &[], |gate| {
+                vcs.undo_op("op-cut_0", "undo-main", "t6", gate)
+            })
+            .unwrap();
         assert!(
             matches!(&undone, whipplescript_store::vcs::UndoOpOutcome::GateRefused(refusal) if refusal.reason == message),
             "{undone:?}"
@@ -19403,6 +19419,422 @@ mod norm_admission_tests {
                 .as_deref(),
             Some("cut_0"),
             "no door moved the mainline"
+        );
+    }
+
+    /// A governed hosted workspace for the configured gate: Main holds
+    /// `main.py` at `cut_0`; stream `triage`'s line, bound to `inst-1`, holds
+    /// the candidate at `cut_1`; the ledger, bootstrapped under the bundled
+    /// charter, leases the mainline to its gate. `requirement` also accepts an
+    /// obligation on `main.py` that no evidence supports. Returns the object,
+    /// the gate's configuration as the Worker installs it, and the requirement.
+    fn configured_hosted_workspace(
+        requirement: bool,
+    ) -> (
+        std::rc::Rc<super::test_support::RusqliteDoSql>,
+        crate::norm_commands::HostedNormGate,
+        Option<String>,
+    ) {
+        use std::rc::Rc;
+        use whipplescript_store::branches::{Branches, MAINLINE_BRANCH_ID};
+        use whipplescript_store::workstreams::Workstreams;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &owner_root,
+            }],
+            BTreeSet::from([("owner".into(), "owner".into())]),
+        )
+        .unwrap();
+        let sql = Rc::new(super::test_support::RusqliteDoSql::from_store_schema());
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.py",
+            Some("def allow(user): return None"),
+            "cut_0",
+            "t1",
+        )
+        .unwrap();
+        vcs.create_branch("line-triage", None, MAINLINE_BRANCH_ID, "t2")
+            .unwrap();
+        crate::do_workstreams::DoWorkstreams::new(Rc::clone(&sql))
+            .unwrap()
+            .create_stream("triage", None, "line-triage", "t2", None)
+            .unwrap();
+        vcs.write(
+            "line-triage",
+            "main.py",
+            Some("def allow(user): return True"),
+            "cut_1",
+            "t3",
+        )
+        .unwrap();
+        vcs.bind_instance("inst-1", "line-triage", "t3").unwrap();
+        whipplescript_store::branches::lease_gated_mainline(&mut branches, "t3").unwrap();
+
+        // The host: the protected runtime, an installed observer whose method
+        // matches it, and the deployment's image bound to that runtime.
+        let runtime = serde_json::json!({
+            "engine": {
+                "kind": "cpython3147_wasi",
+                "artifact_path": "/opt/reactor.wasm",
+                "artifact_sha256": "a".repeat(64),
+            },
+            "executable": "/usr/local/bin/whip",
+            "python_version": "3.14.7",
+            "environment": "epoch",
+        });
+        let method: whipplescript_kernel::norm_runner::PythonCallMethod =
+            serde_json::from_value(serde_json::json!({
+                "runtime": runtime,
+                "module": "main",
+                "function": "allow",
+                "cases": [{"id": "deny", "args": ["unknown"], "kwargs": {}}],
+            }))
+            .unwrap();
+        let body = method.adapter();
+        DoSqliteStore::new(Rc::clone(&sql))
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "observer",
+                argv_json: &serde_json::json!([
+                    "/usr/local/bin/whip",
+                    "executor",
+                    "observe-norm",
+                    "{script}"
+                ])
+                .to_string(),
+                sha256: &whipplescript_kernel::exec_http::sha256_hex(body.as_bytes()),
+                env_json: "{}",
+                hermetic: false,
+                body,
+            })
+            .unwrap();
+        let charter = NormCharter::bundled().unwrap();
+        let obligation = Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "obligation")
+                .unwrap()
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone();
+        let image = format!("sha256:{}", "c".repeat(64));
+        let gate = crate::norm_commands::HostedNormGate {
+            trust: serde_json::json!({
+                "bindings": [owner],
+                "creation_grants": [{"creator": "owner", "owner": "owner"}],
+            })
+            .to_string(),
+            deployment: serde_json::json!({
+                "planning": serde_json::json!({
+                    "capability": "observer",
+                    "roles": [{"vocabulary": obligation, "interpretation": "context"}],
+                })
+                .to_string(),
+                "runtime": runtime.to_string(),
+                "deployed_image": image,
+                "image_binding": serde_json::json!({
+                    "protocol": "whipplescript.exec.runtime-image/v1",
+                    "image_id": image,
+                    "runtime": runtime,
+                })
+                .to_string(),
+            })
+            .to_string(),
+        };
+
+        let mut ledger = DoSqliteStore::new(Rc::clone(&sql));
+        let ledger_id = ledger
+            .append_norm_event(
+                &signed(
+                    owner.clone(),
+                    &owner_key,
+                    "genesis",
+                    NormAct::Bootstrap {
+                        creator: "owner".into(),
+                        charter,
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        if !requirement {
+            return (sql, gate, None);
+        }
+        let support = serde_json::json!({
+            "protocol": "whipplescript.norm.python-calls-support/v1",
+            "method": method,
+            "cases": [{"id": "deny", "assertion": "unknown denied", "expected": false}],
+        });
+        let record = ledger
+            .append_norm_event(
+                &signed(
+                    owner.clone(),
+                    &owner_key,
+                    "R0",
+                    NormAct::Create {
+                        authority: None,
+                        ledger: ledger_id.clone(),
+                        vocabulary: obligation.clone(),
+                        fields_json: serde_json::json!({
+                            "name": "allow",
+                            "proposition": "unknown denied",
+                            "domain": "workspace",
+                            "subject": "main.py",
+                            "support_contract": support.to_string(),
+                        })
+                        .to_string(),
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        ledger
+            .append_norm_event(
+                &signed(
+                    owner,
+                    &owner_key,
+                    "R0-accepted",
+                    NormAct::Transition {
+                        authority: None,
+                        ledger: ledger_id,
+                        vocabulary: obligation,
+                        record: record.clone(),
+                        previous: record.clone(),
+                        status: "accepted".into(),
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        (sql, gate, Some(record))
+    }
+
+    fn hosted_door_effect(
+        effect_id: &str,
+        target: &str,
+        input: serde_json::Value,
+    ) -> whipplescript_store::ClaimableEffect {
+        whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
+            effect_id: effect_id.into(),
+            kind: "capability.call".into(),
+            target: Some(target.into()),
+            profile: None,
+            input_json: input.to_string(),
+            required_capabilities_json: "[]".into(),
+            declared_profiles_json: "[]".into(),
+        }
+    }
+
+    fn hosted_mainline_head(sql: &std::rc::Rc<super::test_support::RusqliteDoSql>) -> String {
+        use whipplescript_store::branches::Branches;
+        crate::do_branches::DoBranches::new(std::rc::Rc::clone(sql))
+            .unwrap()
+            .get_branch(whipplescript_store::branches::MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .unwrap()
+    }
+
+    /// Given the deployment's planning configuration, the hosted in-language
+    /// doors evaluate the gate `/host/norm/promotions` evaluates (norm-plane
+    /// §5, NP-15). A requirement with no support at the candidate refuses the
+    /// promote, the transport onto mainline, the restore and the undo of the
+    /// mainline alike, each naming the requirement, and the mainline stays.
+    #[test]
+    fn the_configured_hosted_mainline_gate_refuses_naming_the_unsupported_requirement() {
+        use std::rc::Rc;
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        use whipplescript_kernel::norm_admission::AdmissionDoor;
+        use whipplescript_store::branches::MAINLINE_BRANCH_ID;
+        let (sql, gate, requirement) = configured_hosted_workspace(true);
+        let requirement = requirement.unwrap();
+        let config = whipplescript_kernel::effect_config::EffectConfig::default();
+        let promote = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
+            sql: Rc::clone(&sql),
+            norm_gate: Some(gate.clone()),
+            now_unix_ms: 1_790_000_000_000,
+        };
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = promote.produce(
+            &hosted_door_effect(
+                "promote-1",
+                "vcs.promote",
+                serde_json::json!({"stream": "triage"}),
+            ),
+            &config,
+        )
+        else {
+            panic!("an unsupported candidate was promoted");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(
+            message,
+            format!("the proposed result is not supported: {requirement} (check)")
+        );
+        assert_eq!(hosted_mainline_head(&sql), "cut_0");
+
+        let selective = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
+            sql: Rc::clone(&sql),
+            instance_id: "inst-1".into(),
+            norm_gate: Some(gate.clone()),
+            now_unix_ms: 1_790_000_000_000,
+        };
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message: transported,
+        } = selective.produce(
+            &hosted_door_effect(
+                "transport-1",
+                "vcs.transport",
+                serde_json::json!({"selection": "path(main.py)", "onto": "mainline"}),
+            ),
+            &config,
+        )
+        else {
+            panic!("a transport of an unsupported candidate moved the mainline");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(transported, message);
+
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        let restored = crate::do_workstreams::with_hosted_mainline_gate(
+            &sql,
+            Some(&gate),
+            1_790_000_000_000,
+            AdmissionDoor::Restore,
+            &[],
+            |gate| vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate),
+        )
+        .unwrap();
+        // A restore and an undo are judged at their own proposed results,
+        // whose support names its own gap; the requirement is named alike.
+        let names_the_requirement = |refusal: &whipplescript_store::vcs::GateRefusal| {
+            refusal
+                .reason
+                .starts_with("the proposed result is not supported: ")
+                && refusal.detail["requirements"].get(&requirement).is_some()
+        };
+        assert!(
+            matches!(&restored, whipplescript_store::vcs::RestoreOutcome::GateRefused(refusal) if names_the_requirement(refusal)),
+            "{restored:?}"
+        );
+        let undone = crate::do_workstreams::with_hosted_mainline_gate(
+            &sql,
+            Some(&gate),
+            1_790_000_000_000,
+            AdmissionDoor::Undo,
+            &[],
+            |gate| vcs.undo_op("op-cut_0", "undo-main", "t6", gate),
+        )
+        .unwrap();
+        assert!(
+            matches!(&undone, whipplescript_store::vcs::UndoOpOutcome::GateRefused(refusal) if names_the_requirement(refusal)),
+            "{undone:?}"
+        );
+        assert_eq!(
+            hosted_mainline_head(&sql),
+            "cut_0",
+            "no door moved the mainline"
+        );
+    }
+
+    /// The configured gate evaluates rather than refusing every governed
+    /// workspace: where no gated requirement lacks support, the hosted promote
+    /// is admitted and the mainline moves, though the unconfigured gate
+    /// refuses the same workspace. A configuration the door cannot build an
+    /// admission host from refuses naming why, and the mainline stays.
+    #[test]
+    fn the_configured_hosted_mainline_gate_admits_what_it_supports() {
+        use std::rc::Rc;
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        use whipplescript_store::branches::MAINLINE_BRANCH_ID;
+        let (sql, gate, _) = configured_hosted_workspace(false);
+        let config = whipplescript_kernel::effect_config::EffectConfig::default();
+        let promote = |effect_id: &str, norm_gate: Option<crate::norm_commands::HostedNormGate>| {
+            crate::do_workstreams::DoVcsPromoteCapabilityProvider {
+                sql: Rc::clone(&sql),
+                norm_gate,
+                now_unix_ms: 1_790_000_000_000,
+            }
+            .produce(
+                &hosted_door_effect(
+                    effect_id,
+                    "vcs.promote",
+                    serde_json::json!({"stream": "triage"}),
+                ),
+                &config,
+            )
+        };
+        let refused = |outcome: CapabilityOutcome| match outcome {
+            CapabilityOutcome::Failed {
+                error_kind,
+                message,
+            } if error_kind == "norm_gate_refused" => message,
+            CapabilityOutcome::Failed { message, .. } => panic!("refused otherwise: {message}"),
+            CapabilityOutcome::Produced(value) => panic!("the mainline moved: {value}"),
+        };
+        let unevaluated = "the mainline's gated requirements cannot be evaluated: ";
+        assert_eq!(
+            refused(promote("unconfigured", None)),
+            format!("{unevaluated}the deployment installs no norm planning configuration for the hosted doors")
+        );
+        // A deployed image other than the one its runtime binding names.
+        let mut deployment: serde_json::Value = serde_json::from_str(&gate.deployment).unwrap();
+        deployment["deployed_image"] = serde_json::json!(format!("sha256:{}", "d".repeat(64)));
+        let misconfigured = crate::norm_commands::HostedNormGate {
+            trust: gate.trust.clone(),
+            deployment: deployment.to_string(),
+        };
+        assert_eq!(
+            refused(promote("misconfigured", Some(misconfigured))),
+            format!(
+                "{unevaluated}runtime image binding differs from deployment image or selected runtime"
+            )
+        );
+        // The door takes its clock from the step, never from configuration.
+        deployment["deployed_image"] = serde_json::json!(format!("sha256:{}", "c".repeat(64)));
+        deployment["time_basis"] = serde_json::json!("configured");
+        let clocked = crate::norm_commands::HostedNormGate {
+            trust: gate.trust.clone(),
+            deployment: deployment.to_string(),
+        };
+        assert!(refused(promote("clocked", Some(clocked)))
+            .starts_with(&format!("{unevaluated}unknown field `time_basis`")),);
+        assert_eq!(
+            hosted_mainline_head(&sql),
+            "cut_0",
+            "no refusal moved the mainline"
+        );
+
+        match promote("configured", Some(gate)) {
+            CapabilityOutcome::Produced(_) => {}
+            CapabilityOutcome::Failed { message, .. } => panic!("not admitted: {message}"),
+        }
+        assert_ne!(hosted_mainline_head(&sql), "cut_0");
+        assert_eq!(
+            crate::do_branches::compose_vcs(&sql)
+                .unwrap()
+                .read(MAINLINE_BRANCH_ID, "main.py")
+                .unwrap()
+                .as_deref(),
+            Some("def allow(user): return True"),
+            "the admitted candidate is the mainline"
         );
     }
 

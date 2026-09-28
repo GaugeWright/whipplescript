@@ -142,7 +142,7 @@ lint.noop_rule COVERED
 lint.readmission_unprotected_effect COVERED
 lint.tool_grant_requires_owned_harness PROVISIONAL
 lint.unused_class COVERED
-lint.unused_coerce PROVISIONAL
+lint.unused_coerce COVERED
 lint.unused_counter PROVISIONAL
 lint.unused_enum PROVISIONAL
 lint.unused_file_store PROVISIONAL

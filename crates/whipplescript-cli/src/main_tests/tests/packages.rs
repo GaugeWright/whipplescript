@@ -6,6 +6,272 @@
 use super::*;
 
 #[test]
+fn native_revision_option_values_are_required() {
+    for (option, expected) in [
+        ("--root", "expected workflow name after `--root`"),
+        ("--package-lock", "expected path after `--package-lock`"),
+    ] {
+        let error = ReviseOptions::parse(&[
+            "instance-id".to_owned(),
+            "workflow.whip".to_owned(),
+            option.to_owned(),
+        ])
+        .expect_err("a flag without its value cannot select a basis");
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn native_start_refuses_an_unresolved_local_import_before_opening_its_store() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let program = unique_test_path("unresolved-local-import", "whip");
+    fs::copy(examples.join("subworkflow-tool-consumer.whip"), &program).unwrap();
+    let store_path = unique_test_path("unresolved-local-import-store", "sqlite");
+    let options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "dev".to_owned(),
+        program.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let outcome = start_workflow_instance(
+        program.to_str().unwrap(),
+        Some("ConsumerFlow"),
+        None,
+        Some(r#"{"request":{"task":"echo"}}"#),
+        &options,
+    );
+    assert!(matches!(outcome, Err(code) if code == ExitCode::from(2)));
+    assert!(
+        !store_path.exists(),
+        "an unresolved import cannot admit a version"
+    );
+}
+
+#[test]
+fn native_start_admits_the_checked_local_import_basis() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let program = examples.join("subworkflow-tool-consumer.whip");
+    let lock_path = examples.join("subworkflow-tool-consumer.lock.json");
+    let store_path = unique_test_path("checked-local-import", "sqlite");
+    let options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "dev".to_owned(),
+        program.to_string_lossy().into_owned(),
+    ])
+    .expect("native options");
+    let started = start_workflow_instance(
+        program.to_str().unwrap(),
+        Some("ConsumerFlow"),
+        Some(&lock_path),
+        Some(r#"{"request":{"task":"echo"}}"#),
+        &options,
+    )
+    .expect("checked native program starts");
+
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    let witness_digest: String = connection
+        .query_row(
+            "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+            [&started.version_id],
+            |row| row.get(0),
+        )
+        .expect("the accepting operation retained its import witness");
+    let store = SqliteStore::open(&store_path).unwrap();
+    let witness = store
+        .program_import_witness(&started.version_id, &witness_digest)
+        .unwrap()
+        .expect("stored witness is readable");
+    assert_eq!(witness.examined, ["toolkit"]);
+    assert_eq!(witness.edges.len(), 1);
+    assert_eq!(witness.edges[0].package_id, "package-toolkit");
+    assert_eq!(
+        witness.compiler_artifact_digest,
+        native_compiler_artifact_digest().unwrap()
+    );
+    let loaded = load_package_lock_file(&lock_path).unwrap();
+    assert_eq!(witness.lock_digest, package_lock_digest(Some(&loaded)));
+    assert_eq!(
+        witness.edges[0].source_digest,
+        loaded.manifests[0].checked_source_digest().unwrap()
+    );
+}
+
+#[test]
+fn native_start_records_a_new_witness_when_package_source_changes_under_the_same_lock() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let fixture = unique_test_path("checked-local-import-drift", "dir");
+    let package_dir = fixture.join("packages");
+    fs::create_dir_all(&package_dir).unwrap();
+    let program = fixture.join("subworkflow-tool-consumer.whip");
+    let lock_path = fixture.join("subworkflow-tool-consumer.lock.json");
+    let tool_source = fixture.join("echo-text-tool.whip");
+    fs::copy(examples.join("subworkflow-tool-consumer.whip"), &program).unwrap();
+    fs::copy(
+        examples.join("subworkflow-tool-consumer.lock.json"),
+        &lock_path,
+    )
+    .unwrap();
+    fs::copy(
+        examples.join("packages/toolkit.json"),
+        package_dir.join("toolkit.json"),
+    )
+    .unwrap();
+    fs::copy(examples.join("echo-text-tool.whip"), &tool_source).unwrap();
+    let store_path = unique_test_path("checked-local-import-drift-store", "sqlite");
+    let options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "dev".to_owned(),
+        program.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let start = || {
+        start_workflow_instance(
+            program.to_str().unwrap(),
+            Some("ConsumerFlow"),
+            Some(&lock_path),
+            Some(r#"{"request":{"task":"echo"}}"#),
+            &options,
+        )
+        .expect("checked program starts")
+    };
+    let first = start();
+    let old_source = fs::read_to_string(&tool_source).unwrap();
+    fs::write(
+        &tool_source,
+        format!("{old_source}\n# same contract, new source\n"),
+    )
+    .unwrap();
+    let second = start();
+    assert_eq!(first.version_id, second.version_id);
+
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    let mut statement = connection
+        .prepare("SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1")
+        .unwrap();
+    let digests = statement
+        .query_map([&first.version_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(digests.len(), 2, "each checked source needs its own basis");
+    let store = SqliteStore::open(&store_path).unwrap();
+    let witnesses = digests
+        .iter()
+        .map(|digest| {
+            store
+                .program_import_witness(&first.version_id, digest)
+                .unwrap()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(witnesses[0].lock_digest, witnesses[1].lock_digest);
+    assert_ne!(
+        witnesses[0].edges[0].source_digest,
+        witnesses[1].edges[0].source_digest
+    );
+}
+
+#[test]
+fn native_revision_admits_its_checked_local_import_with_the_candidate_version() {
+    let lock_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/subworkflow-tool-consumer.lock.json");
+    let original = unique_test_path("checked-revise-original", "whip");
+    let revised = unique_test_path("checked-revise-candidate", "whip");
+    let store_path = unique_test_path("checked-revise-store", "sqlite");
+    fs::write(
+        &original,
+        "use toolkit\nworkflow ImportRevision\nrule noop when started => { }\n",
+    )
+    .unwrap();
+    fs::write(
+        &revised,
+        "use toolkit\nworkflow ImportRevision\nrule noop_v2 when started => { }\n",
+    )
+    .unwrap();
+    let start_options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "start".to_owned(),
+        original.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let started = start_workflow_instance(
+        original.to_str().unwrap(),
+        None,
+        Some(&lock_path),
+        None,
+        &start_options,
+    )
+    .expect("original checked program starts");
+    let absent_lock = revised.with_extension("missing-lock");
+    let bad_lock_options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "revise".to_owned(),
+        started.instance_id.clone(),
+        revised.to_string_lossy().into_owned(),
+        "--package-lock".to_owned(),
+        absent_lock.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    assert_eq!(revise(&bad_lock_options), ExitCode::from(2));
+    let missing_lock_options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "revise".to_owned(),
+        started.instance_id.clone(),
+        revised.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    assert_eq!(revise(&missing_lock_options), ExitCode::from(2));
+    assert_eq!(
+        SqliteStore::open(&store_path)
+            .unwrap()
+            .get_instance(&started.instance_id)
+            .unwrap()
+            .unwrap()
+            .version_id,
+        started.version_id
+    );
+    let revise_options = CliOptions::parse(vec![
+        "--store".to_owned(),
+        store_path.to_string_lossy().into_owned(),
+        "revise".to_owned(),
+        started.instance_id.clone(),
+        revised.to_string_lossy().into_owned(),
+        "--package-lock".to_owned(),
+        lock_path.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    assert_eq!(revise(&revise_options), ExitCode::SUCCESS);
+
+    let store = SqliteStore::open(&store_path).unwrap();
+    let active = store.get_instance(&started.instance_id).unwrap().unwrap();
+    assert_ne!(active.version_id, started.version_id);
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    let digest: String = connection
+        .query_row(
+            "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+            [&active.version_id],
+            |row| row.get(0),
+        )
+        .expect("candidate version and import witness commit together");
+    let witness = store
+        .program_import_witness(&active.version_id, &digest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(witness.examined, ["toolkit"]);
+    assert_eq!(witness.edges[0].package_id, "package-toolkit");
+    assert_eq!(
+        witness.lock_digest,
+        package_lock_digest(Some(&load_package_lock_file(&lock_path).unwrap()))
+    );
+}
+
+#[test]
 fn loaded_package_source_witness_uses_the_attested_tool_bundle() {
     let manifest_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/toolkit.json");
@@ -61,6 +327,10 @@ fn package_tool_grant_refuses_a_source_file_without_its_attested_bundle() {
         path: lock.path,
         manifests: vec![manifest],
     };
+    let error = checked_local_packages(Some(&unbounded))
+        .err()
+        .expect("unattested package cannot supply an import basis");
+    assert!(error.contains("no attested source bundle"), "{error}");
     let error = match resolve_package_tool_grant_from_lock(&unbounded, &ir, "EchoText") {
         Ok(_) => panic!("unattested package tool must refuse"),
         Err(error) => error,

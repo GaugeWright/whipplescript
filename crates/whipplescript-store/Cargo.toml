@@ -41,6 +41,9 @@ rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions", "ho
 
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 hex = "0.4"
+# The UPROAR reference vectors' Ed25519 signatures (norm_uproar's
+# conformance test against gaugenet's pinned vectors). Test-only.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

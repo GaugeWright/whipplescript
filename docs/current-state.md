@@ -4,15 +4,15 @@ WhippleScript is a pre-1.0 product. WhippleScript is good for durable
 orchestration of agents, on your machine and on the edge. But WhippleScript is
 not yet a stable dependency for production.
 
-These documents apply to the `0.2.1` release. The public release line started at
-`0.1.0`, which put the earlier internal 0.2, 0.3, and 0.4 development lines
-together into one cut with the full set of features. This release is the v0.2
-milestone. The number is `0.2.1` and not `0.2.0` because a tag with the name
-`v0.2.0` was already published under the earlier ladder. To pin the exact
-flags of the CLI, the exact fields of the JSON, or the exact behavior of the
-configuration of a provider, use the documents from the applicable Git tag. The
-`whip --help` command prints the version and one `release` label for the
-implementation stage. That label is not a different compatibility version.
+These documents apply to the most recent release. The
+[releases page](https://github.com/GaugeWright/whipplescript/releases/latest)
+names that release, and the
+[changelog](https://github.com/GaugeWright/whipplescript/blob/main/CHANGELOG.md)
+records what each release changed. To pin the exact flags of the CLI, the exact
+fields of the JSON, or the exact behavior of the configuration of a provider,
+use the documents from the applicable Git tag. The `whip --help` command prints
+the version and one `release` label for the implementation stage. That label is
+not a different compatibility version.
 
 ## Sufficiently stable to use
 
@@ -96,8 +96,14 @@ implementation stage. That label is not a different compatibility version.
   assertions that a tag filters. Use these to validate a workflow in CI.
 
 "Sufficiently stable" means that the implementation in the repository and the
-tests hold. This is not a promise about semver. The syntax, the flags of the
-CLI, and the names of the fields of the JSON can still change between releases.
+tests hold. It is not a promise that these surfaces stay the same. The syntax,
+the flags of the CLI, and the names of the fields of the JSON can still change
+between releases. The version tells you when a release breaks one of them.
+Before 1.0, the middle number goes up for a release that breaks stored data, a
+protocol, the CLI, the configuration, or the interface of a published crate.
+The last number goes up for all other releases. The changelog entry for a
+release that breaks something tells you what to do. This rule applies to the
+releases after `0.7.0`.
 
 ## Cloud runtime
 

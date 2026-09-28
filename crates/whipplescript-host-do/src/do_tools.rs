@@ -140,8 +140,9 @@ pub struct DoToolExecutor<Sql: DoSql> {
     /// Full bytes seen by successful native-hosted `read` calls, keyed by tool
     /// call ID until the next model request consumes their source labels.
     model_read_witnesses: std::sync::Mutex<BTreeMap<String, (String, String)>>,
-    /// Every file searched by a bounded directory grep or find, including
-    /// negative matches. A partial or oversized scan never enters this map.
+    /// Every file searched or listed by a bounded directory grep, find, or
+    /// ls, including negative matches. A partial or oversized scan never
+    /// enters this map.
     model_scan_witnesses: std::sync::Mutex<BTreeMap<String, DoScanWitness>>,
     sql: Rc<Sql>,
     key_prefix: String,
@@ -279,7 +280,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_EDIT => self.edit(args),
             TOOL_GREP => self.grep(&call.id, args),
             TOOL_FIND => self.find(&call.id, args),
-            TOOL_LS => self.ls(args),
+            TOOL_LS => self.ls(&call.id, args),
             TOOL_RECALL => self.recall(args),
             TOOL_LIST_TODOS => self.list_todos(args),
             TOOL_ADD_TODO => self.add_todo(args),
@@ -581,15 +582,18 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     /// List `files` keys under a prefix (flat-key `ls`): keys starting with the
     /// given path, or all keys when none is given. Sorted, capped.
-    fn ls(&self, args: &Value) -> Result<String, String> {
+    fn ls(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
         let prefix = directory_prefix(&admitted);
         let limit = usize_arg(args, "limit").unwrap_or(500);
         let mut entries = BTreeSet::new();
-        for key in self.all_keys()? {
-            let Some(relative) = key.strip_prefix(&prefix) else {
-                continue;
-            };
+        let searched: Vec<String> = self
+            .all_keys()?
+            .into_iter()
+            .filter(|key| key.starts_with(&prefix))
+            .collect();
+        for key in &searched {
+            let relative = key.strip_prefix(&prefix).expect("filtered prefix");
             if relative.is_empty() {
                 continue;
             }
@@ -602,6 +606,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 }
             }
         }
+        self.attest_key_listing(call_id, &admitted, &prefix, &searched);
         Ok(entries
             .into_iter()
             .take(limit)
@@ -628,13 +633,23 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .collect();
         hits.truncate(limit);
         // The filename result also depends on the files that did not match.
-        // Reading their bodies is only for a bounded provenance witness; a
-        // failed or larger read leaves find's ordinary result intact.
+        self.attest_key_listing(call_id, &admitted, &prefix, &searched);
+        if hits.is_empty() {
+            Ok("No files found".to_string())
+        } else {
+            Ok(hits.join("\n"))
+        }
+    }
+
+    /// Exact key set and bytes behind filename-only results. Reading bodies is
+    /// for provenance alone; an unreadable or larger set leaves the tool's
+    /// ordinary result intact and its source label coarse.
+    fn attest_key_listing(&self, call_id: &str, admitted: &str, prefix: &str, searched: &[String]) {
         if !searched.is_empty() && searched.len() <= 128 {
-            if let Ok(files) = self.all_files(Some(&prefix)) {
+            if let Ok(files) = self.all_files(Some(prefix)) {
                 let files: Vec<_> = files
                     .into_iter()
-                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .filter(|(key, _)| key.starts_with(prefix))
                     .collect();
                 let same_keys = files.len() == searched.len()
                     && files.iter().map(|(key, _)| key).collect::<BTreeSet<_>>()
@@ -652,7 +667,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                         .insert(
                             call_id.to_owned(),
                             DoScanWitness {
-                                root: admitted,
+                                root: admitted.to_owned(),
                                 files: files
                                     .into_iter()
                                     .map(|(key, content)| {
@@ -668,11 +683,6 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                         );
                 }
             }
-        }
-        if hits.is_empty() {
-            Ok("No files found".to_string())
-        } else {
-            Ok(hits.join("\n"))
         }
     }
 
@@ -963,7 +973,7 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
                 };
             }
         }
-        if matches!(call.name.as_str(), TOOL_GREP | TOOL_FIND) {
+        if matches!(call.name.as_str(), TOOL_GREP | TOOL_FIND | TOOL_LS) {
             let scan = self
                 .model_scan_witnesses
                 .lock()
@@ -1328,6 +1338,17 @@ mod tests {
         assert!(!outcome.content.contains("negative.txt"));
         let find_label = executor.model_output_provenance(&find);
         assert_eq!(find_label, label, "find witnesses negative matches too");
+        let ls = ToolCall {
+            id: "list-one".to_owned(),
+            name: "ls".to_owned(),
+            arguments: json!({"path": "targets/t-one"}),
+        };
+        assert_eq!(executor.execute(&ls).content, "found.txt\nnegative.txt");
+        assert_eq!(
+            executor.model_output_provenance(&ls),
+            label,
+            "listing a directory witnesses every key behind its names"
+        );
         let absent = ToolCall {
             id: "find-absent".to_owned(),
             arguments: json!({"path": "targets/t-one", "pattern": "*absent.txt"}),
@@ -1362,6 +1383,16 @@ mod tests {
             executor.model_output_provenance(&empty).source_handles,
             ["workspace:chat-one"]
         );
+        let empty_ls = ToolCall {
+            id: "empty-list".to_owned(),
+            arguments: json!({"path": "targets/empty"}),
+            ..ls.clone()
+        };
+        assert_eq!(executor.execute(&empty_ls).content, "");
+        assert_eq!(
+            executor.model_output_provenance(&empty_ls).source_handles,
+            ["workspace:chat-one"]
+        );
         assert_eq!(executor.execute(&grep).status, ToolStatus::Ok);
         let failed = ToolCall {
             arguments: json!({"path": "targets/t-one"}),
@@ -1385,6 +1416,17 @@ mod tests {
                 .source_handles,
             ["workspace:chat-one"],
             "a reused find ID cannot inherit an earlier witness"
+        );
+        assert_eq!(executor.execute(&ls).status, ToolStatus::Ok);
+        let failed_ls = ToolCall {
+            arguments: json!({"path": "../outside"}),
+            ..ls.clone()
+        };
+        assert_eq!(executor.execute(&failed_ls).status, ToolStatus::Error);
+        assert_eq!(
+            executor.model_output_provenance(&failed_ls).source_handles,
+            ["workspace:chat-one"],
+            "a reused ls ID cannot inherit an earlier witness"
         );
         for index in 0..126 {
             assert_eq!(
@@ -1419,6 +1461,18 @@ mod tests {
                 .len(),
             129
         );
+        let bounded_ls = ToolCall {
+            id: "bounded-list".to_owned(),
+            ..ls.clone()
+        };
+        assert_eq!(executor.execute(&bounded_ls).status, ToolStatus::Ok);
+        assert_eq!(
+            executor
+                .model_output_provenance(&bounded_ls)
+                .source_handles
+                .len(),
+            129
+        );
         assert_eq!(
             executor
                 .execute(&call(
@@ -1449,6 +1503,16 @@ mod tests {
             executor.model_output_provenance(&large_find).source_handles,
             ["workspace:chat-one"],
             "find over more than 128 files cannot claim a complete witness"
+        );
+        let large_ls = ToolCall {
+            id: "large-list".to_owned(),
+            ..ls
+        };
+        assert_eq!(executor.execute(&large_ls).status, ToolStatus::Ok);
+        assert_eq!(
+            executor.model_output_provenance(&large_ls).source_handles,
+            ["workspace:chat-one"],
+            "ls over more than 128 files cannot claim a complete witness"
         );
     }
 

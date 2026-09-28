@@ -294,6 +294,8 @@ store-authorization.maude	SNSNSSSNSSNNS
 ledger-query.maude	SSNNSNNSSS
 decision-derivation.maude	SSSSNSNSNSNS
 region-reservation.maude	SNSSNSSSNSSNS
-charter-transition.maude	SSNSNSNSNSSNS
+charter-transition.maude	SSNSNSNSNSSNSSSNSNSNS
 recovery-admission.maude	SSSNSNSNSNS
 evidence-reliability.maude	SNSSNSNSSNSSNS
+norm-compatibility.maude	SSNSSNNS
+verdict-admission.maude	SNSSNSNSS

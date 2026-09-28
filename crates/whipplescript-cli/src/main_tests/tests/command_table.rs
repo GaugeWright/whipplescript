@@ -203,32 +203,36 @@ fn the_help_index_names_every_dispatchable_command() {
     }
 }
 
-/// `main` dispatches by table lookup. The only string arms left in it are the
-/// help entry points and the two names that are deliberately not commands — so
-/// a command cannot be added in a second place.
+/// `main` dispatches by table lookup, through `dispatch`. The only string arms
+/// left in the two are the help entry points and the two names that are
+/// deliberately not commands — so a command cannot be added in a second place.
 #[test]
 fn main_dispatches_no_command_outside_the_table() {
     let source = include_str!("../../main.rs");
-    let body = source
-        .split_once("fn main() -> ExitCode {")
-        .expect("main.rs defines `fn main`")
-        .1;
-    let body = body.split_once("\n}\n").expect("`fn main` closes").0;
-
     let mut arms: BTreeSet<&str> = BTreeSet::new();
-    let mut rest = body;
-    while let Some((_, after)) = rest.split_once("Some(\"") {
-        let (name, tail) = after.split_once('"').expect("a closed string pattern");
-        if tail.starts_with(')') {
-            arms.insert(name);
+    for signature in [
+        "fn main() -> ExitCode {",
+        "fn dispatch(raw_args: Vec<String>) -> ExitCode {",
+    ] {
+        let body = source
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("main.rs defines `{signature}`"))
+            .1;
+        let body = body.split_once("\n}\n").expect("the function closes").0;
+        let mut rest = body;
+        while let Some((_, after)) = rest.split_once("Some(\"") {
+            let (name, tail) = after.split_once('"').expect("a closed string pattern");
+            if tail.starts_with(')') {
+                arms.insert(name);
+            }
+            rest = tail;
         }
-        rest = tail;
     }
 
     let expected: BTreeSet<&str> = NON_TABLE_ARMS.iter().copied().collect();
     assert_eq!(
         arms, expected,
-        "`fn main` matches command names by hand; every command belongs in COMMANDS"
+        "`fn main` or `fn dispatch` matches command names by hand; every command belongs in COMMANDS"
     );
     for name in NON_TABLE_ARMS {
         assert!(

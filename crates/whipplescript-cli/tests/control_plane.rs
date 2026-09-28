@@ -63,6 +63,53 @@ fn checks_all_example_workflows() {
     }
 }
 
+/// Every invocation `whip` refuses with exit status 2 is appended to the misuse
+/// log, a credential in it redacted; one it runs is not, and `off` keeps no log
+/// (WS-118).
+#[test]
+fn refused_invocations_are_logged_and_accepted_ones_are_not() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let log = stores.dir.join("state").join("misuse.jsonl");
+    let log_setting = log.to_str().expect("temp path is utf-8");
+    let config = stores.dir.join("config");
+    let status = |setting: &str, args: &[&str]| {
+        whip(bin, &stores)
+            .env("WHIPPLESCRIPT_MISUSE_LOG", setting)
+            .env("WHIPPLESCRIPT_CONFIG_DIR", &config)
+            .args(args)
+            .output()
+            .expect("command runs")
+            .status
+            .code()
+    };
+
+    assert_eq!(status(log_setting, &["isue", "list"]), Some(2));
+    assert_eq!(
+        status(
+            log_setting,
+            &["auth", "set", "anthropc", "sk-ant-not-a-key"]
+        ),
+        Some(2)
+    );
+    assert_eq!(status(log_setting, &["help"]), Some(0));
+    assert_eq!(status("off", &["isue", "list"]), Some(2));
+
+    let written = fs::read_to_string(&log).expect("misuse log written");
+    let entries = written
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON value per line"))
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2, "{written}");
+    assert_eq!(entries[0]["schema"], "whipplescript.misuse.v0");
+    assert_eq!(entries[0]["argv"], json!(["isue", "list"]));
+    assert_eq!(
+        entries[1]["argv"],
+        json!(["auth", "set", "<redacted>", "<redacted>"])
+    );
+    assert!(!written.contains("sk-ant"), "{written}");
+}
+
 /// DR-0023: prove an `action`-expanded effect chain actually executes at runtime,
 /// not just compiles. The inlined `tell -> after succeeds -> done + record` chain
 /// `whip agents <workflow>` (std.agent introspection, DR-0015 declared tier)

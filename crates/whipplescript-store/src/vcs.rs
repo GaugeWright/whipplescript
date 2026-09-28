@@ -4585,6 +4585,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
     ) -> StoreResult<VcsWriteOutcome> {
+        self.require_legacy_source(branch_id, "import")?;
         let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsWriteOutcome::BranchMissing);
         };
@@ -5475,6 +5476,11 @@ mod tests {
                 .head_cut_id,
             None
         );
+        assert!(matches!(
+            vcs.write("flow", "a.txt", Some("tail"), "flow-cut-1", "t6"),
+            Ok(VcsWriteOutcome::Written { .. })
+        ));
+        controlled(vcs.import_diff("flow", &BTreeMap::new(), &[], "flow-cut-1", "t7"));
     }
 
     #[test]

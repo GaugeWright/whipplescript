@@ -331,12 +331,17 @@ pub fn host_norm_command(
             &at,
         )
     };
+    // The object's runtime journal, read through its own handle: the command
+    // host holds the ledger's.
+    let runtime = crate::do_store::DoSqliteStore::new(sql.clone());
+    let running = || whipplescript_store::norm_publication::running_norm_effects(&runtime);
     crate::norm_commands::execute_hosted_norm_command_with_artifacts(
         &mut store,
         trusted_configuration,
         command,
         Some(&artifacts),
         Some(&mut lease_gated_refs),
+        Some(&running),
     )
     .map_err(|error| JsValue::from_str(&error))
 }
@@ -1629,6 +1634,18 @@ fn parse_workspace_resources(json: &str) -> Result<Option<Vec<ResourceRef>>, Str
     Ok(Some(resources))
 }
 
+/// The mainline gate's configuration (norm-plane §5) when the deployment
+/// installs both halves; the doors refuse a governed workspace without it.
+fn norm_gate(
+    trust: Option<String>,
+    deployment: Option<String>,
+) -> Option<crate::norm_commands::HostedNormGate> {
+    Some(crate::norm_commands::HostedNormGate {
+        trust: trust?,
+        deployment: deployment?,
+    })
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -1649,6 +1666,8 @@ impl WasmDurableInstance {
         system_prompt: &str,
         project_context: Option<String>,
         agent_config_json: Option<String>,
+        norm_trust: Option<String>,
+        norm_deployment: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         let package = authored_package(
             package_manifest,
@@ -1691,6 +1710,7 @@ impl WasmDurableInstance {
                 agent_tool_specs: Some(resolved.tools),
                 external_tool_bindings: package.external_tool_bindings(),
                 agent_project_context: resolved.project_context,
+                norm_gate: norm_gate(norm_trust, norm_deployment),
                 ..DurableEffectPorts::default()
             },
         )
@@ -1730,6 +1750,10 @@ impl WasmDurableInstance {
         // type: map, expected a sequence", eight tests deep and nowhere near
         // the cause.
         media_config_json: Option<String>,
+        // The deployment's norm trust and planning installation, which the
+        // in-language doors onto the mainline evaluate its gate with.
+        norm_trust: Option<String>,
+        norm_deployment: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
         // in injection order (context-assembly Phase 3 item 4).
@@ -1783,6 +1807,7 @@ impl WasmDurableInstance {
                 agent_model,
                 exec,
                 turn,
+                norm_gate: norm_gate(norm_trust, norm_deployment),
                 ..DurableEffectPorts::default()
             },
             &project_context,

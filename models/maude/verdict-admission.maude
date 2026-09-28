@@ -1,0 +1,52 @@
+--- norm-plane §11.2 and slice U1: checker verdicts return as observations.
+---
+--- A verdict enters through the ingress door as an advisory observation
+--- carrying its outcome and the grade of the slot it rests on. A verdict
+--- over an empty court compared nothing, so it is indeterminate, never a
+--- universal equivalence. A proof-mode claim needs a present slot; an absent
+--- or partial one supports nothing stronger than what it carries. No verdict
+--- moves a lifecycle: a workflow may act on it only under its own authority.
+mod VERDICT-ADMISSION is
+  protecting NAT .
+  sorts Outcome Grade Status Fact Cfg State .
+  ops compatible incompatible indeterminate universal : -> Outcome [ctor] .
+  ops present absent : -> Grade [ctor] .
+  ops open settled : -> Status [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- A checker's verdict: outcome, how many norms it compared, slot grade.
+  op verdict : Outcome Nat Grade -> Fact [ctor] .
+  op observed : Outcome Grade -> Fact [ctor] .
+  op requirement : Status -> Fact [ctor] .
+  ops proof authorized : -> Fact [ctor] .
+  var O : Outcome . var N : Nat . var G : Grade . var C : Cfg .
+  rl [ingress] : { verdict(O, N, G) C }
+    => { observed(if N == 0 then indeterminate else O fi, G) C } .
+  op proven : Cfg -> Bool .
+  eq proven(proof C) = true .
+  eq proven(C) = false [owise] .
+  crl [prove] : { observed(compatible, present) C } => { proof observed(compatible, present) C }
+    if not proven(C) .
+  rl [authority-settles] : { requirement(open) authorized C } => { requirement(settled) authorized C } .
+endm
+--- An empty court read as universal equivalence.
+mod VERDICT-ADMISSION-WEAK-EMPTY-UNIVERSAL is
+  including VERDICT-ADMISSION .
+  var O : Outcome . var G : Grade . var C : Cfg .
+  rl [empty-universal] : { verdict(O, 0, G) C } => { observed(universal, G) C } .
+endm
+--- An absent slot taken as support for a proof.
+mod VERDICT-ADMISSION-WEAK-ABSENT-PROOF is
+  including VERDICT-ADMISSION .
+  var C : Cfg .
+  crl [absent-proves] : { observed(compatible, absent) C } => { proof observed(compatible, absent) C }
+    if not proven(C) .
+endm
+--- A verdict that settles the requirement directly.
+mod VERDICT-ADMISSION-WEAK-DIRECT-SETTLE is
+  including VERDICT-ADMISSION .
+  var N : Nat . var G : Grade . var C : Cfg .
+  rl [direct-settle] : { verdict(compatible, N, G) requirement(open) C } => { requirement(settled) C } .
+endm

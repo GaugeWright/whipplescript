@@ -1,10 +1,12 @@
-//! Tree-sitter canonicalizers for Rust and TypeScript: exact match only.
+//! Tree-sitter canonicalizers for Rust and TypeScript: exact match only,
+//! locals alpha-renamed where `alpha` resolves them exactly.
 
 use std::collections::BTreeMap;
 
 use tree_sitter::{Language, Node, Parser};
 use whipplescript_store::vcs::{CanonDecl, DeclCanonicalizer};
 
+use crate::alpha::{self, Renames};
 use crate::{digest, UNKEYED};
 
 /// One declaration unit before hashing.
@@ -34,12 +36,14 @@ trait Grammar {
 }
 
 /// The canonical print of a subtree: its tokens, comments dropped, one space
-/// apart. `erase` is a node whose text the rename print replaces with `_`.
+/// apart. `erase` is a node whose text the rename print replaces with `_`;
+/// `locals` gives each alpha-renamed identifier its canonical name.
 fn print(
     node: Node<'_>,
     source: &[u8],
     comment: fn(&str) -> bool,
     erase: Option<Node<'_>>,
+    locals: Option<&Renames>,
 ) -> String {
     let mut tokens = Vec::new();
     let mut stack = vec![node];
@@ -49,6 +53,10 @@ fn print(
         }
         if Some(node.id()) == erase.map(|erase| erase.id()) {
             tokens.push("_".to_owned());
+            continue;
+        }
+        if let Some(canonical) = locals.and_then(|locals| locals.get(&node.id())) {
+            tokens.push(canonical.clone());
             continue;
         }
         if node.child_count() == 0 {
@@ -68,7 +76,7 @@ fn print(
 
 /// The compact text of a node, for identities: tokens without spaces.
 fn compact(node: Node<'_>, source: &[u8], comment: fn(&str) -> bool) -> String {
-    print(node, source, comment, None).replace(' ', "")
+    print(node, source, comment, None, None).replace(' ', "")
 }
 
 fn canonicalize<G: Grammar>(path: &str, source: &str) -> Option<Vec<CanonDecl>> {
@@ -119,7 +127,7 @@ fn canonicalize<G: Grammar>(path: &str, source: &str) -> Option<Vec<CanonDecl>> 
 pub struct RustItems;
 
 impl Grammar for RustItems {
-    const VERSION: &'static str = "whipplescript.canon.rust/1 tree-sitter-rust/0.24";
+    const VERSION: &'static str = "whipplescript.canon.rust/2 tree-sitter-rust/0.24";
 
     fn language() -> Language {
         tree_sitter_rust::LANGUAGE.into()
@@ -177,16 +185,22 @@ impl Grammar for RustItems {
             }
             let prefix: Vec<String> = attributes
                 .drain(..)
-                .map(|attribute| print(attribute, source, Self::comment, None))
+                .map(|attribute| print(attribute, source, Self::comment, None, None))
                 .collect();
-            let printed = |erase: Option<Node<'_>>| {
-                let mut text = prefix.clone();
-                text.push(print(child, source, Self::comment, erase));
-                text.join(" ")
-            };
             // A path attribute moves a module out of path-derived identity.
             let pathed = prefix.iter().any(|attribute| attribute.contains("path ="));
-            if child.has_error() || pathed {
+            let unkeyable = child.has_error() || pathed;
+            let locals = if unkeyable {
+                None
+            } else {
+                alpha::rust(child, source)
+            };
+            let printed = |erase: Option<Node<'_>>| {
+                let mut text = prefix.clone();
+                text.push(print(child, source, Self::comment, erase, locals.as_ref()));
+                text.join(" ")
+            };
+            if unkeyable {
                 unkeyed.push(printed(None));
                 continue;
             }
@@ -327,7 +341,13 @@ fn typescript_items(
             Some(declaration) => (declaration, false),
             None => (child, child.kind() == "export_statement"),
         };
-        let printed = |erase: Option<Node<'_>>| print(child, source, comment, erase);
+        let locals = if child.has_error() || exported_default {
+            None
+        } else {
+            alpha::typescript(declaration, source)
+        };
+        let printed =
+            |erase: Option<Node<'_>>| print(child, source, comment, erase, locals.as_ref());
         if child.has_error() {
             unkeyed.push(printed(None));
             continue;
@@ -368,7 +388,7 @@ fn typescript_items(
                     .collect();
                 match names.as_slice() {
                     [only] if only.kind() == "identifier" => {
-                        let rename = print(child, source, comment, Some(*only));
+                        let rename = printed(Some(*only));
                         units.push(Unit {
                             identity: format!("const {scope}::{}", compact(*only, source, comment)),
                             print: printed(None),
@@ -424,7 +444,7 @@ fn typescript_module_path(path: &str) -> String {
 }
 
 impl Grammar for TypeScript {
-    const VERSION: &'static str = "whipplescript.canon.typescript/1 tree-sitter-typescript/0.23";
+    const VERSION: &'static str = "whipplescript.canon.typescript/2 tree-sitter-typescript/0.23";
     fn language() -> Language {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
@@ -446,7 +466,7 @@ impl Grammar for TypeScript {
 }
 
 impl Grammar for Tsx {
-    const VERSION: &'static str = "whipplescript.canon.tsx/1 tree-sitter-typescript/0.23";
+    const VERSION: &'static str = "whipplescript.canon.tsx/2 tree-sitter-typescript/0.23";
     fn language() -> Language {
         tree_sitter_typescript::LANGUAGE_TSX.into()
     }

@@ -423,6 +423,7 @@ impl Hosted {
             &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"import","events":events}}).to_string(),
             None,
             Some(&mut lease),
+            None,
         )
         .expect("the object admits the history");
         serde_json::from_str::<Value>(&answer).expect("import JSON")["result"].clone()
@@ -452,6 +453,7 @@ impl Hosted {
             &mut DoSqliteStore::new(self.sql.clone()),
             &self.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command":command}).to_string(),
+            None,
             None,
             None,
         )
@@ -1335,13 +1337,41 @@ fn np05_a_zero_exit_over_the_worker_deny_failure_is_diagnosed_and_keeps_its_coun
     }
 }
 
-/// NP-08: a candidate adds configuration outside R0's declared domain, which
-/// Q0's subprocess can read though no observer bounds it. Neither host
-/// claims reuse: A0's support goes stale and a fresh execution is scheduled.
-/// A fresh run whose coverage or artifact cannot be established leaves
-/// admission unresolved, never supported.
+/// NP-06: a change outside the requirement's domain leaves its protected
+/// run's staged files, and so its tested artifact, unchanged. Q0's support
+/// carries on both hosts, no check is scheduled, and the plan names the
+/// ceiling and the change it carried across (DR-0133).
 #[test]
-fn np08_configuration_outside_the_declared_domain_schedules_a_fresh_run_and_stays_unresolved() {
+fn np06_a_change_outside_the_ceiling_reuses_support_and_names_its_witness() {
+    let world = World::new();
+    let a0 = world.observe("a0", "a0", &[]);
+    world.line(
+        "README.md",
+        "# The authorization demo, edited\n",
+        "a1",
+        "t3",
+    );
+    for planned in world.planned("a0", "a1") {
+        let impact = impact(&planned, &world.requirement);
+        assert_eq!(impact["work"]["kind"], "supported", "{impact}");
+        assert_eq!(ids(&impact["selection"]["positive"]), set([a0.as_str()]));
+        assert_eq!(
+            impact["ceiling"],
+            json!({"domain": "authorization", "outside": ["README.md"]}),
+            "{impact}"
+        );
+    }
+}
+
+/// NP-08: configuration outside the declared domain is never staged, so a
+/// protected run cannot read it and reusing its support is sound. Where the
+/// domain itself changes, a fresh run that leaves a premise unestablished
+/// keeps admission unresolved on both hosts. (A partial observer, whose
+/// reads nothing encloses, is never support in production: the protected
+/// policy accepts only protected observations.)
+#[test]
+fn np08_configuration_outside_the_declared_domain_is_never_staged_and_unestablished_premises_stay_unresolved(
+) {
     let world = World::new();
     let a0 = world.observe("a0", "a0", &[]);
     let domain = &world
@@ -1361,29 +1391,33 @@ fn np08_configuration_outside_the_declared_domain_schedules_a_fresh_run_and_stay
         "a1",
         "t3",
     );
-    assert_eq!(
-        world.read("line-work", "src/auth.py"),
-        Some(demo("src/auth.py"))
-    );
-    assert_eq!(
-        world.hosted.read("line-work", "src/auth.py"),
-        Some(demo("src/auth.py"))
-    );
+    let staged = world.prepare("a1", "staged");
+    let files = staged.request().body["stdin"]["files"]
+        .as_object()
+        .expect("the run's staged files")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(files.contains("src/auth.py"), "{files:?}");
+    assert!(!files.contains("deploy/override.toml"), "{files:?}");
+    assert!(!files.contains("README.md"), "{files:?}");
     for planned in world.planned("a0", "a1") {
         let impact = impact(&planned, &world.requirement);
-        assert_eq!(impact["work"]["kind"], "check", "{impact}");
-        let selection = &impact["selection"];
-        assert_eq!(selection["conformance"], "stale");
-        assert!(ids(&selection["positive"]).is_empty());
-        assert_eq!(ids(&selection["stale"]), set([a0.as_str()]));
-        assert_eq!(selection["reuse_evaluations"], json!({}), "{selection}");
-        assert_eq!(selection["reused_by"], json!({}));
+        assert_eq!(impact["work"]["kind"], "supported", "{impact}");
+        assert_eq!(ids(&impact["selection"]["positive"]), set([a0.as_str()]));
+        assert_eq!(
+            impact["ceiling"]["outside"],
+            json!(["deploy/override.toml"]),
+            "{impact}"
+        );
     }
 
-    // The fresh run observes three cases: its coverage is not established.
+    // Inside the domain, a new configuration file invalidates the support,
+    // and a fresh run that observes three cases does not establish coverage.
+    world.line("config/strict.toml", "strict = true\n", "a2", "t4");
     let partial = world
         .observe_with(
-            "a1",
+            "a2",
             "partial",
             Run {
                 only: Some(&["owner-allow", "owner-deny", "worker-allow"]),
@@ -1395,7 +1429,7 @@ fn np08_configuration_outside_the_declared_domain_schedules_a_fresh_run_and_stay
     // A run whose report names another artifact binds to nothing, and
     // neither host publishes it.
     let foreign = world
-        .observe_with("a1", "foreign", PASSING, |body| {
+        .observe_with("a2", "foreign", PASSING, |body| {
             retarget_header(body, "artifact", &"f".repeat(64))
         })
         .expect_err("a report of another artifact is not an observation");
@@ -1409,18 +1443,19 @@ fn np08_configuration_outside_the_declared_domain_schedules_a_fresh_run_and_stay
         hosted_foreign.contains("no bound observer header"),
         "{hosted_foreign}"
     );
-    for planned in world.planned("a0", "a1") {
+    for planned in world.planned("a0", "a2") {
         let impact = impact(&planned, &world.requirement);
         assert_eq!(impact["work"]["kind"], "check", "{impact}");
         let selection = &impact["selection"];
         assert!(ids(&selection["positive"]).is_empty(), "{selection}");
+        assert_eq!(ids(&selection["stale"]), set([a0.as_str()]));
         assert_eq!(ids(&selection["unresolved"]), set([partial.as_str()]));
         assert_eq!(
             selection["judgments"][&partial]["diagnostics"],
             json!([{"kind": "missing_case", "detail": "worker-deny"}])
         );
     }
-    for detail in world.refused("outside-domain") {
+    for detail in world.refused("inside-domain") {
         assert_eq!(
             detail["requirements"][&world.requirement],
             json!(["check"]),

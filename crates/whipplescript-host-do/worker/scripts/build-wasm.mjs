@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const nodeTarget = process.argv.includes("--node");
@@ -8,6 +8,19 @@ const workspaceDirectory = resolve(workerDirectory, "../../..");
 const targetDirectory = process.env.CARGO_TARGET_DIR
   ? resolve(process.env.CARGO_TARGET_DIR)
   : resolve(workspaceDirectory, "target");
+
+// Where the bar hands one over (GaugeWright BUILD.md stage 6): the bundler
+// package wasm-bindgen wrote over the native wasm32 build of this crate, from
+// the fleet's cache when another host built it. Copied over pkg/ as
+// wasm-bindgen's --out-dir writes it, leaving the file pkg/ tracks. The nodejs
+// target and every other caller build it here, as always.
+const prebuilt = process.env.WHIPPLESCRIPT_HOST_DO_PKG;
+if (prebuilt && !nodeTarget) {
+  const out = resolve(workerDirectory, "pkg");
+  mkdirSync(out, { recursive: true });
+  for (const file of readdirSync(prebuilt)) copyFileSync(resolve(prebuilt, file), resolve(out, file));
+  process.exit(0);
+}
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {

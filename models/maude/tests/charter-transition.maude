@@ -20,4 +20,18 @@ search [1] in CHARTER-TRANSITION : { proposal old authorized rec(claim, unplanne
 --- Without the preceding charter's authority nothing activates; self-authorization does.
 search in CHARTER-TRANSITION : { proposal old rec(requirement, successor, authority, authority) } =>* { new C:Cfg } .
 search [1] in CHARTER-TRANSITION-WEAK-SELF-AUTHORIZED : { proposal old rec(requirement, successor, authority, authority) } =>* { new C:Cfg } .
+--- Every run still pending at activation is planned: published under a
+--- kept or successor requirement, withheld under a retired one.
+search [1] in CHARTER-TRANSITION : { proposal old authorized rec(requirement, successor, authority, authority) run(successor, pending) run(retained, pending) run(retired, pending) } =>* { new authorized rec(requirement, successor, authority, authority) run(successor, published) run(retained, published) run(retired, withheld) ev(successor, pinned) ev(retained, pinned) } .
+--- A prepared publication submitted first lets the activation proceed.
+search [1] in CHARTER-TRANSITION : { proposal old authorized rec(requirement, retained, authority, authority) run(retained, prepared) } =>* { new C:Cfg } .
+--- A prepared publication is never stranded; planning only the ledger strands it.
+search in CHARTER-TRANSITION : { proposal old authorized rec(requirement, retained, authority, authority) run(retained, prepared) } =>* { C:Cfg } such that stranded(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-LEDGER-ONLY : { proposal old authorized rec(requirement, retained, authority, authority) run(retained, prepared) } =>* { C:Cfg } such that stranded(C:Cfg) .
+--- A retired requirement's late outcome is never published; publishing every outcome does.
+search in CHARTER-TRANSITION : { proposal old authorized rec(requirement, retired, authority, authority) run(retired, pending) } =>* { C:Cfg } such that revived(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-PUBLISH-RETIRED : { proposal old authorized rec(requirement, retired, authority, authority) run(retired, pending) } =>* { C:Cfg } such that revived(C:Cfg) .
+--- A late outcome never supports the successor; rereading it as current does.
+search in CHARTER-TRANSITION : { proposal old authorized rec(requirement, successor, authority, authority) run(successor, pending) } =>* { C:Cfg } such that reread(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-REREAD : { proposal old authorized rec(requirement, successor, authority, authority) run(successor, pending) } =>* { C:Cfg } such that reread(C:Cfg) .
 quit

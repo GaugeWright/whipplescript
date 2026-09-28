@@ -114,6 +114,20 @@ resolving only today's members, which both doubles a grant and grants before
 expiry; a later-writer merge dropping a claim; and an unfenced door
 admitting a superseded token.
 
+`norm-compatibility.maude` models norm-plane §11.1 for slice U1: norm
+compatibility is a joint typed constraint problem over a bounded domain.
+Overlap that agrees is compatible with a witness assignment. `x = y`, `y = z`
+and `x != z` are pairwise satisfiable but jointly inconsistent, and are never
+judged compatible. Eight searches; a pairwise checker admits the triple, and
+a checker that calls overlap a conflict refuses agreeing norms.
+
+`verdict-admission.maude` models norm-plane §11.2 for slice U1: a checker's
+verdict enters through ingress as an advisory observation carrying its slot
+grade. An empty court is indeterminate, never universal equivalence. An
+absent slot supports no proof, and no verdict settles a lifecycle, which only
+an authorized act does. Nine searches; each of three refusals has the
+weakening that reaches it.
+
 `charter-transition.maude` models norm-plane §10 for slice W1: activating a
 successor charter is the preceding charter's authority's act. Its migration
 plans every live record — a successor, retention under the old vocabulary, or
@@ -122,11 +136,17 @@ necessary but not sufficient: a successor may not weaken an admission unless
 the activation declares the change authorized, may not demote a live
 requirement out of the inventory, and may not change what a live record's
 status means for its effectiveness, declared or not. An obstructed proposal
-is refused and the old charter stays in force. Thirteen searches; five
-refusals each with the weakening that reaches it: checking only the map
-(which launders a weakening, demotes a requirement and relabels
-effectiveness), dropping unplanned records, and self-authorization by the
-proposed charter.
+is refused and the old charter stays in force. Running norm effects, which
+live in the runtime store, are planned too: a publication already prepared
+obstructs the activation until it is submitted, since its envelope names the
+epoch the activation closes, and a run pending at activation publishes as
+evidence for its pinned revision only, and not at all once its requirement is
+retired. Twenty-one searches; eight refusals each with the weakening that
+reaches it: checking only the map (which launders a weakening, demotes a
+requirement and relabels effectiveness), dropping unplanned records,
+self-authorization by the proposed charter, planning only the ledger (which
+strands a prepared publication), publishing a retired requirement's late
+outcome, and reading a late outcome as support for the successor.
 
 `recovery-admission.maude` models norm-plane §5 for slice G1: recovery is
 specified positively. The gate judges every candidate onto a gated ref at its

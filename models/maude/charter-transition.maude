@@ -14,22 +14,38 @@
 --- One live requirement, one live claim and one closed record are modelled.
 --- A record carries its kind, the migration's plan for it, the admission its
 --- old vocabulary required and the admission its successor would require.
+---
+--- Running norm effects live in the runtime store, which the ledger does not
+--- read; the host plans them into the activation. A run carries its
+--- requirement's plan and its stage. A publication already prepared names
+--- the authority epoch the activation closes and is never signed again, so
+--- it obstructs the activation until it is submitted. A run still pending at
+--- activation is interpreted by its pinned revision: its outcome is published
+--- as evidence for that revision only, and not at all once its requirement is
+--- retired.
 mod CHARTER-TRANSITION is
   sorts Kind Plan Strength Fact Cfg State .
   ops requirement claim closed : -> Kind [ctor] .
   --- What the migration does with a record's vocabulary.
   ops successor demoted relabeled retained retired unplanned : -> Plan [ctor] .
   ops public authority : -> Strength [ctor] .
+  sorts Stage Reading .
+  ops pending prepared published withheld : -> Stage [ctor] .
+  --- What a published late outcome is counted as support for.
+  ops pinned current : -> Reading [ctor] .
   subsort Fact < Cfg .
   op none : -> Cfg [ctor] .
   op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
   op {_} : Cfg -> State [ctor] .
   op rec : Kind Plan Strength Strength -> Fact [ctor] .
+  op run : Plan Stage -> Fact [ctor] .
+  op ev : Plan Reading -> Fact [ctor] .
   --- The preceding charter authorizes the act; the proposal declares a change.
   ops authorized declared : -> Fact [ctor] .
   --- The proposal, the charter in force, and the outcome.
   ops proposal old new refused : -> Fact [ctor] .
   vars K : Kind . var P : Plan . vars A B : Strength . var C : Cfg .
+  var S : Stage .
 
   op isDeclared : Cfg -> Bool .
   eq isDeclared(declared C) = true .
@@ -42,6 +58,7 @@ mod CHARTER-TRANSITION is
   eq obstructed(rec(K, relabeled, A, B) C, All:Cfg) = true .
   eq obstructed(rec(K, successor, authority, public) C, All:Cfg) =
     if isDeclared(All:Cfg) then obstructed(C, All:Cfg) else true fi .
+  eq obstructed(run(P, prepared) C, All:Cfg) = true .
   eq obstructed(C, All:Cfg) = false [owise] .
 
   --- The two bad outcomes the searches look for.
@@ -56,8 +73,27 @@ mod CHARTER-TRANSITION is
   eq relabeled(new rec(K, relabeled, A, B) C) = true .
   eq relabeled(C) = false [owise] .
 
+  op stranded : Cfg -> Bool .
+  eq stranded(new run(P, prepared) C) = true .
+  eq stranded(C) = false [owise] .
+  op revived : Cfg -> Bool .
+  eq revived(new run(retired, published) C) = true .
+  eq revived(C) = false [owise] .
+  op reread : Cfg -> Bool .
+  eq reread(new ev(successor, current) C) = true .
+  eq reread(C) = false [owise] .
+
   crl [activate] : { proposal old authorized C } => { new authorized C }
     if not obstructed(C, C) .
+  --- Before activation a prepared publication is submitted as it stands.
+  rl [submit] : { proposal old run(P, prepared) C }
+    => { proposal old run(P, published) ev(P, pinned) C } .
+  --- After it, a pending run's outcome is published as evidence for its
+  --- pinned revision, unless its requirement was retired.
+  crl [publish-late] : { new run(P, pending) C }
+    => { new run(P, published) ev(P, pinned) C } if P =/= retired .
+  rl [withhold-late] : { new run(retired, pending) C }
+    => { new run(retired, withheld) C } .
   crl [refuse] : { proposal old authorized C } => { refused old authorized C }
     if obstructed(C, C) .
 endm
@@ -84,4 +120,29 @@ mod CHARTER-TRANSITION-WEAK-SELF-AUTHORIZED is
   var C : Cfg .
   crl [self-authorize] : { proposal old C } => { new authorized C }
     if not obstructed(C, C) .
+endm
+--- Activation that plans the ledger's records but never reads the runtime
+--- store strands a prepared publication.
+mod CHARTER-TRANSITION-WEAK-LEDGER-ONLY is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  op recordsObstructed : Cfg -> Bool .
+  eq recordsObstructed(run(P:Plan, S:Stage) C) = recordsObstructed(C) .
+  eq recordsObstructed(C) = obstructed(C, C) [owise] .
+  crl [activate-ledger-only] : { proposal old authorized C } => { new authorized C }
+    if not recordsObstructed(C) .
+endm
+--- Publishing every late outcome, a retired requirement's included.
+mod CHARTER-TRANSITION-WEAK-PUBLISH-RETIRED is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  rl [publish-retired] : { new run(retired, pending) C }
+    => { new run(retired, published) ev(retired, pinned) C } .
+endm
+--- Counting a late outcome as support for the requirement's successor.
+mod CHARTER-TRANSITION-WEAK-REREAD is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  rl [reread] : { new run(successor, pending) C }
+    => { new run(successor, published) ev(successor, current) C } .
 endm

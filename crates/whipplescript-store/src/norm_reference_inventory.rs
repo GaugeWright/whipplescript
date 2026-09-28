@@ -15,9 +15,13 @@ use crate::{stable_hash_hex, StoreResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NormReferenceRole {
-    RelationEndpoint { family: String },
+    RelationEndpoint {
+        family: String,
+    },
     ManifestMember,
     CorrespondenceSide,
+    /// The requirement a typed constraint constrains (norm-plane §11.1).
+    ConstraintSubject,
     Unclassified,
 }
 
@@ -136,6 +140,13 @@ fn role(vocabulary: &NormVocabulary, path: &str) -> NormReferenceRole {
     {
         return NormReferenceRole::CorrespondenceSide;
     }
+    if vocabulary
+        .constraint
+        .as_ref()
+        .is_some_and(|constraint| path == constraint.requirement)
+    {
+        return NormReferenceRole::ConstraintSubject;
+    }
     NormReferenceRole::Unclassified
 }
 
@@ -148,7 +159,7 @@ mod tests {
     fn bundled_charter_exposes_every_typed_reference_without_live_routing_claim() {
         let charter = NormCharter::bundled().expect("bundled charter");
         let fields = inventory(&charter);
-        assert_eq!(fields.len(), 12);
+        assert_eq!(fields.len(), 13);
         assert_eq!(
             fields
                 .iter()
@@ -169,6 +180,15 @@ mod tests {
                 .filter(|field| field.role == NormReferenceRole::CorrespondenceSide)
                 .count(),
             2
+        );
+        // A constraint declares which field names the requirement it types.
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.role == NormReferenceRole::ConstraintSubject)
+                .map(|field| (field.vocabulary.as_str(), field.path.as_str()))
+                .collect::<Vec<_>>(),
+            [("constraint", "requirement")]
         );
         // An exception's requirement is read by the planner's interpretation
         // (norm-plane §3.5), not declared by the charter, so the charter
@@ -209,7 +229,7 @@ mod tests {
             editorial: false,
         });
         let fields = inventory(&charter);
-        assert_eq!(fields.len(), 13);
+        assert_eq!(fields.len(), 14);
         assert!(fields.iter().any(|field| {
             field.vocabulary == "issue"
                 && field.path == "metadata.new_links[]"

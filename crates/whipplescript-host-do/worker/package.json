@@ -2,7 +2,7 @@
   "name": "whipplescript-runtime-worker",
   "private": true,
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Cloudflare Worker + Durable Object shell for the sans-IO WhippleScript runtime (DR-0033).",
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",

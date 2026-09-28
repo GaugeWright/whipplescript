@@ -51,34 +51,20 @@ pub fn execute_installed_hosted_norm_promotion<Sql: DoSql + Clone>(
     deployment: &str,
 ) -> Result<String, String> {
     let deployment = Deployment::parse(deployment)?;
-    let installed = deployment.installed()?;
     let request: Request = serde_json::from_str(command).map_err(|e| e.to_string())?;
     if request.protocol != PROTOCOL {
         return Err("unsupported norm promotion protocol".into());
     }
-    let planning = PlanningConfiguration::parse(&deployment.planning)?;
-    let policy = ProtectedPythonPolicy::new(&deployment.runtime, &deployment.time_basis)?;
-    let trust: HostedNormTrust = serde_json::from_str(trust).map_err(|e| e.to_string())?;
-    let verify =
-        |selected: &PythonRuntime| installed.validate_for(&deployment.deployed_image, selected);
     let Promotion {
         stream,
         promotion,
         tokens,
     } = request.command;
-    trust.with_verifier(|verifier| {
+    with_admission_host(sql, trust, &deployment, |host| {
         let ledger = DoSqliteStore::new(sql.clone());
-        let runtime = DoSqliteStore::new(sql.clone());
         let mut gate = NormMainlineAdmission::new(
             &ledger,
-            Ok(AdmissionHost {
-                now: deployment.now.as_deref(),
-                verifier,
-                configuration: &planning,
-                runtime: &runtime,
-                policy: &policy,
-                verify_runtime: &verify,
-            }),
+            Ok(host),
             AdmissionDoor::Promote,
             MAINLINE_BRANCH_ID,
         )
@@ -121,6 +107,35 @@ pub fn execute_installed_hosted_norm_promotion<Sql: DoSql + Clone>(
         };
         serde_json::to_string(&serde_json::json!({"protocol": PROTOCOL, "result": result}))
             .map_err(|e| e.to_string())
+    })
+}
+
+/// The mainline gate's evaluation inputs from deployment-owned configuration
+/// alone: the object's ledger under deployment trust, its runtime journal, and
+/// the deployment's planning roles, protected runtime and verified image. The
+/// promotion route and the in-language doors both build their gate here.
+pub(super) fn with_admission_host<Sql: DoSql + Clone, T>(
+    sql: &Sql,
+    trust: &str,
+    deployment: &Deployment,
+    evaluate: impl FnOnce(AdmissionHost<'_, DoSqliteStore<Sql>>) -> Result<T, String>,
+) -> Result<T, String> {
+    let installed = deployment.installed()?;
+    let planning = PlanningConfiguration::parse(&deployment.planning)?;
+    let policy = ProtectedPythonPolicy::new(&deployment.runtime, &deployment.time_basis)?;
+    let trust: HostedNormTrust = serde_json::from_str(trust).map_err(|e| e.to_string())?;
+    let verify =
+        |selected: &PythonRuntime| installed.validate_for(&deployment.deployed_image, selected);
+    let runtime = DoSqliteStore::new(sql.clone());
+    trust.with_verifier(|verifier| {
+        evaluate(AdmissionHost {
+            now: deployment.now.as_deref(),
+            verifier,
+            configuration: &planning,
+            runtime: &runtime,
+            policy: &policy,
+            verify_runtime: &verify,
+        })
     })
 }
 

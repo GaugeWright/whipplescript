@@ -2,9 +2,12 @@
 
 The Rust crates are APIs with internal stability for the workspace. These APIs
 are useful for an integration test, for a tool on your machine, and for a
-contributor. These APIs are not a published semver contract. If you automate
-WhippleScript, use the CLI and the JSON contracts in the
-[JSON reference](json-reference.md).
+contributor. These APIs can break in any release that raises the middle number
+of the version. Before 1.0, a release that breaks the interface of a published
+crate raises the middle number, so a dependency on `0.7` does not receive a
+break. The crates are designed for the workspace, not for stability, so expect
+breaks in those releases. If you automate WhippleScript, use the CLI and the
+JSON contracts in the [JSON reference](json-reference.md).
 
 There is one exception. That exception is the native surface for a host, which
 a revision pins. GaugeDesk and other hosts that embed WhippleScript use that

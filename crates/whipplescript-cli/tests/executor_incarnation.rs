@@ -53,7 +53,17 @@ fn start(address: SocketAddr) -> (Executor, String) {
             .spawn()
             .expect("start executor process"),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // How long the operating system may take to admit a fresh executable,
+    // not how long the executor takes to come up. On Linux the whole test
+    // takes 0.1-0.4 s, the Legion at a load of 76 included. On macOS the first
+    // launch of a freshly built debug `whip` from a new test process is held
+    // before `main` -- sampled in `_dyld_start` -- for 3.5 to 6 s, and with
+    // thirteen test binaries starting together that passed the ten seconds
+    // this used to allow (WS-107). A startup that never comes up still fails
+    // here, and one that exits fails at once through `try_wait` below, so the
+    // ceiling only has to be far from the host's worst admission.
+    const STARTUP: Duration = Duration::from_secs(60);
+    let deadline = Instant::now() + STARTUP;
     loop {
         let response = ureq::get(&format!("http://{address}/exec/incarnation"))
             .set("authorization", "Bearer incarnation-fixture")
@@ -73,7 +83,7 @@ fn start(address: SocketAddr) -> (Executor, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "executor startup timed out after 10s{}",
+            "executor startup timed out after {STARTUP:?}{}",
             said(&mut log)
         );
         std::thread::sleep(Duration::from_millis(10));

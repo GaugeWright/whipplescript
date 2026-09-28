@@ -486,6 +486,10 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub max_steps: usize,
     /// Injected host clock for persisted reconciliation readiness.
     pub now_unix_ms: i64,
+    /// The deployment's norm planning configuration, which the in-language
+    /// doors onto the mainline evaluate its gate with (norm-plane §5); `None`
+    /// refuses a governed workspace rather than moving it unevaluated.
+    pub norm_gate: Option<&'a crate::norm_commands::HostedNormGate>,
 }
 
 struct DoTurnCommandSource<Sql: DoSql> {
@@ -1040,6 +1044,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     let provider = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
                         sql: self.kernel.store().sql.clone(),
                         instance_id: self.instance_id.to_owned(),
+                        norm_gate: self.norm_gate.cloned(),
+                        now_unix_ms: self.now_unix_ms,
                     };
                     run_capability_effect_generic(
                         &mut self.kernel,
@@ -1058,6 +1064,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // exist.
                     let provider = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
                         sql: self.kernel.store().sql.clone(),
+                        norm_gate: self.norm_gate.cloned(),
+                        now_unix_ms: self.now_unix_ms,
                     };
                     run_capability_effect_generic(
                         &mut self.kernel,
@@ -2823,6 +2831,7 @@ mod tests {
                 kernel,
                 // Fixture clock, as in this module's other driver fixtures.
                 now_unix_ms: 0,
+                norm_gate: None,
                 files: &NoFiles,
                 coerce: None,
                 media: &Default::default(),
@@ -3004,6 +3013,7 @@ mod tests {
             system_prompt: "test",
             max_steps: 8,
             now_unix_ms: 1000,
+            norm_gate: None,
         };
         let effect = |output_type: &str| whipplescript_store::ClaimableEffect {
             attempt_admission_event_id: None,
@@ -3100,6 +3110,7 @@ mod tests {
             system_prompt: "test",
             max_steps: 8,
             now_unix_ms: 1000,
+            norm_gate: None,
         };
         assert_eq!(
             driver.next_ready_effect().unwrap().unwrap().effect_id,
@@ -3174,6 +3185,7 @@ mod tests {
 
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3271,6 +3283,7 @@ complete result { text selected.text } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3420,6 +3433,7 @@ rule finish when started => {
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3565,6 +3579,7 @@ rule finish when started => {
             let driver = DoInstanceDriver {
                 media: &Default::default(),
                 now_unix_ms: 0,
+                norm_gate: None,
                 kernel,
                 files: &NoFiles,
                 coerce: Some(&cfg),
@@ -3777,6 +3792,7 @@ rule finish when Ticket as ticket => {
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3873,6 +3889,7 @@ rule finish when started => { during empty(Stop) { timer 1h as held } on lapse a
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -4168,6 +4185,7 @@ rule finish when started => {
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
@@ -4287,6 +4305,7 @@ rule finish when started => {
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
@@ -4615,6 +4634,7 @@ complete result verdict }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
@@ -4756,6 +4776,7 @@ complete result { text report.text } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -4874,6 +4895,7 @@ complete result { text content } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &ReadFiles,
             coerce: None,
@@ -4988,6 +5010,7 @@ complete result { count count } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &ReadFiles,
             coerce: None,
@@ -5127,6 +5150,7 @@ complete result { event event } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &ReadFiles,
             coerce: None,
@@ -5244,6 +5268,7 @@ complete result { remaining remaining } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &ReadFiles,
             coerce: None,
@@ -5366,6 +5391,7 @@ complete result result }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -5492,6 +5518,7 @@ complete result result }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -5652,6 +5679,7 @@ complete result result }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -5779,6 +5807,7 @@ complete result { text digest } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &files,
             coerce: None,
@@ -5900,6 +5929,7 @@ complete result { count count } }
         let driver = DoInstanceDriver {
             media: &Default::default(),
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &files,
             coerce: None,
@@ -6169,6 +6199,7 @@ complete result { count count } }
                     "clock-overflow" => 253_402_300_799_000,
                     _ => 0,
                 },
+                norm_gate: None,
                 kernel,
                 files: &NoFiles,
                 coerce: None,
@@ -6548,6 +6579,7 @@ complete result { count count } }
         };
         let mut driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -6922,6 +6954,7 @@ complete result { count count } }
         };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
@@ -7100,6 +7133,7 @@ complete result { count count } }
         };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -7292,6 +7326,7 @@ complete result { count count } }
         }];
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -7494,6 +7529,7 @@ complete result { count count } }
         };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
+            norm_gate: None,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -7601,6 +7637,7 @@ complete result { count count } }
             kernel,
             // Fixture clock, as in this module's other driver fixtures.
             now_unix_ms: 0,
+            norm_gate: None,
             files: &NoFiles,
             coerce: None,
             media: &Default::default(),
@@ -7722,6 +7759,7 @@ complete result { count count } }
             kernel,
             // Fixture clock, as in this module's other driver fixtures.
             now_unix_ms: 0,
+            norm_gate: None,
             files: &NoFiles,
             coerce: None,
             media: &Default::default(),

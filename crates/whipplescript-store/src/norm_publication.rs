@@ -69,6 +69,76 @@ struct Acknowledgment {
     event_id: String,
 }
 
+/// A norm run whose outcome this ledger has not received (norm-plane §10):
+/// its effect's intent names the ledger, and no publication of any of its
+/// runs has been acknowledged. The ledger never reads the runtime store, so a
+/// host lists these for a charter activation to plan.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningNormEffect {
+    pub ledger: String,
+    pub instance: String,
+    pub effect: String,
+    /// The effect's runtime status.
+    pub status: String,
+    /// The requirement record the run was prepared against.
+    pub requirement: String,
+    /// A run whose publication is retained and not yet acknowledged. Its
+    /// signed envelope names the authority epoch it was prepared in, and
+    /// recovery never signs it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared: Option<String>,
+}
+
+/// Every running norm effect the runtime store holds, of any ledger.
+pub fn running_norm_effects<S: RuntimeStore + ?Sized>(
+    store: &S,
+) -> StoreResult<Vec<RunningNormEffect>> {
+    let mut running = Vec::new();
+    for instance in store.list_effect_instances()? {
+        let mut prepared = std::collections::BTreeMap::new();
+        let mut acknowledged = std::collections::BTreeSet::new();
+        for event in store.list_events(&instance)? {
+            if event.event_type == PREPARED {
+                let candidate: PublicationCandidate = serde_json::from_str(&event.payload_json)?;
+                prepared.insert(
+                    (candidate.slot.ledger, candidate.slot.effect),
+                    candidate.slot.run,
+                );
+            } else if event.event_type == ACKNOWLEDGED {
+                let acknowledgment: Acknowledgment = serde_json::from_str(&event.payload_json)?;
+                acknowledged.insert((acknowledgment.slot.ledger, acknowledgment.slot.effect));
+            }
+        }
+        for effect in store.list_effects(&instance)? {
+            let Ok(input) = serde_json::from_str::<Value>(&effect.input_json) else {
+                continue;
+            };
+            let intent = &input["norm_intent"];
+            let (Some(ledger), Some(requirement)) = (
+                intent["anchor"]["checkpoint"]["ledger"].as_str(),
+                intent["requirement"]["name"].as_str(),
+            ) else {
+                continue;
+            };
+            let slot = (ledger.to_owned(), effect.effect_id.clone());
+            if acknowledged.contains(&slot) {
+                continue;
+            }
+            running.push(RunningNormEffect {
+                ledger: ledger.to_owned(),
+                instance: instance.clone(),
+                prepared: prepared.get(&slot).cloned(),
+                effect: effect.effect_id,
+                status: effect.status,
+                requirement: requirement.to_owned(),
+            });
+        }
+    }
+    running.sort();
+    Ok(running)
+}
+
 pub trait NormPublicationJournal: RuntimeStore {
     /// Recover signed bytes without consulting a signer or current key configuration.
     fn retained_publication(

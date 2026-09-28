@@ -35,6 +35,7 @@ readme = "README.md"
 cell = "whipplescript"
 checkout = "whipplescript-src"
 feature-checks = "feature-builds"
+wasm = [{ package = "whipplescript-host-do", default-features = false, bindgen = "bundler" }]
 ignored-tests = "buck2-test-executor"
 
 [workspace.lints.rust]

@@ -18,7 +18,8 @@ pub fn discover(
     installed: &ScriptCapabilityRecord,
     verify_runtime: impl FnOnce(&PythonRuntime) -> Result<(), String>,
 ) -> Result<EvidenceVersion, String> {
-    let (contract, method) = PreparedNormExecution::requirement_support(requirement, candidate)?;
+    let (contract, method) =
+        PreparedNormExecution::requirement_support(requirement, candidate.files())?;
     if contract.cases.is_empty() {
         return Err("automatic norm method requires a nonempty case contract".into());
     }

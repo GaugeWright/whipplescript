@@ -2050,6 +2050,161 @@
       "inventory_role": {
         "kind": "non_requirement"
       }
+    },
+    {
+      "definition": {
+        "name": "constraint",
+        "version": "1",
+        "fields": [
+          {
+            "name": "requirement",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "declarations",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "formula",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "accepted",
+            "retired"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "accepted",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "accepted",
+              "to": "retired",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "accepted",
+          "effect": "activate"
+        },
+        {
+          "status": "retired",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "constraint": {
+        "requirement": "requirement",
+        "declarations": "declarations",
+        "formula": "formula"
+      }
+    },
+    {
+      "definition": {
+        "name": "verdict",
+        "version": "1",
+        "fields": [
+          {
+            "name": "family",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "subject",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "outcome",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "compatible",
+                "incompatible",
+                "unresolved"
+              ]
+            }
+          },
+          {
+            "name": "basis",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "mode",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "bounded-exhaustive",
+                "unresolved"
+              ]
+            }
+          },
+          {
+            "name": "witness",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "recorded"
+          ],
+          "initial": "recorded",
+          "transitions": []
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
     }
   ],
   "owner_scopes": [

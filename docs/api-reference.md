@@ -79,7 +79,47 @@ To print the usage line of a command, run `whip <command> --help` or
 | `WHIPPLESCRIPT_EVAL_CONCURRENCY` | The limit on the parallel evaluation of the candidates of a campaign. |
 | `WHIPPLESCRIPT_NO_CONTEXT_FILES` / `WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR` | These variables disable the discovery of the context files of a project for a turn, or move the directory of those files. |
 | `WHIPPLESCRIPT_DESKTOP_NOTIFIER` | This variable overrides the notifier command of the `desktop` channel provider. |
+| `WHIPPLESCRIPT_MISUSE_LOG` | The path of the misuse log. The value `off` stops the log. Refer to [The misuse log](#the-misuse-log). |
 | `WHIPPLESCRIPT_BRANCH_STORE`, `WHIPPLESCRIPT_WORKSTREAM_STORE`, `WHIPPLESCRIPT_VCS_CONTENT_STORE` / `WHIPPLESCRIPT_CONTENT_STORE`, `WHIPPLESCRIPT_MAX_BLOB_BYTES`, `WHIPPLESCRIPT_TEXT_MERGE_GAP` / `WHIPPLESCRIPT_TEXT_MERGE_MAX_BYTES` | The stores of the versioned workspace, and the settings for a merge. These variables are experimental and apply to the `branch` command and the `stream` command. |
+
+### The misuse log
+
+When whip refuses an invocation, whip adds one line to the misuse log. A
+refused invocation exits with the status 2. Examples are an unknown command, an
+unknown option, a missing argument, and a `whip test` source that does not
+compile. An invocation that runs is not in the log. A program that `whip check`
+rejects is not in the log, because that exit status is 1. Use the log to find
+the commands that people and agents expect but that whip does not accept.
+
+The log is at `$WHIPPLESCRIPT_MISUSE_LOG`. If you do not set that variable, the
+path is `$XDG_STATE_HOME/whipplescript/misuse.jsonl` or
+`~/.local/state/whipplescript/misuse.jsonl`. Set the variable to `off` to keep
+no log. A debug build keeps a log only when the variable gives a path, because
+the test suites refuse invocations on purpose.
+
+Each line is one JSON object:
+
+```json
+{"argv":["isue","list"],"at":"2026-09-28T08:15:02Z","schema":"whipplescript.misuse.v0","tty":false,"version":"0.7.1"}
+```
+
+The `argv` field holds the arguments after `whip`. The `tty` field is true when
+a person typed the command at a terminal. The log stays on the computer that
+wrote it. whip writes `<redacted>` in place of each argument that can hold a
+secret:
+
+- each argument after `whip auth set`,
+- the value of an option whose name contains a word such as `token`, `key`,
+  `env`, `header`, or `input`,
+- the value of a `NAME=value` argument whose name contains such a word,
+- an argument that has the form of a known credential, such as `sk-` or `ghp_`.
+
+When the log is larger than 4 MiB, whip moves it to `misuse.jsonl.1` and starts
+a new log. To count the refused commands, run:
+
+```sh
+jq -r '.argv[0:2] | join(" ")' ~/.local/state/whipplescript/misuse.jsonl | sort | uniq -c | sort -rn
+```
 
 ## CLI commands
 

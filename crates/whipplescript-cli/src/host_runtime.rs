@@ -397,9 +397,8 @@ pub struct NativeWorkspaceResolver {
     /// keyed by their call IDs.
     /// A batch may execute several tools before the next model request.
     model_read_witnesses: std::sync::Mutex<HashMap<String, ModelReadWitness>>,
-    /// A directory grep's complete bounded set of files whose contents were
-    /// searched, including files with no match. Omitted if traversal cannot
-    /// attest every searched file.
+    /// A bounded directory search or listing's complete source set. Omitted
+    /// when traversal cannot attest every searched or listed entry.
     model_scan_witnesses: std::sync::Mutex<HashMap<String, ModelScanWitness>>,
     root: PathBuf,
     read_only: Vec<PathBuf>,
@@ -424,6 +423,7 @@ pub struct ModelReadWitness {
 pub struct ModelScanWitness {
     pub root: String,
     pub files: Vec<ModelReadWitness>,
+    pub directories: Vec<String>,
 }
 
 #[derive(Default)]
@@ -698,22 +698,89 @@ impl NativeWorkspaceResolver {
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
-    fn list(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn list(
+        &self,
+        call_id: &str,
+        arguments: &Value,
+        scopes: &[AdmittedFileScope],
+    ) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
         let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
-        let mut names = fs::read_dir(&resolved)
+        let mut names = Vec::new();
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        let mut complete = true;
+        let mut total_bytes = 0u64;
+        for row in fs::read_dir(&resolved)
             .map_err(|error| format!("cannot list workspace path `{path}`: {error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| {
-                let mut name = entry.file_name().to_string_lossy().into_owned();
-                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-                    name.push('/');
+        {
+            let Ok(entry) = row else {
+                complete = false;
+                continue;
+            };
+            let file_name = entry.file_name();
+            if file_name.to_str().is_none() {
+                complete = false;
+            }
+            let mut name = file_name.to_string_lossy().into_owned();
+            let kind = entry.file_type();
+            if kind.as_ref().is_ok_and(|kind| kind.is_dir()) {
+                name.push('/');
+            }
+            names.push(name);
+            if !complete || names.len() > 128 {
+                complete = false;
+                continue;
+            }
+            let Some(relative) = entry
+                .path()
+                .strip_prefix(&self.root)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+            else {
+                complete = false;
+                continue;
+            };
+            match kind {
+                Ok(kind) if kind.is_dir() => directories.push(relative),
+                Ok(kind) if kind.is_file() => {
+                    let max_file = (16 * 1024 * 1024u64)
+                        .saturating_sub(total_bytes)
+                        .min(8 * 1024 * 1024);
+                    let bytes = fs::File::open(entry.path()).and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(max_file + 1).read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    });
+                    match bytes {
+                        Ok(bytes) if bytes.len() as u64 <= max_file => {
+                            total_bytes += bytes.len() as u64;
+                            files.push(ModelReadWitness {
+                                path: relative,
+                                content_hash: whipplescript_store::stable_hash_bytes_hex(&bytes),
+                            });
+                        }
+                        _ => complete = false,
+                    }
                 }
-                name
-            })
-            .collect::<Vec<_>>();
+                _ => complete = false,
+            }
+        }
         names.sort();
+        if complete && !names.is_empty() {
+            self.model_scan_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    call_id.to_owned(),
+                    ModelScanWitness {
+                        root: path.to_owned(),
+                        files,
+                        directories,
+                    },
+                );
+        }
         Ok(self.cap(names.join("\n")))
     }
 
@@ -735,41 +802,48 @@ impl NativeWorkspaceResolver {
         let mut scan_files = Vec::new();
         let mut scan_complete = true;
         let mut scan_bytes = 0u64;
-        walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
-            if scan_files.len() < 128 {
-                // `find` needs filenames, not bodies. Bound the extra reads
-                // made only to attest current bytes for Raw context.
-                let remaining = (16 * 1024 * 1024u64).saturating_sub(scan_bytes);
-                let max_file = remaining.min(8 * 1024 * 1024);
-                let bytes = fs::File::open(absolute).and_then(|file| {
-                    let mut bytes = Vec::new();
-                    file.take(max_file + 1).read_to_end(&mut bytes)?;
-                    Ok(bytes)
-                });
-                match bytes {
-                    Ok(bytes) if bytes.len() as u64 <= max_file => {
-                        scan_bytes += bytes.len() as u64;
-                        scan_files.push(ModelReadWitness {
-                            path: relative.to_owned(),
-                            content_hash: whipplescript_store::stable_hash_bytes_hex(&bytes),
-                        });
-                    }
-                    Ok(_) => scan_complete = false,
-                    Err(_) => scan_complete = false,
+        walk_workspace(
+            &self.root,
+            &resolved,
+            &mut |relative, absolute, valid_path| {
+                if !valid_path {
+                    scan_complete = false;
                 }
-            } else {
-                scan_complete = false;
-            }
-            if wildcard_matches(pattern, relative) {
-                matches.push(relative.to_owned());
-            }
-            if matches.len() >= 5_000 {
-                scan_complete = false;
-                false
-            } else {
-                true
-            }
-        })?;
+                if scan_files.len() < 128 {
+                    // `find` needs filenames, not bodies. Bound the extra reads
+                    // made only to attest current bytes for Raw context.
+                    let remaining = (16 * 1024 * 1024u64).saturating_sub(scan_bytes);
+                    let max_file = remaining.min(8 * 1024 * 1024);
+                    let bytes = fs::File::open(absolute).and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(max_file + 1).read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    });
+                    match bytes {
+                        Ok(bytes) if bytes.len() as u64 <= max_file => {
+                            scan_bytes += bytes.len() as u64;
+                            scan_files.push(ModelReadWitness {
+                                path: relative.to_owned(),
+                                content_hash: whipplescript_store::stable_hash_bytes_hex(&bytes),
+                            });
+                        }
+                        Ok(_) => scan_complete = false,
+                        Err(_) => scan_complete = false,
+                    }
+                } else {
+                    scan_complete = false;
+                }
+                if wildcard_matches(pattern, relative) {
+                    matches.push(relative.to_owned());
+                }
+                if matches.len() >= 5_000 {
+                    scan_complete = false;
+                    false
+                } else {
+                    true
+                }
+            },
+        )?;
         if scan_complete && !scan_files.is_empty() {
             if single_file {
                 self.model_read_witnesses
@@ -785,6 +859,7 @@ impl NativeWorkspaceResolver {
                         ModelScanWitness {
                             root: path.to_owned(),
                             files: scan_files,
+                            directories: Vec::new(),
                         },
                     );
             }
@@ -832,43 +907,52 @@ impl NativeWorkspaceResolver {
         let mut exact_witness = None;
         let mut scan_files = Vec::new();
         let mut scan_complete = true;
-        walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
-            if matches_found >= limit {
-                return false;
-            }
-            let Ok(text) = fs::read_to_string(absolute) else {
-                scan_complete = false;
-                return true;
-            };
-            if !single_file {
-                // A scan over a very large tree still runs, but cannot be
-                // projected as a bounded current-access proof.
-                if scan_files.len() < 128 {
-                    scan_files.push(ModelReadWitness {
+        walk_workspace(
+            &self.root,
+            &resolved,
+            &mut |relative, absolute, valid_path| {
+                if !valid_path {
+                    scan_complete = false;
+                }
+                if matches_found >= limit {
+                    return false;
+                }
+                let Ok(text) = fs::read_to_string(absolute) else {
+                    scan_complete = false;
+                    return true;
+                };
+                if !single_file {
+                    // A scan over a very large tree still runs, but cannot be
+                    // projected as a bounded current-access proof.
+                    if scan_files.len() < 128 {
+                        scan_files.push(ModelReadWitness {
+                            path: relative.to_owned(),
+                            content_hash: whipplescript_store::stable_hash_bytes_hex(
+                                text.as_bytes(),
+                            ),
+                        });
+                    } else {
+                        scan_complete = false;
+                    }
+                }
+                if single_file && absolute == resolved {
+                    exact_witness = Some(ModelReadWitness {
                         path: relative.to_owned(),
                         content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
                     });
-                } else {
-                    scan_complete = false;
                 }
-            }
-            if single_file && absolute == resolved {
-                exact_witness = Some(ModelReadWitness {
-                    path: relative.to_owned(),
-                    content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
-                });
-            }
-            crate::workspace_grep::grep_file_into(
-                relative,
-                &text,
-                &matcher,
-                context,
-                limit,
-                &mut matches_found,
-                &mut matches,
-            );
-            true
-        })?;
+                crate::workspace_grep::grep_file_into(
+                    relative,
+                    &text,
+                    &matcher,
+                    context,
+                    limit,
+                    &mut matches_found,
+                    &mut matches,
+                );
+                true
+            },
+        )?;
         if let Some(witness) = exact_witness {
             self.model_read_witnesses
                 .lock()
@@ -883,6 +967,7 @@ impl NativeWorkspaceResolver {
                     ModelScanWitness {
                         root: path.to_owned(),
                         files: scan_files,
+                        directories: Vec::new(),
                     },
                 );
         }
@@ -920,7 +1005,7 @@ impl NativeWorkspaceResolver {
         roots.sort();
         roots.dedup();
         for root in roots {
-            walk_workspace(&self.root, &root, &mut |relative, absolute| {
+            walk_workspace(&self.root, &root, &mut |relative, absolute, _valid_path| {
                 if admitted_files.len() >= 5_000 {
                     load_error = Some("bash workspace contains more than 5000 files".to_owned());
                     return false;
@@ -1095,7 +1180,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
             "read" => self.read(&call.id, &call.arguments, scopes),
             "write" => self.write(&call.arguments, scopes),
             "edit" => self.edit(&call.arguments, scopes),
-            "ls" => self.list(&call.arguments, scopes),
+            "ls" => self.list(&call.id, &call.arguments, scopes),
             "find" => self.find(&call.id, &call.arguments, scopes),
             "grep" => self.grep(&call.id, &call.arguments, scopes),
             "bash" => {
@@ -1184,7 +1269,7 @@ fn reject_symlinks_between(root: &Path, target: &Path, display: &str) -> Result<
 fn walk_workspace(
     root: &Path,
     start: &Path,
-    visit: &mut dyn FnMut(&str, &Path) -> bool,
+    visit: &mut dyn FnMut(&str, &Path, bool) -> bool,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(start)
         .map_err(|error| format!("cannot inspect workspace path: {error}"))?;
@@ -1194,9 +1279,10 @@ fn walk_workspace(
     if metadata.is_file() {
         let relative = start
             .strip_prefix(root)
-            .map_err(|_| "workspace traversal escaped its capability".to_owned())?
-            .to_string_lossy();
-        let _ = visit(&relative, start);
+            .map_err(|_| "workspace traversal escaped its capability".to_owned())?;
+        let valid_path = relative.to_str().is_some();
+        let relative = relative.to_string_lossy();
+        let _ = visit(&relative, start, valid_path);
         return Ok(());
     }
     let mut pending = vec![start.to_path_buf()];
@@ -1223,9 +1309,10 @@ fn walk_workspace(
             }
             let relative = path
                 .strip_prefix(root)
-                .map_err(|_| "workspace traversal escaped its capability".to_owned())?
-                .to_string_lossy();
-            if !visit(&relative, &path) {
+                .map_err(|_| "workspace traversal escaped its capability".to_owned())?;
+            let valid_path = relative.to_str().is_some();
+            let relative = relative.to_string_lossy();
+            if !visit(&relative, &path, valid_path) {
                 return Ok(());
             }
         }
@@ -5262,6 +5349,80 @@ workflow UnsafeHostChat {
         let _ = fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_walk_refuses_a_symlink_start() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("workspace");
+        fs::write(root.join("target.txt"), "private").expect("target");
+        symlink(root.join("target.txt"), root.join("shortcut.txt")).expect("symlink");
+        let mut visited = false;
+        let result = walk_workspace(&root, &root.join("shortcut.txt"), &mut |_, _, _| {
+            visited = true;
+            true
+        });
+        assert_eq!(
+            result,
+            Err("workspace traversal reached a symlink".to_owned())
+        );
+        assert!(!visited);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_scans_with_lossy_filenames_have_no_exact_model_witness() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-lossy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("workspace");
+        fs::write(root.join("bad\u{fffd}.txt"), "same contents").expect("UTF-8 alias");
+        fs::write(
+            root.join(std::ffi::OsString::from_vec(b"bad\xff.txt".to_vec())),
+            "same contents",
+        )
+        .expect("non-UTF-8 filename");
+        let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
+        let resources = [ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: None,
+            writable: None,
+        }];
+        for (name, arguments) in [
+            ("ls", json!({ "path": "." })),
+            ("find", json!({ "path": ".", "pattern": "*" })),
+            ("grep", json!({ "path": ".", "pattern": "same" })),
+        ] {
+            let call = ToolCall {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                arguments,
+            };
+            resolver
+                .execute_tool(&resources, &call)
+                .expect("tool still returns its normal result");
+            assert!(resolver.take_model_scan_witness(name).is_none(), "{name}");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn native_workspace_tools_are_confined_and_honor_read_only_subtrees() {
         let root = std::env::temp_dir().join(format!(
@@ -5481,6 +5642,41 @@ workflow UnsafeHostChat {
             .iter()
             .any(|tool| tool.name == "write"));
         fs::create_dir(root.join("empty")).expect("empty directory");
+        let listing = resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "list-root".to_owned(),
+                    name: "ls".to_owned(),
+                    arguments: json!({ "path": "." }),
+                },
+            )
+            .expect("directory listing");
+        assert!(listing.contains("empty/"));
+        let listed = resolver
+            .take_model_scan_witness("list-root")
+            .expect("bounded listing witness");
+        assert_eq!(listed.root, ".");
+        assert_eq!(listed.files.len(), 2);
+        assert!(listed.directories.contains(&"empty".to_owned()));
+        assert!(listed.directories.contains(&".pi".to_owned()));
+        assert!(listed.files.iter().any(|file| {
+            file.path == "note.txt"
+                && file.content_hash
+                    == whipplescript_store::stable_hash_bytes_hex(b"alpha\ngamma\n")
+        }));
+        assert!(resolver.take_model_scan_witness("list-root").is_none());
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "empty-list".to_owned(),
+                    name: "ls".to_owned(),
+                    arguments: json!({ "path": "empty" }),
+                },
+            )
+            .expect("empty listing");
+        assert!(resolver.take_model_scan_witness("empty-list").is_none());
         resolver
             .execute_tool(
                 &resources,
@@ -5562,6 +5758,17 @@ workflow UnsafeHostChat {
             )
             .expect("large find still runs");
         assert!(resolver.take_model_scan_witness("oversized-find").is_none());
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "oversized-list".to_owned(),
+                    name: "ls".to_owned(),
+                    arguments: json!({ "path": "." }),
+                },
+            )
+            .expect("large listing still runs");
+        assert!(resolver.take_model_scan_witness("oversized-list").is_none());
         fs::create_dir(root.join("large")).expect("large directory");
         fs::File::create(root.join("large/one.bin"))
             .expect("large file")

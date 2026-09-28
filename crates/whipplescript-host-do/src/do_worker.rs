@@ -118,6 +118,9 @@ pub struct DurableEffectPorts {
     pub exec: Option<ExecutorSidecarConfig>,
     /// Class-B turn-container wiring (agent turns run whole in a container).
     pub turn: Option<TurnContainerConfig>,
+    /// The deployment's norm planning configuration, which the in-language
+    /// doors onto the mainline evaluate its gate with (norm-plane §5).
+    pub norm_gate: Option<crate::norm_commands::HostedNormGate>,
 }
 
 /// One operator-pinned script capability shipped with the deploy (compute
@@ -153,6 +156,7 @@ pub struct DurableInstance<Sql: DoSql> {
     agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     exec: Option<ExecutorSidecarConfig>,
     turn: Option<TurnContainerConfig>,
+    norm_gate: Option<crate::norm_commands::HostedNormGate>,
 }
 
 // `'static` so the default `DoFileStore` over the shared `Rc<Sql>` can be boxed
@@ -272,6 +276,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
+            norm_gate: ports.norm_gate,
         })
     }
 
@@ -595,6 +600,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
+            norm_gate: ports.norm_gate,
         })
     }
 
@@ -714,6 +720,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tool_specs: self.agent_tool_specs.as_deref(),
             exec: self.exec.as_ref(),
             turn: self.turn.as_ref(),
+            norm_gate: self.norm_gate.as_ref(),
             ir: &self.ir,
             instance_id: &self.instance_id,
             system_prompt: &self.system_prompt,

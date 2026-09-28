@@ -147,8 +147,26 @@ impl PreparedNormRun {
         artifact: &whipplescript_store::norm_artifact::CapturedArtifact,
         run_id: String,
     ) -> Result<Self, String> {
-        let mut prepared = Self::prepare(contract, method, artifact.files().clone(), run_id)?;
-        prepared.source = Some(artifact.basis().clone());
+        Self::prepare_staged(
+            contract,
+            method,
+            artifact.files().clone(),
+            artifact.basis(),
+            run_id,
+        )
+    }
+
+    /// As [`Self::prepare_from_artifact`], staging only `files` of the
+    /// captured cut `source` (`norm_staging`).
+    pub fn prepare_staged(
+        contract: ReportContract,
+        method: PythonCallMethod,
+        files: BTreeMap<String, String>,
+        source: &whipplescript_store::norm_artifact::ArtifactBasis,
+        run_id: String,
+    ) -> Result<Self, String> {
+        let mut prepared = Self::prepare(contract, method, files, run_id)?;
+        prepared.source = Some(source.clone());
         Ok(prepared)
     }
 

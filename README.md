@@ -14,7 +14,9 @@ prints about it, and the compiler enforces the report on every line.
 [For IT and data owners](docs/for-it.md)
 
 > WhippleScript is a pre-1.0 product. The language, the CLI, and the provider
-> interfaces can change between releases. Refer to
+> interfaces can change between releases. A release that breaks one of them
+> raises the middle number of the version, and its [changelog](CHANGELOG.md)
+> entry says what to do. Refer to
 > [current state](docs/current-state.md) for the parts that are sufficiently
 > stable to use today. The Markdown documents in this checkout apply to `main`.
 > To find the exact behavior of a released CLI, use the documents from the

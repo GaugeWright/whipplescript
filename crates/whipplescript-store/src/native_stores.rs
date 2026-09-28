@@ -685,6 +685,9 @@ impl RuntimeStore for NativeStores {
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
         self.runtime.list_instances()
     }
+    fn list_effect_instances(&self) -> StoreResult<Vec<String>> {
+        self.runtime.list_effect_instances()
+    }
 
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
         self.runtime.get_instance(instance_id)

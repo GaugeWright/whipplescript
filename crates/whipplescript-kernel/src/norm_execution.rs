@@ -215,15 +215,25 @@ impl PreparedNormExecution {
             .requirements
             .get(selection.requirement)
             .ok_or("norm preparation requires an active requirement")?;
-        let (contract, method) = Self::requirement_support(selected, artifact)?;
+        let (_, method) = Self::requirement_support(selected, artifact.files())?;
+        // A protected run reads only its requirement's domain (norm_staging).
+        let binding = view
+            .resource_inventory(artifact, Default::default())
+            .map_err(|e| format!("{e:?}"))?
+            .bindings
+            .remove(selection.requirement);
+        let staging =
+            crate::norm_staging::stage(&method.runtime.engine, binding.as_ref(), artifact.files());
+        let (contract, method) = Self::requirement_support(selected, &staging.files)?;
         let requirement = contract.subject.requirement.clone();
         if method.runtime.environment != selection.environment_epoch {
             return Err("norm method environment differs from the selected executor epoch".into());
         }
-        let runner = PreparedNormRun::prepare_from_artifact(
+        let runner = PreparedNormRun::prepare_staged(
             contract,
             method,
-            artifact,
+            staging.files,
+            artifact.basis(),
             selection.effect_id.into(),
         )?;
         let request = runner.executor_request(selection.executor_url)?;
@@ -247,26 +257,40 @@ impl PreparedNormExecution {
             capability: capability.into(),
         })
     }
-    pub(crate) fn requirement_support(
+    fn template(
         selected: &whipplescript_store::norm_inventory::InventoryRequirement,
-        artifact: &CapturedArtifact,
-    ) -> Result<(ReportContract, PythonCallMethod), String> {
-        let requirement = selected
-            .requirement
-            .clone()
-            .ok_or("norm requirement has no usable identity")?;
+    ) -> Result<PythonCallSupport, String> {
         let template = selected
             .declaration
             .as_ref()
             .and_then(|d| d.support_contract.as_ref())
             .ok_or("norm requirement has no support template")?;
-        let PythonCallSupport::V1 { method, cases } = serde_json::from_str(template)
-            .map_err(|e| format!("invalid norm support template: {e}"))?;
+        serde_json::from_str(template).map_err(|e| format!("invalid norm support template: {e}"))
+    }
+
+    /// The method a requirement's support template declares.
+    pub(crate) fn requirement_method(
+        selected: &whipplescript_store::norm_inventory::InventoryRequirement,
+    ) -> Result<PythonCallMethod, String> {
+        let PythonCallSupport::V1 { method, .. } = Self::template(selected)?;
+        Ok(method)
+    }
+
+    /// The contract a run of the requirement over `files` is judged against.
+    pub(crate) fn requirement_support(
+        selected: &whipplescript_store::norm_inventory::InventoryRequirement,
+        files: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(ReportContract, PythonCallMethod), String> {
+        let requirement = selected
+            .requirement
+            .clone()
+            .ok_or("norm requirement has no usable identity")?;
+        let PythonCallSupport::V1 { method, cases } = Self::template(selected)?;
         let contract = ReportContract {
             subject: EvidenceSubject {
                 requirement: requirement.clone(),
                 method: method.reference(),
-                artifact: candidate_identity(artifact.files()),
+                artifact: candidate_identity(files),
             },
             cases,
         };
@@ -603,6 +627,10 @@ impl PreparedNormExecution {
 #[cfg(all(test, feature = "native"))]
 #[path = "norm_execution_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "native"))]
+#[path = "norm_activation_effects_tests.rs"]
+mod activation_effects_tests;
 
 #[cfg(all(feature = "native", any(test, feature = "test-support")))]
 #[path = "norm_execution_fixtures.rs"]

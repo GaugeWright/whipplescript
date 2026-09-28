@@ -803,14 +803,14 @@ pub fn home_do_turn_branch<Sql: DoSql + Clone>(
 /// serialization (`SingleWriterSerialization`, vw note §7); and **no
 /// fact routing** — vcs.* fact delivery is the mediator surface (A5),
 /// which lives native-side.
-/// Why the hosted mainline gate cannot evaluate a norm ledger yet.
-pub const HOSTED_ADMISSION_UNCONFIGURED: &str =
-    "the hosted promote door does not yet receive the deployment's norm planning configuration";
-
 pub struct DoVcsPromoteCapabilityProvider<Sql: DoSql + Clone> {
     /// The shared DO SQLite handle (an `Rc<…>` in every real
     /// instantiation, so cloning is a refcount bump).
     pub sql: Sql,
+    /// The deployment's norm planning configuration, when it installs one.
+    pub norm_gate: Option<crate::norm_commands::HostedNormGate>,
+    /// The step's injected clock, which the gate evaluates at.
+    pub now_unix_ms: i64,
 }
 
 impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvider
@@ -872,21 +872,28 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         // Single-writer per object: the DO's turn IS the serialization
         // (DR-0091 Decision 2), so the kernel choreography runs unleased.
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Promote;
-        let result = with_hosted_mainline_gate(&self.sql, door, &grants, |gate| {
-            whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
-                &mut streams,
-                &mut vcs,
-                &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
-                    stream_id,
-                    reservation_id: &reservation_id,
-                    proposed_main: &proposed_main,
-                    at: &at,
-                    receipt_scope: "durable-object-workspace",
-                },
-                &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
-                gate,
-            )
-        });
+        let result = with_hosted_mainline_gate(
+            &self.sql,
+            self.norm_gate.as_ref(),
+            self.now_unix_ms,
+            door,
+            &grants,
+            |gate| {
+                whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
+                    &mut streams,
+                    &mut vcs,
+                    &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
+                        stream_id,
+                        reservation_id: &reservation_id,
+                        proposed_main: &proposed_main,
+                        at: &at,
+                        receipt_scope: "durable-object-workspace",
+                    },
+                    &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
+                    gate,
+                )
+            },
+        );
         // No fact routing: vcs.* fact delivery is the mediator surface (A5),
         // which lives native-side.
         whipplescript_kernel::effect_handlers::promote_effect_outcome(stream_id, &result)
@@ -894,25 +901,65 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
 }
 
 /// The mainline's gate (norm-plane §5) over this object's ledger, for one
-/// door. The hosted doors do not yet receive the deployment's planning inputs,
-/// so a workspace with a norm ledger is refused rather than moved unevaluated;
-/// one without a ledger is gated by nothing.
+/// door: the gate the promotion route builds, from the deployment's planning
+/// configuration evaluated at the step's clock. An object whose deployment
+/// installs none, or installs one this door cannot build a host from, refuses a
+/// workspace with a norm ledger rather than moving it unevaluated; one without
+/// a ledger is gated by nothing.
 pub(crate) fn with_hosted_mainline_gate<Sql: DoSql + Clone, T>(
     sql: &Sql,
+    norm_gate: Option<&crate::norm_commands::HostedNormGate>,
+    now_unix_ms: i64,
     door: whipplescript_kernel::norm_admission::AdmissionDoor,
     grants: &[String],
     f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
 ) -> T {
     let ledger = crate::do_store::DoSqliteStore::new(sql.clone());
+    let Some(norm_gate) = norm_gate else {
+        return mainline_gate(
+            &ledger,
+            Err(
+                "the deployment installs no norm planning configuration for the hosted doors"
+                    .to_owned(),
+            ),
+            door,
+            grants,
+            f,
+        );
+    };
+    // The door runs once: through the host when one is built, and otherwise
+    // under the reason it could not be.
+    let mut door_once = Some(f);
+    let mut ran = None;
+    let built = norm_gate.with_admission_host(sql, now_unix_ms, |host| {
+        if let Some(f) = door_once.take() {
+            ran = Some(mainline_gate(&ledger, Ok(host), door, grants, f));
+        }
+        Ok(())
+    });
+    match (ran, door_once, built) {
+        (Some(result), _, _) => result,
+        (None, Some(f), Err(reason)) => mainline_gate(&ledger, Err(reason), door, grants, f),
+        (None, _, _) => unreachable!("a built host runs the door"),
+    }
+}
+
+fn mainline_gate<'a, Sql: DoSql + Clone, T>(
+    ledger: &'a crate::do_store::DoSqliteStore<Sql>,
+    host: Result<
+        whipplescript_kernel::norm_admission::AdmissionHost<
+            'a,
+            crate::do_store::DoSqliteStore<Sql>,
+        >,
+        String,
+    >,
+    door: whipplescript_kernel::norm_admission::AdmissionDoor,
+    grants: &[String],
+    f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
+) -> T {
     let mut gate = whipplescript_kernel::norm_admission::NormMainlineAdmission::new(
-        &ledger,
-        Err::<
-            whipplescript_kernel::norm_admission::AdmissionHost<
-                '_,
-                crate::do_store::DoSqliteStore<Sql>,
-            >,
-            _,
-        >(HOSTED_ADMISSION_UNCONFIGURED.to_owned()),
+        ledger,
+        host,
         door,
         whipplescript_store::branches::MAINLINE_BRANCH_ID,
     )
@@ -928,6 +975,10 @@ pub(crate) fn with_hosted_mainline_gate<Sql: DoSql + Clone, T>(
 pub struct DoVcsSelectiveCapabilityProvider<Sql: DoSql + Clone> {
     pub sql: Sql,
     pub instance_id: String,
+    /// The deployment's norm planning configuration, when it installs one.
+    pub norm_gate: Option<crate::norm_commands::HostedNormGate>,
+    /// The step's injected clock, which the gate evaluates at.
+    pub now_unix_ms: i64,
 }
 
 impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvider
@@ -989,25 +1040,32 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         } else {
             whipplescript_kernel::norm_admission::AdmissionDoor::Transport
         };
-        let result = with_hosted_mainline_gate(&self.sql, door, &[], |gate| {
-            whipplescript_kernel::effect_handlers::run_selective_verb_generic(
-                &mut vcs,
-                effect.target.as_deref(),
-                &input,
-                &expr,
-                &branch_id,
-                &cut_id,
-                &at,
-                &mut |onto| {
-                    DoWorkstreams::new(sql.clone())
-                        .ok()
-                        .and_then(|streams| streams.get_stream(onto).ok().flatten())
-                        .map(|stream| stream.line_branch_id)
-                },
-                &mut |vcs, line, cut| do_staleness_deltas(&sql, vcs, line, cut),
-                gate,
-            )
-        });
+        let result = with_hosted_mainline_gate(
+            &self.sql,
+            self.norm_gate.as_ref(),
+            self.now_unix_ms,
+            door,
+            &[],
+            |gate| {
+                whipplescript_kernel::effect_handlers::run_selective_verb_generic(
+                    &mut vcs,
+                    effect.target.as_deref(),
+                    &input,
+                    &expr,
+                    &branch_id,
+                    &cut_id,
+                    &at,
+                    &mut |onto| {
+                        DoWorkstreams::new(sql.clone())
+                            .ok()
+                            .and_then(|streams| streams.get_stream(onto).ok().flatten())
+                            .map(|stream| stream.line_branch_id)
+                    },
+                    &mut |vcs, line, cut| do_staleness_deltas(&sql, vcs, line, cut),
+                    gate,
+                )
+            },
+        );
         whipplescript_kernel::effect_handlers::selective_effect_outcome(result)
     }
 }
@@ -1465,6 +1523,8 @@ mod tests {
         let provider = DoVcsSelectiveCapabilityProvider {
             sql: Rc::clone(&sql),
             instance_id: "ins-r4".to_owned(),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         let effect = |id: &str, target: &str, input: &str| whipplescript_store::ClaimableEffect {
             attempt_admission_event_id: None,
@@ -1617,6 +1677,8 @@ mod tests {
 
         let provider = DoVcsPromoteCapabilityProvider {
             sql: Rc::clone(&sql),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         let effect = |id: &str, stream: &str| whipplescript_store::ClaimableEffect {
             attempt_admission_event_id: None,
@@ -1767,6 +1829,8 @@ mod tests {
 
         let provider = DoVcsPromoteCapabilityProvider {
             sql: Rc::clone(&sql),
+            norm_gate: None,
+            now_unix_ms: 0,
         };
         let effect = whipplescript_store::ClaimableEffect {
             attempt_admission_event_id: None,

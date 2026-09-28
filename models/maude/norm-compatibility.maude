@@ -1,0 +1,71 @@
+--- norm-plane §11.1 and slice U1: norm compatibility is a typed constraint
+--- problem over a bounded domain.
+---
+--- Three Boolean variables x, y, z. Each norm contributes one constraint: an
+--- equality or a disequality between two variables. Region overlap only says
+--- which norms to compare; it is not a conflict. The checker admits a set of
+--- norms as compatible only when one assignment satisfies all of them jointly,
+--- and it names the assignment as the witness. x = y, y = z and x != z are
+--- pairwise satisfiable but jointly inconsistent, which only a joint check
+--- sees.
+fmod COMPATIBILITY-DATA is
+  protecting BOOL .
+  sorts Var Norm Norms Assignment .
+  ops x y z : -> Var [ctor] .
+  op eq : Var Var -> Norm [ctor] .
+  op ne : Var Var -> Norm [ctor] .
+  subsort Norm < Norms .
+  op none : -> Norms [ctor] .
+  op __ : Norms Norms -> Norms [ctor assoc comm id: none] .
+  op a : Bool Bool Bool -> Assignment [ctor] .
+  var X Y Z : Bool . vars U V : Var . var N : Norm . var NS : Norms .
+  op val : Assignment Var -> Bool .
+  eq val(a(X, Y, Z), x) = X .
+  eq val(a(X, Y, Z), y) = Y .
+  eq val(a(X, Y, Z), z) = Z .
+  op holds : Assignment Norms -> Bool .
+  eq holds(A:Assignment, none) = true .
+  eq holds(A:Assignment, eq(U, V) NS) = (val(A:Assignment, U) == val(A:Assignment, V)) and holds(A:Assignment, NS) .
+  eq holds(A:Assignment, ne(U, V) NS) = (val(A:Assignment, U) =/= val(A:Assignment, V)) and holds(A:Assignment, NS) .
+  --- Is some assignment of the bounded domain a model of all the norms?
+  op sat : Norms -> Bool .
+  eq sat(NS) = holds(a(true, true, true), NS) or holds(a(true, true, false), NS)
+    or holds(a(true, false, true), NS) or holds(a(true, false, false), NS)
+    or holds(a(false, true, true), NS) or holds(a(false, true, false), NS)
+    or holds(a(false, false, true), NS) or holds(a(false, false, false), NS) .
+  --- The first model of the norms in a fixed order: the witness.
+  op witness : Norms -> Assignment .
+  ceq witness(NS) = a(true, true, true) if holds(a(true, true, true), NS) .
+  ceq witness(NS) = a(true, true, false) if not holds(a(true, true, true), NS) /\ holds(a(true, true, false), NS) .
+  ceq witness(NS) = a(false, false, false) if not holds(a(true, true, true), NS) /\ not holds(a(true, true, false), NS) /\ holds(a(false, false, false), NS) .
+  --- Every pair satisfiable on its own.
+  op pairwise : Norms -> Bool .
+  eq pairwise(N N2:Norm NS) = sat(N N2:Norm) and pairwise(N NS) and pairwise(N2:Norm NS) .
+  eq pairwise(NS) = true [owise] .
+endfm
+mod NORM-COMPATIBILITY is
+  including COMPATIBILITY-DATA .
+  sorts Verdict State .
+  ops compatible incompatible : -> Verdict [ctor] .
+  op check : Norms -> State [ctor] .
+  op judged : Norms Verdict -> State [ctor] .
+  op witnessed : Norms Assignment -> State [ctor] .
+  var NS : Norms . var A : Assignment .
+  --- The joint check: compatible exactly when one assignment models them all,
+  --- and that assignment is the witness.
+  crl [joint-witness] : check(NS) => witnessed(NS, witness(NS)) if sat(NS) = true .
+  crl [joint-compatible] : check(NS) => judged(NS, compatible) if sat(NS) = true .
+  crl [joint-incompatible] : check(NS) => judged(NS, incompatible) if sat(NS) = false .
+endm
+--- A checker that compares norms two at a time.
+mod NORM-COMPATIBILITY-WEAK-PAIRWISE is
+  including NORM-COMPATIBILITY .
+  var NS : Norms .
+  crl [pairwise-compatible] : check(NS) => judged(NS, compatible) if pairwise(NS) = true .
+endm
+--- A checker that calls any overlap a conflict.
+mod NORM-COMPATIBILITY-WEAK-OVERLAP is
+  including NORM-COMPATIBILITY .
+  vars U V : Var . var NS : Norms .
+  rl [overlap-conflict] : check(eq(U, V) NS) => judged(eq(U, V) NS, incompatible) .
+endm

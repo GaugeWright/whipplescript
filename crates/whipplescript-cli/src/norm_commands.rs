@@ -33,6 +33,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   impact <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   render <id-or-alias> [--frontier <file>] | explain <id-or-alias> [--frontier <file>]\n\
   query <expression> [--frontier <file>] [--cut <cut>]\n\
+  compatibility [--frontier <file>] | export-uproar --repository <urn>\n\
   diff --before-frontier <file> [--after-frontier <file>]\n\
   bootstrap --as <binding> --creator <principal> [--charter <file>]\n\
   create <vocabulary@version> --as <binding> --fields <file>\n\
@@ -109,6 +110,8 @@ impl<'a> Arguments<'a> {
             "snapshot" | "inventory" => (0, &["--frontier"]),
             "render" | "explain" => (1, &["--frontier"]),
             "query" => (1, &["--frontier", "--cut"]),
+            "compatibility" => (0, &["--frontier"]),
+            "export-uproar" => (0, &["--repository"]),
             "diff" => (0, &["--before-frontier", "--after-frontier"]),
             "export" | "provision" => (0, &[]),
             "resources" => (1, &["--frontier"]),
@@ -554,10 +557,21 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             &super::now_stamp(),
         )
     };
+    // The runtime store's running norm effects, which an activation plans
+    // (norm-plane §10). A host that has never run one holds none.
+    let running = || {
+        if !runtime_path.exists() {
+            return Ok(Vec::new());
+        }
+        whipplescript_store::norm_publication::running_norm_effects(
+            &whipplescript_store::SqliteStore::open(runtime_path)?,
+        )
+    };
     if args.verb == "dispatch" {
         let response = NormCommandHost::new(&mut store, &verifier)
             .with_artifacts(&artifacts)
             .with_gated_refs(&mut lease_gated_refs)
+            .with_running_effects(&running)
             .execute_json(&args.file("--request")?)
             .map_err(debug_error)?;
         return serde_json::from_str(&response).map_err(|error| error.to_string());
@@ -615,6 +629,12 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             }
         }
         "export" => NormCommand::Export {},
+        "export-uproar" => NormCommand::ExportUproar {
+            repository: args.required("--repository")?.to_owned(),
+        },
+        "compatibility" => NormCommand::Compatibility {
+            frontier: args.frontier("--frontier")?,
+        },
         "plan-activation" => NormCommand::PlanActivation {
             proposal: serde_json::from_str(&args.file("--proposal")?)
                 .map_err(|error| error.to_string())?,
@@ -776,6 +796,7 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
     let response = NormCommandHost::new(&mut store, &verifier)
         .with_artifacts(&artifacts)
         .with_gated_refs(&mut lease_gated_refs)
+        .with_running_effects(&running)
         .execute(NormCommandRequest::new(command))
         .map_err(debug_error)?;
     serde_json::to_value(response).map_err(|error| error.to_string())

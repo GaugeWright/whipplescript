@@ -92,7 +92,36 @@ pub(super) struct Deployment {
     pub(super) now: Option<String>,
 }
 
+/// The installed premises alone, as a door's configuration carries them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Installation {
+    planning: String,
+    runtime: String,
+    image_binding: String,
+    deployed_image: String,
+}
+
 impl Deployment {
+    /// The deployment a door evaluates at a step's injected clock: the
+    /// configuration supplies the premises, the step the time basis and `now`.
+    pub(super) fn at_step(installation: &str, now_unix_ms: i64) -> Result<Self, String> {
+        let Installation {
+            planning,
+            runtime,
+            image_binding,
+            deployed_image,
+        } = serde_json::from_str(installation).map_err(|e| e.to_string())?;
+        Ok(Self {
+            planning,
+            runtime,
+            image_binding,
+            deployed_image,
+            time_basis: format!("hosted-admission/{now_unix_ms}"),
+            now: Some(crate::do_worker::unix_ms_to_iso8601(now_unix_ms)),
+        })
+    }
+
     pub(super) fn parse(deployment: &str) -> Result<Self, String> {
         if deployment.len() > 131_072 {
             return Err("hosted impact deployment exceeds 128 KiB".into());

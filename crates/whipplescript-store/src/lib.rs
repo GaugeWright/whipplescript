@@ -41,6 +41,7 @@ pub mod norm;
 pub mod norm_activation;
 pub mod norm_artifact;
 pub mod norm_commands;
+pub mod norm_constraints;
 pub mod norm_correspondence;
 pub mod norm_enforcement;
 pub mod norm_history;
@@ -52,6 +53,7 @@ pub mod norm_reference_inventory;
 pub mod norm_relations;
 pub mod norm_reservations;
 pub mod norm_resources;
+pub mod norm_uproar;
 pub mod norm_views;
 #[cfg(feature = "native")]
 pub mod payload_protection;
@@ -8749,6 +8751,9 @@ pub trait RuntimeStore {
     ) -> StoreResult<Vec<EvidenceView>>;
     fn list_evidence_links(&self, instance_id: &str) -> StoreResult<Vec<EvidenceLinkView>>;
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>>;
+    /// Every instance id an effect is recorded under, whether or not an
+    /// instance row names it, in order.
+    fn list_effect_instances(&self) -> StoreResult<Vec<String>>;
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>>;
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>>;
     /// Reconstruct the event-sourced fact/effect world at one exact event
@@ -9564,6 +9569,15 @@ impl RuntimeStore for SqliteStore {
     }
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
         self.list_instances()
+    }
+    fn list_effect_instances(&self) -> StoreResult<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT instance_id FROM effects ORDER BY instance_id")?;
+        let rows = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
     }
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
         self.get_instance(instance_id)

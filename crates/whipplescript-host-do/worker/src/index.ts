@@ -450,6 +450,22 @@ class UnsupportedSchemaVersionError extends Error {
 
 // Idempotent first-touch bootstrap: a fresh DO has an empty SQLite; apply the
 // schema + builtin seeds exactly once (schema_migrations doubles as the marker).
+/**
+ * The deployment's installed norm planning premises, when it installs all
+ * four: what `/host/norm/impacts` and `/host/norm/promotions` plan with, and
+ * what the in-language doors onto the mainline evaluate its gate with. The
+ * clock is never one of them; each caller supplies its own.
+ */
+function normPlanningInstallation(env: Env):
+  { planning: string; runtime: string; image_binding: string; deployed_image: string } | undefined {
+  const { WHIP_NORM_PLANNING: planning, WHIP_NORM_RUNTIME: runtime,
+    WHIP_NORM_IMAGE_BINDING: image_binding, WHIP_NORM_DEPLOYMENT_IMAGE: deployed_image } = env;
+  if (!planning?.trim() || !runtime?.trim() || !image_binding?.trim() || !deployed_image?.trim()) {
+    return undefined;
+  }
+  return { planning, runtime, image_binding, deployed_image };
+}
+
 function ensureSchema(sql: SqlStorage): void {
   const marker = sql
     .exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`)
@@ -1585,15 +1601,14 @@ export class WorkflowInstance implements DurableObject {
       ensureSchema(this.ctx.storage.sql);
       try {
         if (url.pathname === "/host/norm/impacts" || url.pathname === "/host/norm/promotions") {
-          const { WHIP_NORM_PLANNING: planning, WHIP_NORM_RUNTIME: runtime,
-            WHIP_NORM_IMAGE_BINDING: image_binding, WHIP_NORM_DEPLOYMENT_IMAGE: deployed_image } = this.env;
-          if (!planning?.trim() || !runtime?.trim() || !image_binding?.trim() || !deployed_image?.trim()) {
+          const installation = normPlanningInstallation(this.env);
+          if (!installation) {
             return Response.json({ error: "norm planning installation is unavailable" }, { status: 503 });
           }
           // A promotion's gate plans exactly what an impact query would.
           const door = url.pathname === "/host/norm/impacts" ? "impact" : "admission";
           const now = new Date();
-          const deployment = JSON.stringify({ planning, runtime, image_binding, deployed_image,
+          const deployment = JSON.stringify({ ...installation,
             time_basis: `hosted-${door}/${now.getTime()}/${crypto.randomUUID()}`,
             now: now.toISOString() });
           const answer = url.pathname === "/host/norm/impacts"
@@ -4900,6 +4915,7 @@ export class WorkflowInstance implements DurableObject {
           initial_model_provenance: this.isPublicSession()
             ? undefined : request.initial_model_provenance,
         }),
+        ...this.normGate(),
       );
       const driven = await this.driveInstance(
         instance,
@@ -5265,6 +5281,16 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  // The mainline gate's deployment inputs for the in-language doors (`promote`,
+  // `transport … onto mainline`): the promotion route's trust and planning
+  // installation, both or neither. Each step supplies the clock the gate is
+  // evaluated at; without them a governed workspace's doors refuse.
+  private normGate(): [string | undefined, string | undefined] {
+    const trust = this.env.WHIP_NORM_TRUST;
+    const installation = normPlanningInstallation(this.env);
+    return trust && installation ? [trust, JSON.stringify(installation)] : [undefined, undefined];
+  }
+
   // Build (get-or-create) the wasm instance from the persisted bootstrap, wiring
   // the effect ports from DO secrets/bindings. Shared by `drive` (the step loop)
   // and the operator command path (checkpoint/restore).
@@ -5336,6 +5362,7 @@ export class WorkflowInstance implements DurableObject {
       this.env.WHIP_SCRIPT_CAPABILITIES_JSON,
       turnConfig,
       mediaConfig,
+      ...this.normGate(),
     );
   }
 

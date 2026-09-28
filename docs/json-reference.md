@@ -3,8 +3,8 @@
 This page is the public contract surface of the CLI that a machine can read. A
 set of fields can become larger in the same version of a schema. Thus a consumer
 must ignore an unknown field. The necessary fields on this page are safe to
-depend on. They are safe for the current set of documents and for the released
-`0.2.1` CLI, unless the version of a schema changes.
+depend on. They are safe for the current set of documents and for the most
+recent release of the CLI, unless the version of a schema changes.
 
 For the use of a command, refer to the [CLI reference](api-reference.md).
 

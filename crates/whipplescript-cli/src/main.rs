@@ -5,6 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -33,6 +34,7 @@ use whipplescript_kernel::exec_http::{
     commit_exec_settlement, encode_cached_exec_result, ingest_exec_stdout, ExecIngest,
     ExecSettlementProjection,
 };
+use whipplescript_kernel::import_coverage::{CheckedImportBasis, ResolvedLocalPackage};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
 #[cfg(test)]
@@ -98,8 +100,8 @@ use whipplescript_store::{
     ClaimableEffect, DerivedFact, DiagnosticRecord, DiagnosticView, DurableDiagnosticCode,
     EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
     EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent, NewFact, NewInstanceAuthority,
-    NewWorkflowInvocation, ProviderValidationEvidence, RestoreDecision, RetryEffect,
-    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    NewWorkflowInvocation, ProgramVersionRecord, ProviderValidationEvidence, RestoreDecision,
+    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
     RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
     SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
 };
@@ -153,6 +155,7 @@ mod lsp_server;
 mod maude_model;
 mod mcp_cli;
 mod mcp_tools;
+mod misuse_log;
 mod model_auth;
 mod norm_commands;
 mod norm_exec_managed;
@@ -194,6 +197,16 @@ const PACKAGE_CONTRACT_SCHEMA: &str = "whipplescript.package_contract.v0";
 
 fn main() -> ExitCode {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    let status = dispatch(raw_args.clone());
+    // Exit status 2 is the refusal of the invocation itself, from here or from
+    // any command's own parsing; each one is kept to improve the surface.
+    if status == ExitCode::from(2) {
+        misuse_log::record(&raw_args);
+    }
+    status
+}
+
+fn dispatch(raw_args: Vec<String>) -> ExitCode {
     if matches!(
         raw_args.first().map(String::as_str),
         Some("--version" | "-V")
@@ -1149,7 +1162,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "revise",
         group: "run",
-        usage: "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--dry-run] [--cancel keep|queued|running]",
+        usage: "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--package-lock <path>] [--dry-run] [--cancel keep|queued|running]",
         run: revise,
     },
     CommandSpec {
@@ -17320,6 +17333,7 @@ struct ReviseOptions {
     instance_id: String,
     program_path: String,
     root: Option<String>,
+    package_lock_path: Option<PathBuf>,
     dry_run: bool,
     cancellation_policy: String,
     /// DR-0077 Decision 4. The operator's explicit `old=new` carries -- the
@@ -17333,6 +17347,7 @@ impl ReviseOptions {
         let mut instance_id = None;
         let mut program_path = None;
         let mut root = None;
+        let mut package_lock_path = None;
         let mut dry_run = false;
         let mut cancellation_policy = "keep".to_owned();
         let mut carries: Vec<RuleCarry> = Vec::new();
@@ -17345,6 +17360,13 @@ impl ReviseOptions {
                         return Err("expected workflow name after `--root`".to_owned());
                     };
                     root = Some(value.clone());
+                }
+                "--package-lock" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected path after `--package-lock`".to_owned());
+                    };
+                    package_lock_path = Some(PathBuf::from(value));
                 }
                 "--dry-run" => dry_run = true,
                 "--carry" => {
@@ -17407,6 +17429,7 @@ impl ReviseOptions {
             instance_id,
             program_path,
             root,
+            package_lock_path,
             dry_run,
             cancellation_policy,
             carries,
@@ -17446,6 +17469,20 @@ fn revise(options: &CliOptions) -> ExitCode {
             return report_compile_failure(&revise_options.program_path, error);
         }
     };
+    let package_lock = match load_package_lock(
+        revise_options.package_lock_path.as_deref(),
+        &[Path::new(&revise_options.program_path)],
+    ) {
+        Ok(package_lock) => package_lock,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(message) = contract_registry_for_ir(package_lock.as_ref(), &ir) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     let typed_actions =
         typed_action_plans_for_compiled_source(&source, revise_options.root.as_deref());
     let source_hash = stable_hash_hex(&source);
@@ -17532,19 +17569,36 @@ fn revise(options: &CliOptions) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let checked_packages = match checked_local_packages(package_lock.as_ref()) {
+        Ok(packages) => packages,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    let compiler_artifact_digest = match native_compiler_artifact_digest() {
+        Ok(digest) => digest,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = register_locked_packages(&store, package_lock.as_ref()) {
+        return report_store_error("failed to register revision packages", error);
+    }
     let mut kernel = RuntimeKernel::new(store);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = match kernel.create_program_version_for_compiled_program(
-        CompiledProgramVersionInput {
-            program_name: &ir.workflow,
-            source_hash: &source_hash,
-            compiler_version: whipplescript_core::version(),
-        },
+    let version = match create_checked_native_program_version(
+        &mut kernel,
+        &source,
         &ir,
         typed_actions.as_ref(),
+        package_lock.as_ref(),
+        &checked_packages,
+        &compiler_artifact_digest,
     ) {
         Ok(version) => version,
         Err(error) => {
@@ -17613,6 +17667,105 @@ const PACKAGE_LOCK_SCHEMA: &str = "whipplescript.package_lock.v0";
 struct LoadedPackageLock {
     path: PathBuf,
     manifests: Vec<PackageManifest>,
+}
+
+struct CheckedLocalPackage {
+    name: String,
+    package_id: String,
+    version: String,
+    source_digest: String,
+}
+
+/// Keep the package-source basis derived from the loaded, attested manifests.
+/// Reading their paths again after contract checking could witness different
+/// bytes from the ones that authorized the program.
+fn checked_local_packages(
+    package_lock: Option<&LoadedPackageLock>,
+) -> Result<Vec<CheckedLocalPackage>, String> {
+    package_lock
+        .into_iter()
+        .flat_map(|lock| &lock.manifests)
+        .map(|manifest| {
+            let source_digest = manifest.checked_source_digest().ok_or_else(|| {
+                format!(
+                    "package `{}` has no attested source bundle for import admission",
+                    manifest.name
+                )
+            })?;
+            Ok(CheckedLocalPackage {
+                name: manifest.name.clone(),
+                package_id: manifest.package_id.clone(),
+                version: manifest.version.clone(),
+                source_digest,
+            })
+        })
+        .collect()
+}
+
+/// The CLI executable contains the native compiler used for this admission.
+/// On Linux, /proc/self/exe retains the running inode across a path replace.
+fn native_compiler_artifact_digest() -> Result<String, String> {
+    static DIGEST: OnceLock<Result<String, String>> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            let path = PathBuf::from("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let path = env::current_exe()
+                .map_err(|error| format!("locate native compiler artifact: {error}"))?;
+            let bytes = fs::read(&path).map_err(|error| {
+                format!(
+                    "read native compiler artifact `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            Ok(sha256_hex(&bytes))
+        })
+        .clone()
+}
+
+/// Native start and revision use the same checked basis and atomic accepting
+/// operation, so neither can accidentally admit a version without its import
+/// witness while the other stays covered.
+fn create_checked_native_program_version(
+    kernel: &mut RuntimeKernel<SqliteStore>,
+    source: &str,
+    program: &IrProgram,
+    typed_actions: Option<&TypedActionPlans>,
+    package_lock: Option<&LoadedPackageLock>,
+    checked_packages: &[CheckedLocalPackage],
+    compiler_artifact_digest: &str,
+) -> Result<ProgramVersionRecord, StoreError> {
+    let source_digest = sha256_hex(source.as_bytes());
+    let lock_digest = package_lock_digest(package_lock);
+    let resolved_packages = checked_packages
+        .iter()
+        .map(|package| ResolvedLocalPackage {
+            name: &package.name,
+            package_id: &package.package_id,
+            version: &package.version,
+            source_digest: &package.source_digest,
+        })
+        .collect::<Vec<_>>();
+    let admission = kernel.create_program_version_for_compiled_program_with_imports(
+        CompiledProgramVersionInput {
+            program_name: &program.workflow,
+            source_hash: &stable_hash_hex(source),
+            compiler_version: whipplescript_core::version(),
+        },
+        program,
+        typed_actions,
+        &CheckedImportBasis {
+            program_source_digest: &source_digest,
+            lock_digest: &lock_digest,
+            compiler_artifact_digest,
+            packages: &resolved_packages,
+        },
+    )?;
+    Ok(ProgramVersionRecord {
+        program_id: admission.program_id,
+        version_id: admission.version_id,
+    })
 }
 
 impl LoadedPackageLock {
@@ -19783,6 +19936,17 @@ fn start_workflow_instance(
         eprintln!("{message}");
         return Err(ExitCode::from(2));
     }
+    let checked_packages = checked_local_packages(package_lock.as_ref()).map_err(|message| {
+        eprintln!("{message}");
+        ExitCode::from(2)
+    })?;
+    let compiler_artifact_digest = match native_compiler_artifact_digest() {
+        Ok(digest) => digest,
+        Err(message) => {
+            eprintln!("{message}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
     let store = match open_store(&options.store_path) {
         Ok(store) => store,
         Err(message) => {
@@ -19800,14 +19964,14 @@ fn start_workflow_instance(
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = match kernel.create_program_version_for_compiled_program(
-        CompiledProgramVersionInput {
-            program_name: &ir.workflow,
-            source_hash: &stable_hash_hex(&source),
-            compiler_version: whipplescript_core::version(),
-        },
+    let version = match create_checked_native_program_version(
+        &mut kernel,
+        &source,
         &ir,
         typed_actions.as_ref(),
+        package_lock.as_ref(),
+        &checked_packages,
+        &compiler_artifact_digest,
     ) {
         Ok(version) => version,
         Err(error) => {
@@ -34058,26 +34222,29 @@ fn knowledge_subject_verbs(
             }
             let expr =
                 whipplescript_store::selection::parse(&basis_text).expect("validated basis parses");
-            let vcs = match open_vcs() {
-                Ok(vcs) => vcs,
-                Err(code) => return code,
+            let vcs = match open_existing_vcs() {
+                Some(Ok(vcs)) => Some(vcs),
+                Some(Err(code)) => return code,
+                None => None,
             };
-            let frontier =
-                match vcs.frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID) {
-                    Ok(Some(frontier)) => frontier,
-                    Ok(None) => {
-                        eprintln!(
-                            "the workspace VCS has no mainline yet — a first `whip branch \
+            let frontier = match vcs
+                .as_ref()
+                .map(|vcs| vcs.frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID))
+            {
+                Some(Ok(Some(frontier))) => frontier,
+                None | Some(Ok(None)) => {
+                    eprintln!(
+                        "the workspace VCS has no mainline yet — a first `whip branch \
                              write main <path> --body ...` creates it; or attest without \
                              a basis for unkeyed evidence"
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    Err(error) => {
-                        eprintln!("frontier unavailable: {error:?}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Some(Err(error)) => {
+                    eprintln!("frontier unavailable: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let (at_cut, content) = frontier;
             let fingerprint = match whipplescript_store::freshness::resolve_basis(&expr, &content) {
                 Ok(fingerprint) => fingerprint,
@@ -34165,9 +34332,9 @@ fn auto_attest_finish(
 ) {
     // One plan, every door (DR-0086 F4): the kernel computes the evidence;
     // this door only supplies its two views and applies.
-    let plan = match open_vcs() {
-        Ok(vcs) => whipplescript_kernel::effect_handlers::plan_finish_attest(store, &vcs, id),
-        Err(_) => whipplescript_kernel::effect_handlers::plan_finish_attest(
+    let plan = match open_existing_vcs() {
+        Some(Ok(vcs)) => whipplescript_kernel::effect_handlers::plan_finish_attest(store, &vcs, id),
+        None | Some(Err(_)) => whipplescript_kernel::effect_handlers::plan_finish_attest(
             store,
             &whipplescript_store::vcs::InertFrontier,
             id,
@@ -34279,7 +34446,7 @@ fn freshness_context() -> Option<(
     whipplescript_store::freshness::FrontierContent,
     Vec<whipplescript_store::selection::ChangeUnit>,
 )> {
-    let vcs = open_vcs().ok()?;
+    let vcs = open_existing_vcs()?.ok()?;
     let (_at_cut, frontier) = vcs
         .frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID)
         .ok()??;
@@ -38896,6 +39063,17 @@ fn vcs_content_store_path() -> PathBuf {
     env::var("WHIPPLESCRIPT_VCS_CONTENT_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/vcs-content.sqlite"))
+}
+
+/// The workspace VCS only where this workspace already has one. Opening
+/// creates the stores, and they are resolved from the current directory, so a
+/// command that merely reads a frontier — a tracker verb run from any checkout
+/// — must not open them unconditionally: `whip issue finish` left an empty
+/// `.whipplescript/` pair in every checkout a session closed an item from
+/// (WS-117). `None` = no workspace VCS here, which every such reader already
+/// treats as no mainline.
+fn open_existing_vcs() -> Option<Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode>> {
+    branch_store_path().exists().then(open_vcs)
 }
 
 fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> {
