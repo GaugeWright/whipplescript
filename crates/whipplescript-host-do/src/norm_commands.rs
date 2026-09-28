@@ -423,9 +423,11 @@ pub fn provision_hosted_norm<D: crate::do_store::DoSql>(
             return Err("norm restoration configuration repeats an object identity".into());
         }
     }
-    let checkpoint = destinations
-        .get(object_id)
-        .ok_or("no norm restoration checkpoint is configured for this object")?;
+    // The refusal names the object, since its id is how an operator writes
+    // the restoration that provisions it, and nothing else reports it.
+    let checkpoint = destinations.get(object_id).ok_or_else(|| {
+        format!("no norm restoration checkpoint is configured for object {object_id}")
+    })?;
     store
         .pin_norm_checkpoint(checkpoint)
         .map_err(|error| format!("norm provisioning refused: {error:?}"))?;
@@ -463,6 +465,11 @@ mod tests {
             assert!(provision_hosted_norm(&mut store, "destination", &valid, body).is_err());
             assert_eq!(store.norm_checkpoint().unwrap(), None);
         }
+        assert_eq!(
+            provision_hosted_norm(&mut store, "another-object", &valid, "{}").unwrap_err(),
+            "no norm restoration checkpoint is configured for object another-object",
+            "an unconfigured object is refused naming its id"
+        );
         for (object, config) in [
             ("another-object", valid.clone()),
             ("destination", configuration(vec![])),

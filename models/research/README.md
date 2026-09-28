@@ -310,18 +310,22 @@ projection for a branch or direct twig:
 python3 models/research/flowing_recovery.py
 ```
 
-Its bounded explorer finds 805 safe states through nine transitions. Explicit
+Its bounded explorer finds 8,040 safe states through nine transitions. Explicit
 traces cover a metadata-only admission that accounts two selected units, a
 coordinator crash after CAS, replacement-coordinator selection before frontier
-recovery, Hold, source rewrite, grant revocation, and independent ref, norm,
-and topology outages. Six defective variants admit a mixed-output alias,
+recovery, cancellation before and after CAS, resubmission after cancellation,
+former-owner cancellation after takeover, Hold, source rewrite, grant
+revocation, and independent ref, norm, and topology outages. Eight defective
+variants admit a mixed-output alias,
 ungated no-op, manual Hold bypass, CAS after releasing norm exclusion,
 duplicate admission by a replacement coordinator that trusts the lagging
-frontier, or operation-id reuse. This probes the CAS-to-frontier seam under
+frontier, operation-id reuse, stale reference coverage, or CAS after a
+queue-only cancellation acknowledgement. This probes the CAS-to-frontier seam under
 the actual norm/ref lock order. It still abstracts private draft retention,
 source lineage derivation, revision across all real mutation doors, branch
 closure with member twigs and parked work, the complete gate plan, and
-production lock scheduling. Those remain open in FB-1 and its implementation
+production lock scheduling. A cancellation tombstone is an abstract ref fact;
+the model does not prove its native or hosted SQL transaction. Those remain open in FB-1 and its implementation
 items; this model alone does not qualify host activation.
 
 `flowing_lock_order.py` probes the physical acquisition order that the recovery

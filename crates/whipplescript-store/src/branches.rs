@@ -1052,7 +1052,7 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// ref-owned flowing source fences and their exact operation receipts.
 /// Version 9 records gated trunk admissions and per-unit uniqueness with the
 /// ref authority; an older writer must not reuse an admitted source unit.
-const SATELLITE_SCHEMA_VERSION: i64 = 9;
+const SATELLITE_SCHEMA_VERSION: i64 = 10;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {

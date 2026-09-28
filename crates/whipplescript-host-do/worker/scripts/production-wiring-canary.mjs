@@ -614,9 +614,14 @@ export async function runPrivateHome(environment = process.env, fetchImpl = fetc
 // Nothing here erases, restores or rolls back. Norm evidence is append-only;
 // the suite's only cleanup is that everything it sends is an exact retry of
 // a stable identity, so after the first run it adds nothing.
-export const NORM_LEDGER_ROUTES = [
-  "commands", "provision", "publications", "enqueues", "impacts", "promotions",
-];
+//
+// The suite is two journeys (DR-0140, after DR-0139). `norm-ledger` answers
+// the ledger's doors and runs now. `runNormEvidence` answers the evidence
+// doors, which run checks against cuts a Home supplies to its hosted peer; no
+// production route supplies one until FB-6, so that journey is kept, tested,
+// and not dispatched.
+export const NORM_LEDGER_ROUTES = ["commands", "provision"];
+export const NORM_EVIDENCE_ROUTES = ["publications", "enqueues", "impacts", "promotions"];
 const normCommandProtocol = "whipplescript.norm.commands/v1";
 const normImpactProtocol = "whipplescript.norm.impact/v1";
 const normEnqueueProtocol = "whipplescript.norm.enqueue/v1";
@@ -693,12 +698,27 @@ function normWorkspace(environment) {
   };
 }
 
-/// Every request body the suite sends, keyed by what it proves. Pure, so the
-/// vector `norm-ledger-canary-requests.json` can pin it and the Rust doors can
-/// decode exactly this: `norm_ledger_canary_requests_decode_at_every_hosted_door`.
-/// `act` and `retained` are forwarded verbatim; the runner never re-signs.
-export function normLedgerRequests(workspace, act, retained = null) {
+/// The ledger doors' request bodies. Pure; `act` is forwarded verbatim.
+export function normLedgerCommandRequests(act) {
   const commands = (command) => ({ protocol: normCommandProtocol, command });
+  return {
+    provision: {},
+    export: commands({ kind: "export" }),
+    append: commands({ kind: "append", event: act }),
+    // Each is refused before anything is written, and says why it must be.
+    refused: {
+      // A restoration is the deployment's, never the request's (NC-01).
+      provision: { checkpoint: { ledger: "0".repeat(64), authority_head: "0".repeat(64) } },
+      // A signature the deployment's binding cannot verify.
+      append: commands({ kind: "append", event: act && { ...act, signature: "00" } }),
+      // Host trust supplied by a request.
+      commands: { ...commands({ kind: "export" }), bindings: [] },
+    },
+  };
+}
+
+/// The evidence doors' request bodies. Pure; `retained` is forwarded verbatim.
+export function normEvidenceRequests(workspace, retained = null) {
   const publication = (command) => ({ protocol: normPublicationProtocol, command });
   const enqueue = (publisher) => ({
     protocol: normEnqueueProtocol,
@@ -724,9 +744,6 @@ export function normLedgerRequests(workspace, act, retained = null) {
     },
   };
   return {
-    provision: {},
-    export: commands({ kind: "export" }),
-    append: commands({ kind: "append", event: act }),
     impact,
     enqueue: enqueue(workspace.publisher.principal),
     prepare: publication({
@@ -741,14 +758,7 @@ export function normLedgerRequests(workspace, act, retained = null) {
       kind: "publish", instance: workspace.instance, run: workspace.run, event: retained,
     }),
     promotion,
-    // Each is refused before anything is written, and says why it must be.
     refused: {
-      // A restoration is the deployment's, never the request's (NC-01).
-      provision: { checkpoint: { ledger: "0".repeat(64), authority_head: "0".repeat(64) } },
-      // A signature the deployment's binding cannot verify.
-      append: commands({ kind: "append", event: act && { ...act, signature: "00" } }),
-      // Host trust supplied by a request.
-      commands: { ...commands({ kind: "export" }), bindings: [] },
       // Planning premises supplied by a request.
       impact: { ...impact, deployment: {} },
       // A publisher the deployment binds no key for.
@@ -760,6 +770,34 @@ export function normLedgerRequests(workspace, act, retained = null) {
         event: retained && { ...retained, signature: "invalid" },
       }),
       promotion: { ...promotion, deployment: {} },
+    },
+  };
+}
+
+/// Every request body the suite sends, keyed by what it proves. Pure, so the
+/// vector `norm-ledger-canary-requests.json` can pin it and the Rust doors can
+/// decode exactly this: `norm_ledger_canary_requests_decode_at_every_hosted_door`.
+/// `act` and `retained` are forwarded verbatim; the runner never re-signs.
+export function normLedgerRequests(workspace, act, retained = null) {
+  const ledger = normLedgerCommandRequests(act);
+  const evidence = normEvidenceRequests(workspace, retained);
+  return {
+    provision: ledger.provision,
+    export: ledger.export,
+    append: ledger.append,
+    impact: evidence.impact,
+    enqueue: evidence.enqueue,
+    prepare: evidence.prepare,
+    publish: evidence.publish,
+    promotion: evidence.promotion,
+    refused: {
+      provision: ledger.refused.provision,
+      append: ledger.refused.append,
+      commands: ledger.refused.commands,
+      impact: evidence.refused.impact,
+      enqueue: evidence.refused.enqueue,
+      publish: evidence.refused.publish,
+      promotion: evidence.refused.promotion,
     },
   };
 }
@@ -780,7 +818,8 @@ function withoutTimeBasis(body) {
     key === "time_basis" ? "<per-query>" : value);
 }
 
-export async function runNormLedger(environment = process.env, fetchImpl = fetch) {
+/// The dedicated placement's norm doors, with the calls every journey makes.
+function normSession(environment, fetchImpl) {
   const origin = exactOrigin(environment, "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN");
   const token = required(environment, "GW_SYNTHETIC_WHIP_CONTROL_TOKEN");
   const tenant = boundedId(environment, "GW_SYNTHETIC_WHIP_TENANT", "synthetic-wiring");
@@ -789,8 +828,6 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
     "GW_SYNTHETIC_NORM_PLACEMENT",
     "production-norm-ledger-canary-v1",
   );
-  const act = normSignedAct(environment);
-  const workspace = normWorkspace(environment);
   const root =
     `/v1/tenants/${encodeURIComponent(tenant)}`
     + `/placements/${encodeURIComponent(placement)}/host/norm`;
@@ -818,24 +855,31 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
     assert.equal(response.status, 400, `${label} was not refused (${response.status})`);
     if (pattern) assert.match(text, pattern, `${label} was refused for another reason`);
   };
-
   // Every door refuses a missing and a wrong control token at the edge. The
   // body is an empty object, which no door but provision decodes and which
   // provision answers idempotently, so even a broken edge turns no probe into
   // a new effect.
-  for (const operation of NORM_LEDGER_ROUTES) {
-    for (const authorization of [null, `Bearer ${token}.invalid`]) {
-      const denied = await post(operation, {}, authorization);
-      await denied.text();
-      assert.equal(
-        denied.status,
-        401,
-        `${operation} admitted ${authorization ? "a wrong" : "a missing"} control token`,
-      );
+  const deniesStrangers = async (routes) => {
+    for (const operation of routes) {
+      for (const authorization of [null, `Bearer ${token}.invalid`]) {
+        const denied = await post(operation, {}, authorization);
+        await denied.text();
+        assert.equal(
+          denied.status,
+          401,
+          `${operation} admitted ${authorization ? "a wrong" : "a missing"} control token`,
+        );
+      }
     }
-  }
+  };
+  return { answered, refused, deniesStrangers };
+}
 
-  const requests = normLedgerRequests(workspace, act);
+export async function runNormLedger(environment = process.env, fetchImpl = fetch) {
+  const act = normSignedAct(environment);
+  const { answered, refused, deniesStrangers } = normSession(environment, fetchImpl);
+  await deniesStrangers(NORM_LEDGER_ROUTES);
+  const requests = normLedgerCommandRequests(act);
 
   // Provision pins only the deployment's configured checkpoint for this object;
   // re-pinning the same one is idempotent, and a request cannot choose it.
@@ -866,6 +910,32 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
     "appending one stable act changed the history by more than that act",
   );
 
+  // Append-only: nothing any step did removed or replaced history.
+  const final = await answered("commands", requests.export, "final norm export");
+  const finalIds = eventIds(final, "final norm export");
+  for (const id of afterIds) {
+    assert(finalIds.includes(id), `history lost ${id}; norm evidence is append-only`);
+  }
+  assert.equal(final.result.checkpoint?.ledger, provisioned.checkpoint.ledger);
+
+  return {
+    ledger: provisioned.checkpoint.ledger,
+    act: appended.result.event_id,
+    history: finalIds.length,
+  };
+}
+
+/// The evidence doors, against the checks a Home's hosted peer runs. Not
+/// dispatched until FB-6 lets a Home supply the peer with cuts (DR-0139).
+export async function runNormEvidence(environment = process.env, fetchImpl = fetch) {
+  const workspace = normWorkspace(environment);
+  const { answered, refused, deniesStrangers } = normSession(environment, fetchImpl);
+  await deniesStrangers(NORM_EVIDENCE_ROUTES);
+  const requests = normEvidenceRequests(workspace);
+  const exportRequest = normLedgerCommandRequests(null).export;
+  const start = await answered("commands", exportRequest, "norm export");
+  const startIds = eventIds(start, "norm export");
+
   // Impacts: a read-only query under the deployment's installed planning.
   const planned = await answered("impacts", requests.impact, "norm impact");
   assert.equal(planned?.protocol, normImpactProtocol);
@@ -877,8 +947,8 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
     "the same impact query planned differently",
   );
   await refused("impacts", requests.refused.impact, "request-supplied planning", /unknown field/);
-  const unmoved = await answered("commands", requests.export, "norm export after impact");
-  assert.deepEqual(unmoved.result.frontier, after.result.frontier, "an impact query moved the ledger");
+  const unmoved = await answered("commands", exportRequest, "norm export after impact");
+  assert.deepEqual(unmoved.result.frontier, start.result.frontier, "an impact query moved the ledger");
 
   // Enqueues: one stable effect identity. The first run admits it; every run
   // after is the same acknowledgment.
@@ -890,7 +960,7 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
   await refused("enqueues", requests.refused.enqueue, "unbound publisher", /deployment binding/);
 
   // Publications: the settled synthetic run's observation was published once,
-  // externally signed, when the ledger was provisioned. The host retains it,
+  // externally signed, when the peer was provisioned. The host retains it,
   // and republishing exactly it re-verifies the signature against the
   // deployment's binding and the recovered execution, and is the same receipt.
   const prepared = await answered("publications", requests.prepare, "norm publication prepare");
@@ -903,15 +973,16 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
   );
   const retained = prepared.result.event;
   assert.equal(retained?.statement?.actor?.principal, workspace.publisher.principal);
-  const published = normLedgerRequests(workspace, act, retained);
+  const published = normEvidenceRequests(workspace, retained);
   const receipt = await answered("publications", published.publish, "norm publication");
   assert.match(receipt?.result?.event_id ?? "", /^[0-9a-f]{64}$/);
   const republished = await answered("publications", published.publish, "norm publication retry");
   assert.deepEqual(republished, receipt, "republishing the retained observation was a new receipt");
   await refused("publications", published.refused.publish, "unverifiable observation", /signature/i);
 
-  // Promotions: one stable promotion of the synthetic stream. Promoted once,
-  // its stream is archived and every later run recovers the same receipt.
+  // Promotions: one stable promotion of the synthetic stream, which on a peer
+  // moves only a line the peer holds (DR-0139). Promoted once, every later run
+  // recovers the same receipt.
   const promoted = await answered("promotions", requests.promotion, "norm promotion");
   assert.equal(promoted?.protocol, normPromotionProtocol);
   assert.equal(
@@ -924,17 +995,12 @@ export async function runNormLedger(environment = process.env, fetchImpl = fetch
   assert.deepEqual(repromoted, promoted, "a promotion retry was not the recovered receipt");
   await refused("promotions", requests.refused.promotion, "request-supplied planning", /unknown field/);
 
-  // Append-only: nothing any step did removed or replaced history.
-  const final = await answered("commands", requests.export, "final norm export");
+  const final = await answered("commands", exportRequest, "final norm export");
   const finalIds = eventIds(final, "final norm export");
-  for (const id of afterIds) {
+  for (const id of startIds) {
     assert(finalIds.includes(id), `history lost ${id}; norm evidence is append-only`);
   }
-  assert.equal(final.result.checkpoint?.ledger, provisioned.checkpoint.ledger);
-
   return {
-    ledger: provisioned.checkpoint.ledger,
-    act: appended.result.event_id,
     effect: enqueued.result.effect_id,
     observation: receipt.result.event_id,
     promoted: promoted.result.promoted,

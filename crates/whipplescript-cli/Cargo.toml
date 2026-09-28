@@ -14,9 +14,19 @@ categories = ["command-line-utilities", "development-tools"]
 # What this crate's tests read at run time beyond the crate and what its
 # sources name by relative path, for the native test runs (GaugeWright
 # BUILD.md stage 5). A run's mount holds only declared files, so a missing
-# entry fails the test instead of caching a pass it never earned. The fixture's
-# dotfiles are for the build_engine tests that run a real Buck2 over it.
-data = ["Cargo.toml", "scripts", "examples/buck2-tests", "examples/buck2-tests/.buck2-version", "examples/buck2-tests/.buckconfig", "examples/buck2-tests/.buckroot", "examples/buck2-tests/inner/.buckconfig"]
+# entry fails the test instead of caching a pass it never earned; a surplus
+# reruns every test here on each change to it, which is why scripts/ is named
+# script by script. The Maude exporters the tests run read report schemas and
+# std manifests by names they choose at run time, so those are directories.
+# The fixture's dotfiles are for the build_engine tests that run a real Buck2
+# over it.
+data = ["Cargo.toml", "scripts/claude-agent-sdk-sidecar.mjs", "scripts/construct-graph-to-maude.py",
+        "scripts/lowered-ir-to-maude.py", "scripts/platform-catalog-to-maude.py", "scripts/artifact_admission.py",
+        "spec/report-schemas", "std/manifests",
+        # The deploy-plan test resolves the hosted worker's directory and lists
+        # its wrangler configurations.
+        "crates/whipplescript-host-do/worker/wrangler.authenticated.test.toml", "crates/whipplescript-host-do/worker/wrangler.edge-staging.toml", "crates/whipplescript-host-do/worker/wrangler.harness.toml", "crates/whipplescript-host-do/worker/wrangler.private-production.toml", "crates/whipplescript-host-do/worker/wrangler.private-staging.toml", "crates/whipplescript-host-do/worker/wrangler.public.toml", "crates/whipplescript-host-do/worker/wrangler.test.toml",
+        "examples/buck2-tests", "examples/buck2-tests/.buck2-version", "examples/buck2-tests/.buckconfig", "examples/buck2-tests/.buckroot", "examples/buck2-tests/inner/.buckconfig"]
 # The two test binaries too long for one run's four cores, split into that many
 # runs of a stable share of their tests each (GaugeWright tools/buck
 # native_test.bzl). control_plane is about 720 test-seconds, soft_middle 280;

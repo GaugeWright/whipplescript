@@ -147,11 +147,22 @@ case "${1:-}" in
     # everywhere else — a gate that means two different things in two places.
     cargo check -p whipplescript-custodian --features pkcs11 --all-targets ;;
   norm-observer)
+    # The guest's license mapping refuses what it must on any host; holding
+    # the real build to it needs the build (DR-0140).
+    python3 experiments/norm-wasi/licenses_checks.py
     norm_host="$(uname -s)-$(uname -m)"
     case "$norm_host" in
       Linux-x86_64 | Linux-amd64)
         python3 experiments/norm-wasi/prepare.py --fetch
-        python3 experiments/norm-wasi/preparation_checks.py ;;
+        python3 experiments/norm-wasi/preparation_checks.py
+        python3 experiments/norm-wasi/inventory.py
+        if [ ! -d target/norm-wasi-sdk-source/src/wasi-libc/.git ] && [ ! -f target/norm-wasi-sdk-source/src/wasi-libc/.git ]; then
+          rm -rf target/norm-wasi-sdk-source
+          git clone -q --depth 1 --branch wasi-sdk-24 https://github.com/WebAssembly/wasi-sdk.git target/norm-wasi-sdk-source
+          git -C target/norm-wasi-sdk-source submodule update -q --init --depth 1 src/wasi-libc
+        fi
+        python3 experiments/norm-wasi/notices.py --fetch-llvm
+        python3 experiments/norm-wasi/licenses.py ;;
       *)
         echo "skipped: the observer reactor builder requires a Linux x86-64 host, and this is $norm_host;"
         echo "         the green-bar CI job runs this same script on ubuntu-latest and prepares it there" ;;

@@ -24,6 +24,12 @@ import { canonicalJson, sha256Hex } from "./private-home-protocol";
 import { canonicalCredentialClassRef } from "./credential-class-ref";
 import { SETTLES_WITHIN_MS } from "./test-bounds";
 
+function createTestInstance(...args: Parameters<typeof WasmDurableInstance.create>): WasmDurableInstance {
+  // The appended compiler digest is positional argument 14 of the WASM ABI.
+  args[13] = wasmArtifactDigest;
+  return WasmDurableInstance.create(...args);
+}
+
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 
 /**
@@ -2517,7 +2523,7 @@ it("rolls back a failed rule commit through the production WASM transaction brid
       '  record Seen { value "observed" }',
       '  complete result { value "observed" }', "}",
     ].join("\n");
-    const instance = WasmDurableInstance.create(bridge, source, "{}", "local/Rollback", undefined, undefined, undefined);
+    const instance = createTestInstance(bridge, source, "{}", "local/Rollback", undefined, undefined, undefined);
     const exec = bridge.exec.bind(bridge);
     let injected = false;
     bridge.exec = (query, params) => {
@@ -2558,7 +2564,7 @@ it("rolls back a failed run start through the production WASM transaction bridge
     const body = "echo ok\n";
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
     const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    const instance = WasmDurableInstance.create(
+    const instance = createTestInstance(
       bridge, source, "{}", "local/RunRollback", undefined, undefined, undefined,
       JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
       JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
@@ -2623,7 +2629,7 @@ it("rolls back terminal writes and retries the retained response through the WAS
       ].join("\n");
       const body = "echo ok\n";
       const sha256 = await sha256Hex(new TextEncoder().encode(body));
-      let instance = WasmDurableInstance.create(
+      let instance = createTestInstance(
         bridge, source, "{}", "local/TerminalRollback", undefined, undefined, undefined,
         JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
         JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
@@ -2670,7 +2676,7 @@ it("rolls back terminal writes and retries the retained response through the WAS
         expect(metadata.stdout).toBe("retained-output");
         expect(metadata.executor_response.body.stdout).toBe("retained-output");
         instance.free();
-        instance = WasmDurableInstance.create(bridge, source, "{}", "local/TerminalRollback", undefined, undefined, undefined);
+        instance = createTestInstance(bridge, source, "{}", "local/TerminalRollback", undefined, undefined, undefined);
         const retried = JSON.parse(instance.step(undefined, Date.now()));
         expect(retried.kind, JSON.stringify(retried)).toBe("terminal");
         expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'effect.terminal'").toArray()).toHaveLength(1);
@@ -2712,7 +2718,7 @@ it("retains deadline fence intent before timeout through cold WASM recovery", as
     ].join("\n");
     const body = "echo ok\n";
     const sha256 = await sha256Hex(new TextEncoder().encode(body));
-    const make = () => WasmDurableInstance.create(
+    const make = () => createTestInstance(
       bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
       JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
       JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
@@ -2767,7 +2773,7 @@ it.each([false, true])("keeps terminal executor cleanup armed across cold alarms
     ].join("\n");
     const body = "echo ok\n";
     const sha256 = await sha256Hex(new TextEncoder().encode(body));
-    const make = () => WasmDurableInstance.create(
+    const make = () => createTestInstance(
       bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
       JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
       JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
@@ -2948,7 +2954,7 @@ it.each(["deadline", "cancellation", "projection-retry"] as const)("closes a tra
     ].join("\n");
     const body = "echo ok\n";
     const sha256 = await sha256Hex(new TextEncoder().encode(body));
-    const make = () => WasmDurableInstance.create(
+    const make = () => createTestInstance(
       bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
       JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
       JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),

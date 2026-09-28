@@ -79,9 +79,10 @@ pub enum FlowingSelectionOutcome {
 
 /// A content comparison for one bound unit against one recorded target cut.
 /// This is preparation only: it neither proves who authored the target cut
-/// nor transfers the unit. The later handoff must bind this exact comparison
-/// to the target ref transition and record its receipt atomically. Its fields
-/// are private so a caller cannot supply asserted effects in place of a read.
+/// nor transfers the unit. Handoff or trunk admission must bind this exact
+/// comparison to the target ref transition and record its receipt atomically.
+/// Its fields are private so a caller cannot supply asserted effects in place
+/// of a read.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FlowingTargetEffect {
     pub path: String,
@@ -355,11 +356,32 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// order; a selection that skips an intermediate write refuses. Mixed
     /// target output stays unsupported until its constituent lineage is
     /// recorded.
-    /// No caller may treat `Verified` as a handoff receipt.
+    /// No caller may treat `Verified` as a transfer or admission receipt.
     pub fn verify_private_target_effects(
         &self,
         unit_id: &str,
         target_cut_id: &str,
+    ) -> StoreResult<FlowingTargetEffectsOutcome> {
+        self.verify_target_effects(unit_id, target_cut_id, false)
+    }
+
+    /// Check one bound unit against a recorded trunk candidate. This is a
+    /// content proof only: admission still needs the gate certificate, source
+    /// fence and atomic ref/receipt transaction. A branch handoff cannot use
+    /// this method to move the trunk ref.
+    pub fn verify_trunk_target_effects(
+        &self,
+        unit_id: &str,
+        target_cut_id: &str,
+    ) -> StoreResult<FlowingTargetEffectsOutcome> {
+        self.verify_target_effects(unit_id, target_cut_id, true)
+    }
+
+    fn verify_target_effects(
+        &self,
+        unit_id: &str,
+        target_cut_id: &str,
+        trunk: bool,
     ) -> StoreResult<FlowingTargetEffectsOutcome> {
         let Some(unit) = self.branches.contribution_declaration(unit_id)? else {
             return Ok(FlowingTargetEffectsOutcome::UnitMissing);
@@ -373,7 +395,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(target_branch_id) = source.parent_branch_id.as_deref() else {
             return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
         };
-        if target_branch_id == crate::branches::MAINLINE_BRANCH_ID {
+        if (target_branch_id == crate::branches::MAINLINE_BRANCH_ID) != trunk {
             return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
         }
         let Some(target_branch) = self.branches.get_branch(target_branch_id)? else {
@@ -707,6 +729,106 @@ mod tests {
 
     fn bound_unit() -> WorkspaceVcs<BranchStore, ContentStore> {
         bound_unit_with_flowing_target(false)
+    }
+
+    fn bound_direct_twig() -> WorkspaceVcs<BranchStore, ContentStore> {
+        let mut vcs = workspace();
+        vcs.init("t0").expect("initialize workspace");
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create direct twig");
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .expect("write source cut");
+        pin(&mut vcs, "twig-a", "pin-a");
+        declare(&mut vcs, "unit-a", "pin-a");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-a",
+                &selection::parse("path(a.txt)").expect("parse source selection"),
+            )
+            .expect("select source changes")
+        else {
+            panic!("source selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t3")
+                .expect("bind source unit"),
+            BindContributionBasisOutcome::Bound
+        );
+        vcs
+    }
+
+    #[test]
+    fn direct_trunk_candidate_checks_actual_selected_content() {
+        let mut vcs = bound_direct_twig();
+        let basis = vcs
+            .branches
+            .contribution_basis("unit-a")
+            .expect("read basis")
+            .expect("bound unit");
+        let after = basis.atoms[0].after.clone().expect("source body");
+        let exact_manifest = vcs
+            .store_manifest(&BTreeMap::from([("a.txt".to_owned(), after)]))
+            .expect("exact candidate manifest");
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "trunk-exact",
+                change_id: "candidate-a",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &exact_manifest,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("coordinator"),
+                intent: None,
+                recorded_at: "t4",
+            })
+            .expect("record exact candidate");
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_trunk_target_effects("unit-a", "trunk-exact")
+            .expect("verify candidate")
+        else {
+            panic!("trunk candidate should carry selected content")
+        };
+        assert_eq!(witness.target_branch_id(), MAINLINE_BRANCH_ID);
+        assert_eq!(
+            witness.effects()[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            vcs.verify_private_target_effects("unit-a", "trunk-exact")
+                .expect("handoff verifier"),
+            FlowingTargetEffectsOutcome::TargetNotParent
+        );
+
+        let empty_manifest = vcs
+            .store_manifest(&BTreeMap::new())
+            .expect("empty candidate manifest");
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "trunk-omitted",
+                change_id: "candidate-omitted",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &empty_manifest,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("coordinator"),
+                intent: None,
+                recorded_at: "t4",
+            })
+            .expect("record omitted candidate");
+        assert_eq!(
+            vcs.verify_trunk_target_effects("unit-a", "trunk-omitted")
+                .expect("verify omitted candidate"),
+            FlowingTargetEffectsOutcome::OmittedEffect {
+                path: "a.txt".into()
+            }
+        );
+        assert!(vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("read trunk")
+            .expect("trunk exists")
+            .head_cut_id
+            .is_none());
     }
 
     fn bound_unit_with_flowing_target(flowing: bool) -> WorkspaceVcs<BranchStore, ContentStore> {

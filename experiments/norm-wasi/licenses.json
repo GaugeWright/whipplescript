@@ -1,0 +1,126 @@
+{
+  "protocol": "whipplescript.norm.guest-licenses/v1",
+  "_comment": [
+    "The protected CPython WASI guest's archive-to-license mapping, release-approved",
+    "by the founder under DR-0140. licenses.py holds every build to it: an archive the reactor",
+    "links that this does not name, an entry naming an archive it no longer links, or a notice",
+    "missing from the collection or differing from its digest refuses. Every license here is",
+    "permissive; the obligation is attribution, met by shipping the collected notices in the",
+    "executor image under /usr/share/doc/whipplescript-norm-guest."
+  ],
+  "approval": {
+    "decision": "DR-0140",
+    "date": "2026-09-28",
+    "artifact_sha256": "f67523ee54d0eb75b552834ef0725fbd0072c4b9ae3da07859be02a82bd4fba0",
+    "distribution": "inside the private executor image the managed Worker runs; not conveyed to customers"
+  },
+  "archives": {
+    "norm-cpython-wasi/cross-build/wasm32-wasip1/libpython3.14.a": {
+      "component": "CPython 3.14.7",
+      "license": "PSF-2.0",
+      "notices": [
+        "cpython-LICENSE",
+        "cpython-Doc-license.rst"
+      ]
+    },
+    "norm-cpython-wasi/cross-build/wasm32-wasip1/Modules/expat/libexpat.a": {
+      "component": "Expat 2.8.2, vendored by CPython",
+      "license": "MIT",
+      "notices": [
+        "cpython-Modules-expat-COPYING"
+      ]
+    },
+    "norm-cpython-wasi/cross-build/wasm32-wasip1/Modules/_decimal/libmpdec/libmpdec.a": {
+      "component": "mpdecimal 2.5.1, vendored by CPython",
+      "license": "BSD-2-Clause",
+      "notices": [
+        "mpdecimal-notice.txt"
+      ]
+    },
+    "norm-cpython-wasi/cross-build/wasm32-wasip1/Modules/_hacl/libHacl_HMAC.a": {
+      "component": "HACL*, vendored by CPython",
+      "license": "MIT",
+      "notices": [
+        "hacl-hmac-notice.txt"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/lib/clang/18/lib/wasi/libclang_rt.builtins-wasm32.a": {
+      "component": "LLVM compiler-rt builtins (wasi-sdk 24)",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "notices": [
+        "compiler-rt-LICENSE.TXT",
+        "compiler-rt-CREDITS.TXT",
+        "llvm-LICENSE.TXT"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasi/libc.a": {
+      "component": "wasi-libc (wasi-sdk 24), with musl, cloudlibc and dlmalloc portions",
+      "license": "(Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND MIT AND BSD-2-Clause AND CC0-1.0",
+      "notices": [
+        "wasi-sdk-LICENSE",
+        "wasi-libc-LICENSE",
+        "wasi-libc-LICENSE-APACHE",
+        "wasi-libc-LICENSE-APACHE-LLVM",
+        "wasi-libc-LICENSE-MIT",
+        "wasi-libc-libc-top-half-musl-COPYRIGHT",
+        "wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+        "wasi-libc-tools-wasi-headers-LICENSE",
+        "dlmalloc-notice.txt"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasi/libdl.a": {
+      "component": "wasi-libc (wasi-sdk 24)",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "notices": [
+        "wasi-libc-LICENSE",
+        "wasi-libc-LICENSE-APACHE",
+        "wasi-libc-LICENSE-APACHE-LLVM",
+        "wasi-libc-LICENSE-MIT"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasi/libwasi-emulated-getpid.a": {
+      "component": "wasi-libc (wasi-sdk 24)",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "notices": [
+        "wasi-libc-LICENSE",
+        "wasi-libc-LICENSE-APACHE",
+        "wasi-libc-LICENSE-APACHE-LLVM",
+        "wasi-libc-LICENSE-MIT"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasi/libwasi-emulated-process-clocks.a": {
+      "component": "wasi-libc (wasi-sdk 24)",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "notices": [
+        "wasi-libc-LICENSE",
+        "wasi-libc-LICENSE-APACHE",
+        "wasi-libc-LICENSE-APACHE-LLVM",
+        "wasi-libc-LICENSE-MIT"
+      ]
+    },
+    "wasi-sdk-24.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasi/libwasi-emulated-signal.a": {
+      "component": "wasi-libc (wasi-sdk 24)",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "notices": [
+        "wasi-libc-LICENSE",
+        "wasi-libc-LICENSE-APACHE",
+        "wasi-libc-LICENSE-APACHE-LLVM",
+        "wasi-libc-LICENSE-MIT"
+      ]
+    }
+  },
+  "unarchived": {
+    "norm-frozen-stdlib.h": {
+      "component": "CPython 3.14.7 pure-Python standard library, frozen",
+      "license": "PSF-2.0",
+      "notices": [
+        "cpython-LICENSE"
+      ]
+    },
+    "bridge.c": {
+      "component": "WhippleScript's native value bridge",
+      "license": "MIT OR Apache-2.0",
+      "notices": []
+    }
+  }
+}

@@ -95,6 +95,44 @@ test("broker envelope strips provider auth and preserves idempotency", async () 
   });
 });
 
+test("stream broker exposes the exact provider body before its response completes", async () => {
+  let releaseBody!: () => void;
+  const bodyReleased = new Promise<void>((resolve) => { releaseBody = resolve; });
+  let observeBody!: (body: unknown) => void;
+  const bodyObserved = new Promise<unknown>((resolve) => { observeBody = resolve; });
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      void bodyReleased.then(() => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ output: [] })));
+        controller.close();
+      });
+    },
+  });
+  const pending = performModelBrokerFetch(
+    {
+      url: "https://api.openai.com/v1/responses",
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: "gpt-test", input: "held request" },
+    },
+    binding,
+    { url: "https://home.example/model-egress", token: "broker-token" },
+    async () => new Response(stream, {
+      headers: {
+        "x-whip-model-egress-protocol": MODEL_EGRESS_STREAM_PROTOCOL,
+        "x-whip-provider-status": "200",
+        "x-whip-provider-content-type": "application/json",
+      },
+    }),
+    undefined,
+    undefined,
+    undefined,
+    observeBody,
+  );
+  assert.deepEqual(await bodyObserved, { model: "gpt-test", input: "held request" });
+  releaseBody();
+  assert.deepEqual(JSON.parse(await pending), { status: 200, body: { output: [] } });
+});
+
 test("stream broker relays split provider bytes and publishes text deltas", async () => {
   const deltas: string[] = [];
   const encoder = new TextEncoder();

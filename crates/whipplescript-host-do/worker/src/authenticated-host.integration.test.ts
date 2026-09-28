@@ -985,6 +985,51 @@ describe("real WorkflowInstance hibernation", () => {
     const instancePath =
       `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
 
+    // Seed only the transient capture inside this exact placement DO. This
+    // proves the privileged live route and public denial independently of
+    // provider timing; the broker test holds a streaming response at handoff.
+    const captureTurn = "synthetic-live-context-probe";
+    const capturePath = `${instancePath}/turns/${captureTurn}/model-context`;
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const placementStub = namespace.get(namespace.idFromName(
+      "tenant:tenant-journey:placement:placement-journey",
+    ));
+    const captureInPlacement = (action: "record" | "clear") => runInDurableObject(
+      placementStub,
+      async (instance) => {
+        const capture = (instance as unknown as {
+          liveModelContext: {
+            record(turn: string, body: unknown, sources: string[], provenance: unknown): void;
+            clear(turn: string): void;
+          };
+        }).liveModelContext;
+        const key = `${opened.instance_ref}\0${captureTurn}`;
+        if (action === "record") {
+          capture.record(key, { input: "synthetic model request" }, ["chat:synthetic"], {
+            messages: [{ source_handles: ["chat:synthetic"], complete: true }],
+            tools: { source_handles: ["runtime"], complete: true },
+          });
+        } else {
+          capture.clear(key);
+        }
+      },
+    );
+    await captureInPlacement("record");
+    const inspectable = await placementFetch(capturePath);
+    expect(inspectable.status, await inspectable.clone().text()).toBe(200);
+    expect(inspectable.headers.get("cache-control")).toBe("no-store");
+    expect(await inspectable.json()).toMatchObject({
+      calls: [{ ordinal: 0, body: { input: "synthetic model request" }, provenance_complete: true }],
+      incomplete: false,
+    });
+    const publicCaptureRead = await SELF.fetch(`${route}${capturePath}`, {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(publicCaptureRead.status).toBe(401);
+    expect((await SELF.fetch(`${route}${capturePath}`)).status).toBe(401);
+    await captureInPlacement("clear");
+    expect((await placementFetch(capturePath)).status).toBe(404);
+
     const missingExplainSelector = await placementFetch(`${instancePath}/explain`);
     expect(missingExplainSelector.status).toBe(400);
     const explanation = await placementFetch(

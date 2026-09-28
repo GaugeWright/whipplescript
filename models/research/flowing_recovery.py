@@ -84,6 +84,10 @@ class State:
     trunk_content: int = 0
     attempts: tuple[Attempt, ...] = ()
     admissions: tuple[Admission, ...] = ()
+    # An acknowledged cancellation burns one attempt id at the ref authority.
+    # cancel_ack also records a deliberately broken queue-only acknowledgement.
+    cancelled: tuple[int, ...] = ()
+    cancel_ack: tuple[int, ...] = ()
     op_registry: tuple[Attempt, ...] = ()
     next_op: int = 1
 
@@ -213,12 +217,30 @@ def rewrite_source(s: State) -> State:
     return replace(s, source_cut=s.source_cut + 1, epoch=s.epoch + 1)
 
 
+def cancel_attempt(s: State, op: int, actor: int, expected_owner_fence: int,
+                   defect: str = "") -> State:
+    # Cancellation and CAS have one ref-authority order. A CAS already in the
+    # durable history wins and is reported, rather than being erased. Queue
+    # deletion is not an acknowledgement because a prepared CAS may still run.
+    attempt_at(s, op)
+    if not s.ref_up or actor != s.owner or expected_owner_fence != s.owner_fence:
+        raise ValueError("cancellation needs the current ref owner fence")
+    if any(entry.op == op for entry in s.admissions):
+        return s  # already admitted; the caller receives that receipt
+    if op in s.cancel_ack:
+        return s  # exact retry or another cancellation of the same attempt
+    cancelled = s.cancelled if defect == "queue_only_cancellation" else s.cancelled + (op,)
+    return replace(s, cancelled=cancelled, cancel_ack=s.cancel_ack + (op,))
+
+
 def content_after(before: int, selected: tuple[str, ...]) -> int:
     return before + ("a" in selected) - ("b" in selected)
 
 
 def cas(s: State, op: int, actor: int, defect: str = "") -> State:
     a = attempt_at(s, op)
+    if op in s.cancelled:
+        raise ValueError("admission attempt was cancelled at the ref authority")
     after = content_after(s.trunk_content, a.selected)
     noop = after == s.trunk_content
     if a.gate != "passed" and not (defect == "noop_without_gate" and noop):
@@ -293,6 +315,8 @@ def violation(s: State) -> str | None:
     seen: set[str] = set()
     before_version = before_content = 0
     for entry in s.admissions:
+        if entry.op in s.cancel_ack:
+            return "admission followed an acknowledged cancellation"
         if entry.selected != entry.accounted:
             return "mixed output identity replaced selected source identities"
         if seen.intersection(entry.accounted):
@@ -348,6 +372,43 @@ def scenario() -> None:
     s = rewrite_source(s)
     assert selected_units(s) == ()  # cut rewrite cannot replay source units
     assert violation(s) is None
+
+    # Cancellation first burns only the attempt id. The selected obligations
+    # remain held and a fresh operation can gate them. CAS first instead makes
+    # the cancellation return the already landed receipt without revocation.
+    cancelled = gate(submit(initial(), 0), 1, "passed")
+    cancelled = cancel_attempt(cancelled, 1, 0, 0)
+    assert cancelled.cancelled == (1,) and cancelled.holders == ("branch", "branch")
+    cancelled = lock_ledger(cancelled, 0)
+    try:
+        cas(cancelled, 1, 0)
+    except ValueError as error:
+        assert "cancelled" in str(error)
+    else:
+        raise AssertionError("acknowledged cancellation failed to fence CAS")
+    retry = submit(unlock_ledger(cancelled, 0), 0)
+    retry = lock_ledger(gate(retry, 2, "passed"), 0)
+    assert violation(cas(retry, 2, 0)) is None
+
+    landed = cas(lock_ledger(gate(submit(initial(), 0), 1, "passed"), 0), 1, 0)
+    assert cancel_attempt(landed, 1, 0, 0) == landed
+    assert landed.cancel_ack == ()
+
+    pending = gate(submit(initial(), 0), 1, "passed")
+    try:
+        cancel_attempt(replace(pending, ref_up=False), 1, 0, 0)
+    except ValueError as error:
+        assert "ref owner fence" in str(error)
+    else:
+        raise AssertionError("ref outage acknowledged cancellation")
+    taken = takeover(pending)
+    try:
+        cancel_attempt(taken, 1, 0, 0)
+    except ValueError as error:
+        assert "ref owner fence" in str(error)
+    else:
+        raise AssertionError("former owner cancelled after takeover")
+    assert cancel_attempt(taken, 1, 1, 1).cancelled == (1,)
 
     # A direct twig is a one-member source, subject to the same gate and CAS.
     twig = initial("twig")
@@ -497,6 +558,11 @@ def mutant_scenarios() -> None:
     wrong = cas(stale_graph, 1, 0, "stale_graph")
     assert violation(wrong) == "admission used stale or incomplete reference coverage"
 
+    queue_only = gate(submit(initial(), 0), 1, "passed")
+    queue_only = cancel_attempt(queue_only, 1, 0, 0, "queue_only_cancellation")
+    queue_only = cas(lock_ledger(queue_only, 0), 1, 0)
+    assert violation(queue_only) == "admission followed an acknowledged cancellation"
+
 
 def steps(s: State):
     """Small interleaving core; the scenarios above cover specialized edges."""
@@ -507,6 +573,11 @@ def steps(s: State):
             except ValueError:
                 pass
     for a in s.attempts:
+        if a.op not in s.cancel_ack and not any(entry.op == a.op for entry in s.admissions):
+            try:
+                yield f"cancel{a.op}", cancel_attempt(s, a.op, s.owner, s.owner_fence)
+            except ValueError:
+                pass
         if a.gate == "waiting":
             try:
                 yield f"pass{a.op}", gate(s, a.op, "passed")
@@ -563,7 +634,7 @@ def main() -> None:
     mutant_scenarios()
     count = explore()
     print(f"flowing recovery: {count} safe states through nine transitions")
-    print("direct twig, no-op, graph freshness, competing coordinators, recovery, and seven mutants passed")
+    print("direct twig, no-op, cancellation, graph freshness, competing coordinators, recovery, and eight mutants passed")
 
 
 if __name__ == "__main__":

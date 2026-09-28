@@ -1769,7 +1769,8 @@ impl WasmDurableInstance {
         norm_trust: Option<String>,
         norm_deployment: Option<String>,
         // Final wasm-bindgen module digest supplied by the Worker shell. Keep
-        // this at the end of the positional ABI for older direct callers.
+        // this at the end of the positional ABI; an older caller that omits it
+        // now receives a refusal before program-version admission.
         compiler_artifact_digest: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`

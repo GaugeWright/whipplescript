@@ -169,29 +169,43 @@
       "executionBoundary": "managed-workflow-placement",
       "contracts": [
         "runtime.host.norm.commands",
-        "runtime.host.norm.provision",
-        "runtime.host.norm.publications",
-        "runtime.host.norm.enqueues",
-        "runtime.host.norm.impacts",
-        "runtime.host.norm.promotions"
+        "runtime.host.norm.provision"
       ],
       "requiredInfrastructure": [
-        "Dedicated synthetic norm ledger placement with deployment-owned principal bindings, creation grant and a restoration checkpoint for that object in the Worker's norm trust",
-        "One stable act of that ledger, signed by the synthetic signer outside the runner and presented verbatim as an exact retry; the runner holds no signing key",
-        "Deployment-owned planning roles and physically verified immutable image binding matched to the deployed executor for read-only impact queries",
-        "Synthetic running instance with installed observer capability, requirement record, recorded artifact cut and deployment executor configuration for authenticated enqueue and retry",
-        "Synthetic settled norm execution with retained runtime journal, captured artifact cut and an observation publication signed externally once at provisioning; the runner only republishes what the host retains",
-        "Synthetic workspace stream line promoted once through the gate under a stable promotion identity, with a synthetic reservation grant for fenced changes"
+        "Dedicated synthetic norm ledger placement with deployment-owned principal bindings, creation grant and a restoration checkpoint for that object in the Worker's norm trust (DR-0140)",
+        "One stable act of that ledger, signed by the synthetic signer outside the runner and presented verbatim as an exact retry; the runner holds no signing key"
       ],
       "requiredEnvironment": [
         "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN",
         "GW_SYNTHETIC_WHIP_CONTROL_TOKEN",
         "GW_SYNTHETIC_WHIP_TENANT",
         "GW_SYNTHETIC_NORM_PLACEMENT",
-        "GW_SYNTHETIC_NORM_SIGNED_ACT",
-        "GW_SYNTHETIC_NORM_WORKSPACE"
+        "GW_SYNTHETIC_NORM_SIGNED_ACT"
       ],
-      "cleanup": "Reuse only the dedicated synthetic ledger and stable signed invocation identities, so every run after the first is an exact retry that adds nothing. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup, and the runner calls no delete, discard, restore or rollback route. Retain bounded synthetic receipts outside customer ledgers; the runner fails once the synthetic history exceeds 256 events. A promotion moves only the synthetic workspace's governed mainline and is recorded like any other; it is never undone by rewriting that history.",
+      "cleanup": "Reuse only the dedicated synthetic ledger and its one stable signed act, so every run after the first is an exact retry that adds nothing. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup, and the runner calls no delete, discard, restore or rollback route. The runner fails once the synthetic history exceeds 256 events.",
+      "surfaces": [
+        "whip-runtime"
+      ]
+    },
+    {
+      "id": "norm-evidence",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-workflow-placement",
+      "contracts": [
+        "runtime.host.norm.publications",
+        "runtime.host.norm.enqueues",
+        "runtime.host.norm.impacts",
+        "runtime.host.norm.promotions"
+      ],
+      "requiredInfrastructure": [
+        "A Home able to supply its hosted execution peer with candidate cuts (DR-0139, flowing-branch tracker FB-6); no production route puts a cut into a hosted object until then",
+        "Deployment-owned planning roles, the verified executor image pinned by digest with its runtime and image binding, the executor token, and a container pool above zero (DR-0140's evidence half)",
+        "Synthetic running instance with installed observer capability and requirement record, for authenticated enqueue and retry",
+        "Synthetic settled norm execution with retained runtime journal and an observation publication signed externally once at provisioning; the journey only republishes what the host retains",
+        "Synthetic line the peer holds, promoted once under a stable promotion identity, with a synthetic reservation grant"
+      ],
+      "cleanup": "The journey is written and tested (runNormEvidence) but not dispatched. When it runs it reuses only the dedicated synthetic ledger and stable signed invocation identities, so every run after the first is an exact retry; norm evidence is append-only, and it calls no delete, discard, restore or rollback route. A promotion moves only a line the peer holds, never a Home's trunk.",
       "surfaces": [
         "whip-runtime"
       ]

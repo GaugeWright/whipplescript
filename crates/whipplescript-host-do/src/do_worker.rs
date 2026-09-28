@@ -90,8 +90,8 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
 #[derive(Default)]
 pub struct DurableEffectPorts {
     /// SHA-256 of the final wasm-bindgen module compiled into this Worker.
-    /// The production shell supplies it; legacy direct callers without an
-    /// artifact basis remain outside RC-2's checked import slice.
+    /// The production shell supplies it. A missing basis refuses creation
+    /// before an unwitnessed program version can be accepted.
     pub compiler_artifact_digest: Option<String>,
     pub files: Option<Box<dyn FileStore>>,
     pub coerce: Option<ResolvedCoercionConfig>,
@@ -324,37 +324,30 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             source_hash: &source_hash,
             compiler_version,
         };
-        let version = match ports.compiler_artifact_digest.as_deref() {
-            Some(compiler_artifact_digest) => {
-                // Hosted workflow creation has no local package lock yet. The
-                // explicit no-lock basis accepts std-only imports and refuses
-                // unresolved local imports instead of inventing empty edges.
-                let no_lock_digest = "0".repeat(64);
-                let admission = kernel
-                    .create_program_version_for_compiled_program_with_imports(
-                        version_input,
-                        &ir,
-                        compiled.typed_actions.as_ref(),
-                        &CheckedImportBasis {
-                            program_source_digest: &source_hash,
-                            lock_digest: &no_lock_digest,
-                            compiler_artifact_digest,
-                            packages: &[],
-                        },
-                    )
-                    .map_err(|error| format!("{error:?}"))?;
-                ProgramVersionRecord {
-                    program_id: admission.program_id,
-                    version_id: admission.version_id,
-                }
-            }
-            None => kernel
-                .create_program_version_for_compiled_program(
-                    version_input,
-                    &ir,
-                    compiled.typed_actions.as_ref(),
-                )
-                .map_err(|error| format!("{error:?}"))?,
+        let compiler_artifact_digest =
+            ports.compiler_artifact_digest.as_deref().ok_or_else(|| {
+                "hosted program admission requires the exact compiler artifact digest".to_owned()
+            })?;
+        // Hosted workflow creation has no local package lock yet. The
+        // explicit no-lock basis accepts std-only imports and refuses
+        // unresolved local imports instead of inventing empty edges.
+        let no_lock_digest = "0".repeat(64);
+        let admission = kernel
+            .create_program_version_for_compiled_program_with_imports(
+                version_input,
+                &ir,
+                compiled.typed_actions.as_ref(),
+                &CheckedImportBasis {
+                    program_source_digest: &source_hash,
+                    lock_digest: &no_lock_digest,
+                    compiler_artifact_digest,
+                    packages: &[],
+                },
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        let version = ProgramVersionRecord {
+            program_id: admission.program_id,
+            version_id: admission.version_id,
         };
         // DO-plane package bootstrap (spec/durable-object-runtime-tracker.md):
         // seed the embedded std manifests so the admission gate is REAL for
@@ -1066,6 +1059,14 @@ fn drive_fixpoint<D: InstanceDriver>(
 }
 
 #[cfg(test)]
+fn test_ports() -> DurableEffectPorts {
+    DurableEffectPorts {
+        compiler_artifact_digest: Some("d".repeat(64)),
+        ..DurableEffectPorts::default()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1091,7 +1092,7 @@ rule finish
             source,
             "{}",
             "local/Context",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1115,7 +1116,7 @@ rule finish
                             content: "Pinned instructions.".into(),
                         },
                     ),
-                    ..DurableEffectPorts::default()
+                    ..test_ports()
                 },
             )
             .expect("attach");
@@ -1343,7 +1344,7 @@ rule finish
             "local/HostedImport",
             DurableEffectPorts {
                 compiler_artifact_digest: Some(compiler_digest.clone()),
-                ..DurableEffectPorts::default()
+                ..test_ports()
             },
             &[],
             &[],
@@ -1375,6 +1376,30 @@ rule finish
     }
 
     #[test]
+    fn hosted_worker_requires_compiler_artifact_before_version_admission() {
+        use crate::do_store::as_i64;
+
+        let sql = store().sql;
+        let result = DurableInstance::create(
+            sql.clone(),
+            "workflow MissingArtifact {}",
+            "{}",
+            "local/MissingArtifact",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        );
+        let Err(message) = result else {
+            panic!("missing artifact basis must refuse");
+        };
+        assert!(message.contains("compiler artifact digest"), "{message}");
+        let rows = sql
+            .query("SELECT COUNT(*) FROM program_versions", &[])
+            .unwrap();
+        assert_eq!(as_i64(&rows[0][0]), 0);
+    }
+
+    #[test]
     fn hosted_worker_refuses_unresolved_local_import_before_version_admission() {
         use crate::do_store::as_i64;
 
@@ -1387,7 +1412,7 @@ rule finish
             "local/HostedImport",
             DurableEffectPorts {
                 compiler_artifact_digest: Some("d".repeat(64)),
-                ..DurableEffectPorts::default()
+                ..test_ports()
             },
             &[],
             &[],
@@ -1416,7 +1441,7 @@ complete result answer }
             SOURCE,
             "{}",
             "local/HostedTypedSource",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1497,7 +1522,7 @@ rule observe_start
             &source,
             "{}",
             "local/MinimalNoop",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1519,7 +1544,7 @@ rule observe_start
             &source,
             "{}",
             "local/MinimalNoop",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1593,7 +1618,7 @@ rule observe_start
             &source_v1,
             "{}",
             "local/MinimalNoop",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1665,7 +1690,7 @@ rule observe_start
             &source_v2,
             "{}",
             "local/MinimalNoop",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1702,7 +1727,7 @@ rule observe_start
             &source_v2,
             "{}",
             "local/MinimalNoop",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -1782,7 +1807,7 @@ rule go
                 timeout_ms: Some(10_000),
                 auth_token: None,
             }),
-            ..DurableEffectPorts::default()
+            ..test_ports()
         };
         let sql = store().sql;
         let mut instance = DurableInstance::create(
@@ -1947,7 +1972,7 @@ rule go
                 max_steps: 8,
                 auth_token: None,
             }),
-            ..DurableEffectPorts::default()
+            ..test_ports()
         };
         let base = store();
         for stmt in [
@@ -2064,7 +2089,7 @@ rule go
                 &source,
                 "{}",
                 "local/SeedProbe",
-                DurableEffectPorts::default(),
+                test_ports(),
                 &[],
                 &scripts,
             )
@@ -2227,7 +2252,7 @@ mod branch_dispatch_tests {
             source,
             "{}",
             "local/BranchDispatch",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -2304,7 +2329,7 @@ mod branch_dispatch_tests {
             source,
             "{}",
             "local/ExportParity",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         )
@@ -2357,7 +2382,7 @@ mod tutorial_tests {
                 SOURCE,
                 INPUT,
                 "person:learner",
-                DurableEffectPorts::default(),
+                test_ports(),
                 &[],
                 &[],
             )
@@ -2404,7 +2429,7 @@ mod tutorial_tests {
             SOURCE,
             r#"{"learner":{"authority":42}}"#,
             "person:learner",
-            DurableEffectPorts::default(),
+            test_ports(),
             &[],
             &[],
         );

@@ -158,6 +158,111 @@ fn native_runtime_context_prepares_exact_profile_and_refuses_bad_inputs() {
     assert_eq!(fs::read(source).expect("original source"), bytes);
 }
 
+#[test]
+fn native_runtime_context_ships_the_guest_notices_its_collection_verifies() {
+    let root = std::env::temp_dir().join(format!("norm-notices-{}", std::process::id()));
+    fs::create_dir(&root).expect("isolated notices fixture");
+    let fixture = Fixture(root);
+    let source = fixture.0.join("reactor.wasm");
+    let bytes = b"the released guest";
+    fs::write(&source, bytes).expect("reactor fixture");
+    let artifact = sha256_hex(bytes);
+    let runtime = PythonRuntime {
+        engine: PythonEngine::Cpython3147Wasi {
+            artifact_path: "/opt/hosted-norm/runtime.wasm".into(),
+            artifact_sha256: artifact.clone(),
+        },
+        executable: "/usr/local/bin/whip".into(),
+        python_version: "3.14.7".into(),
+        environment: "released-epoch".into(),
+    };
+    let notices = fixture.0.join("notices");
+    fs::create_dir(&notices).expect("notices directory");
+    let license = b"MIT License: keep this notice";
+    fs::write(notices.join("expat-COPYING"), license).expect("notice");
+    let manifest = json!({"artifact_sha256": artifact,
+        "entries": [{"file": "expat-COPYING", "sha256": sha256_hex(license)}]});
+    let request_path = fixture.0.join("request.json");
+    let contexts = fixture.0.join("contexts");
+    let invoke = |manifest: &Value| {
+        fs::write(
+            notices.join("manifest.json"),
+            serde_json::to_vec(manifest).expect("manifest JSON"),
+        )
+        .expect("write manifest");
+        let request = json!({"runtime": runtime, "artifact_source": source,
+            "build_root": contexts, "notices": notices});
+        fs::write(
+            &request_path,
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .expect("write request");
+        whip_command(env!("CARGO_BIN_EXE_whip"))
+            .current_dir(&fixture.0)
+            .args(["executor", "prepare-norm-runtime-context", "--request"])
+            .arg(&request_path)
+            .output()
+            .expect("prepare context CLI")
+    };
+    let output = invoke(&manifest);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let prepared: Value = serde_json::from_slice(&output.stdout).expect("prepared receipt");
+    let directory = PathBuf::from(prepared["directory"].as_str().expect("context directory"));
+    assert_eq!(
+        prepared["files"]["notices/expat-COPYING"],
+        sha256_hex(license),
+        "the receipt names each shipped notice"
+    );
+    assert_eq!(
+        fs::read(directory.join("notices/expat-COPYING")).expect("shipped notice"),
+        license
+    );
+    assert!(directory.join("notices/manifest.json").exists());
+    let recipe = fs::read_to_string(directory.join("Dockerfile")).expect("recipe");
+    assert!(recipe.contains("COPY [\"notices\",\"/usr/share/doc/whipplescript-norm-guest\"]"));
+    let ignore = fs::read_to_string(directory.join(".dockerignore")).expect("allowlist");
+    assert!(ignore.contains("!notices/**"));
+
+    for (case, altered) in [
+        (
+            "another artifact",
+            json!({"artifact_sha256": "b".repeat(64), "entries": manifest["entries"]}),
+        ),
+        (
+            "digest mismatch",
+            json!({"artifact_sha256": artifact,
+            "entries": [{"file": "expat-COPYING", "sha256": "c".repeat(64)}]}),
+        ),
+        (
+            "path escape",
+            json!({"artifact_sha256": artifact,
+            "entries": [{"file": "../reactor.wasm", "sha256": sha256_hex(bytes)}]}),
+        ),
+        (
+            "no notices",
+            json!({"artifact_sha256": artifact, "entries": []}),
+        ),
+        (
+            "listed twice",
+            json!({"artifact_sha256": artifact,
+            "entries": [manifest["entries"][0], manifest["entries"][0]]}),
+        ),
+    ] {
+        let before = fs::read_dir(&contexts).expect("contexts").count();
+        let result = invoke(&altered);
+        assert!(!result.status.success(), "{case} accepted");
+        assert_eq!(
+            fs::read_dir(&contexts).expect("unchanged contexts").count(),
+            before,
+            "{case} left a context behind"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "requires Docker and the pinned CPython reactor"]

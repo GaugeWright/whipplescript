@@ -3,27 +3,74 @@ use std::collections::BTreeSet;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    check_fence, validate_request, FlowingAdmissionOutcome, FlowingAdmissionReceipt,
-    FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions, FlowingUnitOutcome,
+    check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
+    FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
+    FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
+    FlowingUnitOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
 use crate::branches::{BranchStatus, BranchStore, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE};
-use crate::StoreResult;
+use crate::{StoreError, StoreResult};
 
 fn read_receipt(
     connection: &Connection,
     op_id: &str,
 ) -> StoreResult<Option<FlowingAdmissionReceipt>> {
-    let json: Option<String> = connection
+    let row: Option<(String, String)> = connection
         .query_row(
-            "SELECT receipt_json FROM flowing_admissions WHERE op_id = ?1",
+            "SELECT op_id, receipt_json FROM flowing_admissions WHERE op_id = ?1",
             [op_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    json.map(|json| serde_json::from_str(&json).map_err(Into::into))
-        .transpose()
+    row.map(|(stored_op_id, json)| {
+        let receipt: FlowingAdmissionReceipt = serde_json::from_str(&json)?;
+        if receipt.request.op_id != stored_op_id {
+            return Err(StoreError::Conflict(
+                "flowing admission receipt differs from its operation key".into(),
+            ));
+        }
+        Ok(receipt)
+    })
+    .transpose()
+}
+
+fn read_cancellation(
+    connection: &Connection,
+    column: &str,
+    op_id: &str,
+) -> StoreResult<Option<FlowingCancelReceipt>> {
+    let query = match column {
+        "admission_op_id" => {
+            "SELECT admission_op_id, cancel_op_id, request_json \
+             FROM flowing_admission_cancellations WHERE admission_op_id = ?1"
+        }
+        "cancel_op_id" => {
+            "SELECT admission_op_id, cancel_op_id, request_json \
+             FROM flowing_admission_cancellations WHERE cancel_op_id = ?1"
+        }
+        _ => unreachable!("the cancellation lookup column is fixed by this module"),
+    };
+    let row: Option<(String, String, String)> = connection
+        .query_row(query, [op_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    row.map(|(admission_op_id, cancel_op_id, json)| {
+        let receipt = FlowingCancelReceipt {
+            request: serde_json::from_str(&json)?,
+        };
+        if receipt.request.admission_op_id != admission_op_id
+            || receipt.request.cancel_op_id != cancel_op_id
+        {
+            return Err(StoreError::Conflict(
+                "flowing cancellation receipt differs from its operation keys".into(),
+            ));
+        }
+        Ok(receipt)
+    })
+    .transpose()
 }
 
 /// All accepted source heads have append ancestry until a controlled
@@ -64,6 +111,11 @@ impl FlowingAdmissions for BranchStore {
             } else {
                 Refused(R::IdentityMismatch)
             });
+        }
+        if let Some(cancelled) = read_cancellation(&tx, "admission_op_id", &request.op_id)? {
+            return Ok(Refused(R::AttemptCancelled {
+                cancel_op_id: cancelled.request.cancel_op_id,
+            }));
         }
 
         let Some(source) = BranchStore::row_by_id(&tx, &request.source_branch_id)? else {
@@ -280,6 +332,87 @@ impl FlowingAdmissions for BranchStore {
     ) -> StoreResult<Option<FlowingAdmissionReceipt>> {
         read_receipt(&self.connection, op_id)
     }
+
+    fn cancel_flowing_attempt(
+        &mut self,
+        request: &FlowingCancelRequest,
+    ) -> StoreResult<FlowingCancelOutcome> {
+        use FlowingCancelOutcome::{
+            AlreadyAdmitted, AlreadyCancelled, Cancelled, Existing, Refused,
+        };
+        use FlowingCancelRefusal as R;
+
+        if let Err(refusal) = validate_cancel_request(request) {
+            return Ok(Refused(refusal));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = read_cancellation(&tx, "cancel_op_id", &request.cancel_op_id)? {
+            return Ok(if existing.request == *request {
+                Existing(existing)
+            } else {
+                Refused(R::IdentityMismatch)
+            });
+        }
+        if let Some(existing) = read_cancellation(&tx, "admission_op_id", &request.admission_op_id)?
+        {
+            return Ok(
+                if existing.request.source_branch_id == request.source_branch_id
+                    && existing.request.source_incarnation_id == request.source_incarnation_id
+                {
+                    AlreadyCancelled(existing)
+                } else {
+                    Refused(R::IdentityMismatch)
+                },
+            );
+        }
+        if let Some(admitted) = read_receipt(&tx, &request.admission_op_id)? {
+            return Ok(
+                if admitted.request.source_branch_id == request.source_branch_id
+                    && admitted.request.source_incarnation_id == request.source_incarnation_id
+                {
+                    AlreadyAdmitted(admitted)
+                } else {
+                    Refused(R::IdentityMismatch)
+                },
+            );
+        }
+        let Some(state) = flowing_fence::native::read_state(&tx, &request.source_branch_id)? else {
+            return Ok(Refused(R::SourceMissing));
+        };
+        if state.incarnation_id != request.source_incarnation_id {
+            return Ok(Refused(R::WrongIncarnation));
+        }
+        if state.owner_epoch != request.expected_owner_epoch {
+            return Ok(Refused(R::StaleOwnerEpoch {
+                current: state.owner_epoch,
+            }));
+        }
+        if state.owner != request.coordinator {
+            return Ok(Refused(R::WrongOwner));
+        }
+        tx.execute(
+            "INSERT INTO flowing_admission_cancellations \
+             (admission_op_id, cancel_op_id, request_json) VALUES (?1, ?2, ?3)",
+            params![
+                &request.admission_op_id,
+                &request.cancel_op_id,
+                serde_json::to_string(request)?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Cancelled(FlowingCancelReceipt {
+            request: request.clone(),
+        }))
+    }
+
+    fn flowing_cancellation_for_attempt(
+        &self,
+        admission_op_id: &str,
+    ) -> StoreResult<Option<FlowingCancelReceipt>> {
+        read_cancellation(&self.connection, "admission_op_id", admission_op_id)
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +523,182 @@ mod tests {
             }],
             recorded_at: "t4".into(),
         }
+    }
+
+    fn cancel(admission_op_id: &str, cancel_op_id: &str) -> FlowingCancelRequest {
+        FlowingCancelRequest {
+            cancel_op_id: cancel_op_id.into(),
+            admission_op_id: admission_op_id.into(),
+            source_branch_id: "twig".into(),
+            source_incarnation_id: "inc".into(),
+            expected_owner_epoch: 0,
+            coordinator: "coordinator".into(),
+            recorded_at: "t4".into(),
+        }
+    }
+
+    #[test]
+    fn cancellation_wins_before_cas_without_disposing_the_unit() {
+        let mut store = fixture();
+        let cancellation = cancel("admission-a", "cancel-a");
+        let receipt = FlowingCancelReceipt {
+            request: cancellation.clone(),
+        };
+        assert_eq!(
+            store.cancel_flowing_attempt(&cancellation).unwrap(),
+            FlowingCancelOutcome::Cancelled(receipt.clone())
+        );
+        assert_eq!(
+            store
+                .flowing_cancellation_for_attempt("admission-a")
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            store.cancel_flowing_attempt(&cancellation).unwrap(),
+            FlowingCancelOutcome::Existing(receipt.clone())
+        );
+        assert_eq!(
+            store
+                .cancel_flowing_attempt(&cancel("admission-a", "cancel-b"))
+                .unwrap(),
+            FlowingCancelOutcome::AlreadyCancelled(receipt)
+        );
+        let mut reused_cancel_id = cancellation.clone();
+        reused_cancel_id.admission_op_id = "admission-b".into();
+        assert_eq!(
+            store.cancel_flowing_attempt(&reused_cancel_id).unwrap(),
+            FlowingCancelOutcome::Refused(FlowingCancelRefusal::IdentityMismatch)
+        );
+        assert_eq!(
+            store
+                .admit_flowing_prefix(&request("unit-a", "admission-a"))
+                .unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptCancelled {
+                cancel_op_id: "cancel-a".into()
+            })
+        );
+        assert!(store
+            .flowing_admission_receipt("admission-a")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+        assert!(matches!(
+            store
+                .admit_flowing_prefix(&request("unit-a", "admission-b"))
+                .unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn cancellation_after_cas_reports_the_landed_receipt() {
+        let mut store = fixture();
+        let admission = request("unit-a", "admission-a");
+        let admitted = store.admit_flowing_prefix(&admission).unwrap();
+        let FlowingAdmissionOutcome::Admitted(receipt) = admitted else {
+            panic!("admission should land")
+        };
+        assert_eq!(
+            store
+                .cancel_flowing_attempt(&cancel("admission-a", "cancel-a"))
+                .unwrap(),
+            FlowingCancelOutcome::AlreadyAdmitted(receipt)
+        );
+        assert!(store
+            .flowing_cancellation_for_attempt("admission-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cancellation_owner_fence_and_failed_write_leave_admission_order_intact() {
+        let mut store = fixture();
+        let mut cancellation = cancel("admission-a", "cancel-a");
+        cancellation.expected_owner_epoch = 1;
+        assert_eq!(
+            store.cancel_flowing_attempt(&cancellation).unwrap(),
+            FlowingCancelOutcome::Refused(FlowingCancelRefusal::StaleOwnerEpoch { current: 0 })
+        );
+        cancellation.expected_owner_epoch = 0;
+        cancellation.coordinator = "other".into();
+        assert_eq!(
+            store.cancel_flowing_attempt(&cancellation).unwrap(),
+            FlowingCancelOutcome::Refused(FlowingCancelRefusal::WrongOwner)
+        );
+        cancellation.coordinator = "coordinator".into();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_cancel BEFORE INSERT ON flowing_admission_cancellations \
+                 BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+            )
+            .unwrap();
+        assert!(store.cancel_flowing_attempt(&cancellation).is_err());
+        assert!(store
+            .flowing_cancellation_for_attempt("admission-a")
+            .unwrap()
+            .is_none());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_cancel")
+            .unwrap();
+        assert!(matches!(
+            store
+                .admit_flowing_prefix(&request("unit-a", "admission-a"))
+                .unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn corrupt_operation_receipts_are_indeterminate() {
+        let mut store = fixture();
+        let cancellation = cancel("admission-a", "cancel-a");
+        store.cancel_flowing_attempt(&cancellation).unwrap();
+        let mut altered = cancellation.clone();
+        altered.admission_op_id = "another-attempt".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_admission_cancellations SET request_json = ?1 \
+                 WHERE admission_op_id = 'admission-a'",
+                [serde_json::to_string(&altered).unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_cancellation_for_attempt("admission-a"),
+            Err(StoreError::Conflict(message)) if message.contains("operation keys")
+        ));
+        assert!(store
+            .admit_flowing_prefix(&request("unit-a", "admission-a"))
+            .is_err());
+
+        let mut admitted_store = fixture();
+        admitted_store
+            .admit_flowing_prefix(&request("unit-a", "admission-b"))
+            .unwrap();
+        let mut altered_receipt = request("unit-a", "another-admission");
+        altered_receipt.op_id = "another-admission".into();
+        admitted_store
+            .connection
+            .execute(
+                "UPDATE flowing_admissions SET receipt_json = ?1 WHERE op_id = 'admission-b'",
+                [serde_json::to_string(&FlowingAdmissionReceipt {
+                    request: altered_receipt,
+                })
+                .unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            admitted_store.flowing_admission_receipt("admission-b"),
+            Err(StoreError::Conflict(message)) if message.contains("operation key")
+        ));
     }
 
     #[test]

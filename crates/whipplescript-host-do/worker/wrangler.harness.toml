@@ -74,7 +74,12 @@ class_name = "WorkspaceBroker"
 # its slot bound from that knob.
 [[containers]]
 class_name = "ExecutorContainer"
-image = "./executor/Dockerfile"
+# The verified norm executor image, pinned by the manifest digest its push
+# reported (DR-0140): scripts/build-norm-executor-image.sh verified it and
+# scripts/push-norm-executor-image.sh pushed it. The registry is
+# content-addressed, so this can run no other image. The pool stays at zero:
+# the evidence half waits on FB-6 (DR-0139).
+image = "registry.cloudflare.com/1689dd452ba2d2d8eb1f3c364c92b3f4/whipplescript-norm-executor@sha256:26baddfc4ba3e82ad7126cfbced61d69a1a6838bf47ba62af9f6e9145f5d7559"
 max_instances = 0
 instance_type = "lite"
 
@@ -101,6 +106,11 @@ WHIP_EXECUTOR_POOL_SIZE = "0"
 # Sentinel host for Class-B turn containers: agent turns run whole in a
 # per-turn container (idFromName over the turn id) over whip-turn/1.
 WHIP_TURN_URL = "http://turn"
+# The norm plane's ledger half (DR-0140): the production canary ledger's
+# public bindings and creation grant. Public keys only; the signing keys are
+# held by the custodian on the founder's workstation. No planning, runtime or
+# image binding is set, so the evidence doors answer unavailable (DR-0139).
+WHIP_NORM_TRUST = '{"bindings":[],"creation_grants":[{"creator":"norm-canary-worker","owner":"norm-canary-owner"}],"public_bindings":[{"actor":{"principal":"norm-canary-owner","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-owner#local"},"public_key_hex":"10cd2b6605e11c0bf46a16b27d7a720a83237ca9646f590adef687ad22012798"},{"actor":{"principal":"norm-canary-worker","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-worker#local"},"public_key_hex":"8b63653f041934d80ca209c9af6a2b6468cb91d8c9ced6d3d163ce59330c7fe0"},{"actor":{"principal":"norm-canary-publisher","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-publisher#local"},"public_key_hex":"e125d4939b6abf4d44455ea791e1372d767adc09dac3db90373de47bb76490b1"}],"restorations":[]}'
 
 # The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
 # `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.

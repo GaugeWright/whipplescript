@@ -2,9 +2,16 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
 import { WasmDurableInstance } from "../pkg/whipplescript_host_do_bg.js";
+import { wasmArtifactDigest } from "../pkg/wasm-artifact-digest";
 import schema from "../do_schema.sql";
 import source from "../../../../examples/gaugedesk-basics.whip?raw";
 import type { TestEnv } from "./integration-helpers";
+
+function createTestInstance(...args: Parameters<typeof WasmDurableInstance.create>): WasmDurableInstance {
+  // The appended compiler digest is positional argument 14 of the WASM ABI.
+  args[13] = wasmArtifactDigest;
+  return WasmDurableInstance.create(...args);
+}
 
 it("runs the ordinary Basics source through wasm and durable SQLite across eviction", async () => {
   const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
@@ -24,7 +31,7 @@ it("runs the ordinary Basics source through wasm and durable SQLite across evict
           return JSON.stringify([...sql.exec(query, ...JSON.parse(paramsJson))].map(Object.values));
         },
       };
-      const instance = WasmDurableInstance.create(
+      const instance = createTestInstance(
         bridge, source, JSON.stringify({ learner: { authority: "person:learner" } }),
         "person:learner", undefined, undefined, undefined, undefined, undefined, undefined,
       );

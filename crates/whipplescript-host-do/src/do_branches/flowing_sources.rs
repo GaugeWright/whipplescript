@@ -834,6 +834,125 @@ mod tests {
     }
 
     #[test]
+    fn hosted_direct_trunk_candidate_checks_actual_selected_content() {
+        use std::rc::Rc;
+
+        use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::content::ContentBlobs;
+        use whipplescript_store::selection::parse;
+        use whipplescript_store::vcs::{
+            FlowingEffectDisposition, FlowingSelectionOutcome, FlowingTargetEffectsOutcome,
+            WorkspaceVcs,
+        };
+
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).expect("branches"),
+            DoContentBlobs::new(Rc::clone(&sql)).expect("content"),
+        );
+        vcs.init("t0").expect("initialize");
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("direct twig");
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .expect("source cut");
+        let mut branches = DoBranches::new(Rc::clone(&sql)).expect("branches");
+        let source_cut = branches.get_cut("twig-a").unwrap().unwrap();
+        branches
+            .pin_private_cut(PinPrivateCut {
+                pin_id: "pin-a",
+                twig_branch_id: "twig",
+                cut_id: "twig-a",
+                manifest_hash: &source_cut.manifest_hash,
+                principal: "s:author",
+                retained_at: "t3",
+            })
+            .expect("pin source");
+        branches
+            .declare_contribution(DeclareContribution {
+                unit_id: "unit-a",
+                pin_id: "pin-a",
+                principal: "s:author",
+                intent: "share one file",
+                read_basis_digest: "reads-a",
+                dependency_basis_digest: "deps-a",
+                scope_digest: "scope-a",
+                declared_at: "t3",
+            })
+            .expect("declare source");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-a", &parse("path(a.txt)").unwrap())
+            .expect("select source")
+        else {
+            panic!("source selection must succeed")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t4")
+                .expect("bind source"),
+            BindContributionBasisOutcome::Bound
+        );
+        let body = DoContentBlobs::new(Rc::clone(&sql)).expect("content");
+        let selected = selection.changes()[0]
+            .after
+            .as_deref()
+            .expect("source body");
+        let manifest = body
+            .put_text(&format!(r#"{{"a.txt":"{selected}"}}"#))
+            .expect("exact candidate manifest");
+        branches
+            .record_cut(CutRecord {
+                cut_id: "trunk-exact",
+                change_id: "candidate-a",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &manifest,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("coordinator"),
+                intent: None,
+                recorded_at: "t5",
+            })
+            .expect("exact candidate cut");
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_trunk_target_effects("unit-a", "trunk-exact")
+            .expect("verify candidate")
+        else {
+            panic!("trunk candidate should carry selected content")
+        };
+        assert_eq!(witness.target_branch_id(), MAINLINE_BRANCH_ID);
+        assert_eq!(
+            witness.effects()[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+
+        let omitted = body.put_text("{}").expect("omitted candidate manifest");
+        branches
+            .record_cut(CutRecord {
+                cut_id: "trunk-omitted",
+                change_id: "candidate-omitted",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &omitted,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("coordinator"),
+                intent: None,
+                recorded_at: "t5",
+            })
+            .expect("omitted candidate cut");
+        assert_eq!(
+            vcs.verify_trunk_target_effects("unit-a", "trunk-omitted")
+                .expect("verify omitted candidate"),
+            FlowingTargetEffectsOutcome::OmittedEffect {
+                path: "a.txt".into()
+            }
+        );
+        assert!(branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
     fn hosted_handoff_accounts_consecutive_writes_as_one_target_effect() {
         use std::rc::Rc;
 

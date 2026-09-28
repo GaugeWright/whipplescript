@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 2] = [
+pub const SCHEMA: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -23,6 +23,11 @@ pub const SCHEMA: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS flowing_admitted_units (
         unit_id TEXT PRIMARY KEY,
         op_id TEXT NOT NULL REFERENCES flowing_admissions(op_id)
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_admission_cancellations (
+        admission_op_id TEXT PRIMARY KEY,
+        cancel_op_id TEXT NOT NULL UNIQUE,
+        request_json TEXT NOT NULL
     )",
 ];
 
@@ -101,6 +106,7 @@ pub enum FlowingAdmissionRefusal {
     UnitNotHeldBySource { unit_id: String },
     UnverifiedLineage { unit_id: String },
     UnitAlreadyAdmitted { unit_id: String },
+    AttemptCancelled { cancel_op_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +114,43 @@ pub enum FlowingAdmissionOutcome {
     Admitted(FlowingAdmissionReceipt),
     Existing(FlowingAdmissionReceipt),
     Refused(FlowingAdmissionRefusal),
+}
+
+/// A cancellation is a ref-authority operation ordered against the attempted
+/// trunk CAS. It fences one admission op id; it never disposes its units.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingCancelRequest {
+    pub cancel_op_id: String,
+    pub admission_op_id: String,
+    pub source_branch_id: String,
+    pub source_incarnation_id: String,
+    pub expected_owner_epoch: i64,
+    pub coordinator: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingCancelReceipt {
+    pub request: FlowingCancelRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingCancelRefusal {
+    Invalid { field: &'static str },
+    IdentityMismatch,
+    SourceMissing,
+    WrongIncarnation,
+    StaleOwnerEpoch { current: i64 },
+    WrongOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingCancelOutcome {
+    Cancelled(FlowingCancelReceipt),
+    Existing(FlowingCancelReceipt),
+    AlreadyCancelled(FlowingCancelReceipt),
+    AlreadyAdmitted(FlowingAdmissionReceipt),
+    Refused(FlowingCancelRefusal),
 }
 
 pub trait FlowingAdmissions {
@@ -119,6 +162,43 @@ pub trait FlowingAdmissions {
         &self,
         op_id: &str,
     ) -> crate::StoreResult<Option<FlowingAdmissionReceipt>>;
+    fn cancel_flowing_attempt(
+        &mut self,
+        request: &FlowingCancelRequest,
+    ) -> crate::StoreResult<FlowingCancelOutcome>;
+    fn flowing_cancellation_for_attempt(
+        &self,
+        admission_op_id: &str,
+    ) -> crate::StoreResult<Option<FlowingCancelReceipt>>;
+}
+
+pub fn validate_cancel_request(request: &FlowingCancelRequest) -> Result<(), FlowingCancelRefusal> {
+    for (field, value) in [
+        ("cancel_op_id", request.cancel_op_id.as_str()),
+        ("admission_op_id", request.admission_op_id.as_str()),
+        ("source_branch_id", request.source_branch_id.as_str()),
+        (
+            "source_incarnation_id",
+            request.source_incarnation_id.as_str(),
+        ),
+        ("coordinator", request.coordinator.as_str()),
+        ("recorded_at", request.recorded_at.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(FlowingCancelRefusal::Invalid { field });
+        }
+    }
+    if request.cancel_op_id == request.admission_op_id {
+        return Err(FlowingCancelRefusal::Invalid {
+            field: "admission_op_id",
+        });
+    }
+    if request.expected_owner_epoch < 0 {
+        return Err(FlowingCancelRefusal::Invalid {
+            field: "expected_owner_epoch",
+        });
+    }
+    Ok(())
 }
 
 pub fn validate_request(request: &FlowingAdmissionRequest) -> Result<(), FlowingAdmissionRefusal> {
@@ -242,6 +322,51 @@ mod tests {
             admission_enabled: true,
             opened_at: "earlier".into(),
         }
+    }
+
+    fn cancel_request() -> FlowingCancelRequest {
+        FlowingCancelRequest {
+            cancel_op_id: "cancel-1".into(),
+            admission_op_id: "admit-1".into(),
+            source_branch_id: "twig-1".into(),
+            source_incarnation_id: "incarnation-1".into(),
+            expected_owner_epoch: 3,
+            coordinator: "coordinator-1".into(),
+            recorded_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn cancellation_request_rejects_missing_or_reused_identity_and_invalid_epoch() {
+        let valid = cancel_request();
+        assert_eq!(validate_cancel_request(&valid), Ok(()));
+
+        let mut missing = valid.clone();
+        missing.admission_op_id = " ".into();
+        assert_eq!(
+            validate_cancel_request(&missing),
+            Err(FlowingCancelRefusal::Invalid {
+                field: "admission_op_id"
+            })
+        );
+
+        let mut reused = valid.clone();
+        reused.admission_op_id = reused.cancel_op_id.clone();
+        assert_eq!(
+            validate_cancel_request(&reused),
+            Err(FlowingCancelRefusal::Invalid {
+                field: "admission_op_id"
+            })
+        );
+
+        let mut negative_epoch = valid;
+        negative_epoch.expected_owner_epoch = -1;
+        assert_eq!(
+            validate_cancel_request(&negative_epoch),
+            Err(FlowingCancelRefusal::Invalid {
+                field: "expected_owner_epoch"
+            })
+        );
     }
 
     #[test]

@@ -6,9 +6,11 @@ import test from "node:test";
 import {
   NORM_LEDGER_HISTORY_LIMIT,
   NORM_LEDGER_PROMOTION,
+  NORM_EVIDENCE_ROUTES,
   NORM_LEDGER_ROUTES,
   normLedgerRequests,
   runManagedHost,
+  runNormEvidence,
   runNormLedger,
   runPrivateHome,
 } from "./production-wiring-canary.mjs";
@@ -342,7 +344,7 @@ function normLedgerDouble(options = {}) {
   return { fetchImpl, calls, history };
 }
 
-test("norm-ledger canary answers every door, refuses bad credentials, and adds only its one act", async () => {
+test("norm-ledger canary answers the ledger doors, refuses bad credentials, and adds only its one act", async () => {
   const double = normLedgerDouble();
   const first = await runNormLedger(normEnvironment, double.fetchImpl);
   const grown = double.history.length;
@@ -350,14 +352,12 @@ test("norm-ledger canary answers every door, refuses bad credentials, and adds o
 
   assert.deepEqual(second, first, "a re-run was not an exact retry");
   assert.equal(double.history.length, grown, "a re-run added history");
-  // Provisioned genesis, the canary's act, and the retained observation.
-  assert.equal(first.history, 3);
-  assert.equal(first.effect, normWorkspace.effect);
-  assert.equal(first.promoted, normWorkspace.promotion.stream);
+  // Provisioned genesis and the canary's act.
+  assert.equal(first.history, 2);
 
-  // Every call is a POST to one of the six doors of the dedicated placement.
-  // No restore, discard, erase, or any other route: norm history is append-only
-  // and this suite's cleanup is that every request is an exact retry.
+  // Every call is a POST to one of the ledger doors of the dedicated
+  // placement. No restore, discard, erase, or any other route: norm history is
+  // append-only and this suite's cleanup is that every request is an exact retry.
   const routes = new Set();
   for (const call of double.calls) {
     assert.equal(call.method, "POST");
@@ -394,6 +394,38 @@ test("norm-ledger canary answers every door, refuses bad credentials, and adds o
   const provisions = double.calls.filter((call) =>
     call.path.endsWith("/provision") && call.headers.get("authorization") === "Bearer control-token");
   assert.deepEqual(provisions.map((call) => Object.keys(call.body)), [[], ["checkpoint"], [], ["checkpoint"]]);
+});
+
+test("norm-ledger canary needs no evidence identities", async () => {
+  const { GW_SYNTHETIC_NORM_WORKSPACE: _unused, ...ledgerOnly } = normEnvironment;
+  const result = await runNormLedger(ledgerOnly, normLedgerDouble().fetchImpl);
+  assert.equal(result.history, 2);
+});
+
+test("norm-evidence journey answers the evidence doors as exact retries", async () => {
+  const double = normLedgerDouble();
+  const first = await runNormEvidence(normEnvironment, double.fetchImpl);
+  const grown = double.history.length;
+  const second = await runNormEvidence(normEnvironment, double.fetchImpl);
+  assert.deepEqual(second, first, "a re-run was not an exact retry");
+  assert.equal(double.history.length, grown, "a re-run added history");
+  assert.equal(first.effect, normWorkspace.effect);
+  assert.equal(first.promoted, normWorkspace.promotion.stream);
+  const routes = new Set(double.calls.map((call) => call.path.slice(normRoot.length)));
+  assert.deepEqual([...routes].sort(), ["commands", ...NORM_EVIDENCE_ROUTES].sort());
+  for (const route of NORM_EVIDENCE_ROUTES) {
+    const denials = double.calls.filter((call) =>
+      call.path.endsWith(`/${route}`) && call.headers.get("authorization") !== "Bearer control-token");
+    assert.deepEqual(
+      denials.map((call) => call.headers.get("authorization")).slice(0, 2),
+      [null, "Bearer control-token.invalid"],
+      `${route} denials`,
+    );
+  }
+  // Commands are only ever read here; the evidence journey appends no act.
+  assert(double.calls
+    .filter((call) => call.path.endsWith("/commands"))
+    .every((call) => call.body.command.kind === "export"));
   const promotions = double.calls.filter((call) => call.body?.command?.promotion);
   assert(promotions.every((call) => call.body.command.promotion === NORM_LEDGER_PROMOTION));
 });
@@ -412,10 +444,10 @@ test("norm-ledger canary fails when a retry mints a new event", async () => {
   );
 });
 
-test("norm-ledger canary will not publish an observation it would have to sign", async () => {
+test("norm-evidence journey will not publish an observation it would have to sign", async () => {
   const double = normLedgerDouble({ unpublished: true });
   await assert.rejects(
-    runNormLedger(normEnvironment, double.fetchImpl),
+    runNormEvidence(normEnvironment, double.fetchImpl),
     /never been published/,
   );
   assert(!double.calls.some((call) => call.body?.command?.kind === "publish"));
@@ -433,15 +465,21 @@ test("norm-ledger canary fails when history is unbounded or loses an event", asy
   );
 });
 
-test("norm-ledger canary refuses malformed synthetic identities before calling anything", async () => {
+test("norm canary journeys refuse malformed synthetic identities before calling anything", async () => {
   const double = normLedgerDouble();
-  for (const [name, value, pattern] of [
-    ["GW_SYNTHETIC_NORM_SIGNED_ACT", "{}", /no norm statement/],
-    ["GW_SYNTHETIC_NORM_WORKSPACE", JSON.stringify({ ...normWorkspace, vocabulary: "unversioned" }), /name@version/],
-    ["GW_SYNTHETIC_NORM_WORKSPACE", JSON.stringify({ ...normWorkspace, effect: "has space" }), /effect is invalid/],
-    ["GW_SYNTHETIC_NORM_WORKSPACE", undefined, /GW_SYNTHETIC_NORM_WORKSPACE is required/],
+  await assert.rejects(
+    runNormLedger({ ...normEnvironment, GW_SYNTHETIC_NORM_SIGNED_ACT: "{}" }, double.fetchImpl),
+    /no norm statement/,
+  );
+  for (const [value, pattern] of [
+    [JSON.stringify({ ...normWorkspace, vocabulary: "unversioned" }), /name@version/],
+    [JSON.stringify({ ...normWorkspace, effect: "has space" }), /effect is invalid/],
+    [undefined, /GW_SYNTHETIC_NORM_WORKSPACE is required/],
   ]) {
-    await assert.rejects(runNormLedger({ ...normEnvironment, [name]: value }, double.fetchImpl), pattern);
+    await assert.rejects(
+      runNormEvidence({ ...normEnvironment, GW_SYNTHETIC_NORM_WORKSPACE: value }, double.fetchImpl),
+      pattern,
+    );
   }
   assert.equal(double.calls.length, 0);
 });
