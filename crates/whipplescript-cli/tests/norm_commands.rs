@@ -2114,5 +2114,7 @@ mod hosted_protected;
 mod admission;
 #[path = "norm_commands/authorization_demo.rs"]
 mod authorization_demo;
+#[path = "norm_commands/evidence_rows.rs"]
+mod evidence_rows;
 #[path = "norm_commands/impact.rs"]
 mod impact;
