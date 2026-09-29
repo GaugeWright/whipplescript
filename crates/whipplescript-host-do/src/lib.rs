@@ -222,6 +222,37 @@ workflow Method {
             verified.envelope,
         )
         .expect("host");
+        let local_import = AuthoredAgentPackage::from_documents(
+            json!({
+                "schema": AGENT_PACKAGE_SCHEMA,
+                "source": "method.whip",
+                "workflow": "Method",
+                "agent": "assistant",
+                "system_prompt": "persona.md",
+                "capabilities": [],
+                "agent_abilities": [],
+                "max_steps": 4,
+            })
+            .to_string(),
+            format!("use local.dep\n{}", package().source_document()),
+            "Be helpful.",
+        )
+        .expect("local-import package documents");
+        let refused_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-do-local-import".to_owned(),
+            package_version_ref: local_import.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        assert!(host
+            .open_instance(&refused_open, &local_import)
+            .unwrap_err()
+            .to_string()
+            .contains("local import `local.dep` has no pinned package lock"));
+        assert!(sql
+            .query("SELECT version_id FROM program_versions", &[])
+            .expect("program versions after refusal")
+            .is_empty());
         let package = package();
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),

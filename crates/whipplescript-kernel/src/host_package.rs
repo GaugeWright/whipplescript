@@ -553,6 +553,19 @@ impl ResolvedPackage {
                 .collect::<Vec<_>>()
                 .join("; ")
         })?;
+        // Authored host packages have no package-lock input. A local import
+        // cannot be resolved and witnessed at this accepting boundary, so it
+        // must not reach create_program_version as an unwitnessed program.
+        if let Some(import) = program
+            .uses
+            .iter()
+            .find(|import| import.name != "std" && !import.name.starts_with("std."))
+        {
+            return Err(format!(
+                "agent package local import `{}` has no pinned package lock",
+                import.name
+            ));
+        }
         let agent = agent.into();
         let system_prompt = system_prompt.into();
         // A declared result contract is part of the package's tool surface, so
@@ -818,6 +831,31 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_host_package_refuses_a_local_import_without_a_lock() {
+        let source = "use local.dep\nworkflow Method { agent assistant { provider owned profile \"repo-reader\" capacity 1 capabilities [] } }";
+        let package = AuthoredAgentPackage::from_documents(
+            json!({
+                "schema": AGENT_PACKAGE_SCHEMA,
+                "source": "method.whip",
+                "workflow": "Method",
+                "agent": "assistant",
+                "system_prompt": "persona.md",
+                "capabilities": [],
+                "agent_abilities": [],
+                "max_steps": 4,
+            })
+            .to_string(),
+            source,
+            "Instructions.",
+        )
+        .expect("package documents");
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap_err()
+            .contains("local import `local.dep` has no pinned package lock"));
+    }
 
     #[test]
     fn v1_agent_context_is_distinct_and_pinned() {
