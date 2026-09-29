@@ -4,6 +4,7 @@
 //! helpers it already resolved against in scope.
 
 use super::*;
+pub(crate) mod declaration_inventory;
 pub(crate) mod declarations;
 pub(crate) mod tables;
 pub(crate) fn lower_program(
@@ -220,7 +221,11 @@ pub(crate) fn lower_program(
         harness_kinds: &harness_kinds,
         semantic: &semantic,
     };
-    for item in program.items {
+    for (occurrence, item) in program.items.into_iter().enumerate() {
+        let registered = declaration_inventory::from_effective_item(&item, occurrence);
+        let before = registered
+            .as_ref()
+            .map(|declaration| declaration_inventory::lowered_count(declaration, &ir));
         match declarations::lower_item(
             item,
             &declarations,
@@ -256,6 +261,9 @@ pub(crate) fn lower_program(
                 },
             ),
             Some(declarations::PendingBody::Action(_)) | None => {}
+        }
+        if let (Some(declaration), Some(before)) = (registered, before) {
+            declaration_inventory::retain_or_refuse(declaration, before, &mut ir, &mut diagnostics);
         }
     }
 

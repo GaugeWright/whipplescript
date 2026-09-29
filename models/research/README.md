@@ -515,21 +515,23 @@ completeness of other construct forms.
 python3 models/research/declaration_construct_inventory.py
 ```
 
-The current IR accessor walks rule-effect metadata. Seven registered std
+The rule-effect IR accessor does not walk declarations. Seven registered std
 declaration rows (`lease`, `ledger`, `counter`, `file store`, `signal`, `source`,
-`tracker`) lower into separate IR lists without a construct-use tag. An IR-only
-capture can therefore report examined-empty even when source declarations
-were lost during lowering. The probe compares compiler-owned occurrence
+`tracker`) lower into separate IR lists. A capture reconstructed only from
+those lists can report examined-empty even when source declarations were lost
+during lowering. The probe compares compiler-owned occurrence
 handles from the selected, pattern-expanded AST with tagged lowered
 declarations before resolving each against one imported registration.
-Omission, duplicate output, extra output,
-changed lowering shape and ambiguous registration refuse. Forging the same
+Omission, duplicate output, extra output, changed lowering shape and ambiguous
+registration refuse. Forging the same
 subset on both sides still passes, exposing the need for compiler provenance.
-Two applications of one pattern need distinct occurrence handles. This is a
-design candidate: production still needs a trustworthy effective-AST
-inventory bound to exact source bytes, root and expansion, tags for the
-declaration forms, and an explicit mapping for source variants. The probe does
-not make the current rule-effect witness complete for declarations.
+Two applications of one pattern need distinct occurrence handles. The compiler
+now emits a scoped declaration-construct inventory from its selected,
+pattern-expanded AST and checks each named lowering step against its IR
+payload. Older IR lacks that inventory and remains unknown. Production still
+needs registration resolution against the exact package snapshot, explicit
+authorization of source variants, a construct admission witness and a closed
+Home operation roster. The current rule-effect witness remains separate.
 
 `home_operation_roster.py` probes how one Home could close that operation
 population when its runtime evidence lives in multiple SQLite stores:

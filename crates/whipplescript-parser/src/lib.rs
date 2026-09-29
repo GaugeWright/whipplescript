@@ -1566,6 +1566,14 @@ pub struct IrProgram {
     pub pattern_applications: Vec<IrPatternApplication>,
     pub workflow_contracts: Vec<IrWorkflowContract>,
     pub uses: Vec<IrUse>,
+    /// Effective-AST occurrences of declaration construct syntax. The
+    /// compiler checks each against the IR payload emitted by that item's
+    /// lowering step before returning a checked program. `None` on older or
+    /// synthetic IR is unknown; `Some(empty)` proves this class was examined
+    /// and had no members. Neither resolves registrations nor covers rule
+    /// effects or platform-core syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_constructs: Option<Vec<IrDeclarationConstruct>>,
     pub harnesses: Vec<IrHarness>,
     pub trackers: Vec<IrTracker>,
     pub streams: Vec<IrStream>,
@@ -1782,6 +1790,20 @@ pub struct IrExpression {
 pub struct IrUse {
     pub kind: IrUseKind,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IrDeclarationConstruct {
+    /// Index in the selected, pattern-expanded item sequence. This separates
+    /// two applications of one source pattern even when they share a span.
+    pub occurrence: usize,
+    pub keyword: String,
+    pub name: String,
+    pub scope: String,
+    pub family: String,
+    pub lowering: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

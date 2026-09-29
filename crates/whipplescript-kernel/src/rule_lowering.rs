@@ -740,6 +740,7 @@ pub fn empty_ir_program() -> IrProgram {
         pattern_applications: Vec::new(),
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
+        declaration_constructs: None,
         harnesses: Vec::new(),
         trackers: Vec::new(),
         streams: Vec::new(),

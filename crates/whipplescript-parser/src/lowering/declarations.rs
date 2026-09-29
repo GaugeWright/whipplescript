@@ -40,6 +40,7 @@ pub(super) fn new_program(
         pattern_applications,
         workflow_contracts: Vec::new(),
         uses: Vec::new(),
+        declaration_constructs: Some(Vec::new()),
         harnesses: Vec::new(),
         trackers: Vec::new(),
         streams: Vec::new(),
