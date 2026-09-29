@@ -765,18 +765,42 @@ fn skill_catalogue_model_provenance(
     else {
         return ModelContentProvenance::default();
     };
-    ModelContentProvenance {
-        source_handles: skills
-            .iter()
-            .map(|skill| {
-                format!(
-                    "workspace-file:{chat_id}:{}:{}",
-                    skill.body_digest, skill.entry.location
-                )
-            })
-            .collect(),
-        complete: true,
-    }
+    let handles = skills
+        .iter()
+        .map(|skill| {
+            let path = skill.entry.location.as_str();
+            if let Some(name) = path
+                .strip_prefix(".gaugedesk-runtime/agent/skills/")
+                .and_then(|rest| rest.strip_suffix("/SKILL.md"))
+            {
+                // The product reader checks this against the frozen discipline
+                // asset and the current method grant. Treating this protected
+                // mount as an ordinary workspace file would bypass that basis.
+                if name != skill.entry.name
+                    || name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return None;
+                }
+                return Some(format!(
+                    "discipline-skill:{chat_id}:{}:{name}",
+                    skill.body_digest
+                ));
+            }
+            Some(format!(
+                "workspace-file:{chat_id}:{}:{path}",
+                skill.body_digest
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    handles.map_or_else(ModelContentProvenance::default, |source_handles| {
+        ModelContentProvenance {
+            source_handles,
+            complete: true,
+        }
+    })
 }
 
 fn discover_workspace_skills<Sql: DoSql>(
@@ -2989,6 +3013,33 @@ mod tests {
                 complete: true,
             }
         );
+        let protected = [DiscoveredSkill {
+            entry: SkillCatalogueEntry {
+                name: "theo".to_owned(),
+                description: "Explain Theory A.".to_owned(),
+                location: ".gaugedesk-runtime/agent/skills/theo/SKILL.md".to_owned(),
+            },
+            body_digest: whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
+        }];
+        assert_eq!(
+            skill_catalogue_model_provenance(&protected, Some(&workspace)),
+            ModelContentProvenance {
+                source_handles: vec![format!(
+                    "discipline-skill:chat-one:{}:theo",
+                    whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
+                )],
+                complete: true,
+            }
+        );
+        let mismatched = [DiscoveredSkill {
+            entry: SkillCatalogueEntry {
+                name: "other".to_owned(),
+                description: protected[0].entry.description.clone(),
+                location: protected[0].entry.location.clone(),
+            },
+            body_digest: protected[0].body_digest.clone(),
+        }];
+        assert!(!skill_catalogue_model_provenance(&mismatched, Some(&workspace)).complete);
         assert!(!skill_catalogue_model_provenance(&skills, None).complete);
         assert!(
             !skill_catalogue_model_provenance(
@@ -7408,7 +7459,7 @@ complete result { count count } }
                 "INSERT INTO files (key, content) VALUES (?1, ?2)",
                 &[
                     crate::do_store::SqlValue::Text(format!(
-                        "{instance_id}/.agents/skills/theo/SKILL.md"
+                        "{instance_id}/.gaugedesk-runtime/agent/skills/theo/SKILL.md"
                     )),
                     crate::do_store::SqlValue::Text(skill_body.to_owned()),
                 ],
@@ -7453,11 +7504,11 @@ complete result { count count } }
             calls[0].messages[0],
             ModelContentProvenance {
                 source_handles: vec![
-                    "package:one".to_owned(),
                     format!(
-                        "workspace-file:chat-one:{}:.agents/skills/theo/SKILL.md",
+                        "discipline-skill:chat-one:{}:theo",
                         whipplescript_store::stable_hash_bytes_hex(skill_body.as_bytes()),
                     ),
+                    "package:one".to_owned(),
                 ],
                 complete: true,
             }
