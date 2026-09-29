@@ -21,6 +21,11 @@ pub struct ProgramImportEdge {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramImportWitness {
     pub program_source_digest: String,
+    /// Present when a version's source id hashes a larger checked identity
+    /// that contains the exact program source (for example an authored host
+    /// package). Older and direct-source witnesses use program_source_digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_source_digest: Option<String>,
     pub lock_digest: String,
     pub compiler_artifact_digest: String,
     pub examined: Vec<String>,
@@ -136,18 +141,22 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Native program source ids are the first 128 bits of SHA-256 over the same
-/// bytes; hosted versions already retain all 256 bits. The witness keeps the
-/// full digest, so either stored form binds to those exact source bytes.
+/// Native direct-source ids may be the first 128 bits of SHA-256; hosted ones
+/// retain all 256 bits. A host package may instead hash a checked composite
+/// identity containing those source bytes. The witness retains both digests.
 pub fn matches_source_id(witness: &ProgramImportWitness, source_id: &str) -> bool {
+    let version_source = witness
+        .version_source_digest
+        .as_deref()
+        .unwrap_or(&witness.program_source_digest);
     matches!(source_id.len(), 32 | 64)
         && source_id
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         && if source_id.len() == 32 {
-            witness.program_source_digest.starts_with(source_id)
+            version_source.starts_with(source_id)
         } else {
-            witness.program_source_digest == source_id
+            version_source == source_id
         }
 }
 
@@ -169,6 +178,15 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
                 "import witness {label} lacks an exact lowercase SHA-256 digest"
             )));
         }
+    }
+    if witness
+        .version_source_digest
+        .as_deref()
+        .is_some_and(|digest| !is_digest(digest))
+    {
+        return Err(StoreError::Conflict(
+            "import witness version source lacks an exact lowercase SHA-256 digest".into(),
+        ));
     }
     if witness.examined.iter().any(|name| name.is_empty())
         || witness.examined.windows(2).any(|pair| pair[0] >= pair[1])
@@ -280,6 +298,7 @@ mod tests {
         }];
         ProgramImportWitness {
             program_source_digest: SOURCE.into(),
+            version_source_digest: None,
             lock_digest: lock.into(),
             compiler_artifact_digest: COMPILER.into(),
             examined: vec!["local.paint".into()],
@@ -304,6 +323,18 @@ mod tests {
             &witness,
             &witness.program_source_digest[..63]
         ));
+    }
+
+    #[test]
+    fn composite_version_source_retains_the_exact_program_source() {
+        let mut checked = witness(LOCK);
+        checked.version_source_digest = Some(NEXT_LOCK.into());
+        assert!(matches_source_id(&checked, NEXT_LOCK));
+        assert!(!matches_source_id(&checked, SOURCE));
+        assert_eq!(checked.program_source_digest, SOURCE);
+        assert!(encode(&checked).is_ok());
+        checked.version_source_digest = Some("not-a-digest".into());
+        assert!(encode(&checked).is_err());
     }
 
     #[test]

@@ -527,8 +527,10 @@ pub fn host_open_instance(
     package_source: &str,
     system_prompt: &str,
     project_context: Option<String>,
+    compiler_artifact_digest: &str,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?
+        .with_compiler_artifact_digest(compiler_artifact_digest);
     let command: OpenInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(
@@ -995,8 +997,10 @@ pub fn host_import_fork(
     package_source: &str,
     system_prompt: &str,
     project_context: Option<String>,
+    compiler_artifact_digest: &str,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?
+        .with_compiler_artifact_digest(compiler_artifact_digest);
     let package = authored_package(
         package_manifest,
         package_source,

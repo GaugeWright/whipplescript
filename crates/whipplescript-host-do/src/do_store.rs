@@ -14762,6 +14762,7 @@ pub(crate) mod tests {
             }];
             ProgramImportWitness {
                 program_source_digest: SOURCE.into(),
+                version_source_digest: None,
                 lock_digest: lock.into(),
                 compiler_artifact_digest: COMPILER.into(),
                 examined: vec!["local.paint".into()],

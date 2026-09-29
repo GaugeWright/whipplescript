@@ -1233,6 +1233,37 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })
     }
 
+    /// Preserve the plain host version's recorded metadata while atomically
+    /// retaining import evidence. The IR is examined for imports, but this
+    /// path does not change the executable profile/capability projection that
+    /// existing native host versions use.
+    pub fn create_program_version_with_imports(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let witness =
+            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        self.store.create_program_version_with_import_witness(
+            NewProgramVersion {
+                program_name: input.program_name,
+                source_hash: input.source_hash,
+                ir_hash: input.ir_hash,
+                ir_snapshot: None,
+                compiler_version: input.compiler_version,
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            },
+            &witness,
+        )
+    }
+
     pub fn create_program_version_for_program(
         &mut self,
         input: ProgramVersionInput<'_>,
@@ -1256,6 +1287,40 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             generated_artifacts_json: "[]",
             artifact_root: None,
         })
+    }
+
+    /// Admit a host program and its import witness under the existing host
+    /// version identity. The source and compiler basis must come from the
+    /// same checked package and running artifact used for this admission.
+    pub fn create_program_version_for_program_with_imports(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let declared_profiles_json = declared_profiles_json(program);
+        let declared_skills_json = declared_skills_json(program);
+        let declared_schemas_json = declared_schemas_json(program);
+        let analysis_summary_json = program_artifact::capture(&self.store, &input, program)?;
+        let witness =
+            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        self.store.create_program_version_with_import_witness(
+            NewProgramVersion {
+                program_name: input.program_name,
+                source_hash: input.source_hash,
+                ir_hash: input.ir_hash,
+                compiler_version: input.compiler_version,
+                ir_snapshot: input.ir_snapshot,
+                declared_capabilities_json: "[]",
+                declared_profiles_json: &declared_profiles_json,
+                declared_skills_json: &declared_skills_json,
+                declared_schemas_json: &declared_schemas_json,
+                analysis_summary_json: &analysis_summary_json,
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            },
+            &witness,
+        )
     }
 
     /// Publish a complete typed-action executable under its composite identity.
@@ -1372,14 +1437,8 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             generated_artifacts_json: "[]",
             artifact_root: None,
         };
-        let witness = import_coverage::capture(
-            program,
-            basis.program_source_digest,
-            basis.lock_digest,
-            basis.compiler_artifact_digest,
-            basis.packages,
-        )
-        .map_err(StoreError::Conflict)?;
+        let witness =
+            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
         self.store
             .create_program_version_with_import_witness(version, &witness)
     }

@@ -124,7 +124,8 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
-    projectContext?: string,
+    projectContext: string | undefined,
+    compilerArtifactDigest: string,
   ) => string;
   host_discard_instance: (
     bridge: unknown,
@@ -216,7 +217,8 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
-    projectContext?: string,
+    projectContext: string | undefined,
+    compilerArtifactDigest: string,
   ) => string;
 };
 
@@ -4553,6 +4555,7 @@ export class WorkflowInstance implements DurableObject {
           packageDocs.source,
           packageDocs.system_prompt,
           packageDocs.project_context,
+          wasmArtifactDigest,
         ),
       ) as { instance_ref?: unknown };
     } catch (error) {
@@ -4768,6 +4771,7 @@ export class WorkflowInstance implements DurableObject {
           request.package.source,
           request.package.system_prompt,
           request.package.project_context,
+          wasmArtifactDigest,
         ),
       );
       await this.ctx.storage.put(
@@ -5155,6 +5159,7 @@ export class WorkflowInstance implements DurableObject {
         request.package.source,
         request.package.system_prompt,
         request.package.project_context,
+        wasmArtifactDigest,
       ));
       await this.ctx.storage.put(
         `host-package:${String(forked.target?.instance_ref ?? "")}`,

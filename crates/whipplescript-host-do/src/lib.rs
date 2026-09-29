@@ -224,12 +224,14 @@ workflow Method {
         ] {
             sql.execute(statement, &[]).expect("seed hosted agent policy");
         }
+        let compiler_digest = "b".repeat(64);
         let mut host = GovernedHostFacade::from_verified_store(
             DoSqliteStore::new(Rc::clone(&sql)),
             7,
             verified.envelope,
         )
-        .expect("host");
+        .expect("host")
+        .with_compiler_artifact_digest("not-a-digest");
         let local_import = AuthoredAgentPackage::from_documents(
             json!({
                 "schema": AGENT_PACKAGE_SCHEMA,
@@ -287,7 +289,58 @@ workflow Method {
             package_version_ref: package.version_ref().to_owned(),
             policy: host.policy_ref().clone(),
         };
+        assert!(host
+            .open_instance(&open, &package)
+            .unwrap_err()
+            .to_string()
+            .contains("compiler artifact must have an exact lowercase SHA-256 digest"));
+        assert!(sql
+            .query("SELECT version_id FROM program_versions", &[])
+            .expect("program versions after missing compiler basis")
+            .is_empty());
+        let mut host = host.with_compiler_artifact_digest(&compiler_digest);
         let opened = host.open_instance(&open, &package).expect("opened");
+        let roster = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("hosted import operations");
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(
+            roster.operations[0].kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = host
+            .kernel()
+            .store()
+            .program_import_witness(
+                &roster.operations[0].version_id,
+                roster.operations[0]
+                    .witness_digest
+                    .as_deref()
+                    .expect("checked witness"),
+            )
+            .expect("witness lookup")
+            .expect("stored witness");
+        assert_eq!(witness.compiler_artifact_digest, compiler_digest);
+        let checked_package = package
+            .resolve(package.version_ref())
+            .expect("checked package");
+        assert_eq!(
+            witness.program_source_digest,
+            checked_package
+                .checked_import_source_digest()
+                .expect("source digest")
+        );
+        assert_eq!(
+            witness.version_source_digest.as_deref(),
+            Some(checked_package.source_hash.as_str())
+        );
+        assert_eq!(
+            witness.lock_digest,
+            whipplescript_kernel::import_coverage::NO_LOCK_DIGEST
+        );
+        assert!(witness.examined.is_empty());
         let turn = StartTurnCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             command_id: "turn-do-1".to_owned(),

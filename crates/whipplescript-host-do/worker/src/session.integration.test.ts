@@ -1960,6 +1960,35 @@ describe("real WorkflowInstance hibernation", () => {
     });
   });
 
+  it("binds public host package admission to checked source and the built wasm artifact", async () => {
+    const sessionId = "hosted-package-import-witness";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    const packageDocs = await packageDocuments();
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql.exec(
+        "SELECT admissions.witness_json, versions.source_hash, operations.kind FROM program_import_admissions AS admissions JOIN program_versions AS versions USING (version_id) JOIN program_import_operations AS operations ON operations.version_id = versions.version_id",
+      ).toArray();
+      expect(rows).toHaveLength(1);
+      const witness = JSON.parse(String(rows[0].witness_json)) as {
+        program_source_digest: string;
+        version_source_digest: string;
+        compiler_artifact_digest: string;
+        lock_digest: string;
+        examined: string[];
+      };
+      expect(rows[0].kind).toBe("checked");
+      expect(witness.program_source_digest).toBe(
+        await sha256Hex(new TextEncoder().encode(packageDocs.source)),
+      );
+      expect(witness.version_source_digest).toBe(rows[0].source_hash);
+      expect(witness.compiler_artifact_digest).toBe(wasmArtifactDigest);
+      expect(witness.lock_digest).toBe("0".repeat(64));
+      expect(witness.examined).toEqual([]);
+    });
+  });
+
   it("upgrades legacy objects through program-import admission without rewriting history", async () => {
     const sessionId = "session-retained-result-upgrade";
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;

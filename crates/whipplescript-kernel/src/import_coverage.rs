@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use whipplescript_parser::IrProgram;
 pub use whipplescript_store::program_imports::{ProgramImportEdge, ProgramImportWitness};
 
+/// Explicit no-lock basis for hosts that admit only std imports.
+pub const NO_LOCK_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 use crate::exec_http::sha256_hex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +31,9 @@ pub struct ResolvedLocalPackage<'a> {
 /// this type does not claim the rest of the Home used the same boundary.
 pub struct CheckedImportBasis<'a> {
     pub program_source_digest: &'a str,
+    /// Version source id when it covers a checked composite identity that
+    /// contains this exact source, rather than the source bytes alone.
+    pub version_source_digest: Option<&'a str>,
     pub lock_digest: &'a str,
     pub compiler_artifact_digest: &'a str,
     pub packages: &'a [ResolvedLocalPackage<'a>],
@@ -98,12 +104,33 @@ pub fn capture(
     let edge_json = serde_json::to_vec(&edges).map_err(|error| error.to_string())?;
     Ok(ProgramImportWitness {
         program_source_digest: program_source_digest.to_owned(),
+        version_source_digest: None,
         lock_digest: lock_digest.to_owned(),
         compiler_artifact_digest: compiler_artifact_digest.to_owned(),
         examined: examined.into_iter().map(str::to_owned).collect(),
         edges,
         edge_digest: sha256_hex(&edge_json),
     })
+}
+
+pub fn capture_basis(
+    program: &IrProgram,
+    basis: &CheckedImportBasis<'_>,
+) -> Result<ProgramImportWitness, String> {
+    let mut witness = capture(
+        program,
+        basis.program_source_digest,
+        basis.lock_digest,
+        basis.compiler_artifact_digest,
+        basis.packages,
+    )?;
+    if let Some(version_source) = basis.version_source_digest {
+        if !is_digest(version_source) {
+            return Err("version source must have an exact lowercase SHA-256 digest".into());
+        }
+        witness.version_source_digest = Some(version_source.to_owned());
+    }
+    Ok(witness)
 }
 
 /// Re-examine current source bytes, lock, compiler and resolved packages. A
@@ -142,6 +169,21 @@ mod tests {
             .expect("checked program")
     }
 
+    #[test]
+    fn composite_version_basis_requires_an_exact_digest() {
+        let ir = program("workflow Checked\n");
+        let basis = CheckedImportBasis {
+            program_source_digest: A,
+            version_source_digest: Some("not-a-digest"),
+            lock_digest: B,
+            compiler_artifact_digest: C,
+            packages: &[],
+        };
+        assert!(capture_basis(&ir, &basis)
+            .unwrap_err()
+            .contains("version source must have an exact lowercase SHA-256 digest"));
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn checked_compiled_admission_persists_the_extracted_imports_with_the_version() {
@@ -157,6 +199,7 @@ mod tests {
         }];
         let basis = CheckedImportBasis {
             program_source_digest: &program_source_digest,
+            version_source_digest: None,
             lock_digest: A,
             compiler_artifact_digest: B,
             packages: &packages,

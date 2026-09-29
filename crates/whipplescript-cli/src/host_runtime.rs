@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ use whipplescript_kernel::harness_loop::{
     ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
+use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use whipplescript_kernel::sansio::{
     HostDriver, HttpResponse, IoRequest, IoResult, ModelContentProvenance, TransportError,
 };
@@ -1923,24 +1925,40 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
-        package
-            .require_supported_imports()
+        let source_digest = package
+            .checked_import_source_digest()
             .map_err(HostRuntimeError::Resolver)?;
         self.check_package_ifc(&package)?;
         if let Some(opened) = self.replayed_open_instance(command, &package)? {
             return Ok(opened);
         }
 
-        let version = self
+        let compiler_artifact_digest =
+            native_compiler_artifact_digest().map_err(HostRuntimeError::Resolver)?;
+        let admission = self
             .kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: &package.agent,
-                source_hash: &package.source_hash,
-                ir_hash: &package.ir_hash,
-                compiler_version: HOST_PROTOCOL,
-                ir_snapshot: None,
-            })
+            .create_program_version_with_imports(
+                ProgramVersionInput {
+                    program_name: &package.agent,
+                    source_hash: &package.source_hash,
+                    ir_hash: &package.ir_hash,
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                },
+                &package.program,
+                &CheckedImportBasis {
+                    program_source_digest: &source_digest,
+                    version_source_digest: Some(&package.source_hash),
+                    lock_digest: NO_LOCK_DIGEST,
+                    compiler_artifact_digest: &compiler_artifact_digest,
+                    packages: &[],
+                },
+            )
             .map_err(HostRuntimeError::Store)?;
+        let version = whipplescript_store::ProgramVersionRecord {
+            program_id: admission.program_id,
+            version_id: admission.version_id,
+        };
         let metadata = InstanceMetadata {
             protocol: HOST_PROTOCOL.to_owned(),
             package_version_ref: command.package_version_ref.clone(),
@@ -3929,6 +3947,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Hash the executable that contains the native compiler used by this host.
+/// Linux keeps the running inode reachable through /proc/self/exe even if its
+/// pathname is replaced while an admission is in progress.
+pub fn native_compiler_artifact_digest() -> Result<String, String> {
+    static DIGEST: OnceLock<Result<String, String>> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            let path = PathBuf::from("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let path = std::env::current_exe()
+                .map_err(|error| format!("locate native compiler artifact: {error}"))?;
+            let bytes = fs::read(&path).map_err(|error| {
+                format!(
+                    "read native compiler artifact `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            Ok(sha256_hex(&bytes))
+        })
+        .clone()
+}
+
 fn positive_sequence(sequence: i64) -> Result<u64, HostRuntimeError> {
     u64::try_from(sequence)
         .ok()
@@ -4258,6 +4299,59 @@ workflow HostChat {
             .expect("admission operations")
             .operations
             .is_empty());
+    }
+
+    #[test]
+    fn native_host_admits_std_only_package_with_exact_import_witness() {
+        let path = temp_store();
+        let policy = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy).expect("runtime");
+        let package = Packages.resolve_package("package:v1").expect("package");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-checked-imports".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        runtime.open_instance(&open, &Packages).expect("opened");
+        let roster = runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .expect("admission operations");
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(
+            roster.operations[0].kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = runtime
+            .kernel
+            .store()
+            .program_import_witness(
+                &roster.operations[0].version_id,
+                roster.operations[0]
+                    .witness_digest
+                    .as_deref()
+                    .expect("checked witness"),
+            )
+            .expect("witness lookup")
+            .expect("stored witness");
+        assert_eq!(
+            witness.program_source_digest,
+            package
+                .checked_import_source_digest()
+                .expect("source digest")
+        );
+        assert_eq!(
+            witness.version_source_digest.as_deref(),
+            Some(package.source_hash.as_str())
+        );
+        assert_eq!(
+            witness.compiler_artifact_digest,
+            native_compiler_artifact_digest().expect("compiler digest")
+        );
+        assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
+        assert!(witness.examined.is_empty());
     }
 
     struct UnsafePackages;

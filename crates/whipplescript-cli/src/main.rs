@@ -5,7 +5,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -17711,23 +17710,7 @@ fn checked_local_packages(
 /// The CLI executable contains the native compiler used for this admission.
 /// On Linux, /proc/self/exe retains the running inode across a path replace.
 fn native_compiler_artifact_digest() -> Result<String, String> {
-    static DIGEST: OnceLock<Result<String, String>> = OnceLock::new();
-    DIGEST
-        .get_or_init(|| {
-            #[cfg(target_os = "linux")]
-            let path = PathBuf::from("/proc/self/exe");
-            #[cfg(not(target_os = "linux"))]
-            let path = env::current_exe()
-                .map_err(|error| format!("locate native compiler artifact: {error}"))?;
-            let bytes = fs::read(&path).map_err(|error| {
-                format!(
-                    "read native compiler artifact `{}`: {error}",
-                    path.display()
-                )
-            })?;
-            Ok(sha256_hex(&bytes))
-        })
-        .clone()
+    whipplescript::host_runtime::native_compiler_artifact_digest()
 }
 
 /// Native start and revision use the same checked basis and atomic accepting
@@ -17763,6 +17746,7 @@ fn create_checked_native_program_version(
         typed_actions,
         &CheckedImportBasis {
             program_source_digest: &source_digest,
+            version_source_digest: None,
             lock_digest: &lock_digest,
             compiler_artifact_digest,
             packages: &resolved_packages,

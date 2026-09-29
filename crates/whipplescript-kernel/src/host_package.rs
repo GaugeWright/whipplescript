@@ -445,9 +445,30 @@ pub struct ResolvedPackage {
     /// assertion rather than on the model falling silent. `None` when the agent
     /// declares no result contract.
     pub result_tool: Option<String>,
+    // These bytes and identities are set only by the compiler. A resolver may
+    // change the public projection, so admission checks it against this exact
+    // compiled source before using it as an import witness basis.
+    checked_source: String,
+    checked_program: IrProgram,
+    checked_source_hash: String,
+    checked_ir_hash: String,
 }
 
 impl ResolvedPackage {
+    /// The exact source that produced this checked IR. Public fields can be
+    /// changed by a custom resolver, so they must still match the compiler's
+    /// private snapshot before an accepting operation can claim a witness.
+    pub fn checked_import_source_digest(&self) -> Result<String, String> {
+        self.require_supported_imports()?;
+        if self.program != self.checked_program
+            || self.source_hash != self.checked_source_hash
+            || self.ir_hash != self.checked_ir_hash
+        {
+            return Err("resolved agent package differs from its checked source".to_owned());
+        }
+        Ok(sha256_hex(self.checked_source.as_bytes()))
+    }
+
     /// Host-package admission has no local package-lock basis. Check this
     /// again at the accepting door because PackageResolver is extensible and
     /// callers can construct a ResolvedPackage without using this compiler.
@@ -600,10 +621,11 @@ impl ResolvedPackage {
         let ir_hash = sha256_hex(
             format!("{}:{}:{}", source_hash, program.workflow, HOST_PROTOCOL).as_bytes(),
         );
+        let checked_program = program.clone();
         Ok(Self {
             version_ref: version_ref.into(),
-            source_hash,
-            ir_hash,
+            source_hash: source_hash.clone(),
+            ir_hash: ir_hash.clone(),
             agent,
             system_prompt,
             project_context: None,
@@ -612,6 +634,10 @@ impl ResolvedPackage {
             max_steps,
             program,
             result_tool,
+            checked_source: source.to_owned(),
+            checked_program,
+            checked_source_hash: source_hash,
+            checked_ir_hash: ir_hash,
         })
     }
 }
@@ -842,6 +868,35 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_modified_program_cannot_claim_checked_source() {
+        let source = "workflow Method { agent assistant { provider owned profile \"repo-reader\" capacity 1 capabilities [] } }";
+        let mut resolved = ResolvedPackage::compile(
+            "package:v1",
+            source,
+            Some("Method"),
+            "assistant",
+            "Instructions.",
+            Vec::new(),
+            4,
+        )
+        .expect("checked package");
+        assert_eq!(
+            resolved
+                .checked_import_source_digest()
+                .expect("source basis"),
+            sha256_hex(source.as_bytes())
+        );
+        resolved.program.uses.push(whipplescript_parser::IrUse {
+            kind: whipplescript_parser::IrUseKind::Package,
+            name: "std.clock".to_owned(),
+        });
+        assert!(resolved
+            .checked_import_source_digest()
+            .unwrap_err()
+            .contains("differs from its checked source"));
+    }
 
     #[test]
     fn authored_host_package_refuses_a_local_import_without_a_lock() {

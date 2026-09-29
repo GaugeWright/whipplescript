@@ -19,7 +19,7 @@
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::host_protocol::ResourceRef;
-use whipplescript_kernel::import_coverage::CheckedImportBasis;
+use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::{idempotency_key, CompiledProgramVersionInput, RuntimeKernel};
@@ -331,7 +331,6 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // Hosted workflow creation has no local package lock yet. The
         // explicit no-lock basis accepts std-only imports and refuses
         // unresolved local imports instead of inventing empty edges.
-        let no_lock_digest = "0".repeat(64);
         let admission = kernel
             .create_program_version_for_compiled_program_with_imports(
                 version_input,
@@ -339,7 +338,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 compiled.typed_actions.as_ref(),
                 &CheckedImportBasis {
                     program_source_digest: &source_hash,
-                    lock_digest: &no_lock_digest,
+                    version_source_digest: None,
+                    lock_digest: NO_LOCK_DIGEST,
                     compiler_artifact_digest,
                     packages: &[],
                 },

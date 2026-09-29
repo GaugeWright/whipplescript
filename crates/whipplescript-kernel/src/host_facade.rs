@@ -19,6 +19,7 @@ use crate::host_protocol::{
     StartTurnCommand, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
+use crate::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
 mod resolution_recording;
@@ -90,6 +91,7 @@ pub struct GovernedHostFacade<S: RuntimeStore> {
     kernel: RuntimeKernel<S>,
     policy: PolicyEpochRef,
     envelope: VerifiedEnvelope,
+    compiler_artifact_digest: Option<String>,
 }
 
 impl<S: RuntimeStore> GovernedHostFacade<S> {
@@ -103,7 +105,15 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             kernel: RuntimeKernel::new(store),
             policy,
             envelope,
+            compiler_artifact_digest: None,
         })
+    }
+
+    /// The host supplies the identity of the running compiler artifact once
+    /// for this facade. Version admission refuses when it was not supplied.
+    pub fn with_compiler_artifact_digest(mut self, digest: impl Into<String>) -> Self {
+        self.compiler_artifact_digest = Some(digest.into());
+        self
     }
 
     pub fn from_signed_store_with_verifier<V: GovernanceAttestationVerifier + ?Sized>(
@@ -393,17 +403,24 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .resolve_package(&command.package_version_ref)
             .map_err(HostFacadeError::Resolver)?;
         self.validate_package(&package, &command.package_version_ref)?;
-        package
-            .require_supported_imports()
+        let source_digest = package
+            .checked_import_source_digest()
             .map_err(HostFacadeError::Resolver)?;
         self.check_package_ifc(&package)?;
         if let Some(opened) = self.replayed_open_instance(command, &package)? {
             return Ok(opened);
         }
+        let compiler_artifact_digest =
+            self.compiler_artifact_digest.as_deref().ok_or_else(|| {
+                HostFacadeError::Resolver(
+                    "hosted program admission requires the exact compiler artifact digest"
+                        .to_owned(),
+                )
+            })?;
 
-        let version = self
+        let admission = self
             .kernel
-            .create_program_version_for_program(
+            .create_program_version_for_program_with_imports(
                 ProgramVersionInput {
                     program_name: &package.agent,
                     source_hash: &package.source_hash,
@@ -412,8 +429,19 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     ir_snapshot: None,
                 },
                 &package.program,
+                &CheckedImportBasis {
+                    program_source_digest: &source_digest,
+                    version_source_digest: Some(&package.source_hash),
+                    lock_digest: NO_LOCK_DIGEST,
+                    compiler_artifact_digest,
+                    packages: &[],
+                },
             )
             .map_err(HostFacadeError::Store)?;
+        let version = whipplescript_store::ProgramVersionRecord {
+            program_id: admission.program_id,
+            version_id: admission.version_id,
+        };
         let metadata = InstanceMetadata {
             protocol: HOST_PROTOCOL.to_owned(),
             package_version_ref: command.package_version_ref.clone(),
@@ -945,11 +973,42 @@ workflow Method {
             package_version_ref: package.version_ref().to_owned(),
             policy: host.policy_ref().clone(),
         };
+        assert!(host
+            .open_instance(&open, &package)
+            .unwrap_err()
+            .to_string()
+            .contains("hosted program admission requires the exact compiler artifact digest"));
+        let compiler_digest = "a".repeat(64);
+        let mut host = host.with_compiler_artifact_digest(&compiler_digest);
         let opened = host.open_instance(&open, &package).expect("opened");
         assert_eq!(
             host.open_instance(&open, &package).expect("replayed"),
             opened
         );
+        let roster = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("import operations");
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(
+            roster.operations[0].kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = host
+            .kernel()
+            .store()
+            .program_import_witness(
+                &roster.operations[0].version_id,
+                roster.operations[0]
+                    .witness_digest
+                    .as_deref()
+                    .expect("checked witness"),
+            )
+            .expect("witness lookup")
+            .expect("stored witness");
+        assert_eq!(witness.compiler_artifact_digest, compiler_digest);
+        assert!(witness.examined.is_empty());
 
         let turn = StartTurnCommand {
             protocol: HOST_PROTOCOL.to_owned(),
