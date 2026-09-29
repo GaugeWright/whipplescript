@@ -146,6 +146,8 @@ function evidenceFor(id) {
   const normLedgerRoute = id === "runtime.host.norm.commands" || id === "runtime.host.norm.provision";
   const normLedgerDeployed =
     "contracts/deployed-evidence.json#norm-ledger-2026-09-28T19:14:10Z";
+  const liveModelContextDeployed =
+    "contracts/deployed-evidence.json#live-model-context-2026-09-29T19:54:51Z";
   return {
     contract: publicSession
       ? ["src/session.integration.test.ts#workerd-production-object"]
@@ -178,6 +180,8 @@ function evidenceFor(id) {
       ? [privateHomeDeployed]
       : normLedgerRoute
         ? [normLedgerDeployed]
+        : id === "runtime.host.live-model-context"
+          ? [liveModelContextDeployed]
         : [],
     property: publicSession || declaredInnerRoute
       ? ["src/authenticated-host.integration.test.ts#declared-route-surface"]

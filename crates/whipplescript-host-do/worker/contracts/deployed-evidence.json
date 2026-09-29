@@ -43,6 +43,27 @@
         "an exact retry of the stable signed act returns its first receipt and adds nothing",
         "an unverifiable signature and request-supplied norm trust refused"
       ]
+    },
+    {
+      "id": "live-model-context-2026-09-29T19:54:51Z",
+      "sourceCommit": "c41999c39aab39f54d8d00ee8e1e013250fee52b",
+      "workerSourceCommit": "742e624c3a4e3df157d6cf227c50e97e961a3d36",
+      "worker": "whipplescript-runtime",
+      "workerVersion": "3e9c2fc8-f3cc-428b-828e-3eb234af02b6",
+      "origin": "https://whipplescript-runtime.jack-168.workers.dev",
+      "runner": "scripts/production-wiring-canary.mjs#live-model-context",
+      "executedAt": "2026-09-29T19:54:51Z",
+      "execution": "identified-operator-run",
+      "result": "passed",
+      "contracts": [
+        "runtime.host.live-model-context"
+      ],
+      "authorityChecks": [
+        "control identity read the exact synthetic provider request while the response was held",
+        "missing and public-session identities were denied with 401",
+        "the transient request body was unavailable after cancellation with cache-control no-store",
+        "the synthetic instance restored its baseline and removed synced files"
+      ]
     }
   ]
 }

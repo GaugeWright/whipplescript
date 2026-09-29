@@ -206,9 +206,17 @@ test("Raw context canary reads only the held synthetic request and proves erasur
     throw new Error(`unexpected ${path}`);
   };
   const result = await runLiveModelContext(environment, fetchImpl);
-  assert.deepEqual(result, {
-    instance: "instance:raw", command: "production-wiring-canary-raw-context-turn-v1",
-  });
+  assert.equal(result.instance, "instance:raw");
+  const runId = result.command.match(/^production-wiring-canary-raw-context-turn-([0-9a-f]{32})$/)?.[1];
+  assert(runId, "each Raw context canary needs a fresh durable command identity");
+  assert.equal(
+    calls.find((call) => call.path === "/host/instances/open").body.command.request_id,
+    "production-wiring-canary:raw-context:open:v2",
+  );
+  assert.equal(
+    calls.find((call) => call.path.endsWith("/checkpoint")).body.cut_id,
+    `production-wiring-canary-raw-context-clean-${runId}`,
+  );
   assert(calls.some((call) => call.path.endsWith("/model-context") && call.authorization === null));
   assert(calls.some((call) => call.path.endsWith("/model-context") && call.authorization === "Bearer public-token"));
   assert(calls.some((call) => call.path.endsWith("/cancel")));

@@ -430,6 +430,11 @@ export async function runLiveModelContext(environment = process.env, fetchImpl =
     "Raw context canary policy has a non-synthetic base_url",
   );
   const packageDocs = await packageDocuments();
+  // Reuse one synthetic instance so the scheduled lane does not accumulate
+  // Durable Objects. Each run needs a fresh cut and turn identity, or its
+  // position ledger collides with an earlier run. The v1 instance retained an
+  // unfinished effect from the pre-release canary and cannot be checkpointed.
+  const runId = crypto.randomUUID().replaceAll("-", "");
   const placementRoot = `/v1/tenants/${encodeURIComponent(tenant)}`
     + `/placements/${encodeURIComponent(placement)}`;
   const route = async (path, init = {}, accepted = [200]) => {
@@ -456,7 +461,7 @@ export async function runLiveModelContext(environment = process.env, fetchImpl =
     body: JSON.stringify({
       command: {
         protocol: hostProtocol,
-        request_id: "production-wiring-canary:raw-context:open:v1",
+        request_id: "production-wiring-canary:raw-context:open:v2",
         package_version_ref: packageDocs.version_ref,
         policy: policy.ref,
       },
@@ -465,12 +470,12 @@ export async function runLiveModelContext(environment = process.env, fetchImpl =
   }, [200, 201]), "Raw context instance open");
   assert.equal(typeof opened?.instance_ref, "string");
   const instancePath = `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
-  const baseline = "production-wiring-canary-raw-context-clean-v1";
+  const baseline = `production-wiring-canary-raw-context-clean-${runId}`;
   await responseJson(await route(`${instancePath}/checkpoint`, {
     method: "POST", body: JSON.stringify({ cut_id: baseline }),
   }), "Raw context baseline");
 
-  const commandId = "production-wiring-canary-raw-context-turn-v1";
+  const commandId = `production-wiring-canary-raw-context-turn-${runId}`;
   const contextPath = `${instancePath}/turns/${encodeURIComponent(commandId)}/model-context`;
   let turnPromise;
   let cancelRequested = false;

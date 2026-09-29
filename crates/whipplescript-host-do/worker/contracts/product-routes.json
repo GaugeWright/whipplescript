@@ -1302,7 +1302,9 @@
         "journey": [
           "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
         ],
-        "deployed": [],
+        "deployed": [
+          "contracts/deployed-evidence.json#live-model-context-2026-09-29T19:54:51Z"
+        ],
         "property": [
           "src/authenticated-host.integration.test.ts#declared-route-surface"
         ]
