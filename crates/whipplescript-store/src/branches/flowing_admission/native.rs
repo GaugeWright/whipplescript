@@ -92,6 +92,17 @@ fn ancestor(connection: &Connection, older: &str, newer: &str) -> StoreResult<bo
 }
 
 impl FlowingAdmissions for BranchStore {
+    fn admitted_unit_operation(&self, unit_id: &str) -> StoreResult<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT op_id FROM flowing_admitted_units WHERE unit_id = ?1",
+                [unit_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,

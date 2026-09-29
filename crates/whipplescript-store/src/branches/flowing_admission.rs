@@ -154,6 +154,9 @@ pub enum FlowingCancelOutcome {
 }
 
 pub trait FlowingAdmissions {
+    /// The ref authority's per-unit uniqueness index, read before preparing
+    /// a candidate. Admission rechecks it under the trunk CAS.
+    fn admitted_unit_operation(&self, unit_id: &str) -> crate::StoreResult<Option<String>>;
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,

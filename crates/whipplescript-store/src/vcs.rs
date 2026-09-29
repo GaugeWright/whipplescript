@@ -25,8 +25,9 @@ pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
 pub use flowing_selection::{
-    FlowingEffectDisposition, FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom,
-    FlowingTargetEffect, FlowingTargetEffects, FlowingTargetEffectsOutcome,
+    native_dependency_basis_digest, native_read_basis_digest, FlowingEffectDisposition,
+    FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect,
+    FlowingTargetEffects, FlowingTargetEffectsOutcome, NativeCandidate, NativeCandidateOutcome,
 };
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 

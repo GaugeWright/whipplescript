@@ -7,6 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::branches::flowing_admission::FlowingSelectedUnit;
+#[cfg(feature = "native")]
+use crate::branches::flowing_admission::{FlowingAdmissions, FlowingUnitOutcome};
 use crate::branches::flowing_sources::{
     BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
     HandoffContribution, HandoffContributionOutcome,
@@ -14,6 +17,8 @@ use crate::branches::flowing_sources::{
 use crate::branches::{BranchStatus, Branches, CutRecord, CutRow};
 use crate::content::ContentBlobs;
 use crate::selection::{self, SelAtom, SelExpr};
+#[cfg(feature = "native")]
+use crate::source_review_native::NativeRevision;
 use crate::{StoreError, StoreResult};
 
 use super::{RawManifest, WorkspaceVcs};
@@ -152,6 +157,51 @@ pub enum FlowingTargetEffectsOutcome {
     UnexpectedEffect { path: String },
 }
 
+/// A content-derived, complete direct-twig prefix at an unchanged trunk base.
+/// The recorded cut is a GC root, but this is preparation, not a gate verdict
+/// or permission to advance the trunk ref.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCandidate {
+    pub contribution_id: String,
+    pub revision_sequence: i64,
+    pub source_cut_id: String,
+    pub expected_trunk_cut_id: Option<String>,
+    pub candidate_cut_id: String,
+    pub candidate_manifest_hash: String,
+    pub source_atoms_digest: String,
+    pub units: Vec<FlowingSelectedUnit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeCandidateOutcome {
+    Prepared(NativeCandidate),
+    StaleBase,
+    SourceMismatch,
+    IncompletePrefix,
+    OverlappingUnits { path: String },
+    MissingContent { content_id: String },
+    UnitAlreadyAdmitted { unit_id: String },
+    UnprovenBasis { unit_id: String },
+    CandidateMismatch,
+}
+
+/// The complete VCS snapshot a source unit says it read when it began.
+/// The host records this at declaration; candidate preparation recomputes it
+/// from the immutable cut immediately before that unit's first write.
+pub fn native_read_basis_digest(cut_id: Option<&str>, manifest_hash: Option<&str>) -> String {
+    let bytes = serde_json::to_vec(&("native-read-basis-v1", cut_id, manifest_hash))
+        .expect("string tuple serializes");
+    format!("sha256:{}", crate::chunking::content_hash_hex(&bytes))
+}
+
+/// Conservative predecessor basis: every earlier unit in the same prefix,
+/// even when a semantic dependency graph might allow a smaller set.
+pub fn native_dependency_basis_digest(prior: &[(String, String)]) -> String {
+    let bytes = serde_json::to_vec(&("native-source-predecessors-v1", prior))
+        .expect("string tuple serializes");
+    format!("sha256:{}", crate::chunking::content_hash_hex(&bytes))
+}
+
 fn requires_unproved_semantics(expr: &SelExpr) -> bool {
     match expr {
         SelExpr::Union(left, right)
@@ -197,6 +247,407 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
         }
         Ok(Ok(selected))
+    }
+
+    /// Prepare the complete selected direct-twig prefix at its original trunk
+    /// branch point. This intentionally refuses selective skips, overlapping
+    /// unit paths and a moved trunk: without a complete dependency graph or
+    /// composed per-unit outcomes, those cases have no closure proof yet.
+    #[cfg(feature = "native")]
+    pub fn prepare_native_review_candidate(
+        &mut self,
+        revision: &NativeRevision,
+        expected_trunk_cut_id: Option<&str>,
+        candidate_cut_id: &str,
+        actor: &str,
+        recorded_at: &str,
+    ) -> StoreResult<NativeCandidateOutcome>
+    where
+        B: FlowingAdmissions,
+    {
+        use NativeCandidateOutcome as R;
+        if candidate_cut_id.trim().is_empty() || actor.trim().is_empty() {
+            return Ok(R::CandidateMismatch);
+        }
+        let Some(source) = self.branches.get_branch(&revision.source_branch_id)? else {
+            return Ok(R::SourceMismatch);
+        };
+        let Some(trunk) = self
+            .branches
+            .get_branch(crate::branches::MAINLINE_BRANCH_ID)?
+        else {
+            return Ok(R::StaleBase);
+        };
+        let Some(fence) = self.branches.flowing_source(&revision.source_branch_id)? else {
+            return Ok(R::SourceMismatch);
+        };
+        if source.status != BranchStatus::Active
+            || source.name.is_some()
+            || source.parent_branch_id.as_deref() != Some(crate::branches::MAINLINE_BRANCH_ID)
+            || fence.kind != crate::branches::flowing_fence::FlowingSourceKind::Twig
+            || fence.incarnation_id != revision.source_incarnation_id
+            || !fence.admission_enabled
+            || fence.held
+            || fence.revision.is_some()
+        {
+            return Ok(R::SourceMismatch);
+        }
+        if trunk.status != BranchStatus::Active
+            || trunk.head_cut_id.as_deref() != expected_trunk_cut_id
+            || source.branch_point_cut_id.as_deref() != expected_trunk_cut_id
+            || source.branch_point_manifest_hash != trunk.head_manifest_hash
+        {
+            return Ok(R::StaleBase);
+        }
+        if let Some(base_id) = expected_trunk_cut_id {
+            let Some(base) = self.branches.get_cut(base_id)? else {
+                return Ok(R::StaleBase);
+            };
+            if base.branch_id != crate::branches::MAINLINE_BRANCH_ID
+                || Some(base.manifest_hash.as_str()) != trunk.head_manifest_hash.as_deref()
+                || self.load_manifest_opt_raw(&base.manifest_hash)?.is_none()
+            {
+                return Ok(R::StaleBase);
+            }
+        }
+        let Some(selected_cut) = self.branches.get_cut(&revision.source_cut_id)? else {
+            return Ok(R::SourceMismatch);
+        };
+        if selected_cut.branch_id != revision.source_branch_id
+            || selected_cut.manifest_hash != revision.source_manifest_hash
+        {
+            return Ok(R::SourceMismatch);
+        }
+        // A later append remains harmless; a rewrite or missing ancestor does
+        // not establish that the selected cut still belongs to this line.
+        let mut head_cursor = source.head_cut_id.clone();
+        let mut head_seen = BTreeSet::new();
+        while let Some(id) = head_cursor {
+            if !head_seen.insert(id.clone()) {
+                return Ok(R::SourceMismatch);
+            }
+            if id == revision.source_cut_id {
+                break;
+            }
+            head_cursor = self
+                .branches
+                .get_cut(&id)?
+                .and_then(|cut| cut.parent_cut_id);
+        }
+        if !head_seen.contains(&revision.source_cut_id) {
+            return Ok(R::SourceMismatch);
+        }
+
+        let mut cuts = Vec::new();
+        let mut cursor = Some(revision.source_cut_id.clone());
+        let mut seen = BTreeSet::new();
+        while cursor.as_deref() != expected_trunk_cut_id {
+            let Some(id) = cursor else {
+                return Ok(R::SourceMismatch);
+            };
+            if !seen.insert(id.clone()) {
+                return Ok(R::SourceMismatch);
+            }
+            let Some(cut) = self.branches.get_cut(&id)? else {
+                return Ok(R::SourceMismatch);
+            };
+            if cut.branch_id != revision.source_branch_id
+                || !cut
+                    .origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.starts_with("write:"))
+                || self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none()
+            {
+                return Ok(R::SourceMismatch);
+            }
+            cursor = cut.parent_cut_id.clone();
+            cuts.push(cut);
+        }
+        cuts.reverse();
+        let selected_ids: BTreeSet<&str> = revision
+            .units
+            .iter()
+            .map(|unit| unit.unit_id.as_str())
+            .collect();
+        let declared_ids: BTreeSet<String> = self
+            .branches
+            .source_contributions(&revision.source_branch_id)?
+            .into_iter()
+            .filter(|unit| seen.contains(&unit.source_cut_id))
+            .map(|unit| unit.unit_id)
+            .collect();
+        if selected_ids.len() != revision.units.len()
+            || selected_ids != declared_ids.iter().map(String::as_str).collect()
+        {
+            return Ok(R::IncompletePrefix);
+        }
+        let mut atoms = Vec::new();
+        for cut in &cuts {
+            let mut change_units = Vec::new();
+            self.push_units_for_cut(cut, &mut change_units)?;
+            for change in change_units {
+                for id in [change.before.as_deref(), change.after.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !self.content.cached_read_available(id)? {
+                        return Ok(R::MissingContent {
+                            content_id: id.into(),
+                        });
+                    }
+                }
+                atoms.push(FlowingSourceAtom {
+                    cut_id: change.cut_id,
+                    change_id: change.change_id,
+                    path: change.path,
+                    before: change.before,
+                    after: change.after,
+                });
+            }
+        }
+        let expected: BTreeMap<(String, String), FlowingSourceAtom> = atoms
+            .iter()
+            .map(|atom| ((atom.cut_id.clone(), atom.path.clone()), atom.clone()))
+            .collect();
+        if atoms.is_empty() || expected.len() != atoms.len() || revision.units.is_empty() {
+            return Ok(R::IncompletePrefix);
+        }
+        let mut owners = BTreeMap::new();
+        let mut cut_owners = BTreeMap::new();
+        let mut declarations = BTreeMap::new();
+        let mut paths = BTreeSet::new();
+        let mut outcomes = Vec::new();
+        for unit in &revision.units {
+            if self
+                .branches
+                .admitted_unit_operation(&unit.unit_id)?
+                .is_some()
+            {
+                return Ok(R::UnitAlreadyAdmitted {
+                    unit_id: unit.unit_id.clone(),
+                });
+            }
+            let Some(declared) = self.branches.contribution_declaration(&unit.unit_id)? else {
+                return Ok(R::IncompletePrefix);
+            };
+            let Some(basis) = self.branches.contribution_basis(&unit.unit_id)? else {
+                return Ok(R::IncompletePrefix);
+            };
+            let Some(pin) = self.branches.private_cut_pin(&unit.pin_id)? else {
+                return Ok(R::IncompletePrefix);
+            };
+            let Some(declared_cut) = self.branches.get_cut(&unit.source_cut_id)? else {
+                return Ok(R::IncompletePrefix);
+            };
+            if declared.source_branch_id != revision.source_branch_id
+                || declared.source_cut_id != unit.source_cut_id
+                || declared.pin_id != unit.pin_id
+                || declared.principal != unit.principal
+                || declared.intent != unit.intent
+                || basis.basis_digest != unit.basis_digest
+                || declared_cut.manifest_hash != declared.source_manifest_hash
+                || !seen.contains(&unit.source_cut_id)
+                || pin.released_at.is_some()
+                || pin.twig_branch_id != revision.source_branch_id
+                || pin.cut_id != unit.source_cut_id
+                || pin.manifest_hash != declared.source_manifest_hash
+                || self.branches.contribution_handoff(&unit.unit_id)?.is_some()
+            {
+                return Ok(R::IncompletePrefix);
+            }
+            let mut unit_paths = BTreeSet::new();
+            for atom in &basis.atoms {
+                let key = (atom.cut_id.clone(), atom.path.clone());
+                if expected.get(&key) != Some(atom)
+                    || owners.insert(key, unit.unit_id.clone()).is_some()
+                {
+                    return Ok(R::IncompletePrefix);
+                }
+                if cut_owners
+                    .insert(atom.cut_id.clone(), unit.unit_id.clone())
+                    .is_some_and(|owner| owner != unit.unit_id)
+                {
+                    return Ok(R::IncompletePrefix);
+                }
+                unit_paths.insert(atom.path.clone());
+            }
+            for path in &unit_paths {
+                if !paths.insert(path.clone()) {
+                    return Ok(R::OverlappingUnits { path: path.clone() });
+                }
+            }
+            let selected = match self.net_source_paths(&basis)? {
+                Ok(selected) => selected,
+                Err(FlowingTargetEffectsOutcome::MissingContent { content_id }) => {
+                    return Ok(R::MissingContent { content_id });
+                }
+                Err(_) => return Ok(R::IncompletePrefix),
+            };
+            let neutralized = selected.values().all(|(before, after)| before == after);
+            outcomes.push(FlowingSelectedUnit {
+                unit_id: unit.unit_id.clone(),
+                basis_digest: unit.basis_digest.clone(),
+                principal: unit.principal.clone(),
+                intent: unit.intent.clone(),
+                outcome: if neutralized {
+                    FlowingUnitOutcome::Neutralized
+                } else {
+                    FlowingUnitOutcome::Applied
+                },
+            });
+            declarations.insert(unit.unit_id.clone(), declared);
+        }
+        if owners.len() != expected.len() {
+            return Ok(R::IncompletePrefix);
+        }
+        // A unit occupies whole consecutive cuts. Its declared read snapshot
+        // must be the cut before its first write; its dependency basis names
+        // every earlier unit, so an unknown edge cannot escape the prefix.
+        let mut ordered: Vec<(String, String)> = Vec::new();
+        let mut finished = BTreeSet::new();
+        let mut previous_owner: Option<&str> = None;
+        let mut last_cut_by_owner = BTreeMap::new();
+        let mut basis_evidence = Vec::new();
+        for cut in &cuts {
+            let Some(owner) = cut_owners.get(&cut.cut_id).map(String::as_str) else {
+                return Ok(R::IncompletePrefix);
+            };
+            if previous_owner != Some(owner) {
+                if !finished.insert(owner) {
+                    return Ok(R::IncompletePrefix);
+                }
+                let parent_manifest = match cut.parent_cut_id.as_deref() {
+                    Some(parent_id) => {
+                        let Some(parent) = self.branches.get_cut(parent_id)? else {
+                            return Ok(R::SourceMismatch);
+                        };
+                        Some(parent.manifest_hash)
+                    }
+                    None => None,
+                };
+                let Some(declared) = declarations.get(owner) else {
+                    return Ok(R::IncompletePrefix);
+                };
+                let read = native_read_basis_digest(
+                    cut.parent_cut_id.as_deref(),
+                    parent_manifest.as_deref(),
+                );
+                let deps = native_dependency_basis_digest(&ordered);
+                if declared.read_basis_digest != read || declared.dependency_basis_digest != deps {
+                    return Ok(R::UnprovenBasis {
+                        unit_id: owner.into(),
+                    });
+                }
+                basis_evidence.push((owner.to_owned(), read, deps));
+                let Some(unit) = revision.units.iter().find(|unit| unit.unit_id == owner) else {
+                    return Ok(R::IncompletePrefix);
+                };
+                ordered.push((owner.to_owned(), unit.basis_digest.clone()));
+                previous_owner = Some(owner);
+            }
+            last_cut_by_owner.insert(owner.to_owned(), cut.cut_id.clone());
+        }
+        if ordered
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+            != revision
+                .units
+                .iter()
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>()
+            || declarations.iter().any(|(id, declaration)| {
+                last_cut_by_owner.get(id) != Some(&declaration.source_cut_id)
+            })
+        {
+            return Ok(R::IncompletePrefix);
+        }
+        let Some(raw) = self.load_manifest_opt_raw(&selected_cut.manifest_hash)? else {
+            return Ok(R::SourceMismatch);
+        };
+        let mut retained_ids = match raw {
+            RawManifest::Tree(_) => {
+                crate::manifest_tree::reachable_ids(&self.content, &selected_cut.manifest_hash)?
+            }
+            RawManifest::Flat(manifest) => manifest.into_values().collect(),
+        };
+        retained_ids.insert(selected_cut.manifest_hash.clone());
+        for id in retained_ids {
+            if !self.content.cached_read_available(&id)? {
+                return Ok(R::MissingContent { content_id: id });
+            }
+        }
+        // Every source write is owned by a selected unit, and the destination
+        // is exactly the source's branch point. The selected source manifest
+        // is therefore the complete proposed trunk result, including undo.
+        let no_op = if let Some(base) = trunk.head_manifest_hash.as_deref() {
+            base == selected_cut.manifest_hash
+        } else {
+            self.load_manifest(Some(&selected_cut.manifest_hash))?
+                .is_empty()
+        };
+        if no_op {
+            if expected_trunk_cut_id != Some(candidate_cut_id) {
+                return Ok(R::CandidateMismatch);
+            }
+        } else {
+            let origin = format!("transport:{}", revision.source_branch_id);
+            let matches = |cut: &CutRow| {
+                cut.branch_id == crate::branches::MAINLINE_BRANCH_ID
+                    && cut.parent_cut_id.as_deref() == expected_trunk_cut_id
+                    && cut.manifest_hash == selected_cut.manifest_hash
+                    && cut.change_id == candidate_cut_id
+                    && cut.origin.as_deref() == Some(origin.as_str())
+                    && cut.actor.as_deref() == Some(actor)
+                    && cut.intent.as_deref() == Some(revision.contribution_id.as_str())
+                    && cut.recorded_at == recorded_at
+            };
+            if let Some(existing) = self.branches.get_cut(candidate_cut_id)? {
+                if !matches(&existing) {
+                    return Ok(R::CandidateMismatch);
+                }
+            } else {
+                self.branches.record_cut(CutRecord {
+                    cut_id: candidate_cut_id,
+                    change_id: candidate_cut_id,
+                    branch_id: crate::branches::MAINLINE_BRANCH_ID,
+                    manifest_hash: &selected_cut.manifest_hash,
+                    parent_cut_id: expected_trunk_cut_id,
+                    origin: Some(&origin),
+                    actor: Some(actor),
+                    intent: Some(&revision.contribution_id),
+                    recorded_at,
+                })?;
+            }
+            if !self
+                .branches
+                .get_cut(candidate_cut_id)?
+                .as_ref()
+                .is_some_and(matches)
+            {
+                return Ok(R::CandidateMismatch);
+            }
+        }
+        let witness = serde_json::to_vec(&(
+            "native-closed-prefix-v1",
+            revision,
+            expected_trunk_cut_id,
+            &atoms,
+            &basis_evidence,
+            &outcomes,
+            candidate_cut_id,
+            &selected_cut.manifest_hash,
+        ))?;
+        Ok(R::Prepared(NativeCandidate {
+            contribution_id: revision.contribution_id.clone(),
+            revision_sequence: revision.sequence,
+            source_cut_id: revision.source_cut_id.clone(),
+            expected_trunk_cut_id: expected_trunk_cut_id.map(str::to_owned),
+            candidate_cut_id: candidate_cut_id.into(),
+            candidate_manifest_hash: selected_cut.manifest_hash,
+            source_atoms_digest: format!("sha256:{}", crate::chunking::content_hash_hex(&witness)),
+            units: outcomes,
+        }))
     }
 
     /// Prepare a direct twig's prospective trunk cut from its bound source
@@ -833,6 +1284,8 @@ mod tests {
     };
     use crate::branches::{BranchStore, CutRecord, MAINLINE_BRANCH_ID};
     use crate::content::ContentStore;
+    use crate::source_review::{ReviewError, ReviewStore};
+    use crate::source_review_native::{NativeCandidateRequest, NativeUpload};
 
     fn workspace() -> WorkspaceVcs<BranchStore, ContentStore> {
         WorkspaceVcs::from_parts(
@@ -880,6 +1333,40 @@ mod tests {
         );
     }
 
+    fn declare_native(
+        vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
+        unit_id: &str,
+        pin_id: &str,
+        prior_cut_id: Option<&str>,
+        prior: &[(String, String)],
+        read_override: Option<&str>,
+    ) {
+        let prior_manifest = prior_cut_id.map(|id| {
+            vcs.branches
+                .get_cut(id)
+                .expect("native candidate test")
+                .expect("native candidate test")
+                .manifest_hash
+        });
+        let read = native_read_basis_digest(prior_cut_id, prior_manifest.as_deref());
+        let deps = native_dependency_basis_digest(prior);
+        assert_eq!(
+            vcs.branches
+                .declare_contribution(DeclareContribution {
+                    unit_id,
+                    pin_id,
+                    principal: "s:author",
+                    intent: "customer change",
+                    read_basis_digest: read_override.unwrap_or(&read),
+                    dependency_basis_digest: &deps,
+                    scope_digest: unit_id,
+                    declared_at: "t5",
+                })
+                .expect("native candidate test"),
+            DeclareContributionOutcome::Declared
+        );
+    }
+
     fn bound_unit() -> WorkspaceVcs<BranchStore, ContentStore> {
         bound_unit_with_flowing_target(false)
     }
@@ -908,6 +1395,589 @@ mod tests {
             BindContributionBasisOutcome::Bound
         );
         vcs
+    }
+
+    fn reviewed_two_unit_twig() -> (WorkspaceVcs<BranchStore, ContentStore>, ReviewStore) {
+        reviewed_two_unit_twig_with_read(None)
+    }
+
+    fn reviewed_two_unit_twig_with_read(
+        second_read_override: Option<&str>,
+    ) -> (WorkspaceVcs<BranchStore, ContentStore>, ReviewStore) {
+        let mut vcs = workspace();
+        vcs.init("t0").expect("native candidate test");
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("native candidate test");
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .expect("native candidate test"),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .expect("native candidate test");
+        pin(&mut vcs, "twig-a", "pin-a");
+        declare_native(&mut vcs, "unit-a", "pin-a", None, &[], None);
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-a",
+                &selection::parse("path(a.txt)").expect("native candidate test"),
+            )
+            .expect("native candidate test")
+        else {
+            panic!("first selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t3")
+                .expect("native candidate test"),
+            BindContributionBasisOutcome::Bound
+        );
+        vcs.write("twig", "b.txt", Some("B"), "twig-b", "t4")
+            .expect("second source write");
+        pin(&mut vcs, "twig-b", "pin-b");
+        let prior = vec![("unit-a".into(), selection.digest().into())];
+        declare_native(
+            &mut vcs,
+            "unit-b",
+            "pin-b",
+            Some("twig-a"),
+            &prior,
+            second_read_override,
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-b",
+                &selection::parse("path(b.txt)").expect("native candidate test"),
+            )
+            .expect("native candidate test")
+        else {
+            panic!("second selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-b", &selection, "t5")
+                .expect("native candidate test"),
+            BindContributionBasisOutcome::Bound
+        );
+        let mut reviews = ReviewStore::open(":memory:").expect("native candidate test");
+        reviews
+            .create_native_contribution(
+                "review-a",
+                "s:author",
+                "two files",
+                MAINLINE_BRANCH_ID,
+                &[],
+            )
+            .expect("native candidate test");
+        (vcs, reviews)
+    }
+
+    fn upload_two_units(
+        vcs: &WorkspaceVcs<BranchStore, ContentStore>,
+        reviews: &mut ReviewStore,
+        units: &[&str],
+    ) {
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-a",
+                    upload_id: "upload-a",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-b",
+                    unit_ids: units,
+                },
+            )
+            .expect("native candidate test");
+    }
+
+    fn native_candidate_request<'a>(
+        candidate_cut_id: &'a str,
+        recorded_at: &'a str,
+    ) -> NativeCandidateRequest<'a> {
+        NativeCandidateRequest {
+            contribution_id: "review-a",
+            sequence: 1,
+            expected_trunk_cut_id: None,
+            candidate_cut_id,
+            actor: "coordinator",
+            recorded_at,
+        }
+    }
+
+    #[test]
+    fn native_candidate_proves_complete_prefix_and_keeps_later_tail_out() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let selected = vcs
+            .branches
+            .get_cut("twig-b")
+            .expect("native candidate test")
+            .expect("native candidate test");
+        vcs.write("twig", "later.txt", Some("tail"), "twig-tail", "t6")
+            .expect("native candidate test");
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .expect("native candidate test");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("complete prefix must construct a candidate: {prepared:?}")
+        };
+        assert_eq!(candidate.candidate_manifest_hash, selected.manifest_hash);
+        assert_eq!(candidate.units.len(), 2);
+        assert!(candidate
+            .units
+            .iter()
+            .all(|unit| unit.outcome == FlowingUnitOutcome::Applied));
+        assert!(candidate.source_atoms_digest.starts_with("sha256:"));
+        assert_eq!(
+            vcs.cut_manifest("candidate-a")
+                .expect("native candidate test")
+                .expect("native candidate test")
+                .len(),
+            2
+        );
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+                .expect("native candidate test"),
+            NativeCandidateOutcome::Prepared(candidate)
+        );
+        assert!(vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("native candidate test")
+            .expect("native candidate test")
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn native_candidate_applies_a_prefix_to_its_exact_existing_trunk_cut() {
+        let mut vcs = workspace();
+        vcs.init("t0").expect("mainline");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "base.txt",
+            Some("base"),
+            "trunk-base",
+            "t1",
+        )
+        .expect("base cut");
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("twig");
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t2".into(),
+                })
+                .expect("flowing source"),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t3")
+            .expect("source write");
+        pin(&mut vcs, "twig-a", "pin-a");
+        declare_native(&mut vcs, "unit-a", "pin-a", Some("trunk-base"), &[], None);
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-a",
+                &selection::parse("path(a.txt)").expect("selection expression"),
+            )
+            .expect("select")
+        else {
+            panic!("selected source atom required")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t4")
+                .expect("bind"),
+            BindContributionBasisOutcome::Bound
+        );
+        let mut reviews = ReviewStore::open(":memory:").expect("review store");
+        reviews
+            .create_native_contribution("review-a", "s:author", "one file", MAINLINE_BRANCH_ID, &[])
+            .expect("review contribution");
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-a",
+                    upload_id: "upload-a",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-a",
+                    unit_ids: &["unit-a"],
+                },
+            )
+            .expect("native revision");
+        let outcome = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                NativeCandidateRequest {
+                    expected_trunk_cut_id: Some("trunk-base"),
+                    ..native_candidate_request("candidate-on-base", "t5")
+                },
+            )
+            .expect("candidate preparation");
+        let NativeCandidateOutcome::Prepared(candidate) = outcome else {
+            panic!("existing base should construct: {outcome:?}")
+        };
+        assert_eq!(
+            candidate.expected_trunk_cut_id.as_deref(),
+            Some("trunk-base")
+        );
+        assert_eq!(
+            vcs.cut_manifest("candidate-on-base")
+                .expect("candidate manifest")
+                .expect("candidate cut")
+                .len(),
+            2
+        );
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("trunk read")
+                .expect("trunk")
+                .head_cut_id
+                .as_deref(),
+            Some("trunk-base")
+        );
+    }
+
+    #[test]
+    fn native_candidate_keeps_a_neutralized_unit_as_a_metadata_only_result() {
+        let mut vcs = workspace();
+        vcs.init("t0").expect("mainline");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "base.txt",
+            Some("base"),
+            "trunk-base",
+            "t1",
+        )
+        .expect("base cut");
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("twig");
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t2".into(),
+                })
+                .expect("flowing source"),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        vcs.write("twig", "scratch.txt", Some("temporary"), "twig-add", "t3")
+            .expect("add");
+        vcs.write("twig", "scratch.txt", None, "twig-undo", "t4")
+            .expect("undo");
+        pin(&mut vcs, "twig-undo", "pin-undo");
+        declare_native(
+            &mut vcs,
+            "unit-undo",
+            "pin-undo",
+            Some("trunk-base"),
+            &[],
+            None,
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-undo",
+                &selection::parse("path(scratch.txt)").expect("selection expression"),
+            )
+            .expect("select")
+        else {
+            panic!("selected source atoms required")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-undo", &selection, "t5")
+                .expect("bind"),
+            BindContributionBasisOutcome::Bound
+        );
+        let mut reviews = ReviewStore::open(":memory:").expect("review store");
+        reviews
+            .create_native_contribution("review-a", "s:author", "undo", MAINLINE_BRANCH_ID, &[])
+            .expect("review contribution");
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-a",
+                    upload_id: "upload-a",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-undo",
+                    unit_ids: &["unit-undo"],
+                },
+            )
+            .expect("native revision");
+        let outcome = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                NativeCandidateRequest {
+                    expected_trunk_cut_id: Some("trunk-base"),
+                    candidate_cut_id: "trunk-base",
+                    ..native_candidate_request("trunk-base", "t6")
+                },
+            )
+            .expect("candidate preparation");
+        let NativeCandidateOutcome::Prepared(candidate) = outcome else {
+            panic!("neutralized prefix should keep exact base: {outcome:?}")
+        };
+        assert_eq!(candidate.candidate_cut_id, "trunk-base");
+        assert_eq!(candidate.units[0].outcome, FlowingUnitOutcome::Neutralized);
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("trunk read")
+                .expect("trunk")
+                .head_cut_id
+                .as_deref(),
+            Some("trunk-base")
+        );
+    }
+
+    #[test]
+    fn native_candidate_refuses_an_omitted_unit_and_a_changed_base() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-b"]);
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-omitted", "t6")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::IncompletePrefix
+        );
+        assert!(vcs
+            .branches
+            .get_cut("candidate-omitted")
+            .expect("native candidate test")
+            .is_none());
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "other.txt",
+            Some("new"),
+            "trunk-new",
+            "t7",
+        )
+        .expect("native candidate test");
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-stale", "t8")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::StaleBase
+        );
+    }
+
+    #[test]
+    fn native_candidate_refuses_unaccounted_review_predecessors() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        reviews
+            .create_native_contribution(
+                "review-dependent",
+                "s:author",
+                "dependent work",
+                MAINLINE_BRANCH_ID,
+                &["review-a"],
+            )
+            .expect("dependent contribution");
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-dependent",
+                    upload_id: "dependent-upload",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-b",
+                    unit_ids: &["unit-a", "unit-b"],
+                },
+            )
+            .expect("dependent revision");
+        let err = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                NativeCandidateRequest {
+                    contribution_id: "review-dependent",
+                    ..native_candidate_request("candidate-dependent", "t6")
+                },
+            )
+            .expect_err("review predecessor has no admission receipt");
+        assert!(matches!(err, ReviewError::Invalid(reason)
+            if reason == "review predecessors need admission receipts before candidate construction"));
+        assert!(vcs
+            .branches
+            .get_cut("candidate-dependent")
+            .expect("candidate lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn native_candidate_refuses_a_nontrunk_review_target() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        reviews
+            .create_native_contribution("review-side", "s:author", "side work", "side", &[])
+            .expect("side contribution");
+        let err = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                NativeCandidateRequest {
+                    contribution_id: "review-side",
+                    ..native_candidate_request("candidate-side", "t6")
+                },
+            )
+            .expect_err("candidate must target trunk");
+        assert!(matches!(err, ReviewError::Invalid(reason)
+            if reason == "native candidate needs the trunk target"));
+        assert!(vcs
+            .branches
+            .get_cut("candidate-side")
+            .expect("candidate lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn native_candidate_includes_even_unbound_prefix_obligations_in_closure() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        declare(&mut vcs, "unit-unbound", "pin-b");
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-unbound", "t6")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::IncompletePrefix
+        );
+        assert!(vcs
+            .branches
+            .get_cut("candidate-unbound")
+            .expect("native candidate test")
+            .is_none());
+    }
+
+    #[test]
+    fn native_candidate_refuses_an_unproved_read_basis() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig_with_read(Some("wrong"));
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-bad-basis", "t6")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::UnprovenBasis {
+                unit_id: "unit-b".into()
+            }
+        );
+        assert!(vcs
+            .branches
+            .get_cut("candidate-bad-basis")
+            .expect("native candidate test")
+            .is_none());
+    }
+
+    #[test]
+    fn native_candidate_refuses_a_reused_cut_identity() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let selected = vcs
+            .branches
+            .get_cut("twig-b")
+            .expect("native candidate test")
+            .expect("native candidate test");
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "candidate-taken",
+                change_id: "candidate-taken",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &selected.manifest_hash,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("someone-else"),
+                intent: Some("review-a"),
+                recorded_at: "t6",
+            })
+            .expect("native candidate test");
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-taken", "t6")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::CandidateMismatch
+        );
+    }
+
+    #[test]
+    fn native_candidate_refuses_overlapping_unit_paths() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        vcs.write("twig", "a.txt", Some("A2"), "twig-a2", "t6")
+            .expect("native candidate test");
+        pin(&mut vcs, "twig-a2", "pin-a2");
+        declare(&mut vcs, "unit-a2", "pin-a2");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-a2",
+                &selection::parse("change(twig-a2)").expect("native candidate test"),
+            )
+            .expect("native candidate test")
+        else {
+            panic!("third selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a2", &selection, "t7")
+                .expect("native candidate test"),
+            BindContributionBasisOutcome::Bound
+        );
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-a",
+                    upload_id: "upload-overlap",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-a2",
+                    unit_ids: &["unit-a", "unit-b", "unit-a2"],
+                },
+            )
+            .expect("native candidate test");
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-overlap", "t8")
+                )
+                .expect("native candidate test"),
+            NativeCandidateOutcome::OverlappingUnits {
+                path: "a.txt".into()
+            }
+        );
+        assert!(vcs
+            .branches
+            .get_cut("candidate-overlap")
+            .expect("native candidate test")
+            .is_none());
     }
 
     #[test]

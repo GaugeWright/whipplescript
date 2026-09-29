@@ -88,6 +88,18 @@ impl<S: DoSql> DoBranches<S> {
 }
 
 impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
+    fn admitted_unit_operation(&self, unit_id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .sql
+            .query(
+                "SELECT op_id FROM flowing_admitted_units WHERE unit_id = ?1",
+                &[text(unit_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map(|row| as_text(&row[0])))
+    }
+
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,
@@ -720,6 +732,12 @@ mod tests {
         else {
             panic!("hosted prefix should admit")
         };
+        assert_eq!(
+            store
+                .admitted_unit_operation("unit-a")
+                .expect("admission index"),
+            Some("admission-a".into())
+        );
         assert_eq!(
             store.admit_flowing_prefix(&first).unwrap(),
             FlowingAdmissionOutcome::Existing(receipt.clone())

@@ -270,6 +270,38 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
         read_declaration(&self.sql, unit_id)
     }
 
+    fn source_contributions(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Vec<ContributionDeclaration>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT unit_id, pin_id, source_branch_id, source_cut_id, \
+             source_manifest_hash, principal, intent, read_basis_digest, \
+             dependency_basis_digest, scope_digest, declared_at \
+             FROM flowing_contributions WHERE source_branch_id = ?1 ORDER BY unit_id",
+                &[text(source_branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| ContributionDeclaration {
+                unit_id: as_text(&row[0]),
+                pin_id: as_text(&row[1]),
+                source_branch_id: as_text(&row[2]),
+                source_cut_id: as_text(&row[3]),
+                source_manifest_hash: as_text(&row[4]),
+                principal: as_text(&row[5]),
+                intent: as_text(&row[6]),
+                read_basis_digest: as_text(&row[7]),
+                dependency_basis_digest: as_text(&row[8]),
+                scope_digest: as_text(&row[9]),
+                declared_at: as_text(&row[10]),
+            })
+            .collect())
+    }
+
     fn bind_contribution_basis(
         &mut self,
         request: BindContributionBasis<'_>,
@@ -1530,6 +1562,15 @@ mod tests {
         assert_eq!(
             store.declare_contribution(declaration()).unwrap(),
             DeclareContributionOutcome::Existing
+        );
+        assert_eq!(
+            store
+                .source_contributions("twig-1")
+                .expect("source inventory"),
+            vec![store
+                .contribution_declaration("unit-1")
+                .expect("declaration read")
+                .expect("declared unit")]
         );
         assert_eq!(
             store

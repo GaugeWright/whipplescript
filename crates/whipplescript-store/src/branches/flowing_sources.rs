@@ -329,6 +329,12 @@ pub trait FlowingSources {
         &self,
         unit_id: &str,
     ) -> crate::StoreResult<Option<ContributionDeclaration>>;
+    /// Complete declaration inventory for a source line. Candidate selection
+    /// must see zero-effect units as well as units with content atoms.
+    fn source_contributions(
+        &self,
+        source_branch_id: &str,
+    ) -> crate::StoreResult<Vec<ContributionDeclaration>>;
     fn bind_contribution_basis(
         &mut self,
         request: BindContributionBasis<'_>,

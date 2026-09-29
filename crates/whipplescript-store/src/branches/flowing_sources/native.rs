@@ -272,6 +272,36 @@ impl FlowingSources for BranchStore {
         read_declaration(&self.connection, unit_id)
     }
 
+    fn source_contributions(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Vec<ContributionDeclaration>> {
+        let mut statement = self.connection.prepare(
+            "SELECT unit_id, pin_id, source_branch_id, source_cut_id, \
+             source_manifest_hash, principal, intent, read_basis_digest, \
+             dependency_basis_digest, scope_digest, declared_at \
+             FROM flowing_contributions WHERE source_branch_id = ?1 ORDER BY unit_id",
+        )?;
+        let rows = statement
+            .query_map([source_branch_id], |row| {
+                Ok(ContributionDeclaration {
+                    unit_id: row.get(0)?,
+                    pin_id: row.get(1)?,
+                    source_branch_id: row.get(2)?,
+                    source_cut_id: row.get(3)?,
+                    source_manifest_hash: row.get(4)?,
+                    principal: row.get(5)?,
+                    intent: row.get(6)?,
+                    read_basis_digest: row.get(7)?,
+                    dependency_basis_digest: row.get(8)?,
+                    scope_digest: row.get(9)?,
+                    declared_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     fn bind_contribution_basis(
         &mut self,
         request: BindContributionBasis<'_>,

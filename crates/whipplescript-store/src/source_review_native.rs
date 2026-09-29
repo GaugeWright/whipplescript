@@ -9,10 +9,13 @@ use std::collections::BTreeSet;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+use crate::branches::flowing_admission::FlowingAdmissions;
 use crate::branches::flowing_fence::FlowingSourceKind;
 use crate::branches::flowing_sources::FlowingSources;
 use crate::branches::{BranchStatus, Branches};
+use crate::content::ContentBlobs;
 use crate::source_review::{ReviewError, ReviewResult, ReviewStore, SourceKind};
+use crate::vcs::{NativeCandidateOutcome, WorkspaceVcs};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeUnitRef {
@@ -47,7 +50,49 @@ pub struct NativeUpload<'a> {
     pub unit_ids: &'a [&'a str],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NativeCandidateRequest<'a> {
+    pub contribution_id: &'a str,
+    pub sequence: i64,
+    pub expected_trunk_cut_id: Option<&'a str>,
+    pub candidate_cut_id: &'a str,
+    pub actor: &'a str,
+    pub recorded_at: &'a str,
+}
+
 impl ReviewStore {
+    /// Construct a candidate from a persisted revision and the current exact
+    /// trunk base. The VCS proves complete source-unit coverage and records
+    /// the immutable cut; this review store owns neither cut nor unit state.
+    pub fn prepare_native_candidate<
+        B: Branches + FlowingSources + FlowingAdmissions,
+        C: ContentBlobs,
+    >(
+        &self,
+        vcs: &mut WorkspaceVcs<B, C>,
+        request: NativeCandidateRequest<'_>,
+    ) -> ReviewResult<NativeCandidateOutcome> {
+        let contribution = self.contribution(request.contribution_id)?;
+        if contribution.target_scope != crate::branches::MAINLINE_BRANCH_ID {
+            return Err(ReviewError::Invalid(
+                "native candidate needs the trunk target".into(),
+            ));
+        }
+        if !contribution.predecessors.is_empty() {
+            return Err(ReviewError::Invalid(
+                "review predecessors need admission receipts before candidate construction".into(),
+            ));
+        }
+        let revision = self.native_revision(request.contribution_id, request.sequence)?;
+        Ok(vcs.prepare_native_review_candidate(
+            &revision,
+            request.expected_trunk_cut_id,
+            request.candidate_cut_id,
+            request.actor,
+            request.recorded_at,
+        )?)
+    }
+
     /// The caller authenticates `actor`. This checks the VCS's retained unit
     /// facts and immutable cut before recording a reference. A later tail can
     /// move the source head without changing this revision. This is not a
