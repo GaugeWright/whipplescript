@@ -336,16 +336,15 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             || declarations.examined.len() != declarations.edges.len()
             || declarations
                 .examined
-                .iter()
-                .enumerate()
-                .any(|(index, declaration)| {
-                    declaration.occurrence != index
-                        || declaration.keyword.is_empty()
-                        || declaration.name.is_empty()
-                        || declaration.scope.is_empty()
-                        || declaration.family.is_empty()
-                        || declaration.lowering.is_empty()
-                })
+                .windows(2)
+                .any(|pair| pair[0].occurrence >= pair[1].occurrence)
+            || declarations.examined.iter().any(|declaration| {
+                declaration.keyword.is_empty()
+                    || declaration.name.is_empty()
+                    || declaration.scope.is_empty()
+                    || declaration.family.is_empty()
+                    || declaration.lowering.is_empty()
+            })
             || declarations
                 .examined
                 .iter()
@@ -545,7 +544,7 @@ mod tests {
         );
 
         let declaration = ProgramDeclarationUse {
-            occurrence: 0,
+            occurrence: 3,
             keyword: "source clock".into(),
             name: "daily".into(),
             scope: "top_level".into(),

@@ -1,4 +1,4 @@
-//! Checked rule-effect construct edges for the bounded RC-3 admission slice.
+//! Checked construct edges for bounded RC-3 admission slices.
 //!
 //! The caller supplies the registry and local package-source mapping from the
 //! same immutable package snapshot used to check the IR. This pure extractor
@@ -8,10 +8,11 @@
 use std::collections::BTreeSet;
 
 use whipplescript_core::{ConstructRegistration, ContractRegistry};
-use whipplescript_parser::{IrConstructUse, IrProgram};
+use whipplescript_parser::{IrConstructUse, IrDeclarationConstruct, IrProgram};
 use whipplescript_store::program_imports::{
     ProgramConstructCapture, ProgramConstructEdge, ProgramConstructMeaning, ProgramConstructScope,
-    ProgramConstructUse, ProgramImportWitness,
+    ProgramConstructUse, ProgramDeclarationCapture, ProgramDeclarationEdge, ProgramDeclarationUse,
+    ProgramImportWitness,
 };
 
 use crate::exec_http::sha256_hex;
@@ -34,6 +35,14 @@ fn matches(form: &ConstructRegistration, use_form: &IrConstructUse) -> bool {
         && form.construct_family == use_form.construct_family
         && form.lowering_target == use_form.lowering_target
         && form.target_capability.as_deref() == Some(use_form.target_capability.as_str())
+}
+
+fn matches_declaration(form: &ConstructRegistration, declaration: &IrDeclarationConstruct) -> bool {
+    form.keyword == declaration.keyword
+        && form.scope == declaration.scope
+        && form.construct_family == declaration.family
+        && form.lowering_target == declaration.lowering
+        && form.target_capability.is_none()
 }
 
 fn is_digest(value: &str) -> bool {
@@ -146,10 +155,98 @@ pub fn capture(
     })
 }
 
+/// Resolve the compiler's seven standard declaration forms against their
+/// checked registry. The inventory is compiler-owned, but this function does
+/// not prove the caller compiled it from the source named by `imports`; the
+/// accepting boundary must retain that same source and registry snapshot.
+/// Package-authored declaration forms remain outside this bounded slice.
+pub fn capture_declarations(
+    program: &IrProgram,
+    registry: &ContractRegistry,
+    imports: &ProgramImportWitness,
+) -> Result<ProgramDeclarationCapture, String> {
+    let declarations = program
+        .declaration_constructs
+        .as_ref()
+        .ok_or_else(|| "checked program has no declaration inventory".to_owned())?;
+    if !is_digest(&imports.compiler_artifact_digest) {
+        return Err("declaration capture lacks an exact compiler artifact digest".into());
+    }
+    let compiler_owned = program
+        .contract_registry()
+        .libraries
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<BTreeSet<_>>();
+    let mut examined = Vec::with_capacity(declarations.len());
+    let mut edges = Vec::with_capacity(declarations.len());
+    let mut previous = None;
+    for declaration in declarations {
+        if previous.is_some_and(|index| declaration.occurrence <= index) {
+            return Err("checked declaration inventory is not in effective-source order".into());
+        }
+        previous = Some(declaration.occurrence);
+        let mut matches = registry
+            .constructs
+            .iter()
+            .filter(|form| matches_declaration(form, declaration));
+        let form = matches.next().ok_or_else(|| {
+            format!(
+                "unresolved checked declaration `{}` lowering to `{}`",
+                declaration.keyword, declaration.lowering
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "checked declaration `{}` resolves to more than one registration",
+                declaration.keyword
+            ));
+        }
+        if !form.library_id.starts_with("std.")
+            || !compiler_owned.contains(&form.library_id)
+            || !registry
+                .libraries
+                .iter()
+                .any(|library| library.id == form.library_id && library.standard)
+        {
+            return Err(format!(
+                "checked declaration `{}` lacks its compiler-owned std library",
+                declaration.keyword
+            ));
+        }
+        let observed = ProgramDeclarationUse {
+            occurrence: declaration.occurrence,
+            keyword: declaration.keyword.clone(),
+            name: declaration.name.clone(),
+            scope: declaration.scope.clone(),
+            family: declaration.family.clone(),
+            lowering: declaration.lowering.clone(),
+        };
+        edges.push(ProgramDeclarationEdge {
+            declaration: observed.clone(),
+            registration_id: form.id.clone(),
+            library_id: form.library_id.clone(),
+            registration_version: form.version.clone(),
+            provider_package: form.library_id.clone(),
+            provider_source_digest: imports.compiler_artifact_digest.clone(),
+            meaning: ProgramConstructMeaning::LiveDependency,
+        });
+        examined.push(observed);
+    }
+    let edge_json = serde_json::to_vec(&edges).map_err(|error| error.to_string())?;
+    Ok(ProgramDeclarationCapture {
+        examined,
+        edges,
+        edge_digest: sha256_hex(&edge_json),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whipplescript_core::{std_messaging_send_construct, std_messaging_send_effect_contract};
+    use whipplescript_core::{
+        std_messaging_send_construct, std_messaging_send_effect_contract, LibraryRegistration,
+    };
     use whipplescript_parser::{IrUse, IrUseKind};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -182,6 +279,211 @@ rule notify
             constructs: vec![std_messaging_send_construct()],
             effect_contracts: vec![std_messaging_send_effect_contract()],
             ..ContractRegistry::default()
+        }
+    }
+
+    fn standard_declaration(
+        id: &str,
+        library: &str,
+        keyword: &str,
+        family: &str,
+        lowering: &str,
+    ) -> ConstructRegistration {
+        ConstructRegistration {
+            id: id.into(),
+            library_id: library.into(),
+            version: "0.1.0".into(),
+            construct_family: family.into(),
+            keyword: keyword.into(),
+            scope: "top_level".into(),
+            grammar: None,
+            fields: Vec::new(),
+            requires: Vec::new(),
+            provides: Vec::new(),
+            lowering_target: lowering.into(),
+            target_capability: None,
+        }
+    }
+
+    #[test]
+    fn declaration_capture_resolves_both_source_variants_and_refuses_unknown_or_ambiguous() {
+        let signal = standard_declaration(
+            "ingress.signal",
+            "std.ingress",
+            "signal",
+            "declaration_block",
+            "metadata_only",
+        );
+        let clock = standard_declaration(
+            "time.clock_source",
+            "std.time",
+            "source clock",
+            "source_declaration",
+            "clock_source",
+        );
+        let generic = standard_declaration(
+            "ingress.source",
+            "std.ingress",
+            "source",
+            "source_declaration",
+            "signal_source",
+        );
+        let registry = ContractRegistry {
+            libraries: vec![
+                LibraryRegistration {
+                    id: "std.ingress".into(),
+                    version: "0.1.0".into(),
+                    standard: true,
+                },
+                LibraryRegistration {
+                    id: "std.time".into(),
+                    version: "0.1.0".into(),
+                    standard: true,
+                },
+            ],
+            constructs: vec![signal, clock.clone(), generic],
+            ..ContractRegistry::default()
+        };
+        for (source, expected) in [
+            (
+                include_str!("../../../examples/clock-source.whip"),
+                "time.clock_source",
+            ),
+            (
+                include_str!("../../../examples/ingress-file-source.whip"),
+                "ingress.source",
+            ),
+        ] {
+            let compiled = whipplescript_parser::compile_program(source);
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+            let program = compiled.ir.unwrap();
+            let mut witness = crate::import_coverage::capture(&program, A, B, C, &[]).unwrap();
+            let capture = capture_declarations(&program, &registry, &witness).unwrap();
+            assert_eq!(capture.examined.len(), 2);
+            assert_eq!(capture.edges.len(), 2);
+            assert_eq!(capture.edges[1].registration_id, expected);
+            assert_eq!(capture.edges[1].provider_source_digest, C);
+            witness.declarations = Some(capture);
+            assert!(whipplescript_store::program_imports::encode(&witness).is_ok());
+
+            let mut older = program.clone();
+            older.declaration_constructs = None;
+            assert!(capture_declarations(&older, &registry, &witness)
+                .unwrap_err()
+                .contains("no declaration inventory"));
+            let mut ambiguous = registry.clone();
+            ambiguous.constructs.push(clock.clone());
+            if expected == "time.clock_source" {
+                assert!(capture_declarations(&program, &ambiguous, &witness)
+                    .unwrap_err()
+                    .contains("more than one registration"));
+            }
+            let mut missing = registry.clone();
+            missing.constructs.retain(|form| form.id != expected);
+            assert!(capture_declarations(&program, &missing, &witness)
+                .unwrap_err()
+                .contains("unresolved checked declaration"));
+            let mut unowned = registry.clone();
+            unowned
+                .constructs
+                .iter_mut()
+                .find(|form| form.id == expected)
+                .unwrap()
+                .library_id = "local.forged".into();
+            assert!(capture_declarations(&program, &unowned, &witness)
+                .unwrap_err()
+                .contains("compiler-owned std library"));
+            let mut bad_artifact = witness.clone();
+            bad_artifact.compiler_artifact_digest = "not-a-digest".into();
+            assert!(capture_declarations(&program, &registry, &bad_artifact)
+                .unwrap_err()
+                .contains("exact compiler artifact digest"));
+            let mut reordered = program.clone();
+            reordered
+                .declaration_constructs
+                .as_mut()
+                .unwrap()
+                .swap(0, 1);
+            assert!(capture_declarations(&reordered, &registry, &witness)
+                .unwrap_err()
+                .contains("effective-source order"));
+        }
+    }
+
+    #[test]
+    fn checked_empty_declaration_inventory_stays_explicitly_empty() {
+        let program = whipplescript_parser::compile_program("workflow Empty")
+            .ir
+            .expect("checked program");
+        let imports = crate::import_coverage::capture(&program, A, B, C, &[]).unwrap();
+        let capture = capture_declarations(&program, &ContractRegistry::default(), &imports)
+            .expect("new compiler checked an empty declaration population");
+        assert!(capture.examined.is_empty());
+        assert!(capture.edges.is_empty());
+        assert_eq!(capture.edge_digest, sha256_hex(b"[]"));
+    }
+
+    #[test]
+    fn every_supported_standard_declaration_form_has_a_resolved_edge() {
+        let forms = [
+            ("coord.lease", "std.coord", "lease"),
+            ("coord.ledger", "std.coord", "ledger"),
+            ("coord.counter", "std.coord", "counter"),
+            ("tracker.tracker", "std.tracker", "tracker"),
+            ("files.file_store", "std.files", "file store"),
+        ];
+        let registry = ContractRegistry {
+            libraries: ["std.coord", "std.tracker", "std.files"]
+                .into_iter()
+                .map(|id| LibraryRegistration {
+                    id: id.into(),
+                    version: "0.1.0".into(),
+                    standard: true,
+                })
+                .collect(),
+            constructs: forms
+                .into_iter()
+                .map(|(id, library, keyword)| {
+                    standard_declaration(id, library, keyword, "declaration_block", "metadata_only")
+                })
+                .collect(),
+            ..ContractRegistry::default()
+        };
+        for (source, expected) in [
+            (
+                include_str!("../../../examples/gastown-lite.whip"),
+                &["coord.lease", "coord.ledger", "tracker.tracker"][..],
+            ),
+            (
+                include_str!("../../../examples/circuit-breaker.whip"),
+                &["coord.counter"][..],
+            ),
+            (
+                include_str!("../../../examples/file-store-demo.whip"),
+                &["files.file_store"][..],
+            ),
+        ] {
+            let compiled = whipplescript_parser::compile_program(source);
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+            let program = compiled.ir.unwrap();
+            let imports = crate::import_coverage::capture(&program, A, B, C, &[]).unwrap();
+            let capture = capture_declarations(&program, &registry, &imports).unwrap();
+            assert_eq!(
+                capture
+                    .edges
+                    .iter()
+                    .map(|edge| edge.registration_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 
