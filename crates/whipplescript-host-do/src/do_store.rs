@@ -14835,6 +14835,7 @@ pub(crate) mod tests {
                 ),
                 edges,
                 constructs: None,
+                declarations: None,
             }
         };
         let mut store = store();
@@ -14842,6 +14843,13 @@ pub(crate) mod tests {
         first_witness.constructs = Some(
             whipplescript_store::program_imports::ProgramConstructCapture {
                 scope: whipplescript_store::program_imports::ProgramConstructScope::RuleEffect,
+                examined: Vec::new(),
+                edges: Vec::new(),
+                edge_digest: whipplescript_store::items::sha256_hex("[]"),
+            },
+        );
+        first_witness.declarations = Some(
+            whipplescript_store::program_imports::ProgramDeclarationCapture {
                 examined: Vec::new(),
                 edges: Vec::new(),
                 edge_digest: whipplescript_store::items::sha256_hex("[]"),
@@ -14868,6 +14876,26 @@ pub(crate) mod tests {
             .create_program_version_with_import_witness(
                 version("hosted-invalid-construct"),
                 &malformed_construct,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        let mut malformed_declaration = first_witness.clone();
+        malformed_declaration
+            .declarations
+            .as_mut()
+            .unwrap()
+            .edge_digest = LOCK.into();
+        assert!(store
+            .create_program_version_with_import_witness(
+                version("hosted-invalid-declaration"),
+                &malformed_declaration,
             )
             .is_err());
         assert_eq!(

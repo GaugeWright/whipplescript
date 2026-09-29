@@ -111,6 +111,7 @@ pub fn capture(
         edges,
         edge_digest: sha256_hex(&edge_json),
         constructs: None,
+        declarations: None,
     })
 }
 

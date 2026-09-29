@@ -36,6 +36,40 @@ pub struct ProgramImportWitness {
     /// no uses; it says nothing about other construct-bearing IR forms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constructs: Option<ProgramConstructCapture>,
+    /// `None` is unknown for compiler-inventoried declarations. `Some(empty)`
+    /// means that exact checked program examined this class and found none.
+    /// This field is separate from rule-effect constructs because declarations
+    /// have no effect capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declarations: Option<ProgramDeclarationCapture>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramDeclarationUse {
+    pub occurrence: usize,
+    pub keyword: String,
+    pub name: String,
+    pub scope: String,
+    pub family: String,
+    pub lowering: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramDeclarationEdge {
+    pub declaration: ProgramDeclarationUse,
+    pub registration_id: String,
+    pub library_id: String,
+    pub registration_version: String,
+    pub provider_package: String,
+    pub provider_source_digest: String,
+    pub meaning: ProgramConstructMeaning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramDeclarationCapture {
+    pub examined: Vec<ProgramDeclarationUse>,
+    pub edges: Vec<ProgramDeclarationEdge>,
+    pub edge_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +331,45 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             ));
         }
     }
+    if let Some(declarations) = &witness.declarations {
+        if !is_digest(&declarations.edge_digest)
+            || declarations.examined.len() != declarations.edges.len()
+            || declarations
+                .examined
+                .iter()
+                .enumerate()
+                .any(|(index, declaration)| {
+                    declaration.occurrence != index
+                        || declaration.keyword.is_empty()
+                        || declaration.name.is_empty()
+                        || declaration.scope.is_empty()
+                        || declaration.family.is_empty()
+                        || declaration.lowering.is_empty()
+                })
+            || declarations
+                .examined
+                .iter()
+                .zip(&declarations.edges)
+                .any(|(declaration, edge)| {
+                    edge.declaration != *declaration
+                        || edge.registration_id.is_empty()
+                        || edge.library_id.is_empty()
+                        || edge.registration_version.is_empty()
+                        || edge.provider_package.is_empty()
+                        || !is_digest(&edge.provider_source_digest)
+                })
+        {
+            return Err(StoreError::Conflict(
+                "declaration witness has incomplete or unordered edges".into(),
+            ));
+        }
+        let edge_json = serde_json::to_string(&declarations.edges)?;
+        if crate::items::sha256_hex(&edge_json) != declarations.edge_digest {
+            return Err(StoreError::Conflict(
+                "declaration witness edge digest differs from its edges".into(),
+            ));
+        }
+    }
     let json = serde_json::to_string(witness)?;
     let digest = crate::items::sha256_hex(&json);
     Ok((digest, json))
@@ -392,6 +465,7 @@ mod tests {
             ),
             edges,
             constructs: None,
+            declarations: None,
         }
     }
 
@@ -455,6 +529,89 @@ mod tests {
             Err(StoreError::Conflict(message)) if message.contains("construct witness edge digest differs")
         ));
         assert_eq!(store.program_import_operation_roster().unwrap(), roster);
+    }
+
+    #[test]
+    fn declaration_capture_is_distinct_from_unknown_and_refuses_malformed_edges_atomically() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let older = witness(LOCK);
+        let older_json = serde_json::to_value(&older).unwrap();
+        assert!(older_json.get("declarations").is_none());
+        assert_eq!(
+            serde_json::from_value::<ProgramImportWitness>(older_json)
+                .unwrap()
+                .declarations,
+            None
+        );
+
+        let declaration = ProgramDeclarationUse {
+            occurrence: 0,
+            keyword: "source clock".into(),
+            name: "daily".into(),
+            scope: "top_level".into(),
+            family: "source_declaration".into(),
+            lowering: "clock_source".into(),
+        };
+        let edge = ProgramDeclarationEdge {
+            declaration: declaration.clone(),
+            registration_id: "time.clock_source".into(),
+            library_id: "std.time".into(),
+            registration_version: "0.1.0".into(),
+            provider_package: "std.time".into(),
+            provider_source_digest: COMPILER.into(),
+            meaning: ProgramConstructMeaning::LiveDependency,
+        };
+        let edges = vec![edge];
+        let mut checked = older;
+        checked.declarations = Some(ProgramDeclarationCapture {
+            examined: vec![declaration],
+            edge_digest: crate::items::sha256_hex(&serde_json::to_string(&edges).unwrap()),
+            edges,
+        });
+        let admitted = store
+            .create_program_version_with_import_witness(version("declaration-checked"), &checked)
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+                .unwrap(),
+            Some(checked.clone())
+        );
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.operations.len(), 1);
+
+        let mut malformed = checked.clone();
+        malformed.declarations.as_mut().unwrap().edges[0]
+            .declaration
+            .name = "other".into();
+        assert!(matches!(
+            store.create_program_version_with_import_witness(version("declaration-invalid"), &malformed),
+            Err(StoreError::Conflict(message)) if message.contains("declaration witness has incomplete or unordered edges")
+        ));
+        assert_eq!(store.program_import_operation_roster().unwrap(), roster);
+        malformed = checked;
+        malformed.declarations.as_mut().unwrap().edge_digest = LOCK.into();
+        assert!(matches!(
+            store.create_program_version_with_import_witness(version("declaration-invalid"), &malformed),
+            Err(StoreError::Conflict(message)) if message.contains("declaration witness edge digest differs")
+        ));
+        assert_eq!(store.program_import_operation_roster().unwrap(), roster);
+
+        let mut empty = witness(LOCK);
+        empty.declarations = Some(ProgramDeclarationCapture {
+            examined: Vec::new(),
+            edges: Vec::new(),
+            edge_digest: crate::items::sha256_hex("[]"),
+        });
+        let admitted = store
+            .create_program_version_with_import_witness(version("declaration-empty"), &empty)
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+                .unwrap(),
+            Some(empty)
+        );
     }
 
     #[test]
