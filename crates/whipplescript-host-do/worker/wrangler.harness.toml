@@ -106,6 +106,9 @@ WHIP_EXECUTOR_POOL_SIZE = "0"
 # Sentinel host for Class-B turn containers: agent turns run whole in a
 # per-turn container (idFromName over the turn id) over whip-turn/1.
 WHIP_TURN_URL = "http://turn"
+# Governed harness turns use the closed synthetic broker. The token is a
+# Worker secret shared only with that broker, never a provider credential.
+WHIP_MODEL_BROKER_URL = "https://models.gaugewright.com/_canary/whip-model-egress"
 # The norm plane's ledger half (DR-0140): the production canary ledger's
 # public bindings and creation grant, and the restoration pinning its object
 # (tenant synthetic-wiring, placement production-norm-ledger-canary-v1) to the
@@ -122,5 +125,4 @@ command = "npm run build:wasm"
 # Secret-free governed turns configure the non-secret broker URL, then set only
 # the broker-hop token as a Worker secret. The verified signed policy epoch owns
 # the exact non-secret provider tuple; there is no Worker provider map.
-#   WHIP_MODEL_BROKER_URL = "https://home.example/model-egress"
 #   wrangler secret put WHIP_MODEL_BROKER_TOKEN

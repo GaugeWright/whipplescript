@@ -295,15 +295,15 @@ Pin the Worker to this root, or the policy is refused with 503 whatever it says:
 Store the envelope where the canary reads it:
 
   infisical secrets set GW_SYNTHETIC_WHIP_SIGNED_POLICY=\
-"$(cat ${policyFile})" --path /synthetics/wiring --env prod
+"$(cat ${policyFile})" --path /synthetics/wiring/whipplescript-src --env prod
 
-Then project it, with the other ten, into the lane's environment.`);
+The fleet canary reads that exact path; the signing key is not stored there.`);
   if (rawPolicyFile) {
     console.log(`
 Store the separately bounded Raw context envelope and its provider origin:
 
   infisical secrets set GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY=\
-"$(cat ${rawPolicyFile})" --path /synthetics/wiring --env prod
+"$(cat ${rawPolicyFile})" --path /synthetics/wiring/whipplescript-src --env prod
 
   GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN=${rawProviderOrigin}
 
@@ -314,11 +314,12 @@ the control token; it will not call a customer provider.`);
   }
   if (keyFile) {
     console.log(`
-Keep the private half so a later epoch can be re-signed. It belongs in
-Infisical beside the rest, under a name that says which half it is:
+Keep the private half so a later epoch can be re-signed. Store it in an
+operator-only folder outside the fleet canary's read scope:
 
+  infisical secrets folders create --name whipplescript-canary-signing --path /synthetics --env prod
   infisical secrets set GW_SYNTHETIC_WHIP_GOVERNANCE_PRIVATE_KEY=\
-"$(cat ${keyFile})" --path /synthetics/wiring --env prod
+"$(cat ${keyFile})" --path /synthetics/whipplescript-canary-signing --env prod
 
 Re-run with --private-key to re-sign without changing what the Worker pins.`);
   }

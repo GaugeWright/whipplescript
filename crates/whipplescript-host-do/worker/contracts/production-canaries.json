@@ -167,6 +167,12 @@
         "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN",
         "GW_SYNTHETIC_WHIP_RAW_CONTEXT_SIGNED_POLICY"
       ],
+      "configuration": {
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN": "https://whipplescript-runtime.jack-168.workers.dev",
+        "GW_SYNTHETIC_WHIP_TENANT": "synthetic-wiring",
+        "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PLACEMENT": "production-raw-context-canary-v1",
+        "GW_SYNTHETIC_WHIP_RAW_CONTEXT_PROVIDER_ORIGIN": "https://models.gaugewright.com"
+      },
       "cleanup": "Cancel the synthetic model call, verify the transient request body is no longer readable, restore the placement baseline, and remove synced files. The synthetic provider releases a held body after twenty seconds even when cancellation is interrupted.",
       "surfaces": [
         "whip-runtime"
