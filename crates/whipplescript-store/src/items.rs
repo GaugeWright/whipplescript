@@ -2039,6 +2039,33 @@ impl WorkItemStore {
         crate::norm::replay_norm(&events, &pin, verifier)
     }
 
+    /// Capture the verified norm view and the full tracker history from one
+    /// SQLite snapshot. Admission planning needs both: a norm event landing
+    /// between independent reads would otherwise pair a view with a different
+    /// history. This is a local capture, not a Home-issued population cut.
+    pub fn norm_admission_capture(
+        &self,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<(crate::norm::NormView, Vec<TrackerEvent>)> {
+        let owned_tx = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let pin = load_norm_checkpoint(&self.connection)?.ok_or_else(|| {
+            StoreError::Conflict("norm ledger is not bootstrapped or pinned".into())
+        })?;
+        let norm_events = load_norm_events(&self.connection)?;
+        let history = self.export_events()?;
+        if let Some(tx) = owned_tx {
+            tx.commit()?;
+        }
+        Ok((
+            crate::norm::replay_norm(&norm_events, &pin, verifier)?,
+            history,
+        ))
+    }
+
     pub fn norm_reference_inventory(
         &self,
         verifier: &dyn crate::norm::NormVerifier,
@@ -4421,6 +4448,27 @@ fn insert_norm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoNormVerifier;
+
+    impl crate::norm::NormVerifier for NoNormVerifier {
+        fn verify(&self, _: &crate::norm::NormActor, _: &[u8], _: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn authorize_creation(&self, _: &str, _: &crate::norm::NormActor) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn admission_capture_refuses_an_unpinned_norm_ledger() {
+        let store = WorkItemStore::open_in_memory().expect("store");
+        assert!(matches!(
+            store.norm_admission_capture(&NoNormVerifier),
+            Err(StoreError::Conflict(message)) if message == "norm ledger is not bootstrapped or pinned"
+        ));
+    }
 
     /// DR-0084 Decision 2: an assertion's durable identity is the content
     /// hash of its `assertion.created` event; `AS-N` is only a clone-local

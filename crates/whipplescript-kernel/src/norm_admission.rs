@@ -331,7 +331,7 @@ impl AdmissionLedger for WorkItemStore {
         Ok(self.norm_checkpoint()?.is_some())
     }
     fn capture(&self, verifier: &dyn NormVerifier) -> StoreResult<(NormView, Vec<TrackerEvent>)> {
-        Ok((self.norm_view(verifier)?, self.export_events()?))
+        self.norm_admission_capture(verifier)
     }
     fn exclusively(
         &self,

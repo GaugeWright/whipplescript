@@ -30,6 +30,42 @@ impl AdmissionLedger for Ledger {
     }
 }
 
+#[test]
+fn native_admission_captures_the_norm_view_and_history_together() {
+    let (mut store, record) = f::fixture(Some(f::template()), false);
+    let captured = |store: &WorkItemStore| {
+        let (view, history) = store.capture(&Boundary).unwrap();
+        let replayed: std::collections::BTreeSet<_> = view.event_order().iter().cloned().collect();
+        let returned: std::collections::BTreeSet<_> = history
+            .iter()
+            .filter(|event| event.kind.starts_with("norm."))
+            .map(|event| event.event_id.clone())
+            .collect();
+        assert_eq!(replayed, returned);
+        view
+    };
+    let before = captured(&store);
+    let current = &before.records[&record];
+    store
+        .append_norm_event(
+            &f::sign(
+                "accept",
+                NormAct::Transition {
+                    ledger: before.ledger.clone(),
+                    authority: None,
+                    vocabulary: current.vocabulary.clone(),
+                    record,
+                    previous: current.head.clone(),
+                    status: "accepted".into(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let after = captured(&store);
+    assert_ne!(before.frontier, after.frontier);
+}
+
 /// A base cut and a proposed one, with the files a gate judges.
 fn cuts() -> (BranchStore, f::Blobs) {
     let blobs = f::Blobs::default();
