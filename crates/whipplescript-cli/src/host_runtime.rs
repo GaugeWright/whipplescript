@@ -1929,7 +1929,7 @@ impl GovernedHostRuntime {
             .checked_import_source_digest()
             .map_err(HostRuntimeError::Resolver)?;
         self.check_package_ifc(&package)?;
-        if let Some(opened) = self.replayed_open_instance(command, &package)? {
+        if let Some(opened) = self.replayed_open_instance(command, &package, &source_digest)? {
             return Ok(opened);
         }
 
@@ -2280,6 +2280,7 @@ impl GovernedHostRuntime {
         &mut self,
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
+        source_digest: &str,
     ) -> Result<Option<OpenedInstance>, HostRuntimeError> {
         for instance in self
             .kernel
@@ -2357,8 +2358,10 @@ impl GovernedHostRuntime {
             // version re-point, spec/agent-harness.md "Program identity
             // across toolchains").
             if version.ir_hash != package.ir_hash {
+                let compiler_artifact_digest =
+                    native_compiler_artifact_digest().map_err(HostRuntimeError::Resolver)?;
                 self.kernel
-                    .reattest_instance_program(
+                    .reattest_instance_program_with_imports(
                         &instance.instance_id,
                         ProgramVersionInput {
                             program_name: &package.agent,
@@ -2366,6 +2369,14 @@ impl GovernedHostRuntime {
                             ir_hash: &package.ir_hash,
                             compiler_version: HOST_PROTOCOL,
                             ir_snapshot: None,
+                        },
+                        &package.program,
+                        &CheckedImportBasis {
+                            program_source_digest: source_digest,
+                            version_source_digest: Some(&package.source_hash),
+                            lock_digest: NO_LOCK_DIGEST,
+                            compiler_artifact_digest: &compiler_artifact_digest,
+                            packages: &[],
                         },
                     )
                     .map_err(HostRuntimeError::Store)?;
@@ -7044,6 +7055,46 @@ workflow Method {
             .open_instance(&open, &Packages)
             .expect("the replayed open re-attests instead of refusing");
         assert_eq!(replayed.instance_ref, first.instance_ref);
+        let roster = runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .expect("import operations after replay");
+        assert_eq!(roster.operations.len(), 2);
+        let checked = roster.operations.last().expect("re-attestation operation");
+        assert_eq!(
+            checked.kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = runtime
+            .kernel
+            .store()
+            .program_import_witness(
+                &checked.version_id,
+                checked
+                    .witness_digest
+                    .as_deref()
+                    .expect("checked witness digest"),
+            )
+            .expect("witness lookup")
+            .expect("retained witness");
+        let package = Packages.resolve_package("package:v1").expect("package");
+        assert_eq!(
+            witness.program_source_digest,
+            package
+                .checked_import_source_digest()
+                .expect("checked source digest")
+        );
+        assert_eq!(
+            witness.version_source_digest.as_deref(),
+            Some(package.source_hash.as_str())
+        );
+        assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
+        assert_eq!(
+            witness.compiler_artifact_digest,
+            native_compiler_artifact_digest().expect("compiler digest")
+        );
+        assert!(witness.examined.is_empty());
         // The re-attestation is an auditable event, and the instance runs.
         {
             let connection = rusqlite::Connection::open(&path).expect("raw store");
