@@ -193,6 +193,63 @@ fn dev_and_pin(env: &Env, program_path: &str) -> String {
 }
 
 #[test]
+fn improve_skips_repeated_canonical_candidate_before_regeneration() {
+    let env = Env::new("repeat-guard");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    let baseline = program("low", "ticket.id", &env.dir);
+    fs::write(&program_path, &baseline).expect("write baseline");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    let repeated_path = env.dir.join("repeated.whip");
+    fs::write(&repeated_path, &baseline).expect("write repeated candidate");
+    let improved_path = env.dir.join("improved.whip");
+    fs::write(&improved_path, program("high", "ticket.id", &env.dir))
+        .expect("write improved candidate");
+    let proposals = format!(
+        "{}:{}:{}",
+        repeated_path.display(),
+        repeated_path.display(),
+        improved_path.display()
+    );
+    let result = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[("WHIPPLESCRIPT_IMPROVE_PROPOSALS", &proposals)],
+    );
+    assert_eq!(result["proposed"], true);
+    let campaign_id = result["campaign"].as_str().expect("campaign id");
+    let campaign = env.run_json(&["--json", "campaign", campaign_id], &[]);
+    let events = campaign["events"].as_array().expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "candidate.recorded")
+            .count(),
+        2,
+        "the duplicate must not run a second regeneration"
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "candidate.rejected"
+            && event["payload"]["candidate"] == "K-2"
+            && event["payload"]["tags"] == serde_json::json!(["exact-retry"])
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "candidate.open_assessed" && event["payload"]["candidate"] == "K-1"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "candidate.proposed" && event["payload"]["candidate"] == "K-3"
+    }));
+}
+
+#[test]
 fn improve_campaign_proposes_dominant_candidate_and_adopts() {
     let env = Env::new("dominant");
     write_judges(&env.dir);
@@ -1114,21 +1171,27 @@ fn spend_cap_parks_and_resume_continues_the_campaign() {
         "record-time pricing recorded the turn's cost: {campaigns}"
     );
 
-    // Resume: a fresh per-invocation allowance under the same recorded
-    // cap; the spec comes from the record, candidate numbering continues.
+    // Resume with a fresh per-invocation allowance. The first proposal
+    // repeats the prior candidate and is skipped before regeneration; the
+    // next one is evaluated under a new candidate id.
     let good = env.dir.join("good.whip");
     fs::write(&good, program("high", "ticket.id", &env.dir)).expect("write good");
-    let good_str = good.to_string_lossy().into_owned();
+    let resumed_proposals = format!("{}:{}", bad.display(), good.display());
     let resumed = env.run_json(
         &[
             "--json",
             "improve",
             "--resume",
             &campaign_id,
+            "--spend-cap",
+            "$5",
             "--provider-config",
             &prices_str,
         ],
-        &[("WHIPPLESCRIPT_IMPROVE_PROPOSALS", &good_str), usage_env],
+        &[
+            ("WHIPPLESCRIPT_IMPROVE_PROPOSALS", &resumed_proposals),
+            usage_env,
+        ],
     );
     assert_eq!(
         resumed["campaign"].as_str(),
@@ -1139,7 +1202,7 @@ fn spend_cap_parks_and_resume_continues_the_campaign() {
     let cards = resumed["cards"].as_array().expect("cards");
     assert_eq!(
         cards[0]["candidate"].as_str(),
-        Some("K-2"),
+        Some("K-3"),
         "candidate numbering continues across the park: {resumed}"
     );
 
@@ -1156,6 +1219,11 @@ fn spend_cap_parks_and_resume_continues_the_campaign() {
                 .map(str::to_owned)
         })
         .collect();
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["type"] == "candidate.rejected"
+            && event["payload"]["candidate"] == "K-2"
+            && event["payload"]["tags"] == serde_json::json!(["exact-retry"])
+    }));
     for expected in ["campaign.parked", "campaign.resumed", "campaign.closed"] {
         assert!(
             event_types.iter().any(|event| event == expected),

@@ -3369,6 +3369,46 @@ impl Proposer for FixtureProposer {
 /// candidate, never a write.
 struct NativeProposer;
 
+impl NativeProposer {
+    fn refine(
+        baseline: &str,
+        candidate: &Proposal,
+        observation: &EditObservation,
+    ) -> Result<Option<Proposal>, String> {
+        let prompt = format!(
+            "You are refining a proposed WhippleScript harness change before evaluation. \
+             Keep ONE independently testable mechanism that targets the stated gauges. \
+             Remove separable edits; preserve coupled declarations when needed. \
+             Return the COMPLETE source, rationale, and edit_account. Do not use \
+             benchmark-specific branches or invent evidence. If the source cannot be \
+             usefully narrowed, return the original source unchanged.\n\n\
+             ## Original mechanism and edit account\n{}\n\n\
+             ## Computed declaration diff\n{}\n\n\
+             ## Baseline\n```whip\n{}\n```\n\n\
+             ## Proposed source\n```whip\n{}\n```",
+            candidate
+                .edit_account
+                .as_ref()
+                .map(|account| serde_json::to_string(account).unwrap_or_default())
+                .unwrap_or_default(),
+            serde_json::to_string(&observation.changes).unwrap_or_default(),
+            baseline,
+            candidate.source,
+        );
+        NativeProposer.propose(&prompt)
+    }
+}
+
+fn needs_scope_refinement(observation: &EditObservation) -> bool {
+    let changed = observation.changes.as_ref().map_or(0, Vec::len);
+    changed >= 3
+        || (changed >= 2
+            && observation
+                .account
+                .as_ref()
+                .is_some_and(|account| account.expected_gauges.len() >= 2))
+}
+
 impl Proposer for NativeProposer {
     fn propose(&mut self, reflection: &str) -> Result<Option<Proposal>, String> {
         let schema = json!({
@@ -3441,7 +3481,8 @@ fn build_reflection(
     baseline_open: &[RunObservation],
     baseline_sealed: &[RunObservation],
     open_scenarios: &[&ScenarioRow],
-    prior_failures: &[String],
+    prior_attempts: &[String],
+    stalled: bool,
     sealed_engaged: bool,
 ) -> String {
     let mut reflection = String::new();
@@ -3527,14 +3568,139 @@ fn build_reflection(
             }
         }
     }
-    if !prior_failures.is_empty() {
-        reflection.push_str("\n## Prior candidates that were refused\n");
-        for failure in prior_failures {
-            reflection.push_str(&format!("- {failure}\n"));
+    if !prior_attempts.is_empty() {
+        reflection.push_str("\n## Prior attempts on open scenarios (newest first)\n");
+        for attempt in prior_attempts {
+            reflection.push_str(&format!("- {attempt}\n"));
         }
+    }
+    if stalled {
+        reflection.push_str("\nRecent mechanisms did not clear the open gauges. Try a different component or a testable deletion; do not merely rephrase a prior candidate.\n");
     }
     reflection.push_str(&format!("\n## Program\n```whip\n{source}\n```\n"));
     reflection
+}
+
+/// Durable proposal memory is deliberately built from OPEN assessment events.
+/// The final candidate cards may contain sealed outcomes and must never be
+/// recycled into proposer context (DR-0143).
+fn campaign_search_memory(
+    store: &ImproveStore,
+    campaign_id: &str,
+) -> Result<(BTreeSet<String>, Vec<String>, bool), String> {
+    let brief = |text: &str| text.chars().take(240).collect::<String>();
+    let events = store
+        .list_campaign_events(campaign_id)
+        .map_err(|error| format!("failed to load proposal history: {error:?}"))?;
+    let mut seen_hashes = BTreeSet::new();
+    let mut drafts = BTreeMap::new();
+    let mut assessments = Vec::new();
+    for event in &events {
+        match event.event_type.as_str() {
+            "candidate.drafted" => {
+                if let Some(hash) = event.payload["hash"].as_str() {
+                    seen_hashes.insert(hash.to_owned());
+                }
+                if let Some(id) = event.payload["candidate"].as_str() {
+                    drafts.insert(id.to_owned(), &event.payload);
+                }
+            }
+            // Candidates from campaigns created before DR-0143 still count
+            // for retry prevention, though they lack open-only summaries.
+            "candidate.recorded" => {
+                if let Some(hash) = event.payload["hash"].as_str() {
+                    seen_hashes.insert(hash.to_owned());
+                }
+            }
+            "candidate.refinement" => {
+                if matches!(
+                    event.payload["status"].as_str(),
+                    Some("selected" | "open-refused" | "no-comparable-pairs")
+                ) {
+                    if let Some(hash) = event.payload["hash"].as_str() {
+                        seen_hashes.insert(hash.to_owned());
+                    }
+                }
+            }
+            "candidate.open_assessed" => assessments.push(&event.payload),
+            _ => {}
+        }
+    }
+    let stalled = assessments.iter().rev().take(2).count() == 2
+        && assessments.iter().rev().take(2).all(|assessment| {
+            assessment["proposable"].as_bool() != Some(true)
+                && assessment["tradeoff"].as_bool() != Some(true)
+        });
+    let recent = assessments
+        .iter()
+        .rev()
+        .take(6)
+        .map(|assessment| {
+            let id = assessment["candidate"].as_str().unwrap_or("?");
+            let draft = drafts.get(id).copied();
+            let mechanism = draft
+                .and_then(|value| value["edit"]["account"]["mechanism"].as_str())
+                .unwrap_or("unreported");
+            let changed = draft
+                .and_then(|value| value["edit"]["changed_declarations"].as_array())
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|change| change["identity"].as_str())
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let movement = assessment["gauges"]
+                .as_array()
+                .map(|gauges| {
+                    gauges
+                        .iter()
+                        .filter_map(|gauge| {
+                            Some(format!(
+                                "{} {}",
+                                gauge["gauge"].as_str()?,
+                                gauge["delta"].as_str()?
+                            ))
+                        })
+                        .take(12)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let reasons = assessment["reasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            format!(
+                "{id}: mechanism {}; changed [{changed}]; open gauges [{movement}]; {}",
+                brief(mechanism),
+                brief(&reasons)
+            )
+        })
+        .collect();
+    Ok((seen_hashes, recent, stalled))
+}
+
+fn campaign_candidate_sequence(store: &ImproveStore, campaign_id: &str) -> Result<usize, String> {
+    let events = store
+        .list_campaign_events(campaign_id)
+        .map_err(|error| format!("failed to load candidate sequence: {error:?}"))?;
+    Ok(events
+        .iter()
+        .filter_map(|event| event.payload["candidate"].as_str())
+        .filter_map(|id| id.strip_prefix("K-"))
+        .filter_map(|number| number.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -3722,62 +3888,63 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
         );
     }
     let prices = PriceTable::load(&args.provider_config_paths)?;
-    let (campaign_id, candidate_seq_start, campaign_spec, proposer_name) =
-        if let Some(resume_id) = &args.resume {
-            let (summary, payload) = resumable_campaign(&store, resume_id)?;
-            let recorded_hash = payload
-                .get("baseline_hash")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            // The same guard adoption uses: a campaign's verdicts are
-            // paired against ITS baseline; a drifted program needs a new
-            // campaign, not a silently re-based old one.
-            if recorded_hash != baseline_hash {
-                return Err(format!(
-                    "the program changed since campaign `{resume_id}` parked (recorded baseline \
+    let (campaign_id, candidate_seq_start, campaign_spec, proposer_name) = if let Some(resume_id) =
+        &args.resume
+    {
+        let (summary, payload) = resumable_campaign(&store, resume_id)?;
+        let recorded_hash = payload
+            .get("baseline_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // The same guard adoption uses: a campaign's verdicts are
+        // paired against ITS baseline; a drifted program needs a new
+        // campaign, not a silently re-based old one.
+        if recorded_hash != baseline_hash {
+            return Err(format!(
+                "the program changed since campaign `{resume_id}` parked (recorded baseline \
                      {}…, current {}…); open a new campaign",
-                    &recorded_hash[..12.min(recorded_hash.len())],
-                    &baseline_hash[..12]
-                ));
-            }
-            let mut spec = campaign_spec_from_json(payload.get("spec").unwrap_or(&Value::Null))?;
-            // The allowance is per invocation (decision 2026-07-14): an
-            // unchanged cap buys a fresh round of proposals; --spend-cap
-            // refines it.
-            spec.spend_cap_micros = args.spec.spend_cap_micros.or(spec.spend_cap_micros);
-            let proposer_name = if options.args.iter().any(|arg| arg == "--proposer") {
-                args.proposer.clone()
-            } else {
-                payload
-                    .get("proposer")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&args.proposer)
-                    .to_owned()
-            };
-            store
-                .append_campaign_event(
-                    resume_id,
-                    "campaign.resumed",
-                    &json!({"cumulative_spent_micros": summary.spent_micros}),
-                )
-                .map_err(|error| format!("failed to record resume: {error:?}"))?;
-            (
-                resume_id.clone(),
-                summary.candidates.max(0) as usize,
-                spec,
-                proposer_name,
-            )
+                &recorded_hash[..12.min(recorded_hash.len())],
+                &baseline_hash[..12]
+            ));
+        }
+        let mut spec = campaign_spec_from_json(payload.get("spec").unwrap_or(&Value::Null))?;
+        // The allowance is per invocation (decision 2026-07-14): an
+        // unchanged cap buys a fresh round of proposals; --spend-cap
+        // refines it.
+        spec.spend_cap_micros = args.spec.spend_cap_micros.or(spec.spend_cap_micros);
+        let proposer_name = if options.args.iter().any(|arg| arg == "--proposer") {
+            args.proposer.clone()
         } else {
-            let campaign_id = store
-                .open_campaign(&json!({
-                    "spec": args.spec.to_json(),
-                    "program": program_path,
-                    "baseline_hash": baseline_hash,
-                    "proposer": args.proposer,
-                }))
-                .map_err(|error| format!("failed to open campaign: {error:?}"))?;
-            (campaign_id, 0, args.spec.clone(), args.proposer.clone())
+            payload
+                .get("proposer")
+                .and_then(Value::as_str)
+                .unwrap_or(&args.proposer)
+                .to_owned()
         };
+        store
+            .append_campaign_event(
+                resume_id,
+                "campaign.resumed",
+                &json!({"cumulative_spent_micros": summary.spent_micros}),
+            )
+            .map_err(|error| format!("failed to record resume: {error:?}"))?;
+        (
+            resume_id.clone(),
+            campaign_candidate_sequence(&store, resume_id)?.max(summary.candidates.max(0) as usize),
+            spec,
+            proposer_name,
+        )
+    } else {
+        let campaign_id = store
+            .open_campaign(&json!({
+                "spec": args.spec.to_json(),
+                "program": program_path,
+                "baseline_hash": baseline_hash,
+                "proposer": args.proposer,
+            }))
+            .map_err(|error| format!("failed to open campaign: {error:?}"))?;
+        (campaign_id, 0, args.spec.clone(), args.proposer.clone())
+    };
     let (open, sealed, sealing_engaged) = seal_scenarios(&campaign_id, &scenarios);
     let unheld_out = !sealing_engaged;
     contain_side_stores();
@@ -4123,7 +4290,6 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
             // Answered tradeoffs from every prior campaign: the only source of
             // auto-resolution authority (default-on, locality-bounded).
             let precedents = load_precedents(store)?;
-            let mut prior_failures: Vec<String> = Vec::new();
             let mut cards: Vec<Value> = Vec::new();
             let mut proposed_any = false;
             // Resume continues the record's numbering: K-ids stay unique
@@ -4148,6 +4314,8 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         break;
                     }
                 }
+                let (seen_hashes, prior_attempts, stalled) =
+                    campaign_search_memory(store, &campaign_id)?;
                 let reflection = build_reflection(
                     &source,
                     &spec_active,
@@ -4155,10 +4323,11 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     &baseline_open,
                     &baseline_sealed,
                     &open,
-                    &prior_failures,
+                    &prior_attempts,
+                    stalled,
                     sealing_engaged,
                 );
-                let Some(proposal) = proposer.propose(&reflection)? else {
+                let Some(mut proposal) = proposer.propose(&reflection)? else {
                     break;
                 };
                 if proposal.tokens > 0 {
@@ -4190,15 +4359,57 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 }
                 candidate_seq += 1;
                 let candidate_id = format!("K-{candidate_seq}");
-                let edit = observe_edit(&source, &proposal.source, proposal.edit_account.clone());
+                let mut candidate_hash = program_hash(&proposal.source);
+                let mut edit =
+                    observe_edit(&source, &proposal.source, proposal.edit_account.clone());
+                if seen_hashes.contains(&candidate_hash) {
+                    store
+                        .append_campaign_event(
+                            &campaign_id,
+                            "candidate.rejected",
+                            &json!({
+                                "candidate": candidate_id,
+                                "hash": candidate_hash,
+                                "reason": "same canonical program already attempted in this campaign",
+                                "rationale": proposal.rationale,
+                                "edit": edit.payload(),
+                                "tags": ["exact-retry"],
+                            }),
+                        )
+                        .map_err(|error| format!("failed to record exact retry: {error:?}"))?;
+                    store
+                        .append_campaign_event(
+                            &campaign_id,
+                            "candidate.open_assessed",
+                            &json!({"candidate": candidate_id, "proposable": false,
+                            "tradeoff": false,
+                            "reasons": ["same canonical program already attempted"]}),
+                        )
+                        .map_err(|error| format!("failed to record retry refusal: {error:?}"))?;
+                    continue;
+                }
+                store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "candidate.drafted",
+                        &json!({
+                            "candidate": candidate_id,
+                            "hash": candidate_hash,
+                            "source": proposal.source,
+                            "rationale": proposal.rationale,
+                            "baseline_hash": baseline_hash,
+                            "edit": edit.payload(),
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record draft: {error:?}"))?;
                 let candidate_path =
                     eval_scratch_dir().join(format!("candidate-{candidate_seq}.whip"));
                 std::fs::write(&candidate_path, &proposal.source)
                     .map_err(|error| format!("failed to stage candidate: {error}"))?;
-                let candidate_path_str = candidate_path.to_string_lossy().into_owned();
+                let mut candidate_path_str = candidate_path.to_string_lossy().into_owned();
                 // The static gate battery is a free feasibility oracle: candidates
                 // that break invariants die before a sample is spent.
-                let candidate_ir = match crate::compile_source_path_with_root(
+                let mut candidate_ir = match crate::compile_source_path_with_root(
                     &candidate_path_str,
                     args.root.as_deref(),
                 ) {
@@ -4217,25 +4428,193 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                        prior_failures.push(format!("{candidate_id}: does not compile"));
+                        store
+                            .append_campaign_event(
+                                &campaign_id,
+                                "candidate.open_assessed",
+                                &json!({"candidate": candidate_id, "proposable": false,
+                                "tradeoff": false, "reasons": ["does not compile"]}),
+                            )
+                            .map_err(|error| format!("failed to record open refusal: {error:?}"))?;
                         continue;
                     }
                 };
-                let candidate_open =
-                    evaluate_all(&candidate_path_str, &candidate_ir, &open, &mut seq)?;
-                judge_spend(
-                    store,
-                    &candidate_open,
-                    &format!("judge turns ({candidate_id})"),
-                    &mut spent_micros,
-                )?;
-                workflow_spend(
-                    store,
-                    &candidate_open,
-                    &format!("workflow turns ({candidate_id})"),
-                    &mut spent_micros,
-                )?;
-                let candidate_hash = program_hash(&proposal.source);
+                let mut prefetched_open = None;
+                if proposer.name() == "native"
+                    && needs_scope_refinement(&edit)
+                    && spec_active
+                        .spend_cap_micros
+                        .is_none_or(|cap| spent_micros < cap)
+                {
+                    match NativeProposer::refine(&source, &proposal, &edit) {
+                        Err(reason) => {
+                            store.append_campaign_event(
+                                &campaign_id,
+                                "candidate.refinement",
+                                &json!({"candidate": candidate_id, "status": "turn-failed", "reason": reason}),
+                            ).map_err(|error| format!("failed to record refinement: {error:?}"))?;
+                        }
+                        Ok(Some(refinement)) => {
+                            if refinement.tokens > 0 {
+                                let cost_micros = refinement
+                                    .usage
+                                    .as_ref()
+                                    .and_then(|usage| prices.cost_micros(usage));
+                                store.append_campaign_event(
+                                    &campaign_id,
+                                    "campaign.spend",
+                                    &json!({
+                                        "cost_micros": cost_micros.unwrap_or(0),
+                                        "priced": cost_micros.is_some(),
+                                        "tokens": refinement.tokens,
+                                        "input_tokens": refinement.usage.as_ref().map(|usage| usage.input_tokens),
+                                        "output_tokens": refinement.usage.as_ref().map(|usage| usage.output_tokens),
+                                        "provider": refinement.usage.as_ref().map(|usage| usage.provider.clone()),
+                                        "model": refinement.usage.as_ref().map(|usage| usage.model.clone()),
+                                        "what": "scope refinement turn",
+                                    }),
+                                ).map_err(|error| format!("failed to record refinement spend: {error:?}"))?;
+                                spent_micros += cost_micros.unwrap_or(0);
+                            }
+                            let refined_hash = program_hash(&refinement.source);
+                            let refined_edit = observe_edit(
+                                &source,
+                                &refinement.source,
+                                refinement.edit_account.clone(),
+                            );
+                            let original_count = edit.changes.as_ref().map_or(0, Vec::len);
+                            let refined_count = refined_edit.changes.as_ref().map_or(0, Vec::len);
+                            let mut refinement_event = json!({
+                                "candidate": candidate_id,
+                                "source": refinement.source,
+                                "hash": refined_hash,
+                                "rationale": refinement.rationale,
+                                "edit": refined_edit.payload(),
+                                "original_hash": candidate_hash,
+                                "status": "not-narrower",
+                            });
+                            if refined_hash != candidate_hash
+                                && !seen_hashes.contains(&refined_hash)
+                                && refined_count > 0
+                                && refined_count < original_count
+                            {
+                                let refined_path = eval_scratch_dir()
+                                    .join(format!("candidate-{candidate_seq}-refined.whip"));
+                                std::fs::write(&refined_path, &refinement.source).map_err(
+                                    |error| format!("failed to stage refinement: {error}"),
+                                )?;
+                                let refined_path_str = refined_path.to_string_lossy().into_owned();
+                                match crate::compile_source_path_with_root(
+                                    &refined_path_str,
+                                    args.root.as_deref(),
+                                ) {
+                                    Err(error) => {
+                                        refinement_event["status"] = json!("compile-failed");
+                                        refinement_event["reason"] =
+                                            json!(compile_failure_summary(&error));
+                                    }
+                                    Ok((_, refined_ir)) => {
+                                        match evaluate_all(
+                                            &refined_path_str,
+                                            &refined_ir,
+                                            &open,
+                                            &mut seq,
+                                        ) {
+                                            Err(reason) => {
+                                                refinement_event["status"] =
+                                                    json!("open-evaluation-failed");
+                                                refinement_event["reason"] = json!(reason);
+                                            }
+                                            Ok(refined_observations) => {
+                                                judge_spend(
+                                                    store,
+                                                    &refined_observations,
+                                                    &format!(
+                                                        "judge turns ({candidate_id}, refinement)"
+                                                    ),
+                                                    &mut spent_micros,
+                                                )?;
+                                                workflow_spend(
+                                                    store,
+                                                    &refined_observations,
+                                                    &format!("workflow turns ({candidate_id}, refinement)"),
+                                                    &mut spent_micros,
+                                                )?;
+                                                let (base, cand, _) = comparable_pairs(
+                                                    &baseline_open,
+                                                    &refined_observations,
+                                                );
+                                                if !base.is_empty() {
+                                                    let open_verdict = dominance_verdict(
+                                                        &specs,
+                                                        &spec_active,
+                                                        &base,
+                                                        &cand,
+                                                    );
+                                                    refinement_event["open"] = evidence_card(
+                                                        &campaign_id,
+                                                        &candidate_id,
+                                                        &refinement.rationale,
+                                                        &open_verdict,
+                                                        &[],
+                                                        unheld_out,
+                                                        &refined_edit,
+                                                    );
+                                                    if open_verdict.proposable {
+                                                        refinement_event["status"] =
+                                                            json!("selected");
+                                                        proposal = refinement;
+                                                        edit = refined_edit;
+                                                        candidate_hash = refined_hash;
+                                                        candidate_path_str = refined_path_str;
+                                                        candidate_ir = refined_ir;
+                                                        prefetched_open =
+                                                            Some(refined_observations);
+                                                    } else {
+                                                        refinement_event["status"] =
+                                                            json!("open-refused");
+                                                    }
+                                                } else {
+                                                    refinement_event["status"] =
+                                                        json!("no-comparable-pairs");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            store
+                                .append_campaign_event(
+                                    &campaign_id,
+                                    "candidate.refinement",
+                                    &refinement_event,
+                                )
+                                .map_err(|error| {
+                                    format!("failed to record refinement: {error:?}")
+                                })?;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                let candidate_open = if let Some(observations) = prefetched_open {
+                    observations
+                } else {
+                    let observations =
+                        evaluate_all(&candidate_path_str, &candidate_ir, &open, &mut seq)?;
+                    judge_spend(
+                        store,
+                        &observations,
+                        &format!("judge turns ({candidate_id})"),
+                        &mut spent_micros,
+                    )?;
+                    workflow_spend(
+                        store,
+                        &observations,
+                        &format!("workflow turns ({candidate_id})"),
+                        &mut spent_micros,
+                    )?;
+                    observations
+                };
                 record_observations(
                     store,
                     &candidate_open,
@@ -4277,11 +4656,33 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                    prior_failures.push(format!("{candidate_id}: no comparable scenario pairs"));
+                    store
+                        .append_campaign_event(
+                            &campaign_id,
+                            "candidate.open_assessed",
+                            &json!({"candidate": candidate_id, "proposable": false,
+                            "tradeoff": false, "reasons": ["no comparable scenario pairs"]}),
+                        )
+                        .map_err(|error| format!("failed to record open refusal: {error:?}"))?;
                     continue;
                 }
                 let open_verdict =
                     dominance_verdict(&specs, &spec_active, &paired_base, &paired_cand);
+                store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "candidate.open_assessed",
+                        &evidence_card(
+                            &campaign_id,
+                            &candidate_id,
+                            &proposal.rationale,
+                            &open_verdict,
+                            &[],
+                            unheld_out,
+                            &edit,
+                        ),
+                    )
+                    .map_err(|error| format!("failed to record open assessment: {error:?}"))?;
                 let mut verdict = open_verdict.clone();
                 let mut gate_tags = campaign_tags.clone();
                 gate_tags.extend(edit.tags.iter().cloned());
@@ -4422,25 +4823,16 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     store
                         .append_campaign_event(&campaign_id, "candidate.rejected", &card)
                         .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                    prior_failures.push(format!(
-                        "{candidate_id}: auto-rejected by precedent ({})",
-                        verdict.reasons.join("; ")
-                    ));
                     cards.push(card);
                 } else if verdict.tradeoff {
                     store
                         .append_campaign_event(&campaign_id, "candidate.tradeoff", &card)
                         .map_err(|error| format!("failed to record tradeoff: {error:?}"))?;
-                    prior_failures.push(format!(
-                        "{candidate_id}: genuine tradeoff ({}) — escalated, not accepted",
-                        verdict.reasons.join("; ")
-                    ));
                     cards.push(card);
                 } else {
                     store
                         .append_campaign_event(&campaign_id, "candidate.rejected", &card)
                         .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                    prior_failures.push(format!("{candidate_id}: {}", verdict.reasons.join("; ")));
                     cards.push(card);
                 }
             }
@@ -5942,6 +6334,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proposal_memory_uses_only_open_assessments_and_survives_reload() {
+        let mut store = ImproveStore::open_in_memory().expect("store");
+        let campaign = store.open_campaign(&json!({})).expect("campaign");
+        for (number, hash) in [(1, "first"), (2, "second")] {
+            let id = format!("K-{number}");
+            store
+                .append_campaign_event(
+                    &campaign,
+                    "candidate.drafted",
+                    &json!({"candidate": id, "hash": hash,
+                    "edit": {"account": {"mechanism": format!("hypothesis {number}")},
+                        "changed_declarations": [{"identity": "rule triage"}]}}),
+                )
+                .expect("draft");
+            store
+                .append_campaign_event(
+                    &campaign,
+                    "candidate.open_assessed",
+                    &json!({"candidate": id, "proposable": false, "tradeoff": false,
+                    "gauges": [{"gauge": "quality", "delta": "in-band"}],
+                    "reasons": ["no open gain"]}),
+                )
+                .expect("open assessment");
+            store
+                .append_campaign_event(
+                    &campaign,
+                    "candidate.rejected",
+                    &json!({"candidate": id, "reasons": ["SEALED SECRET"]}),
+                )
+                .expect("final verdict");
+        }
+        let (hashes, history, stalled) = campaign_search_memory(&store, &campaign).expect("memory");
+        assert!(hashes.contains("first") && hashes.contains("second"));
+        assert!(stalled);
+        assert_eq!(history.len(), 2);
+        assert!(history[0].contains("hypothesis 2"));
+        assert!(history[0].contains("quality in-band"));
+        assert!(!history.join(" ").contains("SEALED SECRET"));
+        assert_eq!(campaign_candidate_sequence(&store, &campaign).unwrap(), 2);
+    }
+
+    #[test]
     fn edit_account_mismatch_is_observed_without_claiming_causal_independence() {
         let baseline = "workflow Demo\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  message \"done\"\n}\n";
         let candidate = baseline
@@ -6259,6 +6693,7 @@ mod tests {
             &sealed_observations,
             &[],
             &[],
+            false,
             true,
         );
         assert!(
@@ -6370,6 +6805,7 @@ mod tests {
             &[],
             &[&row],
             &[],
+            false,
             false,
         );
         assert!(
