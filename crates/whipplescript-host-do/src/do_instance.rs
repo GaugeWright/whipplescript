@@ -279,6 +279,37 @@ fn is_governed_host_model_input(input: &serde_json::Value, effect_id: &str) -> b
         && input.pointer("/input/text").is_some()
 }
 
+fn attested_authored_package_source(
+    initial: Option<&whipplescript_kernel::sansio::InitialModelProvenance>,
+    instance_input_json: &str,
+) -> ModelContentProvenance {
+    // The admitted instance binds the exact package version. A host's current
+    // command may attest that package, but its chat/user/world labels belong
+    // only to the governed command, not to an agent.tell authored by the
+    // package while that command is running.
+    let package_ref = serde_json::from_str::<serde_json::Value>(instance_input_json)
+        .ok()
+        .and_then(|input| {
+            input
+                .get("package_version_ref")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    let handle = package_ref.map(|version| format!("package:{version}"));
+    match (initial, handle) {
+        (Some(initial), Some(handle))
+            if initial.system.source_handles.contains(&handle)
+                && initial.tools.source_handles.contains(&handle) =>
+        {
+            ModelContentProvenance {
+                source_handles: vec![handle],
+                complete: true,
+            }
+        }
+        _ => ModelContentProvenance::default(),
+    }
+}
+
 fn resumed_source_labels<Sql: DoSql>(
     sql: &Sql,
     prior_effect: Option<&str>,
@@ -1591,7 +1622,16 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let mut model_provenance = if host_command {
                     self.initial_model_provenance.cloned().unwrap_or_default()
                 } else {
-                    Default::default()
+                    let instance = self.kernel.store().get_instance(self.instance_id)?;
+                    let package = attested_authored_package_source(
+                        self.initial_model_provenance,
+                        instance.as_ref().map_or("", |row| row.input_json.as_str()),
+                    );
+                    whipplescript_kernel::sansio::InitialModelProvenance {
+                        system: package.clone(),
+                        tools: package,
+                        ..Default::default()
+                    }
                 };
                 model_provenance.system = project_doc_model_provenance(
                     model_provenance.system,
@@ -2817,6 +2857,40 @@ mod tests {
             )
             .complete
         );
+    }
+
+    #[test]
+    fn authored_effect_inherits_only_the_exact_attested_package() {
+        let known = |handles: &[&str]| ModelContentProvenance {
+            source_handles: handles.iter().map(|handle| (*handle).to_owned()).collect(),
+            complete: true,
+        };
+        let initial = whipplescript_kernel::sansio::InitialModelProvenance {
+            system: known(&["package:version-one", "chat:one"]),
+            user: known(&["chat:one"]),
+            world: known(&["workspace:one"]),
+            tools: known(&["package:version-one", "chat:one"]),
+            workspace_content: known(&["workspace:one"]),
+        };
+        let instance = r#"{"package_version_ref":"version-one"}"#;
+        assert_eq!(
+            attested_authored_package_source(Some(&initial), instance),
+            known(&["package:version-one"]),
+        );
+        assert!(
+            !attested_authored_package_source(
+                Some(&initial),
+                r#"{"package_version_ref":"version-two"}"#,
+            )
+            .complete
+        );
+        assert!(!attested_authored_package_source(None, instance).complete);
+        assert!(!attested_authored_package_source(Some(&initial), "{}").complete);
+        let unpaired = whipplescript_kernel::sansio::InitialModelProvenance {
+            tools: ModelContentProvenance::default(),
+            ..initial
+        };
+        assert!(!attested_authored_package_source(Some(&unpaired), instance).complete);
     }
 
     #[test]
@@ -7205,7 +7279,7 @@ complete result { count count } }
         let instance_id = kernel
             .create_instance_with_authority(
                 &version,
-                "{}",
+                r#"{"package_version_ref":"one"}"#,
                 NewInstanceAuthority {
                     workflow_principal: "local/AgentDemo",
                     effective_authority_json: "{}",
@@ -7252,9 +7326,9 @@ complete result { count count } }
         let outcome = run_to_completion(&mut machine, &host);
         let calls = host.0.borrow();
         assert!(!calls.is_empty());
-        assert!(calls[0].messages.iter().all(|part| !part.complete));
-        assert!(calls[0].messages[0].source_handles.is_empty());
-        assert!(!calls[0].tools.complete);
+        assert_eq!(calls[0].messages[0], known("package:one"));
+        assert!(calls[0].messages.iter().skip(1).all(|part| !part.complete));
+        assert_eq!(calls[0].tools, known("package:one"));
         assert!(
             matches!(outcome, InstanceOutcome::Terminal),
             "the DO drives the agent turn over fetch to a terminal: {outcome:?}"
