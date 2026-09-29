@@ -49,7 +49,11 @@ pub(crate) fn from_effective_item(
             "metadata_only",
         ),
         Item::Source(item) => (
-            "source",
+            if item.clock.is_some() {
+                "source clock"
+            } else {
+                "source"
+            },
             item.name.name.as_str(),
             "source_declaration",
             if item.clock.is_some() {
@@ -79,7 +83,7 @@ pub(crate) fn lowered_count(declaration: &IrDeclarationConstruct, ir: &IrProgram
         "ledger" => ir.ledgers.len(),
         "counter" => ir.counters.len(),
         "signal" => ir.events.len(),
-        "source" => ir.sources.len(),
+        "source" | "source clock" => ir.sources.len(),
         _ => 0,
     }
 }
@@ -127,7 +131,7 @@ pub(crate) fn verify_lowered_once(
                     item.name == declaration.name && item.span == declaration.span
                 })
         }
-        "source" => {
+        "source" | "source clock" => {
             ir.sources.len() == before + 1
                 && ir.sources.get(before).is_some_and(|item| {
                     item.name == declaration.name
@@ -195,7 +199,7 @@ mod tests {
             ),
             (
                 include_str!("../../../../examples/clock-source.whip"),
-                &["signal", "source"][..],
+                &["signal", "source clock"][..],
                 Some("clock_source"),
             ),
             (
@@ -232,7 +236,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .iter()
-                    .find(|item| item.keyword == "source")
+                    .find(|item| item.lowering == expected)
                     .unwrap();
                 assert_eq!(observed.lowering, expected);
             }
@@ -253,7 +257,7 @@ mod tests {
             .as_ref()
             .expect("checked inventory")
             .iter()
-            .find(|item| item.keyword == "source")
+            .find(|item| item.keyword == "source clock")
             .unwrap()
             .clone();
         assert!(verify_lowered_once(&source, 0, &ir).is_ok());

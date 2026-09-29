@@ -7,7 +7,16 @@
     {
       "id": "std.time",
       "version": "0.1.0",
-      "standard": true
+      "standard": true,
+      "constructs": [
+        {
+          "id": "time.clock_source",
+          "construct_family": "source_declaration",
+          "keyword": "source clock",
+          "scope": "top_level",
+          "lowering_target": "clock_source"
+        }
+      ]
     }
   ],
   "capabilities": [],

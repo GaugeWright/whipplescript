@@ -576,6 +576,75 @@ fn embedded_std_manifests_parse() {
     }
 }
 
+#[test]
+fn source_variants_resolve_to_distinct_embedded_constructs() {
+    for (program, keyword, lowering, registration) in [
+        (
+            include_str!("../../../../../examples/clock-source.whip"),
+            "source clock",
+            "clock_source",
+            "time.clock_source",
+        ),
+        (
+            include_str!("../../../../../examples/ingress-file-source.whip"),
+            "source",
+            "signal_source",
+            "ingress.source",
+        ),
+    ] {
+        let compiled = whipplescript_parser::compile_program(program);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("checked program");
+        if keyword == "source clock" {
+            assert!(
+                !ir.uses.iter().any(|item| item.name == "std.time"),
+                "the clock fixture exercises the advisory-import path"
+            );
+        }
+        let declaration = ir
+            .declaration_constructs
+            .as_ref()
+            .expect("compiler declaration inventory")
+            .iter()
+            .find(|item| item.keyword == keyword)
+            .expect("source variant in inventory");
+        assert_eq!(declaration.lowering, lowering);
+        let registry = contract_registry_for_ir(None, &ir).expect("embedded registry");
+        assert_eq!(registry.validate(), Vec::new());
+        let matches = registry
+            .constructs
+            .iter()
+            .filter(|form| {
+                form.keyword == declaration.keyword
+                    && form.scope == declaration.scope
+                    && form.construct_family == declaration.family
+                    && form.lowering_target == declaration.lowering
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{keyword} must resolve uniquely: uses={:?}, registration={:?}",
+            ir.uses,
+            registry.constructs
+        );
+        assert_eq!(matches[0].id, registration);
+        if keyword == "source" {
+            assert!(
+                registry
+                    .constructs
+                    .iter()
+                    .all(|form| form.id != "time.clock_source"),
+                "a generic source does not implicitly import std.time"
+            );
+        }
+    }
+}
+
 /// The agent-provider kinds are a CLOSED vocabulary, and one of the two places
 /// that fact is written down lives in another crate.
 ///

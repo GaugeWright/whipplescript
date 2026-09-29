@@ -17907,9 +17907,10 @@ fn embedded_operator_provider_default(
         .and_then(|config| config.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
-/// Merge embedded std manifests into `registry` for every imported name that is
-/// NOT already `provided` (e.g. by the lock). The lock wins: a provided name is
-/// skipped so its manifest is never double-merged with the embedded copy.
+/// Merge embedded std manifests into `registry` for every imported name and
+/// for the compiler-owned clock declaration's `std.time` library. The latter
+/// also exists without an explicit `use std.time` (the import lint is advisory).
+/// A name already `provided` by a lock is skipped to avoid double-merging.
 fn merge_embedded_std_manifests(
     registry: &mut ContractRegistry,
     ir: &IrProgram,
@@ -17921,7 +17922,11 @@ fn merge_embedded_std_manifests(
         .map(|use_decl| use_decl.name.as_str())
         .collect::<BTreeSet<_>>();
     for manifest in embedded_std_manifests() {
-        if imported.contains(manifest.name.as_str()) && !provided.contains(manifest.name.as_str()) {
+        let compiler_owned_clock =
+            manifest.name == "std.time" && ir.sources.iter().any(|source| source.is_clock);
+        if (imported.contains(manifest.name.as_str()) || compiler_owned_clock)
+            && !provided.contains(manifest.name.as_str())
+        {
             registry.merge(manifest.registry);
         }
     }
