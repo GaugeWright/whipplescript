@@ -1,6 +1,6 @@
-//! The native reviewed-contribution record under DR-0141. This first slice
-//! persists stable identity and predecessor declarations. Candidate revisions,
-//! Git pins, authenticated transport and admission follow behind this record.
+//! The reviewed-contribution record under DR-0141 and DR-0145. WhippleScript
+//! source cuts and units are the primary candidate authority. Git is a
+//! compatibility source; authenticated transport and admission remain open.
 
 use std::path::Path;
 
@@ -9,7 +9,30 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::source_review_git::{GitCandidatePins, GitPin};
 use crate::StoreError;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Native,
+    Git,
+}
+
+impl SourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Git => "git",
+        }
+    }
+
+    fn parse(value: &str) -> ReviewResult<Self> {
+        match value {
+            "native" => Ok(Self::Native),
+            "git" => Ok(Self::Git),
+            _ => Err(ReviewError::Corrupt(format!("unknown source kind {value}"))),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ReviewError {
@@ -48,7 +71,8 @@ pub struct Contribution {
     pub id: String,
     pub author: String,
     pub intent: String,
-    pub target_ref: String,
+    pub source_kind: SourceKind,
+    pub target_scope: String,
     pub predecessors: Vec<String>,
 }
 
@@ -74,7 +98,7 @@ struct GitUploadRequest<'a> {
 }
 
 pub struct ReviewStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 impl ReviewStore {
@@ -84,7 +108,7 @@ impl ReviewStore {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         crate::establish_wal(&connection)?;
         crate::stamp_satellite_schema(&connection, "source-review", SCHEMA_VERSION)?;
         connection.execute_batch(
@@ -94,6 +118,7 @@ impl ReviewStore {
                 author TEXT NOT NULL,
                 intent TEXT NOT NULL,
                 target_ref TEXT NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'git',
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE TABLE IF NOT EXISTS predecessors (
@@ -122,8 +147,31 @@ impl ReviewStore {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 PRIMARY KEY (contribution_id, sequence),
                 UNIQUE (contribution_id, upload_id)
+            );
+            CREATE TABLE IF NOT EXISTS native_revisions (
+                contribution_id TEXT NOT NULL REFERENCES contributions(id),
+                sequence INTEGER NOT NULL,
+                upload_id TEXT NOT NULL,
+                revision_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (contribution_id, sequence),
+                UNIQUE (contribution_id, upload_id)
             );",
         )?;
+        let migration = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_source_kind = migration
+            .prepare("PRAGMA table_info(contributions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "source_kind");
+        if !has_source_kind {
+            migration.execute(
+                "ALTER TABLE contributions ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'git'",
+                [],
+            )?;
+        }
+        migration.commit()?;
         Ok(Self { connection })
     }
 
@@ -135,6 +183,43 @@ impl ReviewStore {
         author: &str,
         intent: &str,
         target_ref: &str,
+        predecessors: &[&str],
+    ) -> ReviewResult<Contribution> {
+        self.create_with_kind(
+            id,
+            author,
+            intent,
+            SourceKind::Git,
+            target_ref,
+            predecessors,
+        )
+    }
+
+    pub fn create_native_contribution(
+        &mut self,
+        id: &str,
+        author: &str,
+        intent: &str,
+        target_branch_id: &str,
+        predecessors: &[&str],
+    ) -> ReviewResult<Contribution> {
+        self.create_with_kind(
+            id,
+            author,
+            intent,
+            SourceKind::Native,
+            target_branch_id,
+            predecessors,
+        )
+    }
+
+    fn create_with_kind(
+        &mut self,
+        id: &str,
+        author: &str,
+        intent: &str,
+        source_kind: SourceKind,
+        target_scope: &str,
         predecessors: &[&str],
     ) -> ReviewResult<Contribution> {
         if id.is_empty()
@@ -152,18 +237,30 @@ impl ReviewStore {
                 "author and intent are required".into(),
             ));
         }
-        if !target_ref.starts_with("refs/heads/") || target_ref == "refs/heads/" {
-            return Err(ReviewError::Invalid(
-                "target must name a full branch ref".into(),
-            ));
+        match source_kind {
+            SourceKind::Git
+                if !target_scope.starts_with("refs/heads/") || target_scope == "refs/heads/" =>
+            {
+                return Err(ReviewError::Invalid(
+                    "target must name a full branch ref".into(),
+                ));
+            }
+            SourceKind::Native
+                if target_scope.trim().is_empty() || target_scope.starts_with("refs/") =>
+            {
+                return Err(ReviewError::Invalid(
+                    "target must name a WhippleScript branch id".into(),
+                ));
+            }
+            _ => {}
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO contributions (id, author, intent, target_ref)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, author, intent, target_ref],
+            "INSERT INTO contributions (id, author, intent, target_ref, source_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, author, intent, target_scope, source_kind.as_str()],
         )?;
         for predecessor in predecessors {
             if *predecessor == id {
@@ -184,29 +281,35 @@ impl ReviewStore {
         let value = self
             .connection
             .query_row(
-                "SELECT id, author, intent, target_ref FROM contributions WHERE id=?1",
+                "SELECT id, author, intent, target_ref, source_kind FROM contributions WHERE id=?1",
                 [id],
                 |row| {
-                    Ok(Contribution {
-                        id: row.get(0)?,
-                        author: row.get(1)?,
-                        intent: row.get(2)?,
-                        target_ref: row.get(3)?,
-                        predecessors: Vec::new(),
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 },
             )
             .optional()?;
-        if value.is_none() {
-            return Err(ReviewError::Missing(format!("contribution {id}")));
-        }
-        let mut value = value.expect("checked contribution presence above");
+        let (id, author, intent, target_scope, kind) =
+            value.ok_or_else(|| ReviewError::Missing(format!("contribution {id}")))?;
+        let mut value = Contribution {
+            id,
+            author,
+            intent,
+            target_scope,
+            source_kind: SourceKind::parse(&kind)?,
+            predecessors: Vec::new(),
+        };
         let mut statement = self.connection.prepare(
             "SELECT predecessor_id FROM predecessors
              WHERE contribution_id=?1 ORDER BY predecessor_id",
         )?;
         value.predecessors = statement
-            .query_map([id], |row| row.get(0))?
+            .query_map([value.id.as_str()], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(value)
     }
@@ -238,17 +341,13 @@ impl ReviewStore {
                 "upload source must be a branch".into(),
             ));
         }
-        let author: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT author FROM contributions WHERE id=?1",
-                [contribution_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let author = author
-            .ok_or_else(|| ReviewError::Missing(format!("contribution {contribution_id}")))?;
-        if actor != author {
+        let contribution = self.contribution(contribution_id)?;
+        if contribution.source_kind != SourceKind::Git {
+            return Err(ReviewError::Invalid(
+                "Git revision needs a Git contribution".into(),
+            ));
+        }
+        if actor != contribution.author {
             return Err(ReviewError::Invalid("only the author may upload".into()));
         }
         if let Some(existing) = revision_by_upload(&self.connection, contribution_id, upload_id)? {
@@ -557,6 +656,105 @@ mod tests {
         let reopened = ReviewStore::open(&path).expect("reopen");
         assert_eq!(reopened.contribution("B").expect("read"), b);
         std::fs::remove_file(path).expect("remove db");
+    }
+
+    #[test]
+    fn old_git_contributions_keep_their_kind_when_native_scope_is_added() {
+        let path = store_path();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE contributions (
+                    id TEXT PRIMARY KEY,
+                    author TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    target_ref TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO contributions (id, author, intent, target_ref)
+                VALUES ('old', 'alice', 'before native', 'refs/heads/main');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = ReviewStore::open(&path).unwrap();
+        let old = store.contribution("old").unwrap();
+        assert_eq!(old.source_kind, SourceKind::Git);
+        assert_eq!(old.target_scope, "refs/heads/main");
+        let native = store
+            .create_native_contribution("new", "alice", "native", "main", &[])
+            .unwrap();
+        assert_eq!(native.source_kind, SourceKind::Native);
+        assert_eq!(native.target_scope, "main");
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn source_kind_and_target_scope_refuse_invalid_records() {
+        let mut store = ReviewStore::open(":memory:").unwrap();
+        match store.create_contribution("git-bad", "alice", "change", "refs/tags/v1", &[]) {
+            Err(ReviewError::Invalid(message)) => {
+                assert_eq!(message, "target must name a full branch ref")
+            }
+            other => panic!("expected Git target refusal, found {other:?}"),
+        }
+        assert!(matches!(
+            store.contribution("git-bad"),
+            Err(ReviewError::Missing(_))
+        ));
+        match store.create_native_contribution(
+            "native-bad",
+            "alice",
+            "change",
+            "refs/heads/main",
+            &[],
+        ) {
+            Err(ReviewError::Invalid(message)) => {
+                assert_eq!(message, "target must name a WhippleScript branch id")
+            }
+            other => panic!("expected native target refusal, found {other:?}"),
+        }
+        assert!(matches!(
+            store.contribution("native-bad"),
+            Err(ReviewError::Missing(_))
+        ));
+        store
+            .create_contribution("git", "alice", "change", "refs/heads/main", &[])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE contributions SET source_kind='unknown' WHERE id='git'",
+                [],
+            )
+            .unwrap();
+        match store.contribution("git") {
+            Err(ReviewError::Corrupt(message)) => {
+                assert_eq!(message, "unknown source kind unknown")
+            }
+            other => panic!("expected unknown source kind refusal, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_upload_refuses_a_native_contribution() {
+        let fixture = GitFixture::new();
+        let commit = fixture.commit("one\n");
+        let mut store = fixture.store();
+        store
+            .create_native_contribution("native", "alice", "change", "main", &[])
+            .unwrap();
+        assert!(matches!(
+            store.upload_git_revision(
+                &fixture.pins(),
+                "native",
+                "upload",
+                "alice",
+                "refs/heads/work",
+                &commit
+            ),
+            Err(ReviewError::Invalid(_))
+        ));
     }
 
     #[test]

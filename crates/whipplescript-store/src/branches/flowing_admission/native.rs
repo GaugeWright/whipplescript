@@ -423,6 +423,50 @@ mod tests {
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
     };
     use crate::branches::{Branches, CreateBranch, CutRecord};
+    use crate::source_review::{ReviewError, ReviewStore, SourceKind};
+    use crate::source_review_native::{NativeRevision, NativeUpload};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_REVIEW_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn native_request<'a>(
+        upload_id: &'a str,
+        source_cut_id: &'a str,
+        unit_ids: &'a [&'a str],
+    ) -> NativeUpload<'a> {
+        NativeUpload {
+            contribution_id: "review-a",
+            upload_id,
+            actor: "author",
+            source_branch_id: "twig",
+            source_cut_id,
+            unit_ids,
+        }
+    }
+
+    fn upload(
+        reviews: &mut ReviewStore,
+        source: &BranchStore,
+        upload_id: &str,
+        source_cut_id: &str,
+        unit_ids: &[&str],
+    ) -> Result<NativeRevision, ReviewError> {
+        reviews.upload_native_revision(source, native_request(upload_id, source_cut_id, unit_ids))
+    }
+
+    fn expect_invalid(result: Result<NativeRevision, ReviewError>, expected: &str) {
+        match result {
+            Err(ReviewError::Invalid(message)) => assert_eq!(message, expected),
+            other => panic!("expected invalid native review: {expected}; found {other:?}"),
+        }
+    }
+
+    fn expect_missing(result: Result<NativeRevision, ReviewError>, expected: &str) {
+        match result {
+            Err(ReviewError::Missing(message)) => assert_eq!(message, expected),
+            other => panic!("expected missing native source: {expected}; found {other:?}"),
+        }
+    }
 
     fn fixture() -> BranchStore {
         let mut store = BranchStore::open_in_memory().unwrap();
@@ -523,6 +567,199 @@ mod tests {
             }],
             recorded_at: "t4".into(),
         }
+    }
+
+    #[test]
+    fn native_review_revision_keeps_the_selected_cut_after_a_source_tail() {
+        let mut source = fixture();
+        let root = std::env::temp_dir().join(format!(
+            "whipplescript-native-review-{}-{}",
+            std::process::id(),
+            NEXT_REVIEW_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let review_path = root.join("review.sqlite");
+        let mut reviews = ReviewStore::open(&review_path).unwrap();
+        let contribution = reviews
+            .create_native_contribution("review-a", "author", "change", MAINLINE_BRANCH_ID, &[])
+            .unwrap();
+        assert_eq!(contribution.source_kind, SourceKind::Native);
+        assert_eq!(contribution.target_scope, MAINLINE_BRANCH_ID);
+        let first = upload(&mut reviews, &source, "upload-a", "source", &["unit-a"]).unwrap();
+        assert_eq!(first.source_incarnation_id, "inc");
+        assert_eq!(first.source_cut_id, "source");
+        assert_eq!(first.units[0].basis_digest, "basis-a");
+        assert_eq!(first.units[0].principal, "author");
+        assert_eq!(first.units[0].intent, "change");
+        drop(reviews);
+        let mut reviews = ReviewStore::open(&review_path).unwrap();
+
+        source
+            .record_cut(CutRecord {
+                cut_id: "tail",
+                change_id: "later-change",
+                branch_id: "twig",
+                manifest_hash: "tail-manifest",
+                parent_cut_id: Some("source"),
+                origin: Some("write:later"),
+                actor: Some("author"),
+                intent: Some("later"),
+                recorded_at: "t4",
+            })
+            .unwrap();
+        source
+            .advance_head("twig", Some("source"), "tail", "tail-manifest", "t4")
+            .unwrap();
+        assert_eq!(reviews.native_revision("review-a", 1).unwrap(), first);
+        assert_eq!(
+            upload(&mut reviews, &source, "upload-a", "source", &["unit-a"]).unwrap(),
+            first
+        );
+        assert!(matches!(
+            upload(&mut reviews, &source, "upload-a", "tail", &["unit-a"]),
+            Err(ReviewError::Conflict(_))
+        ));
+        assert!(matches!(
+            upload(&mut reviews, &source, "upload-tail", "tail", &["unit-a"]),
+            Err(ReviewError::Invalid(_))
+        ));
+        drop(reviews);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_review_refuses_unbound_duplicate_and_lost_source_units() {
+        let source = fixture();
+        let mut reviews = ReviewStore::open(":memory:").unwrap();
+        reviews
+            .create_native_contribution("review-a", "author", "change", MAINLINE_BRANCH_ID, &[])
+            .unwrap();
+        assert!(matches!(
+            upload(
+                &mut reviews,
+                &source,
+                "duplicate",
+                "source",
+                &["unit-a", "unit-a"]
+            ),
+            Err(ReviewError::Invalid(_))
+        ));
+        assert!(matches!(
+            upload(&mut reviews, &source, "missing", "source", &["unknown"]),
+            Err(ReviewError::Missing(_))
+        ));
+        source
+            .connection
+            .execute(
+                "UPDATE flowing_private_pins SET released_at='t5' WHERE pin_id='pin'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            upload(&mut reviews, &source, "released", "source", &["unit-a"]),
+            Err(ReviewError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn native_review_refuses_invalid_upload_identity_and_kind() {
+        let source = fixture();
+        let mut reviews = ReviewStore::open(":memory:").unwrap();
+        reviews
+            .create_native_contribution("review-a", "author", "change", MAINLINE_BRANCH_ID, &[])
+            .unwrap();
+        expect_invalid(
+            upload(&mut reviews, &source, "", "source", &["unit-a"]),
+            "invalid upload id",
+        );
+        let mut request = native_request("empty-actor", "source", &["unit-a"]);
+        request.actor = "";
+        expect_invalid(
+            reviews.upload_native_revision(&source, request),
+            "actor and selected units are required",
+        );
+        expect_invalid(
+            upload(&mut reviews, &source, "empty-units", "source", &[]),
+            "actor and selected units are required",
+        );
+        request = native_request("wrong-author", "source", &["unit-a"]);
+        request.actor = "intruder";
+        expect_invalid(
+            reviews.upload_native_revision(&source, request),
+            "only the author may upload",
+        );
+        reviews
+            .create_contribution("git-review", "author", "change", "refs/heads/main", &[])
+            .unwrap();
+        request = native_request("wrong-kind", "source", &["unit-a"]);
+        request.contribution_id = "git-review";
+        expect_invalid(
+            reviews.upload_native_revision(&source, request),
+            "native revision needs a native contribution",
+        );
+    }
+
+    #[test]
+    fn native_review_refuses_missing_or_ineligible_source_line() {
+        let source = fixture();
+        let mut reviews = ReviewStore::open(":memory:").unwrap();
+        reviews
+            .create_native_contribution("review-a", "author", "change", MAINLINE_BRANCH_ID, &[])
+            .unwrap();
+        let mut request = native_request("missing-source", "source", &["unit-a"]);
+        request.source_branch_id = "missing";
+        expect_missing(
+            reviews.upload_native_revision(&source, request),
+            "source branch missing",
+        );
+        reviews
+            .create_native_contribution("missing-target", "author", "change", "missing", &[])
+            .unwrap();
+        request = native_request("missing-target", "source", &["unit-a"]);
+        request.contribution_id = "missing-target";
+        expect_missing(
+            reviews.upload_native_revision(&source, request),
+            "target branch missing",
+        );
+
+        let inactive = fixture();
+        inactive
+            .connection
+            .execute(
+                "UPDATE branches SET status='discarded' WHERE branch_id='twig'",
+                [],
+            )
+            .unwrap();
+        expect_invalid(
+            upload(&mut reviews, &inactive, "inactive", "source", &["unit-a"]),
+            "source must be an active child of the target",
+        );
+        let unfenced = fixture();
+        unfenced
+            .connection
+            .execute(
+                "DELETE FROM flowing_source_fences WHERE source_branch_id='twig'",
+                [],
+            )
+            .unwrap();
+        expect_missing(
+            upload(&mut reviews, &unfenced, "unfenced", "source", &["unit-a"]),
+            "flowing source twig",
+        );
+        let disabled = fixture();
+        let mut state = disabled.flowing_source("twig").unwrap().unwrap();
+        state.admission_enabled = false;
+        disabled
+            .connection
+            .execute(
+                "UPDATE flowing_source_fences SET state_json=?1 WHERE source_branch_id='twig'",
+                [serde_json::to_string(&state).unwrap()],
+            )
+            .unwrap();
+        expect_invalid(
+            upload(&mut reviews, &disabled, "disabled", "source", &["unit-a"]),
+            "source needs an eligible settled twig",
+        );
     }
 
     fn cancel(admission_op_id: &str, cancel_op_id: &str) -> FlowingCancelRequest {
