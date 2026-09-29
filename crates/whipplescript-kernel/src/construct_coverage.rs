@@ -45,6 +45,26 @@ fn matches_declaration(form: &ConstructRegistration, declaration: &IrDeclaration
         && form.target_capability.is_none()
 }
 
+/// Select an embedded manifest only when its registration matches a
+/// compiler-inventoried declaration. A library inferred from effect metadata
+/// alone is not evidence that its declaration syntax appeared in this source.
+pub fn registry_matches_declaration_inventory(
+    program: &IrProgram,
+    registry: &ContractRegistry,
+) -> bool {
+    program
+        .declaration_constructs
+        .as_ref()
+        .is_some_and(|declarations| {
+            declarations.iter().any(|declaration| {
+                registry
+                    .constructs
+                    .iter()
+                    .any(|form| matches_declaration(form, declaration))
+            })
+        })
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value

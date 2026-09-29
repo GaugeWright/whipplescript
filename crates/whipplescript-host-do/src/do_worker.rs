@@ -17,6 +17,7 @@
 //! JSON marshalling) — it carries no orchestration logic of its own.
 
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::construct_coverage::CheckedConstructBasis;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
@@ -328,9 +329,12 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             ports.compiler_artifact_digest.as_deref().ok_or_else(|| {
                 "hosted program admission requires the exact compiler artifact digest".to_owned()
             })?;
+        let construct_registry = crate::do_packages::construct_registry_for_ir(&ir)?;
         // Hosted workflow creation has no local package lock yet. The
         // explicit no-lock basis accepts std-only imports and refuses
-        // unresolved local imports instead of inventing empty edges.
+        // unresolved local imports instead of inventing empty edges. The
+        // construct registry is resolved from these same compiled source and
+        // embedded manifest bytes before the one accepting transaction.
         let admission = kernel
             .create_program_version_for_compiled_program_with_imports(
                 version_input,
@@ -343,7 +347,10 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     compiler_artifact_digest,
                     packages: &[],
                 },
-                None,
+                Some(&CheckedConstructBasis {
+                    registry: &construct_registry,
+                    sources: &[],
+                }),
             )
             .map_err(|error| format!("{error:?}"))?;
         let version = ProgramVersionRecord {
@@ -1374,6 +1381,129 @@ rule finish
         assert_eq!(witness.lock_digest, "0".repeat(64));
         assert!(witness.examined.is_empty());
         assert!(witness.edges.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(witness
+            .declarations
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+    }
+
+    #[test]
+    fn hosted_worker_retains_compiler_owned_declarations_in_the_admission_operation() {
+        for (source, expected) in [
+            (
+                "workflow BareTracker\ntracker backlog\n",
+                &["tracker.tracker"][..],
+            ),
+            (
+                include_str!("../../../examples/clock-source.whip"),
+                &["ingress.signal", "time.clock_source"][..],
+            ),
+        ] {
+            let sql = store().sql;
+            let compiler_digest = "d".repeat(64);
+            let instance = DurableInstance::create(
+                sql,
+                source,
+                "{}",
+                "local/HostedDeclaration",
+                DurableEffectPorts {
+                    compiler_artifact_digest: Some(compiler_digest.clone()),
+                    ..test_ports()
+                },
+                &[],
+                &[],
+            )
+            .expect("hosted checked declaration admission");
+            let kernel = instance.kernel.as_ref().expect("kernel");
+            let roster = kernel.store().program_import_operation_roster().unwrap();
+            assert_eq!(roster.operations.len(), 1);
+            let operation = &roster.operations[0];
+            let witness = kernel
+                .store()
+                .program_import_witness(
+                    &operation.version_id,
+                    operation.witness_digest.as_deref().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let declarations = witness.declarations.expect("checked declaration capture");
+            assert_eq!(declarations.examined.len(), expected.len());
+            assert_eq!(
+                declarations
+                    .edges
+                    .iter()
+                    .map(|edge| edge.registration_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(declarations
+                .edges
+                .iter()
+                .all(|edge| edge.provider_source_digest == compiler_digest));
+            assert!(witness.constructs.is_some());
+        }
+    }
+
+    #[test]
+    fn hosted_worker_refuses_unimported_rule_effect_construct_before_version_admission() {
+        use crate::do_store::{as_i64, SqlValue};
+
+        let body = r##"
+@service
+workflow Notify
+class Trigger { id string }
+channel alerts { provider fixture destination "#ops" }
+rule notify
+  when Trigger as t
+=> {
+  send via alerts { text "hello" } as sent
+}
+"##;
+        for (imports, admitted) in [("", false), ("use std.messaging\n", true)] {
+            let source = format!("{imports}{body}");
+            let sql = store().sql;
+            let result = DurableInstance::create(
+                sql.clone(),
+                &source,
+                "{}",
+                "local/Notify",
+                test_ports(),
+                &[],
+                &[],
+            );
+            if admitted {
+                let instance = result.expect("imported send admits");
+                let kernel = instance.kernel.as_ref().unwrap();
+                let operation = &kernel
+                    .store()
+                    .program_import_operation_roster()
+                    .unwrap()
+                    .operations[0];
+                let witness = kernel
+                    .store()
+                    .program_import_witness(
+                        &operation.version_id,
+                        operation.witness_digest.as_deref().unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(witness.constructs.unwrap().examined.len(), 1);
+            } else {
+                let error = result.err().expect("unimported send refuses");
+                assert!(
+                    error.contains("unresolved checked construct `send`"),
+                    "{error}"
+                );
+                let rows = sql
+                    .query("SELECT COUNT(*) FROM program_versions", &[] as &[SqlValue])
+                    .unwrap();
+                assert_eq!(as_i64(&rows[0][0]), 0);
+            }
+        }
     }
 
     #[test]

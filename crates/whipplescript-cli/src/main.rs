@@ -17934,20 +17934,11 @@ fn merge_embedded_std_manifests(
         .map(|use_decl| use_decl.name.as_str())
         .collect::<BTreeSet<_>>();
     for manifest in embedded_std_manifests() {
-        let owns_declaration = ir
-            .declaration_constructs
-            .as_ref()
-            .is_some_and(|declarations| {
-                declarations.iter().any(|declaration| {
-                    manifest.registry.constructs.iter().any(|form| {
-                        form.keyword == declaration.keyword
-                            && form.scope == declaration.scope
-                            && form.construct_family == declaration.family
-                            && form.lowering_target == declaration.lowering
-                            && form.target_capability.is_none()
-                    })
-                })
-            });
+        let owns_declaration =
+            whipplescript_kernel::construct_coverage::registry_matches_declaration_inventory(
+                ir,
+                &manifest.registry,
+            );
         if (imported.contains(manifest.name.as_str()) || owns_declaration)
             && !provided.contains(manifest.name.as_str())
         {

@@ -20,6 +20,9 @@
 //! one leaves the hosted path knowing a smaller package universe than the
 //! native one (DR-0074 §12) — its effects refuse at the admission gate.
 
+use whipplescript_core::ContractRegistry;
+use whipplescript_kernel::{construct_coverage, package_registry};
+use whipplescript_parser::IrProgram;
 use whipplescript_store::{RuntimeStore, StoreError};
 
 /// The always-embedded std manifests (name, JSON source), byte-identical to the
@@ -85,6 +88,32 @@ pub const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Resolve the embedded construct vocabulary for one compiled hosted program.
+/// Rule-effect constructs require an explicit import at capture; declaration
+/// manifests may be selected by the compiler's exact declaration inventory.
+/// Parsing the shipped bytes here binds this registry to the same wasm artifact
+/// whose digest the worker passes to checked admission.
+pub fn construct_registry_for_ir(program: &IrProgram) -> Result<ContractRegistry, String> {
+    let mut registry = program.contract_registry();
+    for (name, json) in EMBEDDED_STD_MANIFESTS {
+        let path = std::path::PathBuf::from(format!("<embedded:{name}>"));
+        let manifest = package_registry::package_manifest_from_json_with_embedded(
+            &path,
+            (*json).to_owned(),
+            EMBEDDED_STD_MANIFESTS,
+        )?;
+        if program.uses.iter().any(|use_decl| use_decl.name == *name)
+            || construct_coverage::registry_matches_declaration_inventory(
+                program,
+                &manifest.registry,
+            )
+        {
+            registry.merge(manifest.registry);
+        }
+    }
+    Ok(registry)
+}
+
 /// Seed the embedded std manifests into the DO store so the admission gate is
 /// real for their effect kinds. Idempotent: `register_package_manifest` writes
 /// `ON CONFLICT DO UPDATE`, so a rehydrated isolate re-seeding is a no-op. Call
@@ -142,7 +171,16 @@ mod tests {
         }
         let embedded: BTreeSet<String> = EMBEDDED_STD_MANIFESTS
             .iter()
-            .map(|(name, _)| (*name).to_owned())
+            .map(|(name, json)| {
+                let manifest: serde_json::Value = serde_json::from_str(json)
+                    .unwrap_or_else(|error| panic!("embedded `{name}` is invalid JSON: {error}"));
+                assert_eq!(
+                    manifest.get("name").and_then(serde_json::Value::as_str),
+                    Some(*name),
+                    "embedded manifest roster name must match its payload"
+                );
+                (*name).to_owned()
+            })
             .collect();
         assert_eq!(
             embedded, shipped,
