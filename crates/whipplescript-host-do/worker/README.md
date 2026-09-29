@@ -49,6 +49,13 @@ journey, which forwards through the placement root, so it names
 awaiting production identity and how many still need one; local runner tests, a
 disabled workflow, or a credential-free run never count as deployed evidence.
 
+Adding a route trips three pins at once. A critical route with no deployed
+evidence must be mapped to exactly one suite in
+`contracts/production-canaries.json`, `scripts/check-production-canaries.test.mjs`
+pins the gap, coverage and suite counts, and
+`src/authenticated-host.integration.test.ts` pins how many declared operations
+its route filter yields.
+
 ## Deploy steps
 
 **One command:** `whip deploy` (compute plane P8) runs the whole sequence

@@ -123,6 +123,7 @@ fn neutralize_reserved_tags(text: &str) -> String {
 pub enum InstructionAuthority {
     Untrusted,
     Package,
+    AgentAuthor,
     Project,
     Registry,
     Operator,
@@ -147,7 +148,7 @@ impl InstructionAuthority {
         match self {
             Self::Untrusted | Self::Package => InstructionRole::User,
             Self::Project | Self::Registry | Self::Operator => InstructionRole::Developer,
-            Self::Governance | Self::Runtime => InstructionRole::System,
+            Self::AgentAuthor | Self::Governance | Self::Runtime => InstructionRole::System,
         }
     }
 }
@@ -311,7 +312,11 @@ pub fn render_project_context(instructions: &[ProjectInstruction]) -> String {
 /// The assembled system prompt plus per-bundle provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssembledContext {
+    /// Legacy joined view for inspection and callers that do not own a model
+    /// wire. Provider requests must use the role-specific fields below.
     pub system_prompt: String,
+    pub system_role: String,
+    pub developer_role: String,
     pub contributions: Vec<ContributionProvenance>,
 }
 
@@ -341,6 +346,12 @@ pub fn assemble(mut contributions: Vec<InstructionContribution>) -> AssembledCon
             replacements.get(key) == Some(&(item.sequence, item.contribution_id.clone()))
         })
     });
+    assert!(
+        contributions
+            .iter()
+            .all(|item| item.message_role != InstructionRole::User),
+        "user-role instruction contributions require an explicit conversation renderer"
+    );
     contributions.sort_by(|left, right| {
         (&left.ordering_key, &left.contribution_id)
             .cmp(&(&right.ordering_key, &right.contribution_id))
@@ -350,6 +361,16 @@ pub fn assemble(mut contributions: Vec<InstructionContribution>) -> AssembledCon
         .map(|item| item.body.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
+    let role_body = |role| {
+        contributions
+            .iter()
+            .filter(|item| item.message_role == role)
+            .map(|item| item.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let system_role = role_body(InstructionRole::System);
+    let developer_role = role_body(InstructionRole::Developer);
     let provenance = contributions
         .into_iter()
         .map(|item| ContributionProvenance {
@@ -369,6 +390,8 @@ pub fn assemble(mut contributions: Vec<InstructionContribution>) -> AssembledCon
         .collect();
     AssembledContext {
         system_prompt,
+        system_role,
+        developer_role,
         contributions: provenance,
     }
 }
@@ -388,6 +411,23 @@ mod tests {
             ContributionLifecycle::Stable,
             body,
         )
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "user-role instruction contributions require an explicit conversation renderer"
+    )]
+    fn an_unrendered_role_cannot_disappear_from_the_request() {
+        assemble(vec![contribution(
+            "user-context",
+            "package:reference",
+            "v1",
+            InstructionAuthority::Package,
+            InstructionRole::User,
+            "090-user-context",
+            ContributionLifecycle::Turn,
+            "Read this reference",
+        )]);
     }
 
     #[test]

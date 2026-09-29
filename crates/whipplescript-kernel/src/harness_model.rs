@@ -1046,6 +1046,12 @@ fn openai_compat_messages(messages: &[ChatMessage]) -> Vec<Value> {
             ChatMessage::System(text) => {
                 out.push(json!({ "role": "system", "content": text }));
             }
+            ChatMessage::Developer(text) => {
+                out.push(json!({
+                    "role": "system",
+                    "content": format!("## Developer instructions\n{text}\n## End developer instructions"),
+                }));
+            }
             ChatMessage::User { text, images } => {
                 if images.is_empty() {
                     out.push(json!({ "role": "user", "content": text }));
@@ -1245,6 +1251,12 @@ fn coerced_tools_messages(messages: &[ChatMessage]) -> Vec<Value> {
         match message {
             ChatMessage::System(text) => {
                 out.push(json!({ "role": "system", "content": text }));
+            }
+            ChatMessage::Developer(text) => {
+                out.push(json!({
+                    "role": "system",
+                    "content": format!("## Developer instructions\n{text}\n## End developer instructions"),
+                }));
             }
             ChatMessage::User { text, images } => {
                 if images.is_empty() {
@@ -1470,6 +1482,11 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) 
     for message in messages {
         match message {
             ChatMessage::System(text) => system_parts.push(text.clone()),
+            ChatMessage::Developer(text) => {
+                system_parts.push(format!(
+                    "## Developer instructions\n{text}\n## End developer instructions"
+                ));
+            }
             ChatMessage::User { text, images } => {
                 // Always content blocks, including the text-only case that used
                 // to send a plain string. A cache breakpoint attaches to a
@@ -1598,6 +1615,9 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
             ChatMessage::System(text) => {
                 out.push(json!({ "role": "system", "content": text }));
             }
+            ChatMessage::Developer(text) => {
+                out.push(json!({ "role": "developer", "content": text }));
+            }
             ChatMessage::User { text, images } => {
                 // Text-only stays a plain string (cache stability); images use
                 // Responses content parts with data-URL `input_image` entries
@@ -1725,7 +1745,10 @@ pub(crate) fn wire_input_provenance(
     let mut system_parts = Vec::new();
     for (message, label) in messages.iter().zip(labels) {
         match (format, message) {
-            (ModelWireInputFormat::AnthropicMessages, ChatMessage::System(_)) => {
+            (
+                ModelWireInputFormat::AnthropicMessages,
+                ChatMessage::System(_) | ChatMessage::Developer(_),
+            ) => {
                 system_parts.push(label);
             }
             (ModelWireInputFormat::AnthropicMessages, _) => items.push(label.clone()),
@@ -2166,6 +2189,10 @@ fn provider_error_excerpt(body: &Value) -> String {
 mod tests {
     use super::*;
     use crate::harness_loop::ToolResultMsg;
+    use crate::host_package::workspace_tool_specs_from_registry;
+    use crate::world_state::{
+        render_world_projection, EnvironmentState, WorldProjection, WorldSnapshot,
+    };
     use std::cell::RefCell;
 
     #[test]
@@ -2541,6 +2568,119 @@ mod tests {
                 wire_input_provenance(&changed, &messages, &labels, &tools, &tool_label).is_none(),
                 "{wire:?} drift must not receive a partial-disclosure map"
             );
+        }
+    }
+
+    #[test]
+    fn provider_request_contract_preserves_instruction_world_and_tool_planes() {
+        let world = WorldSnapshot::new("fixture-turn")
+            .with_section(
+                "environment",
+                &EnvironmentState {
+                    cwd: Some("/effective/workspace".into()),
+                    workspace_roots: vec!["/effective/workspace".into()],
+                    timezone: Some("UTC".into()),
+                    shell_family: None,
+                },
+            )
+            .expect("runtime world fixture");
+        let rendered_world =
+            render_world_projection(&WorldProjection::Full(world)).expect("full world is visible");
+        let messages = vec![
+            ChatMessage::System("runtime and authored system".into()),
+            ChatMessage::Developer("AGENTS.md project guidance".into()),
+            ChatMessage::System(rendered_world),
+            ChatMessage::user_text("work"),
+        ];
+        let tools = workspace_tool_specs_from_registry(true, true, true);
+        assert!(
+            !tools.is_empty(),
+            "runtime registry must offer fixture tools"
+        );
+        for wire in [
+            ModelWire::OpenAiResponses,
+            ModelWire::OpenAiChatCompat,
+            ModelWire::AnthropicMessages,
+            ModelWire::CoercedTools,
+        ] {
+            let request = build_request(
+                wire,
+                "https://provider.example.invalid",
+                "key",
+                "fixture-model",
+                None,
+                None,
+                &messages,
+                &tools,
+            );
+            let body = &request.body;
+            let encoded = body.to_string();
+            assert!(encoded.contains("runtime and authored system"), "{wire:?}");
+            assert!(encoded.contains("AGENTS.md project guidance"), "{wire:?}");
+            assert!(encoded.contains("/effective/workspace"), "{wire:?}");
+            for tool in &tools {
+                assert!(encoded.contains(&tool.name), "{wire:?}: {}", tool.name);
+                assert!(
+                    encoded.contains(&tool.description),
+                    "{wire:?}: {}",
+                    tool.name
+                );
+            }
+            match wire {
+                ModelWire::OpenAiResponses => {
+                    assert_eq!(body["input"][1]["role"], "developer");
+                    assert_eq!(body["tools"].as_array().unwrap().len(), tools.len());
+                }
+                ModelWire::OpenAiChatCompat => {
+                    assert_eq!(body["messages"][1]["role"], "system");
+                    assert!(body["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("## Developer instructions"));
+                    assert_eq!(body["tools"].as_array().unwrap().len(), tools.len());
+                }
+                ModelWire::AnthropicMessages => {
+                    assert!(body["system"]
+                        .to_string()
+                        .contains("Developer instructions"));
+                    assert_eq!(body["tools"].as_array().unwrap().len(), tools.len());
+                }
+                ModelWire::CoercedTools => {
+                    assert_eq!(body["messages"][1]["role"], "system");
+                    assert!(body["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("## Developer instructions"));
+                    let instruction = body["messages"].as_array().unwrap().last().unwrap()
+                        ["content"]
+                        .as_str()
+                        .unwrap();
+                    for tool in &tools {
+                        assert!(instruction.contains(&tool.input_schema.to_string()));
+                    }
+                }
+            }
+            let labels = (0..messages.len())
+                .map(|index| ModelContentProvenance {
+                    source_handles: vec![format!("source:{index}")],
+                    complete: true,
+                })
+                .collect::<Vec<_>>();
+            let tool_label = ModelContentProvenance {
+                source_handles: vec!["effective-tools".into()],
+                complete: true,
+            };
+            let provenance = wire_input_provenance(body, &messages, &labels, &tools, &tool_label)
+                .expect("each wire maps the exact role and tool request to source labels");
+            if wire == ModelWire::AnthropicMessages {
+                let system = provenance.system.expect("joined system has a source label");
+                assert!(system.source_handles.contains(&"source:1".to_owned()));
+            } else {
+                assert!(provenance
+                    .items
+                    .iter()
+                    .any(|item| item.source_handles.contains(&"source:1".to_owned())));
+            }
         }
     }
 

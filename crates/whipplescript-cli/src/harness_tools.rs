@@ -5483,7 +5483,8 @@ pub fn run_owned_agent_turn(
     .map_err(StoreError::Conflict)?;
     let input = BrokeredTurnInput {
         model_provenance: Default::default(),
-        system: assembled.system_prompt,
+        system: assembled.system_role,
+        developer: assembled.developer_role,
         user: input_json.to_string(),
         tools,
         max_steps,

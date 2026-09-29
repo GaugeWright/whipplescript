@@ -8,7 +8,7 @@
 //! Wire (text frames, JSON):
 //! - client → server, first frame: the turn request
 //!   `{protocol: "whip-turn/1", turn_id, provider: {provider|"fixture",
-//!   base_url?, api_key?, model?, max_tokens?}, system, user, max_steps?,
+//!   base_url?, api_key?, model?, max_tokens?}, system, developer?, user, max_steps?,
 //!   tools: "file"|"none"}` — or `{protocol, resume: turn_id}` to re-attach
 //!   (DR-0035 B4 re-query: the container outlives any one DO invocation).
 //! - server → client: `{"kind":"accepted","turn_id":..}`, then zero or more
@@ -310,6 +310,11 @@ pub fn run_turn_in_workspace(
         .and_then(Value::as_str)
         .unwrap_or("You are a coding agent working in a scratch directory.")
         .to_owned();
+    let mut developer = request
+        .get("developer")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let mut context_bundles = Vec::new();
     let user = request
         .get("user")
@@ -415,7 +420,8 @@ pub fn run_turn_in_workspace(
             result_tool = resolved.result_tool.clone();
             executor = executor.with_result_contract(resolved.result_contract());
             let context = resolved.context_for_model();
-            system = context.system_prompt;
+            system = context.system_role;
+            developer = context.developer_role;
             context_bundles = context.contributions;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
@@ -450,7 +456,8 @@ pub fn run_turn_in_workspace(
             result_tool = resolved.result_tool.clone();
             executor = executor.with_result_contract(resolved.result_contract());
             let context = resolved.context_for_model();
-            system = context.system_prompt;
+            system = context.system_role;
+            developer = context.developer_role;
             context_bundles = context.contributions;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
@@ -505,6 +512,7 @@ pub fn run_turn_in_workspace(
     let input = BrokeredTurnInput {
         model_provenance: Default::default(),
         system,
+        developer,
         user,
         tools,
         max_steps,

@@ -229,8 +229,8 @@ case "${1:-}" in
       exit 1
   else
       echo "-- hosted runtime contracts SKIPPED: missing$missing_hosted --" >&2
-      echo "   the hosted-runtime-contracts CI job has this toolchain and runs them on" >&2
-      echo "   every pull request. To close the gap locally: $hosted_install" >&2
+      echo "   the fleet's bar (scripts/check.sh required) has this toolchain and runs them on" >&2
+      echo "   every change. To close the gap locally: $hosted_install" >&2
   fi ;;
   *) echo "section.sh: unknown section '${1:-}'" >&2; exit 2 ;;
 esac

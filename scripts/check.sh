@@ -438,22 +438,13 @@ fi
 
 # What a release compiles, which is more than what it distributes: every
 # workspace member for every target in dist-workspace.toml. The command lives in
-# the script below because the `windows-compiles` gate job runs that same script
-# rather than a cargo invocation of its own, so the Windows leg cannot drift from
-# this bar. On a non-Windows host it says why it cannot answer instead of
-# pretending to.
+# the script below because the fleet's `windows-compile` job
+# (`gaugewright/bar/windows`) runs that same script rather than a cargo
+# invocation of its own, so the Windows leg cannot drift from this bar. On a
+# non-Windows host it says why it cannot answer instead of pretending to.
 echo "== release compile for windows =="
 section windows-compile
 
-# The hosted Durable Object worker is part of the same per-change gate: its
-# production route inventory, authenticated compositions, types, and deployable
-# artifact. Missing tooling fails loudly here rather than being skipped quietly.
-#
-# CI is the one caller that already runs these steps: the
-# `hosted-runtime-contracts` job installs the wasm-bindgen/wrangler/Node
-# toolchain and runs exactly this sequence. It sets WHIPPLESCRIPT_CHECK_SKIP_HOSTED
-# so the green bar does not demand the same toolchain a second time. Nothing
-# else should set it — unset, a missing tool is still a hard failure.
 echo "== docs =="
 # The programs the documentation tells a reader to run are part of the product.
 # This checks and lint-cleans every file under examples/ that the docs cite,
@@ -573,6 +564,15 @@ if [ -d .github/workflows ]; then
 fi
 
 echo "== hosted runtime contracts =="
+# The hosted Durable Object worker is part of the same per-change gate: its
+# production route inventory, authenticated compositions, types, and deployable
+# artifact. A workstation without the wasm toolchain skips it and names the
+# install; the fleet's `required` run refuses to.
+#
+# WHIPPLESCRIPT_CHECK_SKIP_HOSTED let the retired `green-bar` workflow job leave
+# these to its sibling `hosted-runtime-contracts` job, which installed the
+# toolchain and ran this same sequence. Both jobs are gone and nothing sets it.
+#
 # The skip is decided HERE rather than inside the section, so that a run which
 # skipped is never a verdict at all: a section that resolved to "skipped" would
 # be a cacheable answer keyed on inputs that did not decide it.

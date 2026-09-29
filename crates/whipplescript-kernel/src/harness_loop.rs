@@ -134,6 +134,7 @@ pub struct MediaInput {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessage {
     System(String),
+    Developer(String),
     /// A user turn: text plus any inline images (pi-conformance §6).
     User {
         text: String,
@@ -513,6 +514,7 @@ pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> Prov
 #[derive(Clone, Debug)]
 pub struct BrokeredTurnInput {
     pub system: String,
+    pub developer: String,
     pub user: String,
     pub tools: Vec<ToolSpec>,
     /// Identity of the initial content, supplied by the owning host rather
@@ -639,13 +641,15 @@ where
     E: ToolExecutor + ?Sized,
 {
     let mut messages = if input.resume_from.is_empty() {
-        vec![
-            ChatMessage::System(input.system.clone()),
-            ChatMessage::User {
-                text: input.user.clone(),
-                images: input.user_images.clone(),
-            },
-        ]
+        let mut initial = vec![ChatMessage::System(input.system.clone())];
+        if !input.developer.is_empty() {
+            initial.push(ChatMessage::Developer(input.developer.clone()));
+        }
+        initial.push(ChatMessage::User {
+            text: input.user.clone(),
+            images: input.user_images.clone(),
+        });
+        initial
     } else {
         // Resume-from-projection: continue from the persisted transcript, dropping
         // a dangling final tool-call (a crash between request and result) so the
@@ -1406,6 +1410,11 @@ where
                 self.observations.extend(media_observations);
                 let mut messages = vec![ChatMessage::System(self.input.system.clone())];
                 self.message_provenance = vec![self.input.model_provenance.system.clone()];
+                if !self.input.developer.is_empty() {
+                    messages.push(ChatMessage::Developer(self.input.developer.clone()));
+                    self.message_provenance
+                        .push(self.input.model_provenance.system.clone());
+                }
                 if let Some(world) = self.input.world.clone() {
                     let projection = WorldProjection::Full(world.clone());
                     if let Some(rendered) = render_world_projection(&projection) {
@@ -2566,6 +2575,7 @@ pub fn chat_messages_to_json(messages: &[ChatMessage]) -> Value {
 fn chat_message_to_json(message: &ChatMessage) -> Value {
     match message {
         ChatMessage::System(text) => json!({ "role": "system", "text": text }),
+        ChatMessage::Developer(text) => json!({ "role": "developer", "text": text }),
         ChatMessage::User { text, images } => {
             // Wire-format stability: a text-only user message keeps the exact
             // pre-images shape, so persisted transcripts round-trip unchanged.
@@ -2626,6 +2636,7 @@ fn chat_message_from_json(value: &Value) -> Option<ChatMessage> {
     };
     match value.get("role").and_then(Value::as_str)? {
         "system" => Some(ChatMessage::System(text(value))),
+        "developer" => Some(ChatMessage::Developer(text(value))),
         "user" => {
             // Old-format entries carry no `images` key → empty (compatibility).
             let images = value
@@ -2872,6 +2883,7 @@ mod tests {
         BrokeredTurnInput {
             model_provenance: InitialModelProvenance::default(),
             system: "you are a coding agent".to_string(),
+            developer: String::new(),
             user: "read the readme".to_string(),
             tools: vec![ToolSpec {
                 name: "read".to_string(),

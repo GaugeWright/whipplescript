@@ -2793,7 +2793,8 @@ impl GovernedHostRuntime {
             ModelContentProvenance::derived_from([&model_provenance.system, &skill_sources]);
         let input = BrokeredTurnInput {
             model_provenance,
-            system: context.system_prompt,
+            system: context.system_role,
+            developer: context.developer_role,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
             max_steps: package.max_steps,
@@ -3535,7 +3536,7 @@ impl GovernedHostRuntime {
                         }
                     }
                 }
-                ChatMessage::System(_) | ChatMessage::User { .. } => {}
+                ChatMessage::System(_) | ChatMessage::Developer(_) | ChatMessage::User { .. } => {}
             }
         }
         if assistant_text.is_empty() {

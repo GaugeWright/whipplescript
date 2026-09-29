@@ -38,7 +38,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if [ "$#" -lt 2 ]; then
-  echo "usage: scripts/check-mutation-sweep.sh <file> <cargo-test-filter> [limit]" >&2
+  echo "usage: scripts/check-mutation-sweep.sh <file> <cargo-test-filter> [limit] [lines]" >&2
   echo >&2
   echo "examples:" >&2
   echo "  scripts/check-mutation-sweep.sh \\" >&2
@@ -68,6 +68,15 @@ DEFERRED="${WHIPPLESCRIPT_SWEEP_DEFERRED:-}"
 # reads as a broken build rather than an interrupted sweep. Refuse to start on a
 # tree that already has uncommitted changes to the target, so an interrupted run
 # is always recoverable with `git checkout -- <file>`.
+#
+# To stop a run, kill its `mutation_sweep.py` and the `cargo test` it spawned
+# by pid, after confirming with `lsof -p <pid> | grep cwd` that they belong to
+# your worktree: other sessions run sweeps, so never kill by pattern. Then
+# restore the target, remove `<file>.sweepbak`, and check that nothing is still
+# rooted in the worktree before starting again, or the next run finds the file
+# being mutated and refuses. Write the new run's transcript to a new file: a
+# writer still alive keeps its offset in the old one, so truncating it with `>`
+# puts that writer's dying traceback inside the new run's output.
 if ! git diff --quiet -- "$TARGET"; then
   echo "refusing to sweep: $TARGET has uncommitted changes" >&2
   echo "the sweep rewrites this file in place; commit or stash first" >&2

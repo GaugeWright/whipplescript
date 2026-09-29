@@ -1286,16 +1286,28 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         whipplescript_kernel::context_assembly::is_managed_agents_path(&doc.path)
                     })
                     .collect();
-                let mut contributions = vec![contribution(
-                    "persona",
-                    "package:system-prompt",
-                    "v1",
-                    InstructionAuthority::Runtime,
-                    InstructionRole::System,
-                    "010-persona",
-                    ContributionLifecycle::Stable,
-                    self.system_prompt,
-                )];
+                let mut contributions = vec![
+                    contribution(
+                        "runtime-rules",
+                        "runtime:agent-rules",
+                        "v1",
+                        InstructionAuthority::Runtime,
+                        InstructionRole::System,
+                        "000-runtime-rules",
+                        ContributionLifecycle::Stable,
+                        whipplescript_kernel::host_package::RUNTIME_AGENT_RULES,
+                    ),
+                    contribution(
+                        "persona",
+                        "package:system-prompt",
+                        "v1",
+                        InstructionAuthority::AgentAuthor,
+                        InstructionRole::System,
+                        "010-persona",
+                        ContributionLifecycle::Stable,
+                        self.system_prompt,
+                    ),
+                ];
                 for doc in &docs {
                     contributions.push(contribution(
                         format!("project-context:{}", doc.position),
@@ -1367,7 +1379,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 "protocol": "whip-turn/1",
                                 "turn_id": effect.effect_id,
                                 "provider": cfg.provider,
-                                "system": assembled.system_prompt,
+                                "system": assembled.system_role,
+                                "developer": assembled.developer_role,
                                 "user": prompt,
                                 "media": user_media,
                                 "world": world,
@@ -1587,16 +1600,28 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         whipplescript_kernel::context_assembly::is_managed_agents_path(&doc.path)
                     })
                     .collect();
-                let mut bundles = vec![contribution(
-                    "persona",
-                    "package:system-prompt",
-                    "v1",
-                    InstructionAuthority::Runtime,
-                    InstructionRole::System,
-                    "010-persona",
-                    ContributionLifecycle::Stable,
-                    self.system_prompt,
-                )];
+                let mut bundles = vec![
+                    contribution(
+                        "runtime-rules",
+                        "runtime:agent-rules",
+                        "v1",
+                        InstructionAuthority::Runtime,
+                        InstructionRole::System,
+                        "000-runtime-rules",
+                        ContributionLifecycle::Stable,
+                        whipplescript_kernel::host_package::RUNTIME_AGENT_RULES,
+                    ),
+                    contribution(
+                        "persona",
+                        "package:system-prompt",
+                        "v1",
+                        InstructionAuthority::AgentAuthor,
+                        InstructionRole::System,
+                        "010-persona",
+                        ContributionLifecycle::Stable,
+                        self.system_prompt,
+                    ),
+                ];
                 if !docs.is_empty() {
                     for doc in &docs {
                         let instruction = ProjectInstruction {
@@ -1722,7 +1747,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 }
                 let turn_input = BrokeredTurnInput {
                     model_provenance,
-                    system: assembled.system_prompt,
+                    system: assembled.system_role,
+                    developer: assembled.developer_role,
                     user: prompt,
                     // The package-derived ability ceiling selects the exact
                     // in-isolate workspace tools advertised for this turn;
@@ -7513,7 +7539,11 @@ complete result { count count } }
                 complete: true,
             }
         );
-        assert!(calls[0].messages.iter().skip(1).all(|part| !part.complete));
+        assert!(
+            calls[0].messages[1].complete,
+            "developer context retains its package and skill sources"
+        );
+        assert!(calls[0].messages.iter().skip(2).all(|part| !part.complete));
         assert_eq!(calls[0].tools, known("package:one"));
         assert!(
             matches!(outcome, InstanceOutcome::Terminal),
@@ -7575,6 +7605,7 @@ complete result { count count } }
         /// A fake model that captures the system prompt it was asked to send.
         struct CapturingModel {
             systems: RefCell<Vec<String>>,
+            developers: RefCell<Vec<String>>,
         }
         impl HttpModelClient for CapturingModel {
             fn build_request(
@@ -7585,6 +7616,8 @@ complete result { count count } }
                 for message in messages {
                     if let ChatMessage::System(system) = message {
                         self.systems.borrow_mut().push(system.clone());
+                    } else if let ChatMessage::Developer(developer) = message {
+                        self.developers.borrow_mut().push(developer.clone());
                     }
                 }
                 whipplescript_kernel::sansio::HttpRequest {
@@ -7695,6 +7728,7 @@ complete result { count count } }
 
         let model = CapturingModel {
             systems: RefCell::new(Vec::new()),
+            developers: RefCell::new(Vec::new()),
         };
         // Match a public read-workspace panel such as Theo: skill discovery must
         // not depend on write, tracker, or command authority.
@@ -7733,26 +7767,28 @@ complete result { count count } }
             "turn completes: {outcome:?}"
         );
 
-        // The system prompt carried the store-resolved project context in pi's
-        // exact wrapper.
+        // The system prompt and project context retain their distinct roles.
         let systems = model.systems.borrow();
         let system = systems.first().expect("a model round ran");
         assert!(
-            system.starts_with("You are the package persona."),
+            system.starts_with("Available tools and their effects"),
             "{system}"
         );
+        assert!(system.contains("You are the package persona."), "{system}");
+        let developers = model.developers.borrow();
+        let developer = developers.first().expect("developer context was sent");
         assert!(
-            system.contains("<project_instructions path=\"repo/AGENTS.md\">"),
-            "{system}"
+            developer.contains("<project_instructions path=\"repo/AGENTS.md\">"),
+            "{developer}"
         );
-        assert!(system.contains("Always be excellent."), "{system}");
-        assert!(system.contains("<available_skills>"), "{system}");
+        assert!(developer.contains("Always be excellent."), "{developer}");
+        assert!(developer.contains("<available_skills>"), "{developer}");
         assert!(
-            system.contains("<skill name=\"theo\" location=\".agents/skills/theo/SKILL.md\">"),
-            "{system}"
+            developer.contains("<skill name=\"theo\" location=\".agents/skills/theo/SKILL.md\">"),
+            "{developer}"
         );
-        assert!(!system.contains("name=\"hidden\""), "{system}");
-        assert!(system.contains("Explain Theory A."), "{system}");
+        assert!(!developer.contains("name=\"hidden\""), "{developer}");
+        assert!(developer.contains("Explain Theory A."), "{developer}");
 
         // One context.bundle provenance row rode the Phase 1 seam.
         let driver = machine.into_driver();
@@ -7767,8 +7803,8 @@ complete result { count count } }
             .collect();
         assert_eq!(
             bundles.len(),
-            3,
-            "package persona, project context, and skill catalogue are evidenced"
+            4,
+            "runtime rules, package persona, project context, and skill catalogue are evidenced"
         );
         assert!(
             bundles
@@ -7805,17 +7841,26 @@ complete result { count count } }
 
     /// A canned Class-B turn container: asserts the whip-turn/1 start
     /// request shape and answers the blocking form's final outcome.
-    struct TurnContainerHost;
+    struct TurnContainerHost {
+        project_context: bool,
+    }
     impl HostDriver for TurnContainerHost {
         fn fulfill(&self, request: &IoRequest) -> IoResult {
             let IoRequest::Http(request) = request;
             assert!(request.url.ends_with("/turn"), "{}", request.url);
             assert_eq!(request.body["protocol"], serde_json::json!("whip-turn/1"));
             assert_eq!(request.body["tools"], serde_json::json!("file"));
-            assert_eq!(
-                request.body["system"],
-                serde_json::json!("You are a WhippleScript agent.")
-            );
+            assert!(request.body["system"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Available tools and their effects")
+                    && text.contains("You are a WhippleScript agent.")));
+            if self.project_context {
+                assert!(request.body["developer"].as_str().is_some_and(|text| text
+                    .contains("<project_instructions path=\"repo/AGENTS.md\">")
+                    && text.contains("Always be excellent.")));
+            } else {
+                assert_eq!(request.body["developer"], serde_json::json!(""));
+            }
             assert_eq!(
                 request.body["world"]["sections"]["identity"]["placement"],
                 serde_json::json!("turn_container")
@@ -7877,6 +7922,9 @@ complete result { count count } }
         ] {
             store.sql.execute(stmt, &[]).expect("seed agent provider");
         }
+        store
+            .register_project_context_doc(0, "repo/AGENTS.md", "Always be excellent.")
+            .expect("project context registers");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version_for_program(
@@ -7931,7 +7979,12 @@ complete result { count count } }
             max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
-        let outcome = run_to_completion(&mut machine, &TurnContainerHost);
+        let outcome = run_to_completion(
+            &mut machine,
+            &TurnContainerHost {
+                project_context: true,
+            },
+        );
         assert!(
             matches!(outcome, InstanceOutcome::Terminal),
             "the container turn settles to a terminal: {outcome:?}"
@@ -8037,7 +8090,12 @@ complete result { count count } }
             max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
-        let outcome = run_to_completion(&mut machine, &TurnContainerHost);
+        let outcome = run_to_completion(
+            &mut machine,
+            &TurnContainerHost {
+                project_context: false,
+            },
+        );
         let driver = machine.into_driver();
 
         let facts = driver

@@ -5,6 +5,12 @@
 //! workspace content store as the Home's endpoint keeps them. Ignored by default: it
 //! needs `buck2` on the PATH and is run by the bar's `buck2-test-executor`
 //! section, which names the remedy where Buck2 is absent.
+//!
+//! Buck2 is started with `tokio::process::Command` and awaited. The endpoint's
+//! tonic server runs on this test's current-thread runtime, so a blocking
+//! `std::process::Command::output()` starves it: Buck2's HTTP/2 keep-alive
+//! pings go unanswered and the build fails with `Failed to query capabilities
+//! of remote` against an endpoint that was never asked anything.
 
 #![cfg(feature = "endpoint")]
 

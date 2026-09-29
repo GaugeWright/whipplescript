@@ -452,7 +452,7 @@ fn project_output(
                     }
                 }
             }
-            ChatMessage::System(_) | ChatMessage::User { .. } => {}
+            ChatMessage::System(_) | ChatMessage::Developer(_) | ChatMessage::User { .. } => {}
         }
     }
     Ok(Some(HostedOutputObservation {
