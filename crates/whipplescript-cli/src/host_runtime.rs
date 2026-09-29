@@ -5700,13 +5700,13 @@ workflow UnsafeHostChat {
                 .expect("clock")
                 .as_nanos()
         ));
-        fs::create_dir_all(root.join(".pi")).expect("dirs");
+        fs::create_dir_all(root.join(".method")).expect("dirs");
         fs::write(root.join("note.txt"), "alpha\nbeta\n").expect("note");
         fs::write(root.join("other.txt"), "separate\n").expect("other");
-        fs::write(root.join(".pi/SYSTEM.md"), "protected").expect("method");
+        fs::write(root.join(".method/SYSTEM.md"), "protected").expect("method");
         let resolver = NativeWorkspaceResolver::new(&root)
             .expect("resolver")
-            .read_only([PathBuf::from(".pi")])
+            .read_only([PathBuf::from(".method")])
             .expect("read-only path");
         let resources = [ResourceRef {
             handle: "project".to_owned(),
@@ -5886,7 +5886,7 @@ workflow UnsafeHostChat {
             "alpha\ngamma\n"
         );
 
-        for path in ["../outside", ".pi/SYSTEM.md"] {
+        for path in ["../outside", ".method/SYSTEM.md"] {
             assert!(resolver
                 .execute_tool(
                     &resources,
@@ -5899,7 +5899,7 @@ workflow UnsafeHostChat {
                 .is_err());
         }
         assert_eq!(
-            fs::read_to_string(root.join(".pi/SYSTEM.md")).expect("protected method"),
+            fs::read_to_string(root.join(".method/SYSTEM.md")).expect("protected method"),
             "protected"
         );
         assert!(native_workspace_tool_specs(false)
@@ -5926,7 +5926,7 @@ workflow UnsafeHostChat {
         assert_eq!(listed.root, ".");
         assert_eq!(listed.files.len(), 2);
         assert!(listed.directories.contains(&"empty".to_owned()));
-        assert!(listed.directories.contains(&".pi".to_owned()));
+        assert!(listed.directories.contains(&".method".to_owned()));
         assert!(listed.files.iter().any(|file| {
             file.path == "note.txt"
                 && file.content_hash
@@ -6226,10 +6226,10 @@ workflow UnsafeHostChat {
                 .expect("clock")
                 .as_nanos()
         ));
-        fs::create_dir_all(root.join(".pi")).expect("dirs");
+        fs::create_dir_all(root.join(".method")).expect("dirs");
         let resolver = NativeWorkspaceResolver::new(&root)
             .expect("resolver")
-            .read_only([PathBuf::from(".pi")])
+            .read_only([PathBuf::from(".method")])
             .expect("read-only");
         let project_only = [ResourceRef {
             handle: "project".to_owned(),
@@ -6269,7 +6269,7 @@ workflow UnsafeHostChat {
             "HELLO"
         );
         assert!(resolver
-            .execute_tool(&admitted, &call("echo tampered > .pi/SYSTEM.md"))
+            .execute_tool(&admitted, &call("echo tampered > .method/SYSTEM.md"))
             .is_err());
         assert!(resolver
             .execute_tool(&admitted, &call("definitely-not-a-bashkit-command"))

@@ -1959,7 +1959,7 @@ fn doctor_provider_health_checks(
             for health_check in &capability.health_checks {
                 if !matches!(
                     health_check.as_str(),
-                    "codex_cli" | "claude_sdk" | "pi_cli" | "api_key"
+                    "codex_cli" | "claude_sdk" | "api_key"
                 ) {
                     checks.push(DoctorProviderHealthCheck {
                         provider: provider.clone(),
