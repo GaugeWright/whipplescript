@@ -741,11 +741,49 @@ impl<Sql: DoSql> TurnCommandSource for DoTurnCommandSource<Sql> {
     }
 }
 
+struct DiscoveredSkill {
+    entry: SkillCatalogueEntry,
+    body_digest: String,
+}
+
+/// Bind catalogue metadata to the exact bodies read by this discovery pass.
+/// A source handle is never a read grant; the owning host must recheck the
+/// selected file and its retained bytes for each reader.
+fn skill_catalogue_model_provenance(
+    skills: &[DiscoveredSkill],
+    workspace_content: Option<&ModelContentProvenance>,
+) -> ModelContentProvenance {
+    let Some(workspace_content) = workspace_content.filter(|source| source.complete) else {
+        return ModelContentProvenance::default();
+    };
+    let [workspace] = workspace_content.source_handles.as_slice() else {
+        return ModelContentProvenance::default();
+    };
+    let Some(chat_id) = workspace
+        .strip_prefix("workspace:")
+        .filter(|id| !id.is_empty())
+    else {
+        return ModelContentProvenance::default();
+    };
+    ModelContentProvenance {
+        source_handles: skills
+            .iter()
+            .map(|skill| {
+                format!(
+                    "workspace-file:{chat_id}:{}:{}",
+                    skill.body_digest, skill.entry.location
+                )
+            })
+            .collect(),
+        complete: true,
+    }
+}
+
 fn discover_workspace_skills<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
     resources: Option<&[ResourceRef]>,
-) -> Result<Vec<SkillCatalogueEntry>, StoreError> {
+) -> Result<Vec<DiscoveredSkill>, StoreError> {
     let prefix = format!("{instance_id}/");
     let rows = sql
         .query(
@@ -771,14 +809,17 @@ fn discover_workspace_skills<Sql: DoSql>(
         if frontmatter.name != directory_name {
             continue;
         }
-        skills.push(SkillCatalogueEntry {
-            name: frontmatter.name,
-            description: frontmatter.description,
-            location: path,
+        skills.push(DiscoveredSkill {
+            entry: SkillCatalogueEntry {
+                name: frontmatter.name,
+                description: frontmatter.description,
+                location: path,
+            },
+            body_digest: whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
         });
     }
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
-    skills.dedup_by(|left, right| left.name == right.name);
+    skills.sort_by(|left, right| left.entry.name.cmp(&right.entry.name));
+    skills.dedup_by(|left, right| left.entry.name == right.entry.name);
     Ok(skills)
 }
 
@@ -1559,7 +1600,10 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     self.instance_id,
                     self.agent_workspace_resources,
                 )?;
-                if !skills.is_empty() && tools.iter().any(|tool| tool.name == "read") {
+                let skills_in_prompt =
+                    !skills.is_empty() && tools.iter().any(|tool| tool.name == "read");
+                if skills_in_prompt {
+                    let entries: Vec<_> = skills.iter().map(|skill| skill.entry.clone()).collect();
                     bundles.push(contribution(
                         "available-skills",
                         "workspace:skills",
@@ -1568,7 +1612,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         InstructionRole::Developer,
                         "050-available-skills",
                         ContributionLifecycle::Turn,
-                        render_available_skills(&skills),
+                        render_available_skills(&entries),
                     ));
                 }
                 let assembled = assemble(bundles);
@@ -1638,9 +1682,16 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     &model_provenance.workspace_content,
                     &docs,
                 );
-                if !skills.is_empty() {
-                    // Skill discovery can read an unclassified workspace source.
-                    model_provenance.system.complete = false;
+                if skills_in_prompt {
+                    let catalogue = skill_catalogue_model_provenance(
+                        &skills,
+                        self.initial_model_provenance
+                            .map(|initial| &initial.workspace_content),
+                    );
+                    model_provenance.system = ModelContentProvenance::derived_from([
+                        &model_provenance.system,
+                        &catalogue,
+                    ]);
                 }
                 if !resume_provenance.is_empty() {
                     resume_provenance.push(model_provenance.user.clone());
@@ -2891,6 +2942,64 @@ mod tests {
             ..initial
         };
         assert!(!attested_authored_package_source(Some(&unpaired), instance).complete);
+    }
+
+    #[test]
+    fn hosted_skill_catalogue_names_the_exact_admitted_file() {
+        let store = store();
+        let body = "---\nname: theo\ndescription: Explain Theory A.\n---\n# Theo\n";
+        for (path, content) in [
+            ("instance/.agents/skills/theo/SKILL.md", body),
+            (
+                "instance/private/skills/hidden/SKILL.md",
+                "---\nname: hidden\ndescription: Secret skill.\n---\n",
+            ),
+        ] {
+            store
+                .sql
+                .execute(
+                    "INSERT INTO files (key, content) VALUES (?1, ?2)",
+                    &[
+                        crate::do_store::SqlValue::Text(path.to_owned()),
+                        crate::do_store::SqlValue::Text(content.to_owned()),
+                    ],
+                )
+                .unwrap();
+        }
+        let resources = [ResourceRef {
+            handle: "skills".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: Some(".agents/skills".to_owned()),
+            writable: Some(false),
+        }];
+        let skills = discover_workspace_skills(&store.sql, "instance", Some(&resources)).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].entry.name, "theo");
+        let workspace = ModelContentProvenance {
+            source_handles: vec!["workspace:chat-one".to_owned()],
+            complete: true,
+        };
+        assert_eq!(
+            skill_catalogue_model_provenance(&skills, Some(&workspace)),
+            ModelContentProvenance {
+                source_handles: vec![format!(
+                    "workspace-file:chat-one:{}:.agents/skills/theo/SKILL.md",
+                    whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
+                )],
+                complete: true,
+            }
+        );
+        assert!(!skill_catalogue_model_provenance(&skills, None).complete);
+        assert!(
+            !skill_catalogue_model_provenance(
+                &skills,
+                Some(&ModelContentProvenance {
+                    source_handles: vec!["workspace:chat-one".to_owned(), "chat:one".to_owned()],
+                    complete: true,
+                }),
+            )
+            .complete
+        );
     }
 
     #[test]
@@ -7291,6 +7400,20 @@ complete result { count count } }
             .expect("start event");
 
         let model = FinalReplyModel;
+        let skill_body = "---\nname: theo\ndescription: Explain Theory A.\n---\n# Theo\n";
+        kernel
+            .store()
+            .sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2)",
+                &[
+                    crate::do_store::SqlValue::Text(format!(
+                        "{instance_id}/.agents/skills/theo/SKILL.md"
+                    )),
+                    crate::do_store::SqlValue::Text(skill_body.to_owned()),
+                ],
+            )
+            .expect("skill file seeds");
         let known = |handle: &str| whipplescript_kernel::sansio::ModelContentProvenance {
             source_handles: vec![handle.to_owned()],
             complete: true,
@@ -7300,7 +7423,7 @@ complete result { count count } }
             user: known("chat:one"),
             world: known("package:one"),
             tools: known("package:one"),
-            workspace_content: known("workspace:one"),
+            workspace_content: known("workspace:chat-one"),
         };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
@@ -7326,7 +7449,19 @@ complete result { count count } }
         let outcome = run_to_completion(&mut machine, &host);
         let calls = host.0.borrow();
         assert!(!calls.is_empty());
-        assert_eq!(calls[0].messages[0], known("package:one"));
+        assert_eq!(
+            calls[0].messages[0],
+            ModelContentProvenance {
+                source_handles: vec![
+                    "package:one".to_owned(),
+                    format!(
+                        "workspace-file:chat-one:{}:.agents/skills/theo/SKILL.md",
+                        whipplescript_store::stable_hash_bytes_hex(skill_body.as_bytes()),
+                    ),
+                ],
+                complete: true,
+            }
+        );
         assert!(calls[0].messages.iter().skip(1).all(|part| !part.complete));
         assert_eq!(calls[0].tools, known("package:one"));
         assert!(
