@@ -432,7 +432,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 9;
+const SUPPORTED_DO_SCHEMA_VERSION = 10;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer
@@ -790,6 +790,12 @@ function ensureSchema(sql: SqlStorage): void {
     data_base64 TEXT NOT NULL,
     PRIMARY KEY (instance_id, command_id, selector)
   )`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS agent_turn_source_identities (
+    effect_id TEXT PRIMARY KEY, messages_sha256 TEXT NOT NULL,
+    labels_json TEXT NOT NULL
+  )`);
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (10, 'settled-agent-source-identities')`);
   // Live text is a repairable operational projection. Terminal transcript and
   // receipt events remain authority; these rows only let an SSE consumer catch
   // up after a transient disconnect during the active turn.
@@ -4003,12 +4009,15 @@ export class WorkflowInstance implements DurableObject {
       "public_managed_provider_bounds",
       "public_session_events",
       // The visitor's own words, and the media they attached, live outside the
-      // runtime tables above: the agent conversation in `agent_turn_snapshots`,
-      // and every steer/follow-up/compaction command in its own queue table
-      // (`text` plus base64 `images_json` bodies, retained after it applies).
+      // runtime tables above: an in-flight agent conversation in
+      // `agent_turn_snapshots`, its settled source identities in
+      // `agent_turn_source_identities`, and every steer/follow-up/compaction
+      // command in its own queue table (`text` plus base64 `images_json`
+      // bodies, retained after it applies).
       // Teardown that swept only the runtime tables left the whole conversation
       // resolvable on a tombstoned object, against DR-0049 §7.
       "agent_turn_snapshots",
+      "agent_turn_source_identities",
       "public_turn_commands",
       "public_compaction_commands",
       "events",

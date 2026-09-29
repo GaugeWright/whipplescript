@@ -11397,6 +11397,10 @@ pub mod test_support {
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
+            CREATE TABLE agent_turn_source_identities (
+                effect_id TEXT PRIMARY KEY, messages_sha256 TEXT NOT NULL,
+                labels_json TEXT NOT NULL
+            );
             CREATE TABLE public_turn_commands (
                 command_id TEXT PRIMARY KEY, turn_command_id TEXT NOT NULL,
                 kind TEXT NOT NULL, text TEXT NOT NULL, images_json TEXT NOT NULL DEFAULT '[]',
@@ -11544,6 +11548,106 @@ pub fn do_load_agent_snapshot<Sql: DoSql>(
         )
         .map_err(sql_err)?;
     Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+pub fn do_delete_agent_snapshot<Sql: DoSql>(sql: &Sql, effect_id: &str) -> StoreResult<()> {
+    sql.execute(
+        "DELETE FROM agent_turn_snapshots WHERE effect_id = ?1",
+        &[text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Retain source identities only, bound to the settled effect and exact
+/// conversation bytes. The transcript is owned by the runtime event stream;
+/// this row must never carry provider request or conversation content.
+pub fn do_save_agent_source_identities<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+    messages_sha256: &str,
+    labels_json: &str,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT OR IGNORE INTO agent_turn_source_identities \
+         (effect_id, messages_sha256, labels_json) VALUES (?1, ?2, ?3)",
+        &[text(effect_id), text(messages_sha256), text(labels_json)],
+    )
+    .map_err(sql_err)?;
+    let rows = sql
+        .query(
+            "SELECT messages_sha256, labels_json FROM agent_turn_source_identities \
+             WHERE effect_id = ?1",
+            &[text(effect_id)],
+        )
+        .map_err(sql_err)?;
+    if !rows
+        .first()
+        .is_some_and(|row| as_text(&row[0]) == messages_sha256 && as_text(&row[1]) == labels_json)
+    {
+        return Err(StoreError::Conflict(
+            "settled source identities changed on replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn do_load_agent_source_identities<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+    messages_sha256: &str,
+) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            "SELECT labels_json FROM agent_turn_source_identities \
+             WHERE effect_id = ?1 AND messages_sha256 = ?2",
+            &[text(effect_id), text(messages_sha256)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+#[cfg(test)]
+#[test]
+fn settled_source_identities_require_exact_effect_and_conversation_digest() {
+    let sql = test_support::RusqliteDoSql::with_runtime_schema();
+    do_save_agent_source_identities(
+        &sql,
+        "effect-one",
+        "digest-one",
+        r#"[{"source_handles":["chat:one"],"complete":true}]"#,
+    )
+    .unwrap();
+    assert!(
+        do_load_agent_source_identities(&sql, "effect-two", "digest-one")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        do_load_agent_source_identities(&sql, "effect-one", "digest-two")
+            .unwrap()
+            .is_none()
+    );
+    let labels = do_load_agent_source_identities(&sql, "effect-one", "digest-one")
+        .unwrap()
+        .unwrap();
+    assert!(labels.contains("chat:one"));
+    assert!(!labels.contains("old input"));
+    do_save_agent_source_identities(
+        &sql,
+        "effect-one",
+        "digest-one",
+        r#"[{"source_handles":["chat:one"],"complete":true}]"#,
+    )
+    .expect("identical replay");
+    assert!(do_save_agent_source_identities(&sql, "effect-one", "digest-one", "[]").is_err());
+    assert!(do_save_agent_source_identities(&sql, "effect-one", "digest-two", &labels).is_err());
+    assert_eq!(
+        do_load_agent_source_identities(&sql, "effect-one", "digest-one")
+            .unwrap()
+            .unwrap(),
+        labels
+    );
 }
 
 /// Read unconsumed interactive commands for one live agent effect. The rows

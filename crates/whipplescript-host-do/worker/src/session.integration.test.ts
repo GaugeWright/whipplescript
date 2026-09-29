@@ -1973,6 +1973,7 @@ describe("real WorkflowInstance hibernation", () => {
       state.storage.sql.exec("DROP TABLE tracker_control_receipts");
       state.storage.sql.exec("DROP TABLE program_import_operations");
       state.storage.sql.exec("DROP TABLE program_import_admissions");
+      state.storage.sql.exec("DROP TABLE agent_turn_source_identities");
       state.storage.sql.exec("ALTER TABLE facts DROP COLUMN validity_json");
       const stamp = state.storage.sql.exec("SELECT MAX(version) AS version FROM schema_migrations").toArray() as { version: number }[];
       // One below the DELETE above, not a generation number: this says the
@@ -1987,7 +1988,8 @@ describe("real WorkflowInstance hibernation", () => {
     expect(response.status).toBe(200);
     await runInDurableObject(stub, async (_instance, state) => {
       const stamp = state.storage.sql.exec("SELECT MAX(version) AS version FROM schema_migrations").toArray() as { version: number }[];
-      expect(stamp[0].version).toBe(9);
+      expect(stamp[0].version).toBe(10);
+      expect(state.storage.sql.exec("SELECT effect_id FROM agent_turn_source_identities").toArray()).toEqual([]);
       expect(state.storage.sql.exec("SELECT operation_id FROM tracker_filing_receipts").toArray()).toEqual([]);
       expect(state.storage.sql.exec("SELECT operation_id FROM tracker_closure_receipts").toArray()).toEqual([]);
       expect(state.storage.sql.exec("SELECT operation_id FROM tracker_control_receipts").toArray()).toEqual([]);

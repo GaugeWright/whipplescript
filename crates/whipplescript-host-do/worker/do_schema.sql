@@ -8,6 +8,7 @@
             INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
             INSERT INTO schema_migrations (version, name) VALUES (8, 'program-import-admission');
             INSERT INTO schema_migrations (version, name) VALUES (9, 'program-import-operation-population');
+            INSERT INTO schema_migrations (version, name) VALUES (10, 'settled-agent-source-identities');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -232,6 +233,10 @@
             );
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
+            );
+            CREATE TABLE agent_turn_source_identities (
+                effect_id TEXT PRIMARY KEY, messages_sha256 TEXT NOT NULL,
+                labels_json TEXT NOT NULL
             );
             CREATE TABLE public_turn_commands (
                 command_id TEXT PRIMARY KEY,

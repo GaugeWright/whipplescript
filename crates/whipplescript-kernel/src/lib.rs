@@ -1015,6 +1015,18 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         agent: &str,
         up_to_sequence: Option<i64>,
     ) -> StoreResult<Vec<crate::harness_loop::ChatMessage>> {
+        self.snapshot_agent_thread_with_source(instance_id, agent, up_to_sequence)
+            .map(|(messages, _)| messages)
+    }
+
+    /// The settled effect that supplied a resumed thread. A seed or absent
+    /// thread has no effect identity and cannot inherit a prior turn's labels.
+    pub fn snapshot_agent_thread_with_source(
+        &self,
+        instance_id: &str,
+        agent: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<(Vec<crate::harness_loop::ChatMessage>, Option<String>)> {
         let events = self.store.list_events(instance_id)?;
         let mut live: Vec<&EventView> = Vec::new();
         for event in &events {
@@ -1039,8 +1051,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 continue;
             }
             if event.event_type == "agent.thread.seeded" {
-                return Ok(crate::harness_loop::chat_messages_from_json(
-                    payload.get("messages").unwrap_or(&Value::Null),
+                return Ok((
+                    crate::harness_loop::chat_messages_from_json(
+                        payload.get("messages").unwrap_or(&Value::Null),
+                    ),
+                    None,
                 ));
             }
             if event.event_type != "agent.turn.completed" {
@@ -1063,12 +1078,15 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             });
             if let Some(transcript) = transcript {
                 let checkpoint: Value = serde_json::from_str(&transcript.payload_json)?;
-                return Ok(crate::harness_loop::chat_messages_from_json(
-                    checkpoint.get("messages").unwrap_or(&Value::Null),
+                return Ok((
+                    crate::harness_loop::chat_messages_from_json(
+                        checkpoint.get("messages").unwrap_or(&Value::Null),
+                    ),
+                    Some(effect_id.to_owned()),
                 ));
             }
         }
-        Ok(Vec::new())
+        Ok((Vec::new(), None))
     }
 
     /// Seed a newly opened instance with an exported thread snapshot. The

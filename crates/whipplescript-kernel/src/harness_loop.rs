@@ -897,6 +897,9 @@ where
     compactor: &'a dyn Compactor,
     messages: Vec<ChatMessage>,
     message_provenance: Vec<ModelContentProvenance>,
+    /// Metadata for an exact resumed conversation, supplied by the host only
+    /// on a fresh turn. Never accepted from the durable command itself.
+    resume_provenance: Vec<ModelContentProvenance>,
     observations: Vec<LoopObservation>,
     usage: Value,
     step: usize,
@@ -951,6 +954,7 @@ where
             compactor,
             messages: Vec::new(),
             message_provenance: Vec::new(),
+            resume_provenance: Vec::new(),
             observations: Vec::new(),
             usage: Value::Null,
             step: 0,
@@ -993,6 +997,7 @@ where
             compactor,
             messages: snapshot.messages,
             message_provenance: snapshot.message_provenance,
+            resume_provenance: Vec::new(),
             observations: snapshot.observations,
             usage: snapshot.usage,
             step: snapshot.step,
@@ -1030,6 +1035,13 @@ where
 
     pub fn with_command_source(mut self, source: &'a mut dyn TurnCommandSource) -> Self {
         self.command_source = Some(source);
+        self
+    }
+
+    /// Reapply retained source identities to the exact conversation selected
+    /// by the host. A length mismatch makes every resumed entry unknown.
+    pub fn with_resume_provenance(mut self, labels: Vec<ModelContentProvenance>) -> Self {
+        self.resume_provenance = labels;
         self
     }
 
@@ -1405,7 +1417,11 @@ where
                 messages
             } else {
                 let resumed = sanitize_resume_messages(self.input.resume_from.clone());
-                self.message_provenance = vec![ModelContentProvenance::default(); resumed.len()];
+                self.message_provenance = if self.resume_provenance.len() == resumed.len() {
+                    std::mem::take(&mut self.resume_provenance)
+                } else {
+                    vec![ModelContentProvenance::default(); resumed.len()]
+                };
                 resumed
             };
             (self.checkpoint)(&self.messages);
@@ -3093,6 +3109,51 @@ mod tests {
             panic!("retried call");
         };
         assert_eq!(retried, first.0);
+    }
+
+    #[test]
+    fn exact_resumed_conversation_keeps_old_labels_and_labels_the_new_input_separately() {
+        let http = ScriptedHttpClient::new(Vec::new());
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let known = |source: &str| ModelContentProvenance {
+            source_handles: vec![source.to_owned()],
+            complete: true,
+        };
+        let mut turn = input(1);
+        turn.resume_from = vec![
+            ChatMessage::System("old system".to_owned()),
+            ChatMessage::user_text("old input"),
+            ChatMessage::user_text("new input"),
+        ];
+        turn.model_provenance.tools = ModelContentProvenance::default();
+        let labels = vec![known("package:old"), known("chat:old"), known("chat:new")];
+        let mut checkpoint = no_checkpoint();
+        let first =
+            BrokeredTurnMachine::new(&http, &executor, &turn, &mut checkpoint, &NoopCompactor)
+                .with_resume_provenance(labels.clone())
+                .step(None);
+        let Outcome::NeedsIo(IoRequest::Http(first)) = first else {
+            panic!("first call");
+        };
+        assert_eq!(first.model_provenance.unwrap().messages, labels);
+
+        let mut checkpoint = no_checkpoint();
+        let mismatch =
+            BrokeredTurnMachine::new(&http, &executor, &turn, &mut checkpoint, &NoopCompactor)
+                .with_resume_provenance(vec![known("package:old")])
+                .step(None);
+        let Outcome::NeedsIo(IoRequest::Http(mismatch)) = mismatch else {
+            panic!("first call with mismatched labels");
+        };
+        assert!(mismatch
+            .model_provenance
+            .unwrap()
+            .messages
+            .iter()
+            .all(|source| !source.complete));
     }
 
     /// Transient provider errors auto-retry (bounded); a persistent one still

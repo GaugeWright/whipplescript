@@ -222,7 +222,10 @@ pub fn do_config_fingerprint(
     ))
 }
 
-use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
+use crate::do_store::{
+    do_delete_agent_snapshot, do_load_agent_snapshot, do_load_agent_source_identities,
+    do_save_agent_snapshot, do_save_agent_source_identities, DoSql, DoSqliteStore,
+};
 
 /// Projected executor-sidecar wiring (compute plane P8): where Class-A exec
 /// effects go (the DO cannot spawn processes — exec is HTTP to the sidecar,
@@ -274,6 +277,28 @@ fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
 fn is_governed_host_model_input(input: &serde_json::Value, effect_id: &str) -> bool {
     input.get("command_id").and_then(serde_json::Value::as_str) == Some(effect_id)
         && input.pointer("/input/text").is_some()
+}
+
+fn resumed_source_labels<Sql: DoSql>(
+    sql: &Sql,
+    prior_effect: Option<&str>,
+    messages: &[ChatMessage],
+) -> Result<Vec<ModelContentProvenance>, StoreError> {
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let digest = whipplescript_kernel::exec_http::sha256_hex(
+        whipplescript_kernel::harness_loop::chat_messages_to_json(messages)
+            .to_string()
+            .as_bytes(),
+    );
+    let matched = prior_effect
+        .map(|effect_id| do_load_agent_source_identities(sql, effect_id, &digest))
+        .transpose()?
+        .flatten()
+        .and_then(|json| serde_json::from_str::<Vec<ModelContentProvenance>>(&json).ok())
+        .filter(|labels| labels.len() == messages.len());
+    Ok(matched.unwrap_or_else(|| vec![ModelContentProvenance::default(); messages.len()]))
 }
 
 fn project_doc_model_provenance(
@@ -1431,12 +1456,17 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         &input,
                     )?
                 };
-                let mut resume_from = if loaded.is_none() {
+                let (mut resume_from, prior_effect) = if loaded.is_none() {
                     self.kernel
-                        .snapshot_agent_thread(self.instance_id, agent, None)?
+                        .snapshot_agent_thread_with_source(self.instance_id, agent, None)?
                 } else {
-                    Vec::new()
+                    (Vec::new(), None)
                 };
+                let mut resume_provenance = resumed_source_labels(
+                    &self.kernel.store().sql,
+                    prior_effect.as_deref(),
+                    &resume_from,
+                )?;
                 if loaded.is_none() && !resume_from.is_empty() {
                     resume_from.push(ChatMessage::User {
                         text: prompt.clone(),
@@ -1571,6 +1601,9 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 if !skills.is_empty() {
                     // Skill discovery can read an unclassified workspace source.
                     model_provenance.system.complete = false;
+                }
+                if !resume_provenance.is_empty() {
+                    resume_provenance.push(model_provenance.user.clone());
                 }
                 let turn_input = BrokeredTurnInput {
                     model_provenance,
@@ -1737,6 +1770,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         )
                     }
                 }
+                .with_resume_provenance(resume_provenance)
                 .with_cancel_check(&cancel_probe)
                 .with_command_source(&mut command_source)
                 .with_world_source(&mut world_source);
@@ -1767,6 +1801,27 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         return Ok(EffectStep::NeedsHttp(request));
                     }
                     Outcome::Settle(outcome) => {
+                        // This row carries only source identities, keyed to the
+                        // effect selected by snapshot_agent_thread and the exact
+                        // conversation checkpoint. It is never a read grant.
+                        if snapshot.message_provenance.len() == snapshot.messages.len() {
+                            let messages_sha256 = whipplescript_kernel::exec_http::sha256_hex(
+                                whipplescript_kernel::harness_loop::chat_messages_to_json(
+                                    &snapshot.messages,
+                                )
+                                .to_string()
+                                .as_bytes(),
+                            );
+                            let labels_json =
+                                serde_json::to_string(&snapshot.message_provenance)
+                                    .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                            do_save_agent_source_identities(
+                                &self.kernel.store().sql,
+                                &effect.effect_id,
+                                &messages_sha256,
+                                &labels_json,
+                            )?;
+                        }
                         let result = provider_result_from_brokered_turn(&outcome);
                         let execution = AgentTurnExecution {
                             instance_id: self.instance_id,
@@ -1781,8 +1836,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             input_json: &effect.input_json,
                             skill_names: &[],
                         };
-                        self.kernel
-                            .settle_provider_run_result(execution, "{}", &result)?
+                        let settled = self
+                            .kernel
+                            .settle_provider_run_result(execution, "{}", &result)?;
+                        do_delete_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
+                        settled
                     }
                 }
             }
@@ -2659,6 +2717,45 @@ mod tests {
         );
         assert!(is_governed_host_model_input(&input, "command-1"));
         assert!(!is_governed_host_model_input(&input, "other-command"));
+    }
+
+    #[test]
+    fn resumed_labels_require_the_selected_effect_and_exact_conversation() {
+        let sql = store().sql;
+        let messages = vec![ChatMessage::user_text("earlier input")];
+        let digest = whipplescript_kernel::exec_http::sha256_hex(
+            whipplescript_kernel::harness_loop::chat_messages_to_json(&messages)
+                .to_string()
+                .as_bytes(),
+        );
+        let known = ModelContentProvenance {
+            source_handles: vec!["chat:earlier".to_owned()],
+            complete: true,
+        };
+        do_save_agent_source_identities(
+            &sql,
+            "settled-effect",
+            &digest,
+            &serde_json::to_string(&vec![known.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed_source_labels(&sql, Some("settled-effect"), &messages).unwrap(),
+            vec![known]
+        );
+        assert!(
+            !resumed_source_labels(&sql, Some("different-effect"), &messages).unwrap()[0].complete
+        );
+        assert!(!resumed_source_labels(&sql, None, &messages).unwrap()[0].complete);
+        assert!(
+            !resumed_source_labels(
+                &sql,
+                Some("settled-effect"),
+                &[ChatMessage::user_text("different bytes")]
+            )
+            .unwrap()[0]
+                .complete
+        );
     }
 
     #[test]
@@ -7179,6 +7276,32 @@ complete result { count count } }
             ChatMessage::Assistant { text, tool_calls }
                 if text == "done" && tool_calls.is_empty()
         )));
+        let (selected, effect_id) = driver
+            .kernel
+            .snapshot_agent_thread_with_source(&instance_id, "helper", None)
+            .expect("selected settled conversation");
+        assert_eq!(selected, thread);
+        let effect_id = effect_id.expect("settled effect identity");
+        let digest = whipplescript_kernel::exec_http::sha256_hex(
+            whipplescript_kernel::harness_loop::chat_messages_to_json(&selected)
+                .to_string()
+                .as_bytes(),
+        );
+        let labels =
+            do_load_agent_source_identities(&driver.kernel.store().sql, &effect_id, &digest)
+                .expect("source identity read")
+                .expect("settled source identities");
+        assert_eq!(
+            serde_json::from_str::<Vec<ModelContentProvenance>>(&labels)
+                .expect("ordered labels")
+                .len(),
+            selected.len()
+        );
+        assert!(
+            do_load_agent_snapshot(&driver.kernel.store().sql, &effect_id)
+                .expect("snapshot read")
+                .is_none()
+        );
     }
 
     /// Store-backed project instructions (context-assembly Phase 3 item 4):
