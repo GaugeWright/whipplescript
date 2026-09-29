@@ -50,7 +50,10 @@ rule echo when InputReference as reference => { complete result { handle referen
         7,
         envelope(7, "product"),
     )
-    .unwrap();
+    .unwrap()
+    .with_compiler_artifact_digest(
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
     let admission = facade
         .admit_action(
             command.clone(),

@@ -221,8 +221,11 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
     register_file_capabilities(&store);
     let action =
         CompiledHostAction::compile("file.save", SOURCE, None).expect("compiled file action");
-    let mut facade =
-        GovernedHostFacade::from_verified_store(store, 7, envelope(7)).expect("admission facade");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(7))
+        .expect("admission facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let command = HostActionCommand {
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),

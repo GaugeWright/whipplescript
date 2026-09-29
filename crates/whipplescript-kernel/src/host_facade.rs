@@ -169,7 +169,14 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             self.require_governed(&resource.resource.handle)?;
         }
         self.check_program_ifc(action.program())?;
-        self.kernel.admit_compiled_host_action(action, &admission)
+        let compiler_artifact_digest =
+            self.compiler_artifact_digest.as_deref().ok_or_else(|| {
+                HostFacadeError::Resolver(
+                    "host action admission requires the exact compiler artifact digest".to_owned(),
+                )
+            })?;
+        self.kernel
+            .admit_compiled_host_action(action, &admission, compiler_artifact_digest)
     }
 
     /// Execute one ordinary file effect under freshly verified current authority.

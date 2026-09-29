@@ -255,7 +255,11 @@ fn setup(case: &str, actor: &str) -> Fixture {
     .expect("signed policy");
     let envelope = VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &PolicyFixture)
         .expect("verify fixture policy");
-    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope).expect("facade");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
+        .expect("facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let action = ResolutionRecordingAction::compile().expect("fixed recording workflow");
     let input = serde_json::to_string(
         &ResolutionRecordingInput::new(vec![RegionResolution {

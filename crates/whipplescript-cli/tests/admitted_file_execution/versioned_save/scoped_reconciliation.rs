@@ -208,8 +208,11 @@ fn run_scoped<S, B, C>(
         recorded_at: "t3".into(),
     };
     let action = CompiledHostAction::compile("file.save", SOURCE, None).expect("compiled workflow");
-    let mut facade =
-        GovernedHostFacade::from_verified_store(store, 7, scoped_envelope(7)).expect("facade");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, scoped_envelope(7))
+        .expect("facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let original = HostActionCommand {
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),

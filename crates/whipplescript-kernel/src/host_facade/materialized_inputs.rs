@@ -93,6 +93,11 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         if let Some(receipt) = self.kernel.existing_action_admission(&admission)? {
             return Ok(receipt);
         }
+        let compiler_artifact_digest = self.compiler_artifact_digest.clone().ok_or_else(|| {
+            HostFacadeError::Resolver(
+                "host action admission requires the exact compiler artifact digest".to_owned(),
+            )
+        })?;
         resolver
             .with_inputs(&admission, |values| {
                 // Even an empty declaration is closed: the legacy untyped startup
@@ -106,8 +111,12 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     .map_err(|_| {
                         ProtocolError::Invalid("materialized input does not match workflow schema")
                     })?;
-                self.kernel
-                    .admit_host_action_inputs(action, &admission, facts)
+                self.kernel.admit_host_action_inputs(
+                    action,
+                    &admission,
+                    facts,
+                    &compiler_artifact_digest,
+                )
             })
             .map_err(|_| {
                 HostFacadeError::Resolver("workflow input custody is unavailable".into())

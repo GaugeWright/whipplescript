@@ -465,7 +465,11 @@ where
     .expect("policy");
     let envelope = VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &Policy)
         .expect("fixture policy");
-    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope).expect("facade");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
+        .expect("facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let action = ResolutionRecordingAction::compile().expect("recording profile");
     let mut receipts = Vec::new();
     for (actor, body) in [

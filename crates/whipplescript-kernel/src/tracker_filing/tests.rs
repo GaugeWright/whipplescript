@@ -127,7 +127,10 @@ fn fixture_for_source(
     let action = CompiledHostAction::compile_materialized_inputs("workflow.launch", source, None)
         .expect("compile fixture workflow");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(policy(), 7))
-        .expect("create governed fixture");
+        .expect("create governed fixture")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     facade
         .kernel()
         .store()

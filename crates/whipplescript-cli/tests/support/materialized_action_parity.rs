@@ -60,9 +60,7 @@ impl ActionInputResolver for Custody {
 fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead>(
     store: S,
 ) -> Vec<Value> {
-    let action = CompiledHostAction::compile_materialized_inputs(
-        "workflow.launch",
-        r#"
+    let source = r#"
 workflow Typed(learner: Learner) -> string
 class Learner { authority string }
 rule begin
@@ -71,12 +69,14 @@ rule begin
   done learner
   complete result learner.authority
 }
-"#,
-        None,
-    )
-    .expect("ordinary typed source");
-    let mut facade =
-        GovernedHostFacade::from_verified_store(store, 7, envelope()).expect("typed facade");
+"#;
+    let action = CompiledHostAction::compile_materialized_inputs("workflow.launch", source, None)
+        .expect("ordinary typed source");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope())
+        .expect("typed facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let mut outcomes = Vec::new();
     for actor in ["person:1", "agent:1"] {
         let command = HostActionCommand {
@@ -172,7 +172,10 @@ rule begin
             7,
             envelope(),
         )
-        .expect("reconstructed embedding");
+        .expect("reconstructed embedding")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
         assert_eq!(
             facade
                 .admit_action_with_inputs(
@@ -250,6 +253,40 @@ rule begin
         );
         outcomes.push(json!({"instance": receipt.instance_ref, "fingerprint": receipt.fingerprint,
             "command": command, "typed": serde_json::from_str::<Value>(&input.value_json).expect("input")}));
+    }
+    let roster = facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .expect("typed action import operation roster");
+    assert!(roster.operations.len() >= 2);
+    for operation in &roster.operations {
+        assert_eq!(
+            operation.kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = facade
+            .kernel()
+            .store()
+            .program_import_witness(
+                &operation.version_id,
+                operation.witness_digest.as_deref().expect("witness digest"),
+            )
+            .expect("witness lookup")
+            .expect("retained witness");
+        assert_eq!(
+            witness.program_source_digest,
+            whipplescript_kernel::exec_http::sha256_hex(source.as_bytes())
+        );
+        assert_eq!(
+            witness.lock_digest,
+            whipplescript_kernel::import_coverage::NO_LOCK_DIGEST
+        );
+        assert_eq!(
+            witness.compiler_artifact_digest,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert!(witness.examined.is_empty());
     }
     outcomes
 }

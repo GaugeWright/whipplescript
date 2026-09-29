@@ -24,8 +24,10 @@ use whipplescript_kernel::host_protocol::action_result::{
 };
 use whipplescript_kernel::host_protocol::ProtocolError;
 use whipplescript_kernel::ifc::VerifiedEnvelope;
+use whipplescript_kernel::import_coverage::NO_LOCK_DIGEST;
 use whipplescript_store::log_append::LogAppend;
 use whipplescript_store::native_stores::NativeStores;
+use whipplescript_store::program_imports::ProgramImportOperationKind;
 use whipplescript_store::{
     coordination::Coordination, items::WorkItems, vcs::FrontierRead, RuntimeStore,
 };
@@ -86,10 +88,12 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
     let envelope =
         VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &FixtureAuthority(vec![]))
             .expect("verified policy");
-    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope).expect("facade");
-    let action = CompiledHostAction::compile(
-        "reference.echo",
-        r#"
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
+        .expect("facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
+    let source = r#"
 workflow ParityAction
 input content InputReference
 output result Result
@@ -98,10 +102,9 @@ class Result { handle string }
 rule echo
   when InputReference as r
 => { complete result { handle r.handle } }
-"#,
-        None,
-    )
-    .expect("ordinary compiled action");
+"#;
+    let action = CompiledHostAction::compile("reference.echo", source, None)
+        .expect("ordinary compiled action");
     let mut outcomes = Vec::new();
     for (actor, origin) in [("person:1", "editor.save"), ("agent:1", "tool.call")] {
         let command = HostActionCommand {
@@ -304,6 +307,34 @@ rule echo
             .len(),
         2
     );
+    let roster = facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .expect("action import operation roster");
+    assert!(roster.operations.len() >= 2);
+    for operation in &roster.operations {
+        assert_eq!(operation.kind, ProgramImportOperationKind::Checked);
+        let witness = facade
+            .kernel()
+            .store()
+            .program_import_witness(
+                &operation.version_id,
+                operation.witness_digest.as_deref().expect("witness digest"),
+            )
+            .expect("witness lookup")
+            .expect("retained witness");
+        assert_eq!(
+            witness.program_source_digest,
+            whipplescript_kernel::exec_http::sha256_hex(source.as_bytes())
+        );
+        assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
+        assert_eq!(
+            witness.compiler_artifact_digest,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert!(witness.examined.is_empty());
+    }
     outcomes
 }
 

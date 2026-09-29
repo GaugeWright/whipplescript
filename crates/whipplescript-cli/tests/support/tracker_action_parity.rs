@@ -172,7 +172,10 @@ fn prepare_source_with_custody<
     let action = CompiledHostAction::compile_materialized_inputs("workflow.launch", source, None)
         .expect("compile tutorial filing");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope())
-        .expect("governed tracker facade");
+        .expect("governed tracker facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     facade
         .kernel()
         .store()
@@ -389,7 +392,10 @@ fn journey<
             7,
             envelope(),
         )
-        .expect("restart embedding");
+        .expect("restart embedding")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
         facade
             .kernel_mut()
             .store_mut()
@@ -467,7 +473,10 @@ fn journey<
                 7,
                 envelope(),
             )
-            .expect("restart before closure delivery");
+            .expect("restart before closure delivery")
+            .with_compiler_artifact_digest(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
             let timed_before = facade
                 .kernel()
                 .store()
@@ -767,7 +776,10 @@ where
                 7,
                 envelope(),
             )
-            .expect("reconstruct embedding");
+            .expect("reconstruct embedding")
+            .with_compiler_artifact_digest(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
             if expired {
                 assert_eq!(
                     facade

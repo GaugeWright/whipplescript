@@ -239,8 +239,11 @@ fn run<S, B, C>(
     };
     let action =
         CompiledHostAction::compile("file.save", &source, None).expect("compile ordinary workflow");
-    let mut facade =
-        GovernedHostFacade::from_verified_store(store, 7, envelope(7)).expect("facade");
+    let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(7))
+        .expect("facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let command = HostActionCommand {
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),

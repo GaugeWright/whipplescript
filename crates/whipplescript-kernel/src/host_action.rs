@@ -10,6 +10,7 @@ use crate::host_protocol::action::{
     ActionAdmissionReceipt, HostActionCommand, VerifiedActionAdmission, HOST_ACTION_PROTOCOL,
 };
 use crate::host_protocol::{PinnedPosition, ProtocolError};
+use crate::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use crate::workflow_input::{validate_workflow_start_input, WorkflowInputFact};
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
@@ -175,9 +176,10 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         &mut self,
         action: &CompiledHostAction,
         admission: &VerifiedActionAdmission,
+        compiler_artifact_digest: &str,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let facts = action.validate_inputs(admission)?;
-        self.admit_host_action_inputs(action, admission, facts)
+        self.admit_host_action_inputs(action, admission, facts, compiler_artifact_digest)
     }
 
     pub(crate) fn admit_host_action_inputs(
@@ -185,14 +187,16 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         action: &CompiledHostAction,
         admission: &VerifiedActionAdmission,
         facts: Vec<WorkflowInputFact>,
+        compiler_artifact_digest: &str,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let source_hash = self
             .store()
             .put_content(&action.source)
             .map_err(HostFacadeError::Store)?;
         let ir_hash = whipplescript_store::stable_hash_hex(&action.identity);
-        let version = self
-            .create_program_version_for_program(
+        let source_digest = crate::exec_http::sha256_hex(action.source.as_bytes());
+        let version_admission = self
+            .create_program_version_for_program_with_imports(
                 ProgramVersionInput {
                     program_name: &action.program.workflow,
                     source_hash: &source_hash,
@@ -201,6 +205,13 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
                     compiler_version: whipplescript_core::version(),
                 },
                 &action.program,
+                &CheckedImportBasis {
+                    program_source_digest: &source_digest,
+                    version_source_digest: None,
+                    lock_digest: NO_LOCK_DIGEST,
+                    compiler_artifact_digest,
+                    packages: &[],
+                },
             )
             .map_err(HostFacadeError::Store)?;
         let command = admission.command();
@@ -244,8 +255,8 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
                 fingerprint: admission.fingerprint(),
                 command_json: &command_json,
                 instance: NewInstance {
-                    program_id: &version.program_id,
-                    version_id: &version.version_id,
+                    program_id: &version_admission.program_id,
+                    version_id: &version_admission.version_id,
                     input_json: &input_json,
                 },
                 authority: NewInstanceAuthority {
@@ -388,6 +399,9 @@ mod tests {
     use crate::host_protocol::action::tests::{command, envelope, ExactAdmission};
     use whipplescript_store::native_stores::NativeStores;
 
+    const COMPILER_DIGEST: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     const SOURCE: &str = r#"
 workflow ReferenceAction
 input content InputReference
@@ -416,7 +430,8 @@ rule echo
             7,
             envelope(7, "product"),
         )
-        .unwrap();
+        .unwrap()
+        .with_compiler_artifact_digest(COMPILER_DIGEST);
         (action, command, facade)
     }
 
@@ -432,6 +447,35 @@ rule echo
                 b"authenticated fixture",
             )
             .unwrap();
+        let roster = facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("host action import operations");
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(
+            roster.operations[0].kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = facade
+            .kernel()
+            .store()
+            .program_import_witness(
+                &roster.operations[0].version_id,
+                roster.operations[0]
+                    .witness_digest
+                    .as_deref()
+                    .expect("checked witness"),
+            )
+            .expect("witness lookup")
+            .expect("stored witness");
+        assert_eq!(
+            witness.program_source_digest,
+            crate::exec_http::sha256_hex(SOURCE.as_bytes())
+        );
+        assert_eq!(witness.compiler_artifact_digest, COMPILER_DIGEST);
+        assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
+        assert!(witness.examined.is_empty());
         assert_eq!(facade.kernel().store().list_instances().unwrap().len(), 1);
         let start_events = facade
             .kernel()
@@ -532,6 +576,53 @@ rule echo
             first
         );
         assert_eq!(facade.kernel().store().list_instances().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn host_action_refuses_an_unresolved_local_import_before_version_admission() {
+        let (_, mut command, mut facade) = fixture();
+        let source = format!("use local.dep\n{SOURCE}");
+        let action =
+            CompiledHostAction::compile("reference.echo", &source, None).expect("compiled action");
+        command.program_version_ref = action.version_ref().into();
+        command.input_schema_ref = action.input_schema_ref().into();
+        let verifier = ExactAdmission(command.signing_bytes().expect("command"));
+        assert!(facade
+            .admit_action(command, &action, &verifier, b"authenticated fixture")
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved local package import `local.dep`"));
+        assert!(facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("import operations")
+            .operations
+            .is_empty());
+    }
+
+    #[test]
+    fn host_action_refuses_missing_compiler_artifact_before_version_admission() {
+        let (action, command, facade) = fixture();
+        let mut facade = GovernedHostFacade::from_verified_store(
+            facade.into_kernel().into_store(),
+            7,
+            envelope(7, "product"),
+        )
+        .expect("facade without compiler artifact");
+        let verifier = ExactAdmission(command.signing_bytes().expect("command"));
+        assert!(facade
+            .admit_action(command, &action, &verifier, b"authenticated fixture")
+            .unwrap_err()
+            .to_string()
+            .contains("requires the exact compiler artifact digest"));
+        assert!(facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("import operations")
+            .operations
+            .is_empty());
     }
 
     #[test]

@@ -240,7 +240,10 @@ fn setup(
     let envelope = VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &PolicyFixture)
         .expect("verify fixture policy");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
-        .expect("construct governed facade");
+        .expect("construct governed facade")
+        .with_compiler_artifact_digest(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
     let source = match case {
         "record" => SOURCE.replace(
             "complete result",
