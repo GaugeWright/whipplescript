@@ -343,6 +343,29 @@ let a second operation finish before admission. This is a lock schedule model,
 not a measurement of the actual store APIs; FB-3 must enforce the same order
 at every production path that needs both authorities.
 
+`home_cut_authorities.py` extends that question to the native runtime admission
+roster, which is in a different SQLite file from the norm ledger and ref:
+
+```sh
+python3 models/research/home_cut_authorities.py
+```
+
+It explores 2,436 safe states through ten transitions for one linked operation,
+one gate, two independent writes and a second operation needing both stores.
+The modeled protocol records a durable pending marker with the linked
+operation's first component, keeps it across a crash, and clears it only after
+the second component lands. The gate prepares exact norm/runtime revisions,
+then takes norm, runtime and ref exclusion in that order, rechecks both
+revisions and the marker, and holds all three through CAS. Positive traces
+include completion after a crash, a stale gate interleaved with recovery, and
+release after a ref outage. Six weakened variants expose false completeness
+after a partial operation, stale preparation, early lock release and a
+norm/runtime circular wait. The pending marker is one candidate recovery
+mechanism, not a chosen production schema. The probe assumes its first write
+is atomic, each revision is monotone, and every linked accepting operation
+participates. It does not establish Home identity, enumerate production
+accepting paths, implement the locks, or prove a hosted single-writer cut.
+
 `twig_handoff.py` isolates the holder transfer that the larger lifecycle
 probe treats as one step:
 
