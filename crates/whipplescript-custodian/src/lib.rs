@@ -14,6 +14,10 @@
 //! earlier — never credential material (§13).
 
 pub mod egress;
+// Hosted GaugeVault final-use backing. Kept inside the custodian crate: this
+// is not a custody protocol operation and has no agent-facing read route.
+#[allow(dead_code)] // Staged until the Cosmos-consumed dispatch path is mounted.
+mod gaugevault_keyvault;
 pub mod openbao;
 // The daemon's listener is a Unix domain socket by construction — the 0o600
 // socket *is* the authority boundary (§4), not an implementation detail — so
