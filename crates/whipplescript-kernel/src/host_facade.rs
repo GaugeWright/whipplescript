@@ -393,6 +393,9 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .resolve_package(&command.package_version_ref)
             .map_err(HostFacadeError::Resolver)?;
         self.validate_package(&package, &command.package_version_ref)?;
+        package
+            .require_supported_imports()
+            .map_err(HostFacadeError::Resolver)?;
         self.check_package_ifc(&package)?;
         if let Some(opened) = self.replayed_open_instance(command, &package)? {
             return Ok(opened);

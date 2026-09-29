@@ -82,7 +82,7 @@ mod governed_host_tests {
     use whipplescript_kernel::harness_model::MessagesApiClient;
     use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
     use whipplescript_kernel::host_package::{
-        AuthoredAgentPackage, PackageResolver, AGENT_PACKAGE_SCHEMA,
+        AuthoredAgentPackage, PackageResolver, ResolvedPackage, AGENT_PACKAGE_SCHEMA,
     };
     use whipplescript_kernel::host_policy::{
         HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
@@ -127,6 +127,14 @@ workflow Method {
             "Be helpful.",
         )
         .expect("package")
+    }
+
+    struct SuppliedPackage(ResolvedPackage);
+
+    impl PackageResolver for SuppliedPackage {
+        fn resolve_package(&self, _version_ref: &str) -> Result<ResolvedPackage, String> {
+            Ok(self.0.clone())
+        }
     }
 
     fn signed_policy() -> (GaugeDeskGovernanceRoot, String) {
@@ -249,11 +257,30 @@ workflow Method {
             .unwrap_err()
             .to_string()
             .contains("local import `local.dep` has no pinned package lock"));
+        let package = package();
+        let mut supplied = package
+            .resolve(package.version_ref())
+            .expect("resolved package");
+        supplied.program.uses.push(whipplescript_parser::IrUse {
+            kind: whipplescript_parser::IrUseKind::Package,
+            name: "local.dep".to_owned(),
+        });
+        let supplied = SuppliedPackage(supplied);
+        let supplied_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-do-supplied-import".to_owned(),
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        assert!(host
+            .open_instance(&supplied_open, &supplied)
+            .unwrap_err()
+            .to_string()
+            .contains("local import `local.dep` has no pinned package lock"));
         assert!(sql
             .query("SELECT version_id FROM program_versions", &[])
             .expect("program versions after refusal")
             .is_empty());
-        let package = package();
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             request_id: "open-do-1".to_owned(),

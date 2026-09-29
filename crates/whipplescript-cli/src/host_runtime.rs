@@ -1923,6 +1923,9 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
+        package
+            .require_supported_imports()
+            .map_err(HostRuntimeError::Resolver)?;
         self.check_package_ifc(&package)?;
         if let Some(opened) = self.replayed_open_instance(command, &package)? {
             return Ok(opened);
@@ -4217,6 +4220,44 @@ workflow HostChat {
                 4,
             )
         }
+    }
+
+    struct ForgedLocalImportPackages;
+
+    impl PackageResolver for ForgedLocalImportPackages {
+        fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+            let mut package = Packages.resolve_package(version_ref)?;
+            package.program.uses.push(whipplescript_parser::IrUse {
+                kind: whipplescript_parser::IrUseKind::Package,
+                name: "local.dep".to_owned(),
+            });
+            Ok(package)
+        }
+    }
+
+    #[test]
+    fn native_host_refuses_a_resolver_supplied_local_import_before_version_admission() {
+        let path = temp_store();
+        let policy = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-forged-local-import".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        assert!(runtime
+            .open_instance(&open, &ForgedLocalImportPackages)
+            .unwrap_err()
+            .to_string()
+            .contains("local import `local.dep` has no pinned package lock"));
+        assert!(runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .expect("admission operations")
+            .operations
+            .is_empty());
     }
 
     struct UnsafePackages;

@@ -448,6 +448,13 @@ pub struct ResolvedPackage {
 }
 
 impl ResolvedPackage {
+    /// Host-package admission has no local package-lock basis. Check this
+    /// again at the accepting door because PackageResolver is extensible and
+    /// callers can construct a ResolvedPackage without using this compiler.
+    pub fn require_supported_imports(&self) -> Result<(), String> {
+        require_supported_imports(&self.program)
+    }
+
     /// The authored package's pinned model context. V0 keeps its historical
     /// persona bytes; v1 carries AGENTS.md as a separate project contribution.
     pub fn context_for_model(&self) -> crate::context_assembly::AssembledContext {
@@ -553,19 +560,7 @@ impl ResolvedPackage {
                 .collect::<Vec<_>>()
                 .join("; ")
         })?;
-        // Authored host packages have no package-lock input. A local import
-        // cannot be resolved and witnessed at this accepting boundary, so it
-        // must not reach create_program_version as an unwitnessed program.
-        if let Some(import) = program
-            .uses
-            .iter()
-            .find(|import| import.name != "std" && !import.name.starts_with("std."))
-        {
-            return Err(format!(
-                "agent package local import `{}` has no pinned package lock",
-                import.name
-            ));
-        }
+        require_supported_imports(&program)?;
         let agent = agent.into();
         let system_prompt = system_prompt.into();
         // A declared result contract is part of the package's tool surface, so
@@ -619,6 +614,22 @@ impl ResolvedPackage {
             result_tool,
         })
     }
+}
+
+fn require_supported_imports(program: &IrProgram) -> Result<(), String> {
+    // The authored host-package format has no package-lock input. A local
+    // import cannot be resolved and witnessed at this accepting boundary.
+    if let Some(import) = program
+        .uses
+        .iter()
+        .find(|import| import.name != "std" && !import.name.starts_with("std."))
+    {
+        return Err(format!(
+            "agent package local import `{}` has no pinned package lock",
+            import.name
+        ));
+    }
+    Ok(())
 }
 
 /// The result contract an agent in this program declares, if any. One
