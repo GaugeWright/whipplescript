@@ -1451,6 +1451,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 )
                 .map_err(StoreError::Conflict)?,
             );
+            witness.declarations = Some(
+                construct_coverage::capture_declarations(
+                    program,
+                    construct_basis.registry,
+                    &witness,
+                )
+                .map_err(StoreError::Conflict)?,
+            );
         }
         self.store
             .create_program_version_with_import_witness(version, &witness)

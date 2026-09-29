@@ -4786,9 +4786,10 @@ impl IrProgram {
         }
 
         // Package-owned construct registrations (e.g. `send`, `recall`) are NOT
-        // registered here: they come from a package manifest — embedded std
-        // manifests included — merged in by the CLI when the owning package is
-        // imported (`use std.messaging`). Modeled in
+        // registered here: they come from a package manifest. The CLI merges
+        // an embedded std manifest for an explicit import or a matching
+        // compiler-inventoried declaration. Rule-effect constructs still
+        // require their explicit import (`use std.messaging`). Modeled in
         // `models/maude/std-construct-authorization.maude`.
         ContractRegistry {
             libraries: libraries.into_values().collect(),

@@ -645,6 +645,107 @@ fn source_variants_resolve_to_distinct_embedded_constructs() {
     }
 }
 
+#[test]
+fn native_checked_admission_retains_declaration_edges_with_the_import_operation() {
+    let compiler_digest = "a".repeat(64);
+    for (source, expected) in [
+        (
+            include_str!("../../../../../examples/clock-source.whip"),
+            &["ingress.signal", "time.clock_source"][..],
+        ),
+        (
+            include_str!("../../../../../examples/ingress-file-source.whip"),
+            &["ingress.signal", "ingress.source"][..],
+        ),
+        (
+            include_str!("../../../../../examples/gastown-lite.whip"),
+            &["coord.lease", "coord.ledger", "tracker.tracker"][..],
+        ),
+        (
+            include_str!("../../../../../examples/circuit-breaker.whip"),
+            &["coord.counter"][..],
+        ),
+        (
+            include_str!("../../../../../examples/file-store-demo.whip"),
+            &["files.file_store"][..],
+        ),
+        (
+            "workflow BareTracker\ntracker backlog\n",
+            &["tracker.tracker"][..],
+        ),
+    ] {
+        let compiled = whipplescript_parser::compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("checked IR");
+        let mut kernel = RuntimeKernel::new(SqliteStore::open_in_memory().expect("store"));
+        let admitted = create_checked_native_program_version(
+            &mut kernel,
+            source,
+            &ir,
+            None,
+            None,
+            &[],
+            &compiler_digest,
+        )
+        .expect("declarations and imports land together");
+        let roster = kernel.store().program_import_operation_roster().unwrap();
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(roster.operations[0].version_id, admitted.version_id);
+        let witness = kernel
+            .store()
+            .program_import_witness(
+                &admitted.version_id,
+                roster.operations[0].witness_digest.as_deref().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let declarations = witness
+            .declarations
+            .expect("checked declaration population");
+        assert_eq!(declarations.examined.len(), expected.len());
+        assert_eq!(
+            declarations
+                .edges
+                .iter()
+                .map(|edge| edge.registration_id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(declarations
+            .edges
+            .iter()
+            .all(|edge| edge.provider_source_digest == compiler_digest));
+        assert!(
+            witness.constructs.is_some(),
+            "rule-effect scope stays separate"
+        );
+
+        let mut older = ir.clone();
+        older.declaration_constructs = None;
+        let mut rejected = RuntimeKernel::new(SqliteStore::open_in_memory().expect("store"));
+        assert!(create_checked_native_program_version(
+            &mut rejected,
+            source,
+            &older,
+            None,
+            None,
+            &[],
+            &compiler_digest,
+        )
+        .is_err());
+        assert!(rejected
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+    }
+}
+
 /// The agent-provider kinds are a CLOSED vocabulary, and one of the two places
 /// that fact is written down lives in another crate.
 ///
@@ -1582,6 +1683,23 @@ rule notify
         "embedded resolution registers the messaging.send contract"
     );
     assert_eq!(registry.validate(), Vec::new());
+
+    // Supply the embedded registration directly so the locked validation door
+    // must enforce the import itself, even when the registry contains `send`.
+    let locked_direct_error = validate_construct_uses(Some(&lock), &without_import, &registry)
+        .expect_err("a locked registry cannot authorize send without its import");
+    assert!(
+        locked_direct_error.contains("add `use std.messaging`"),
+        "{locked_direct_error}"
+    );
+
+    let artifact_error =
+        validate_construct_uses_against_registry(&without_import, &registry, "artifact")
+            .expect_err("a source-backed registry cannot authorize send without its import");
+    assert!(
+        artifact_error.contains("add `use std.messaging`"),
+        "{artifact_error}"
+    );
 
     let mut ambiguous = registry;
     let mut competing = ambiguous

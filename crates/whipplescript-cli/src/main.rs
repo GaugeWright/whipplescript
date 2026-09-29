@@ -5266,6 +5266,17 @@ fn validate_construct_uses_against_registry(
                 use_form.target_capability
             ));
         };
+        if form.library_id.starts_with("std.")
+            && !ir
+                .uses
+                .iter()
+                .any(|use_decl| use_decl.name == form.library_id)
+        {
+            return Err(format!(
+                "construct `{}` is provided by the embedded std package `{}`; add `use {}`",
+                use_form.keyword, form.library_id, form.library_id
+            ));
+        }
         if !registry.effect_contracts.iter().any(|contract| {
             contract.id == use_form.target_capability && contract.effect_kind == "capability.call"
         }) {
@@ -17907,10 +17918,11 @@ fn embedded_operator_provider_default(
         .and_then(|config| config.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
-/// Merge embedded std manifests into `registry` for every imported name and
-/// for the compiler-owned clock declaration's `std.time` library. The latter
-/// also exists without an explicit `use std.time` (the import lint is advisory).
-/// A name already `provided` by a lock is skipped to avoid double-merging.
+/// Merge embedded std manifests named by explicit `use` entries or by a
+/// compiler-inventoried declaration matching one of their registrations. A
+/// bare declaration may have only an advisory import, while a rule-effect
+/// construct still needs an explicit `use`. A name already `provided` by a
+/// lock is skipped to avoid merging the same manifest twice.
 fn merge_embedded_std_manifests(
     registry: &mut ContractRegistry,
     ir: &IrProgram,
@@ -17922,9 +17934,21 @@ fn merge_embedded_std_manifests(
         .map(|use_decl| use_decl.name.as_str())
         .collect::<BTreeSet<_>>();
     for manifest in embedded_std_manifests() {
-        let compiler_owned_clock =
-            manifest.name == "std.time" && ir.sources.iter().any(|source| source.is_clock);
-        if (imported.contains(manifest.name.as_str()) || compiler_owned_clock)
+        let owns_declaration = ir
+            .declaration_constructs
+            .as_ref()
+            .is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    manifest.registry.constructs.iter().any(|form| {
+                        form.keyword == declaration.keyword
+                            && form.scope == declaration.scope
+                            && form.construct_family == declaration.family
+                            && form.lowering_target == declaration.lowering
+                            && form.target_capability.is_none()
+                    })
+                })
+            });
+        if (imported.contains(manifest.name.as_str()) || owns_declaration)
             && !provided.contains(manifest.name.as_str())
         {
             registry.merge(manifest.registry);
@@ -18115,6 +18139,17 @@ fn validate_construct_uses(
                 use_form.target_capability
             ));
         };
+        if form.library_id.starts_with("std.")
+            && !ir
+                .uses
+                .iter()
+                .any(|use_decl| use_decl.name == form.library_id)
+        {
+            return Err(format!(
+                "construct `{}` is provided by the embedded std package `{}`; add `use {}`",
+                use_form.keyword, form.library_id, form.library_id
+            ));
+        }
         if !registry.effect_contracts.iter().any(|contract| {
             contract.id == use_form.target_capability && contract.effect_kind == "capability.call"
         }) {
