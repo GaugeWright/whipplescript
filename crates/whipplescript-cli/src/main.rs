@@ -5257,7 +5257,7 @@ fn validate_construct_uses_against_registry(
     label: &str,
 ) -> Result<(), String> {
     for use_form in ir.construct_uses() {
-        let Some(form) = registry_construct_for_use(registry, use_form) else {
+        let Some(form) = unique_registry_construct_for_use(registry, use_form)? else {
             return Err(format!(
                 "{label} source-backed artifact registry does not authorize `{}` as a {} {} construct lowering to `{}`",
                 use_form.keyword,
@@ -17991,6 +17991,13 @@ fn validate_construct_uses(
     // resolve names against manifest-contributed vocabulary.
     validate_source_provider_kinds(ir, package_lock)?;
     let uses = ir.construct_uses();
+    // A registration's parse shape is not its identity. Two admitted packages
+    // can offer the same shape, and picking whichever appears first would make
+    // the checked program's provider depend on iteration order. Resolve every
+    // occurrence uniquely before the no-lock std exemption or lock checks.
+    for use_form in &uses {
+        unique_registry_construct_for_use(registry, use_form)?;
+    }
     let Some(package_lock) = package_lock else {
         // Without a lock, both a non-`std.` import and a package-owned construct
         // use are unsatisfiable. Name every blocker so a workflow that imports a
@@ -18045,7 +18052,7 @@ fn validate_construct_uses(
         return Ok(());
     }
     for use_form in uses {
-        let Some(form) = registry_construct_for_use(registry, use_form) else {
+        let Some(form) = unique_registry_construct_for_use(registry, use_form)? else {
             // An embedded std construct fails here only when its package is not
             // imported (an imported embedded manifest is merged before this
             // check), so the fix is the import, not the lock.
@@ -18080,13 +18087,36 @@ fn registry_construct_for_use<'a>(
     registry: &'a ContractRegistry,
     use_form: &IrConstructUse,
 ) -> Option<&'a ConstructRegistration> {
-    registry.constructs.iter().find(|form| {
-        form.keyword == use_form.keyword
-            && form.scope == use_form.scope
-            && form.construct_family == use_form.construct_family
-            && form.lowering_target == use_form.lowering_target
-            && form.target_capability.as_deref() == Some(use_form.target_capability.as_str())
-    })
+    registry
+        .constructs
+        .iter()
+        .find(|form| construct_matches_use(form, use_form))
+}
+
+fn construct_matches_use(form: &ConstructRegistration, use_form: &IrConstructUse) -> bool {
+    form.keyword == use_form.keyword
+        && form.scope == use_form.scope
+        && form.construct_family == use_form.construct_family
+        && form.lowering_target == use_form.lowering_target
+        && form.target_capability.as_deref() == Some(use_form.target_capability.as_str())
+}
+
+fn unique_registry_construct_for_use<'a>(
+    registry: &'a ContractRegistry,
+    use_form: &IrConstructUse,
+) -> Result<Option<&'a ConstructRegistration>, String> {
+    let mut matches = registry
+        .constructs
+        .iter()
+        .filter(|form| construct_matches_use(form, use_form));
+    let selected = matches.next();
+    if matches.next().is_some() {
+        return Err(format!(
+            "construct `{}` resolves to more than one registration for {} {} lowering to `{}`",
+            use_form.keyword, use_form.scope, use_form.construct_family, use_form.target_capability
+        ));
+    }
+    Ok(selected)
 }
 
 fn package(options: &CliOptions) -> ExitCode {

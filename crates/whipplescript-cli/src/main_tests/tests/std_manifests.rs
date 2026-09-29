@@ -1513,6 +1513,36 @@ rule notify
         "embedded resolution registers the messaging.send contract"
     );
     assert_eq!(registry.validate(), Vec::new());
+
+    let mut ambiguous = registry;
+    let mut competing = ambiguous
+        .constructs
+        .iter()
+        .find(|form| form.keyword == "send")
+        .expect("embedded send registration")
+        .clone();
+    competing.id = "other.messaging.send".into();
+    ambiguous.constructs.push(competing);
+    let error = validate_construct_uses(None, &with_import, &ambiguous)
+        .expect_err("a checked use must resolve to one registration");
+    assert!(
+        error.contains("resolves to more than one registration"),
+        "{error}"
+    );
+    let artifact_error =
+        validate_construct_uses_against_registry(&with_import, &ambiguous, "artifact")
+            .expect_err("source-backed artifact validation also refuses ambiguity");
+    assert!(
+        artifact_error.contains("resolves to more than one registration"),
+        "{artifact_error}"
+    );
+    ambiguous.constructs.clear();
+    let missing = validate_construct_uses_against_registry(&with_import, &ambiguous, "artifact")
+        .expect_err("a source-backed artifact cannot omit the checked construct");
+    assert!(
+        missing.contains("source-backed artifact registry does not authorize `send`"),
+        "{missing}"
+    );
 }
 
 #[test]

@@ -110,7 +110,55 @@ impl GitCandidatePins {
                 "candidate pin is missing or moved".into(),
             ));
         }
+        let actual_tree = git(
+            &self.git_dir,
+            &["rev-parse", &format!("{}^{{tree}}", pin.commit_oid)],
+        )?;
+        if actual_tree != pin.tree_oid {
+            return Err(ReviewError::Corrupt(
+                "candidate tree disagrees with its commit".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Recover a pin after the review store recorded an upload but before it
+    /// published the revision. This does not consult the moving source branch.
+    pub fn recover(
+        &self,
+        contribution_id: &str,
+        upload_id: &str,
+        source_ref: &str,
+        commit_oid: &str,
+    ) -> ReviewResult<Option<GitPin>> {
+        let pin_ref = format!("refs/reviews/{contribution_id}/{upload_id}");
+        git(&self.git_dir, &["check-ref-format", &pin_ref])?;
+        match git_status(
+            &self.git_dir,
+            &["show-ref", "--verify", "--quiet", &pin_ref],
+        )? {
+            0 => {}
+            1 => return Ok(None),
+            status => return Err(ReviewError::Git(format!("Git show-ref exited {status}"))),
+        }
+        let actual = git(&self.git_dir, &["rev-parse", "--verify", &pin_ref])?;
+        if actual != commit_oid {
+            return Err(ReviewError::Conflict(
+                "pending upload pin names another commit".into(),
+            ));
+        }
+        let tree_oid = git(
+            &self.git_dir,
+            &["rev-parse", &format!("{commit_oid}^{{tree}}")],
+        )?;
+        Ok(Some(GitPin {
+            contribution_id: contribution_id.into(),
+            upload_id: upload_id.into(),
+            source_ref: source_ref.into(),
+            commit_oid: commit_oid.into(),
+            tree_oid,
+            pin_ref,
+        }))
     }
 }
 
@@ -319,6 +367,30 @@ mod tests {
         assert!(matches!(
             exit_code(std::process::ExitStatus::from_raw(9)),
             Err(ReviewError::Git(message)) if message == "Git command was interrupted"
+        ));
+    }
+
+    #[test]
+    fn recovery_distinguishes_missing_conflicting_and_broken_pins() {
+        let fixture = Fixture::new();
+        let first = fixture.commit("one\n");
+        let pins = fixture.pins();
+        assert!(pins
+            .recover("C1", "upload-one", "refs/heads/work", &first)
+            .expect("missing pin")
+            .is_none());
+        pins.pin("C1", "upload-one", "refs/heads/work", &first)
+            .expect("pin");
+        let second = fixture.commit("two\n");
+        assert!(matches!(
+            pins.recover("C1", "upload-one", "refs/heads/work", &second),
+            Err(ReviewError::Conflict(message)) if message == "pending upload pin names another commit"
+        ));
+        std::fs::rename(&fixture.bare, fixture.root.join("moved.git"))
+            .expect("simulate missing Git repository");
+        assert!(matches!(
+            pins.recover("C1", "upload-one", "refs/heads/work", &first),
+            Err(ReviewError::Git(message)) if message.starts_with("Git show-ref exited")
         ));
     }
 }

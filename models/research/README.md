@@ -489,6 +489,25 @@ operation. The model therefore assumes an authoritative **operation** roster
 and atomic witness capture for each acceptance. Neither property follows from
 an on-demand `whip compile` report or the current version and witness tables.
 
+`program_construct_coverage.py` probes the companion RC-3 construct class:
+
+```sh
+python3 models/research/program_construct_coverage.py
+```
+
+Each IR construct occurrence resolves to exactly one registration in the
+checked registry, owned by an imported library. The candidate witness binds
+the selected registration identity/version and the bytes that supplied it to
+the program source, lock and compiler artifact. It refuses an omitted,
+unresolved, unimported or ambiguous use. A later unwitnessed accepting call
+remains unknown even when it reuses the same program-version row. A changed
+package source under an unchanged v0 lock, changed compiler, forged edge
+subset, and first-match selection from two registrations all invalidate the
+claim. The model assumes the compiler's IR use list is complete, the registry
+was built from the same immutable package snapshot as the admission, and a
+Home operation roster is authoritative. It does not establish any of those
+production properties or persist a construct witness.
+
 `home_operation_roster.py` probes how one Home could close that operation
 population when its runtime evidence lives in multiple SQLite stores:
 
