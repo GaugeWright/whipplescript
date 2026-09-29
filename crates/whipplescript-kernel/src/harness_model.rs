@@ -25,7 +25,9 @@ use crate::harness_loop::{
     ModelReply, ToolCall, ToolSpec,
 };
 use crate::idempotency_key;
-use crate::sansio::run_to_completion;
+use crate::sansio::{
+    run_to_completion, ModelContentProvenance, ModelWireInputFormat, ModelWireInputProvenance,
+};
 
 /// Cap on a provider control-plane error string crossing into a turn failure
 /// (matches the coerce path; DR-0024 lets operational errors cross redaction).
@@ -1655,6 +1657,116 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
     out
 }
 
+/// Align logical labels with the actual serialized provider array. A custom
+/// transport or a changed wire shape gets no partial-disclosure map until its
+/// exact request serialization is understood here.
+pub(crate) fn wire_input_provenance(
+    body: &Value,
+    messages: &[ChatMessage],
+    labels: &[ModelContentProvenance],
+    tools: &[ToolSpec],
+    tool_label: &ModelContentProvenance,
+) -> Option<ModelWireInputProvenance> {
+    if messages.len() != labels.len() {
+        return None;
+    }
+
+    let format = if let Some(input) = body.get("input") {
+        if body.get("messages").is_some()
+            || body.get("system").is_some()
+            || input != &json!(openai_input(messages))
+        {
+            return None;
+        }
+        ModelWireInputFormat::OpenAiResponses
+    } else if body.get("input").is_none()
+        && body.get("system").is_none()
+        && body.get("response_format").is_some()
+    {
+        let mut expected = coerced_tools_messages(messages);
+        if !tools.is_empty() {
+            expected.push(json!({
+                "role": "system",
+                "content": coerced_tools_instruction(tools),
+            }));
+        }
+        if body.get("messages") != Some(&json!(expected)) {
+            return None;
+        }
+        ModelWireInputFormat::CoercedTools
+    } else if body.get("input").is_none() && body.get("system").is_none() {
+        let actual = body.get("messages")?;
+        if actual == &json!(openai_compat_messages(messages)) {
+            ModelWireInputFormat::OpenAiChatCompat
+        } else {
+            let (system, wire_messages) = anthropic_messages(messages);
+            if system.is_none() && actual == &json!(mark_conversation_cache(wire_messages)) {
+                ModelWireInputFormat::AnthropicMessages
+            } else {
+                return None;
+            }
+        }
+    } else if body.get("input").is_none() {
+        let (system, wire_messages) = anthropic_messages(messages);
+        let expected_system = system.map(
+            |text| json!([{"type":"text", "text":text, "cache_control":{"type":"ephemeral"}}]),
+        );
+        if body.get("system") != expected_system.as_ref()
+            || body.get("messages") != Some(&json!(mark_conversation_cache(wire_messages)))
+        {
+            return None;
+        }
+        ModelWireInputFormat::AnthropicMessages
+    } else {
+        return None;
+    };
+
+    let mut items = Vec::new();
+    let mut system_parts = Vec::new();
+    for (message, label) in messages.iter().zip(labels) {
+        match (format, message) {
+            (ModelWireInputFormat::AnthropicMessages, ChatMessage::System(_)) => {
+                system_parts.push(label);
+            }
+            (ModelWireInputFormat::AnthropicMessages, _) => items.push(label.clone()),
+            (
+                ModelWireInputFormat::OpenAiResponses,
+                ChatMessage::Assistant { text, tool_calls },
+            ) => {
+                if !text.is_empty() {
+                    items.push(label.clone());
+                }
+                items.extend(std::iter::repeat_n(label.clone(), tool_calls.len()));
+            }
+            (ModelWireInputFormat::OpenAiResponses, ChatMessage::ToolResults(results))
+            | (
+                ModelWireInputFormat::OpenAiChatCompat | ModelWireInputFormat::CoercedTools,
+                ChatMessage::ToolResults(results),
+            ) => {
+                items.extend(std::iter::repeat_n(label.clone(), results.len()));
+            }
+            _ => items.push(label.clone()),
+        }
+    }
+    if format == ModelWireInputFormat::CoercedTools && !tools.is_empty() {
+        items.push(tool_label.clone());
+    }
+    let actual_items = match format {
+        ModelWireInputFormat::OpenAiResponses => body.get("input")?.as_array()?,
+        _ => body.get("messages")?.as_array()?,
+    };
+    if items.len() != actual_items.len() {
+        return None;
+    }
+    let system =
+        (!system_parts.is_empty()).then(|| ModelContentProvenance::derived_from(system_parts));
+    Some(ModelWireInputProvenance {
+        format,
+        items,
+        system,
+    })
+}
+
 // -- response parsing -----------------------------------------------------
 
 fn parse_response(
@@ -2362,6 +2474,121 @@ mod tests {
             description: "read a file".into(),
             input_schema: json!({ "type": "object" }),
         }]
+    }
+
+    #[test]
+    fn wire_input_labels_match_each_provider_body_and_fail_closed_on_drift() {
+        let mut messages = convo();
+        if let ChatMessage::ToolResults(results) = &mut messages[3] {
+            results.push(ToolResultMsg {
+                tool_call_id: "call_2".into(),
+                tool_name: "read".into(),
+                content: "other".into(),
+                is_error: false,
+            });
+        }
+        let labels = (0..messages.len())
+            .map(|index| ModelContentProvenance {
+                source_handles: vec![format!("source:{index}")],
+                complete: true,
+            })
+            .collect::<Vec<_>>();
+        let tool_label = ModelContentProvenance {
+            source_handles: vec!["tool-schema".into()],
+            complete: true,
+        };
+        let tools = tool_specs();
+        for (wire, expected) in [
+            (ModelWire::AnthropicMessages, vec![1, 2, 3]),
+            (ModelWire::OpenAiResponses, vec![0, 1, 2, 3, 3]),
+            (ModelWire::OpenAiChatCompat, vec![0, 1, 2, 3, 3]),
+            (ModelWire::CoercedTools, vec![0, 1, 2, 3, 3, 4]),
+        ] {
+            let request = build_request(
+                wire,
+                "https://provider.example.invalid",
+                "key",
+                "model",
+                None,
+                None,
+                &messages,
+                &tools,
+            );
+            let map = wire_input_provenance(&request.body, &messages, &labels, &tools, &tool_label)
+                .expect("built provider body has an exact map");
+            let mapped = map
+                .items
+                .iter()
+                .map(|item| {
+                    if item == &tool_label {
+                        4
+                    } else {
+                        labels.iter().position(|label| label == item).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(mapped, expected, "{wire:?}");
+            assert_eq!(map.system.is_some(), wire == ModelWire::AnthropicMessages);
+
+            let mut changed = request.body;
+            let field = if wire == ModelWire::OpenAiResponses {
+                "input"
+            } else {
+                "messages"
+            };
+            changed[field][0] = json!({"role":"user","content":"changed"});
+            assert!(
+                wire_input_provenance(&changed, &messages, &labels, &tools, &tool_label).is_none(),
+                "{wire:?} drift must not receive a partial-disclosure map"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_joined_system_block_requires_every_system_source() {
+        let messages = vec![
+            ChatMessage::System("first".into()),
+            ChatMessage::System("second".into()),
+            ChatMessage::user_text("question"),
+        ];
+        let labels = [
+            ModelContentProvenance {
+                source_handles: vec!["first-source".into()],
+                complete: true,
+            },
+            ModelContentProvenance::default(),
+            ModelContentProvenance {
+                source_handles: vec!["chat-source".into()],
+                complete: true,
+            },
+        ];
+        let body = build_request(
+            ModelWire::AnthropicMessages,
+            "https://provider.example.invalid",
+            "key",
+            "model",
+            None,
+            None,
+            &messages,
+            &[],
+        )
+        .body;
+        let map = wire_input_provenance(
+            &body,
+            &messages,
+            &labels,
+            &[],
+            &ModelContentProvenance::default(),
+        )
+        .unwrap();
+        assert_eq!(map.items, vec![labels[2].clone()]);
+        assert_eq!(
+            map.system.unwrap(),
+            ModelContentProvenance {
+                source_handles: vec!["first-source".into()],
+                complete: false,
+            }
+        );
     }
 
     /// The config door both hosts read: identities it knows, the one dialect

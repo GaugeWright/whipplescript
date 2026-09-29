@@ -35,6 +35,28 @@ pub struct ModelContentProvenance {
 pub struct ModelRequestProvenance {
     pub messages: Vec<ModelContentProvenance>,
     pub tools: ModelContentProvenance,
+    /// Labels aligned to the exact provider array after wire serialization.
+    /// Older or custom transports omit this and retain whole-call redaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<ModelWireInputProvenance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelWireInputProvenance {
+    pub format: ModelWireInputFormat,
+    pub items: Vec<ModelContentProvenance>,
+    /// Anthropic joins every logical system message into one wire block.
+    pub system: Option<ModelContentProvenance>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelWireInputFormat {
+    AnthropicMessages,
+    OpenAiResponses,
+    OpenAiChatCompat,
+    CoercedTools,
 }
 
 impl ModelContentProvenance {

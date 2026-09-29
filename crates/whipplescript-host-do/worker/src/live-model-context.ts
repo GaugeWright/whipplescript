@@ -27,6 +27,12 @@ export interface ModelContentProvenance {
 export interface ModelRequestProvenance {
   readonly messages: readonly ModelContentProvenance[];
   readonly tools: ModelContentProvenance;
+  /** Exact provider-array alignment; absent for unknown or custom wires. */
+  readonly wire?: {
+    readonly format: "anthropic-messages" | "open-ai-responses" | "open-ai-chat-compat" | "coerced-tools";
+    readonly items: readonly ModelContentProvenance[];
+    readonly system: ModelContentProvenance | null;
+  } | null;
 }
 
 export interface LiveModelContextView {

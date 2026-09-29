@@ -1086,6 +1086,7 @@ where
                     complete: true,
                 }
             },
+            wire: None,
         }
     }
 
@@ -1100,7 +1101,15 @@ where
     }
 
     fn attach_provenance(&self, mut request: HttpRequest, tools: bool) -> HttpRequest {
-        request.model_provenance = Some(self.current_provenance(tools));
+        let mut provenance = self.current_provenance(tools);
+        provenance.wire = crate::harness_model::wire_input_provenance(
+            &request.body,
+            &self.messages,
+            &provenance.messages,
+            if tools { &self.input.tools } else { &[] },
+            &provenance.tools,
+        );
+        request.model_provenance = Some(provenance);
         request
     }
 
@@ -1236,13 +1245,22 @@ where
                     self.awaiting = Awaiting::Summary;
                     let mut http = self.model.build_request(&request.request_messages, &[]);
                     let inherited = self.all_current_sources();
-                    http.model_provenance = Some(ModelRequestProvenance {
+                    let mut provenance = ModelRequestProvenance {
                         messages: vec![inherited; request.request_messages.len()],
                         tools: ModelContentProvenance {
                             source_handles: Vec::new(),
                             complete: true,
                         },
-                    });
+                        wire: None,
+                    };
+                    provenance.wire = crate::harness_model::wire_input_provenance(
+                        &http.body,
+                        &request.request_messages,
+                        &provenance.messages,
+                        &[],
+                        &provenance.tools,
+                    );
+                    http.model_provenance = Some(provenance);
                     self.pending_compaction = Some(request);
                     return Outcome::NeedsIo(IoRequest::Http(http));
                 }
@@ -1456,7 +1474,7 @@ where
                         };
                         let mut request =
                             self.model.build_request(&compaction.request_messages, &[]);
-                        request.model_provenance = Some(ModelRequestProvenance {
+                        let mut provenance = ModelRequestProvenance {
                             messages: vec![
                                 self.all_current_sources();
                                 compaction.request_messages.len()
@@ -1465,7 +1483,16 @@ where
                                 source_handles: Vec::new(),
                                 complete: true,
                             },
-                        });
+                            wire: None,
+                        };
+                        provenance.wire = crate::harness_model::wire_input_provenance(
+                            &request.body,
+                            &compaction.request_messages,
+                            &provenance.messages,
+                            &[],
+                            &provenance.tools,
+                        );
+                        request.model_provenance = Some(provenance);
                         request
                     }
                 };
