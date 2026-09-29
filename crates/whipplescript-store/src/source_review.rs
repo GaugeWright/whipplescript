@@ -14,6 +14,9 @@ const SCHEMA_VERSION: i64 = 1;
 pub enum ReviewError {
     Invalid(String),
     Missing(String),
+    Conflict(String),
+    Corrupt(String),
+    Git(String),
     Sqlite(rusqlite::Error),
     Store(StoreError),
     Io(std::io::Error),

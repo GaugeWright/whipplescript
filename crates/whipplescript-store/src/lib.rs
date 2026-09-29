@@ -81,6 +81,8 @@ pub use whipplescript_core::selection;
 pub mod skill_frontmatter;
 #[cfg(feature = "native")]
 pub mod source_review;
+#[cfg(feature = "native")]
+pub mod source_review_git;
 pub mod stat_cache;
 pub mod text_merge;
 pub mod transfer;
