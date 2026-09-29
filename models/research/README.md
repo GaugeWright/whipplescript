@@ -488,3 +488,30 @@ path: a version-keyed roster sees the first witness and hides the second
 operation. The model therefore assumes an authoritative **operation** roster
 and atomic witness capture for each acceptance. Neither property follows from
 an on-demand `whip compile` report or the current version and witness tables.
+
+`home_operation_roster.py` probes how one Home could close that operation
+population when its runtime evidence lives in multiple SQLite stores:
+
+```sh
+python3 models/research/home_operation_roster.py
+```
+
+The candidate protocol durably registers a pending Home pointer before a
+runtime shard accepts a program, records the immutable shard operation and
+witness, completes the Home pointer, then acknowledges the acceptance. A
+Home-issued cut enumerates completed pointers and treats pending ones as
+unknown. Final admission rechecks the journal revision under Home write
+exclusion held through ref CAS. Its 141 safe states through ten transitions
+include crashes before and after the shard write, repair, stale capture and
+ref outage. Six weakened variants expose a missed newly created shard,
+missing or ignored pending state, early acknowledgment, stale final comparison
+and early lock release. This is one recovery candidate, not a selected Home
+schema. It assumes all accepting paths use the Home door, completed pointers
+resolve to immutable evidence, and the issuer has a host-bound Home identity.
+It does not establish current source/lock/compiler revalidation, norm-ledger
+composition, product migration, or the authority of existing Home commands.
+The model has no liveness claim: its gate waits for a Home-wide absence of
+pending operations and requires an unchanged global journal revision. Under
+continuous admissions either condition can starve the gate. A usable design
+needs a sealed cut and an explicit rule for admissions after that cut, including
+their dependency and historical-pin obligations.
