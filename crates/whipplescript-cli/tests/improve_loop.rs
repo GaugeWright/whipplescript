@@ -250,6 +250,159 @@ fn improve_skips_repeated_canonical_candidate_before_regeneration() {
 }
 
 #[test]
+fn native_shortcut_critic_generalizes_a_planted_case_answer() {
+    let env = Env::new("shortcut-generalization");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("write baseline");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+
+    let planted = program("high", "\"T-1\"", &env.dir);
+    let generalized = program("high", "ticket.id", &env.dir);
+    let account = serde_json::json!({
+        "mechanism": "raise priority while preserving ticket identity",
+        "declarations": ["rule triage"],
+        "expected_gauges": ["priority_correct"],
+    });
+    let replies = vec![
+        serde_json::json!({"rationale": "repair priority", "source": planted,
+            "edit_account": account})
+        .to_string(),
+        serde_json::json!({"classification": "clear", "source_quote": "ticket \"T-1\"",
+            "reason": "the output copies the pinned case id instead of its input"})
+        .to_string(),
+        serde_json::json!({"rationale": "read the ticket id from input", "source": generalized,
+            "edit_account": account})
+        .to_string(),
+        serde_json::json!({"classification": "none", "source_quote": "", "reason": ""}).to_string(),
+    ];
+    let (base_url, bodies) = mock_coerce_sequence_endpoint(replies);
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "native",
+        ],
+        &[
+            ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+            ("OPENAI_API_KEY", "test-key"),
+            ("WHIPPLESCRIPT_COERCE_BASE_URL", &base_url),
+            ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+        ],
+    );
+    assert_eq!(report["proposed"], true, "{report}");
+    let card = &report["cards"][0];
+    assert_eq!(card["shortcut"]["original"]["classification"], "clear");
+    assert_eq!(card["shortcut"]["original"]["status"], "source-verified");
+    assert_eq!(card["shortcut"]["selected"]["classification"], "none");
+    assert_eq!(card["shortcut"]["excerpt_removed_by_revision"], true);
+    assert!(card["tags"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("shortcut-revised")));
+
+    let campaign = env.run_json(
+        &["--json", "campaign", report["campaign"].as_str().unwrap()],
+        &[],
+    );
+    let events = campaign["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| {
+        event["type"] == "candidate.refinement"
+            && event["payload"]["kind"] == "shortcut-generalization"
+            && event["payload"]["status"] == "selected"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "candidate.recorded"
+            && event["payload"]["source"].as_str() == Some(generalized.as_str())
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "candidate.shortcut_assessed")
+            .count(),
+        2,
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "campaign.spend"
+                && event["payload"]["what"] == "shortcut critic turn")
+            .count(),
+        2,
+    );
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        4,
+        "proposal, critic, revision, critic"
+    );
+}
+
+#[test]
+fn ambiguous_shortcut_finding_remains_reviewable_and_testable() {
+    let env = Env::new("shortcut-ambiguous");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("write baseline");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    let candidate = program("high", "ticket.id", &env.dir);
+    let replies = vec![
+        serde_json::json!({
+            "rationale": "raise urgent priority", "source": candidate,
+            "edit_account": {"mechanism": "raise priority", "declarations": ["rule triage"],
+                "expected_gauges": ["priority_correct"]},
+        })
+        .to_string(),
+        serde_json::json!({
+            "classification": "ambiguous", "source_quote": "priority \"high\"",
+            "reason": "a constant may be legitimate domain routing",
+        })
+        .to_string(),
+    ];
+    let (base_url, bodies) = mock_coerce_sequence_endpoint(replies);
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "native",
+        ],
+        &[
+            ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+            ("OPENAI_API_KEY", "test-key"),
+            ("WHIPPLESCRIPT_COERCE_BASE_URL", &base_url),
+            ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+        ],
+    );
+    assert_eq!(report["proposed"], true, "{report}");
+    let card = &report["cards"][0];
+    assert_eq!(card["shortcut"]["selected"]["classification"], "ambiguous");
+    assert!(card["tags"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("shortcut-ambiguous")));
+    assert_eq!(card["shortcut"]["excerpt_removed_by_revision"], false);
+    let campaign = env.run_json(
+        &["--json", "campaign", report["campaign"].as_str().unwrap()],
+        &[],
+    );
+    assert!(!campaign["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| { event["type"] == "candidate.refinement" }));
+    assert_eq!(bodies.lock().unwrap().len(), 2, "proposal and critic only");
+}
+
+#[test]
 fn improve_campaign_proposes_dominant_candidate_and_adopts() {
     let env = Env::new("dominant");
     write_judges(&env.dir);
@@ -1447,12 +1600,19 @@ fn sustained_live_contradiction_reopens_an_answered_call() {
 fn mock_coerce_endpoint(
     verdict: &'static str,
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    mock_coerce_sequence_endpoint(vec![verdict.to_owned()])
+}
+
+fn mock_coerce_sequence_endpoint(
+    verdicts: Vec<String>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
     let base_url = format!("http://{}", listener.local_addr().expect("addr"));
     let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let collected = bodies.clone();
     std::thread::spawn(move || {
+        let mut response_index = 0usize;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let mut raw = Vec::new();
@@ -1492,6 +1652,11 @@ fn mock_coerce_endpoint(
             }
             let body = String::from_utf8_lossy(&raw[body_start..]).into_owned();
             collected.lock().expect("bodies lock").push(body);
+            let verdict = verdicts
+                .get(response_index)
+                .or_else(|| verdicts.last())
+                .expect("mock endpoint has a response");
+            response_index += 1;
             let content = serde_json::to_string(verdict).expect("encode content");
             let reply = format!(
                 r#"{{"choices":[{{"message":{{"content":{content}}}}}],"usage":{{"input_tokens":3,"output_tokens":2}}}}"#
