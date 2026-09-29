@@ -505,8 +505,31 @@ package source under an unchanged v0 lock, changed compiler, forged edge
 subset, and first-match selection from two registrations all invalidate the
 claim. The model assumes the compiler's IR use list is complete, the registry
 was built from the same immutable package snapshot as the admission, and a
-Home operation roster is authoritative. It does not establish any of those
-production properties or persist a construct witness.
+Home operation roster is authoritative. Native admission now retains the
+rule-effect slice, but the model does not establish those assumptions or
+completeness of other construct forms.
+
+`declaration_construct_inventory.py` probes the next source-to-IR gap:
+
+```sh
+python3 models/research/declaration_construct_inventory.py
+```
+
+The current IR accessor walks rule-effect metadata. Seven registered std
+declaration rows (`lease`, `ledger`, `counter`, `file store`, `signal`, `source`,
+`tracker`) lower into separate IR lists without a construct-use tag. An IR-only
+capture can therefore report examined-empty even when source declarations
+were lost during lowering. The probe compares compiler-owned occurrence
+handles from the selected, pattern-expanded AST with tagged lowered
+declarations before resolving each against one imported registration.
+Omission, duplicate output, extra output,
+changed lowering shape and ambiguous registration refuse. Forging the same
+subset on both sides still passes, exposing the need for compiler provenance.
+Two applications of one pattern need distinct occurrence handles. This is a
+design candidate: production still needs a trustworthy effective-AST
+inventory bound to exact source bytes, root and expansion, tags for the
+declaration forms, and an explicit mapping for source variants. The probe does
+not make the current rule-effect witness complete for declarations.
 
 `home_operation_roster.py` probes how one Home could close that operation
 population when its runtime evidence lives in multiple SQLite stores:

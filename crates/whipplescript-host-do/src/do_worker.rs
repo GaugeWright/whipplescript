@@ -343,6 +343,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     compiler_artifact_digest,
                     packages: &[],
                 },
+                None,
             )
             .map_err(|error| format!("{error:?}"))?;
         let version = ProgramVersionRecord {

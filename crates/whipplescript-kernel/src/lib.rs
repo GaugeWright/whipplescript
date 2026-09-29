@@ -8,6 +8,7 @@ pub mod coerce;
 pub mod coerce_native;
 #[cfg(all(test, feature = "native"))]
 mod coerce_settlement_tests;
+pub mod construct_coverage;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
@@ -1400,6 +1401,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             >,
         >,
         basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
         let identity = program_artifact::identity_projection(program, typed_actions)
             .map_err(StoreError::Conflict)?;
@@ -1437,8 +1439,19 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             generated_artifacts_json: "[]",
             artifact_root: None,
         };
-        let witness =
+        let mut witness =
             import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        if let Some(construct_basis) = construct_basis {
+            witness.constructs = Some(
+                construct_coverage::capture(
+                    program,
+                    construct_basis.registry,
+                    &witness,
+                    construct_basis.sources,
+                )
+                .map_err(StoreError::Conflict)?,
+            );
+        }
         self.store
             .create_program_version_with_import_witness(version, &witness)
     }

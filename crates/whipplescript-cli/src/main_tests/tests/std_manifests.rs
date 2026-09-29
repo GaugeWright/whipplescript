@@ -1543,6 +1543,44 @@ rule notify
         missing.contains("source-backed artifact registry does not authorize `send`"),
         "{missing}"
     );
+
+    let mut kernel = RuntimeKernel::new(SqliteStore::open_in_memory().expect("store"));
+    let compiler_digest = "a".repeat(64);
+    let admitted = create_checked_native_program_version(
+        &mut kernel,
+        &source("\nuse std.messaging\n"),
+        &with_import,
+        None,
+        None,
+        &[],
+        &compiler_digest,
+    )
+    .expect("the checked native program and its construct edge are admitted together");
+    let roster = kernel.store().program_import_operation_roster().unwrap();
+    assert_eq!(roster.operations.len(), 1);
+    assert_eq!(roster.operations[0].version_id, admitted.version_id);
+    let witness = kernel
+        .store()
+        .program_import_witness(
+            &admitted.version_id,
+            roster.operations[0].witness_digest.as_deref().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let constructs = witness.constructs.expect("checked construct population");
+    assert_eq!(
+        constructs.scope,
+        whipplescript_store::program_imports::ProgramConstructScope::RuleEffect
+    );
+    assert_eq!(constructs.examined.len(), 1);
+    assert_eq!(constructs.edges.len(), 1);
+    assert_eq!(constructs.edges[0].registration_id, "messaging.send");
+    assert_eq!(constructs.edges[0].library_id, "std.messaging");
+    assert_eq!(constructs.edges[0].provider_source_digest, compiler_digest);
+    assert_eq!(
+        constructs.edges[0].meaning,
+        whipplescript_store::program_imports::ProgramConstructMeaning::LiveDependency
+    );
 }
 
 #[test]

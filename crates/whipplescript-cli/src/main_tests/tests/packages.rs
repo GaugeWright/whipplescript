@@ -105,6 +105,15 @@ fn native_child_admits_its_checked_local_import_basis() {
         .unwrap();
     assert_eq!(witness.examined, ["toolkit"]);
     assert_eq!(witness.edges[0].package_id, "package-toolkit");
+    assert!(
+        witness
+            .constructs
+            .as_ref()
+            .is_some_and(|capture| capture.scope
+                == whipplescript_store::program_imports::ProgramConstructScope::RuleEffect
+                && capture.edges.is_empty()),
+        "an examined program with no rule-effect construct uses retains Some(empty)"
+    );
     assert_eq!(
         witness.compiler_artifact_digest,
         native_compiler_artifact_digest().unwrap()
@@ -225,6 +234,15 @@ fn native_start_admits_the_checked_local_import_basis() {
     assert_eq!(witness.examined, ["toolkit"]);
     assert_eq!(witness.edges.len(), 1);
     assert_eq!(witness.edges[0].package_id, "package-toolkit");
+    assert!(
+        witness
+            .constructs
+            .as_ref()
+            .is_some_and(|capture| capture.scope
+                == whipplescript_store::program_imports::ProgramConstructScope::RuleEffect
+                && capture.edges.is_empty()),
+        "the native accepting operation records an examined empty rule-effect construct set"
+    );
     assert_eq!(
         witness.compiler_artifact_digest,
         native_compiler_artifact_digest().unwrap()
@@ -426,6 +444,21 @@ fn loaded_package_source_witness_uses_the_attested_tool_bundle() {
         Some(checked_source.as_str())
     );
     assert!(manifest.checked_source_digest().is_some());
+}
+
+#[test]
+fn checked_construct_sources_refuse_a_lock_without_its_attested_package() {
+    let manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/toolkit.json");
+    let manifest = load_package_manifest(&manifest_path).expect("tool manifest loads");
+    let lock = LoadedPackageLock {
+        path: manifest_path,
+        manifests: vec![manifest],
+    };
+    assert!(matches!(
+        checked_construct_sources(Some(&lock), &[]),
+        Err(StoreError::Conflict(message)) if message.contains("lacks its attested source")
+    ));
 }
 
 #[test]

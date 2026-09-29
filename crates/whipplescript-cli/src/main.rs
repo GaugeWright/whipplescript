@@ -17713,6 +17713,35 @@ fn native_compiler_artifact_digest() -> Result<String, String> {
     whipplescript::host_runtime::native_compiler_artifact_digest()
 }
 
+fn checked_construct_sources<'a>(
+    package_lock: Option<&'a LoadedPackageLock>,
+    checked_packages: &'a [CheckedLocalPackage],
+) -> Result<Vec<whipplescript_kernel::construct_coverage::ResolvedConstructSource<'a>>, StoreError>
+{
+    let mut sources = Vec::new();
+    for manifest in package_lock.into_iter().flat_map(|lock| &lock.manifests) {
+        let package = checked_packages
+            .iter()
+            .find(|package| package.name == manifest.name)
+            .ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "checked package `{}` lacks its attested source",
+                    manifest.name
+                ))
+            })?;
+        for library in &manifest.registry.libraries {
+            sources.push(
+                whipplescript_kernel::construct_coverage::ResolvedConstructSource {
+                    library_id: &library.id,
+                    package_name: &manifest.name,
+                    source_digest: &package.source_digest,
+                },
+            );
+        }
+    }
+    Ok(sources)
+}
+
 /// Native start and revision use the same checked basis and atomic accepting
 /// operation, so neither can accidentally admit a version without its import
 /// witness while the other stays covered.
@@ -17727,6 +17756,10 @@ fn create_checked_native_program_version(
 ) -> Result<ProgramVersionRecord, StoreError> {
     let source_digest = sha256_hex(source.as_bytes());
     let lock_digest = package_lock_digest(package_lock);
+    // The registry and source map are derived from the loaded manifests that
+    // authorized this IR, never by reopening their mutable paths after check.
+    let registry = contract_registry_for_ir(package_lock, program).map_err(StoreError::Conflict)?;
+    let construct_sources = checked_construct_sources(package_lock, checked_packages)?;
     let resolved_packages = checked_packages
         .iter()
         .map(|package| ResolvedLocalPackage {
@@ -17751,6 +17784,12 @@ fn create_checked_native_program_version(
             compiler_artifact_digest,
             packages: &resolved_packages,
         },
+        Some(
+            &whipplescript_kernel::construct_coverage::CheckedConstructBasis {
+                registry: &registry,
+                sources: &construct_sources,
+            },
+        ),
     )?;
     Ok(ProgramVersionRecord {
         program_id: admission.program_id,

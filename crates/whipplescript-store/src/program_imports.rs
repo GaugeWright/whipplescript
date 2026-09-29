@@ -31,6 +31,52 @@ pub struct ProgramImportWitness {
     pub examined: Vec<String>,
     pub edges: Vec<ProgramImportEdge>,
     pub edge_digest: String,
+    /// `None` is unknown for this rule-effect construct class, including older
+    /// witnesses. `Some` with no edges proves this class was examined and had
+    /// no uses; it says nothing about other construct-bearing IR forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constructs: Option<ProgramConstructCapture>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramConstructUse {
+    pub occurrence: usize,
+    pub keyword: String,
+    pub scope: String,
+    pub family: String,
+    pub lowering: String,
+    pub capability: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramConstructMeaning {
+    LiveDependency,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramConstructEdge {
+    pub use_form: ProgramConstructUse,
+    pub registration_id: String,
+    pub library_id: String,
+    pub registration_version: String,
+    pub provider_package: String,
+    pub provider_source_digest: String,
+    pub meaning: ProgramConstructMeaning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramConstructCapture {
+    pub scope: ProgramConstructScope,
+    pub examined: Vec<ProgramConstructUse>,
+    pub edges: Vec<ProgramConstructEdge>,
+    pub edge_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramConstructScope {
+    RuleEffect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +258,45 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             "import witness edge digest differs from its edges".into(),
         ));
     }
+    if let Some(constructs) = &witness.constructs {
+        if !is_digest(&constructs.edge_digest)
+            || constructs.examined.len() != constructs.edges.len()
+            || constructs
+                .examined
+                .iter()
+                .enumerate()
+                .any(|(index, use_form)| {
+                    use_form.occurrence != index
+                        || use_form.keyword.is_empty()
+                        || use_form.scope.is_empty()
+                        || use_form.family.is_empty()
+                        || use_form.lowering.is_empty()
+                        || use_form.capability.is_empty()
+                })
+            || constructs
+                .examined
+                .iter()
+                .zip(&constructs.edges)
+                .any(|(use_form, edge)| {
+                    edge.use_form != *use_form
+                        || edge.registration_id.is_empty()
+                        || edge.library_id.is_empty()
+                        || edge.registration_version.is_empty()
+                        || edge.provider_package.is_empty()
+                        || !is_digest(&edge.provider_source_digest)
+                })
+        {
+            return Err(StoreError::Conflict(
+                "construct witness has incomplete or unordered edges".into(),
+            ));
+        }
+        let edge_json = serde_json::to_string(&constructs.edges)?;
+        if crate::items::sha256_hex(&edge_json) != constructs.edge_digest {
+            return Err(StoreError::Conflict(
+                "construct witness edge digest differs from its edges".into(),
+            ));
+        }
+    }
     let json = serde_json::to_string(witness)?;
     let digest = crate::items::sha256_hex(&json);
     Ok((digest, json))
@@ -306,7 +391,70 @@ mod tests {
                 &serde_json::to_string(&edges).expect("fixture edge JSON"),
             ),
             edges,
+            constructs: None,
         }
+    }
+
+    #[test]
+    fn construct_capture_is_retained_with_its_accepting_operation_or_refused_atomically() {
+        let use_form = ProgramConstructUse {
+            occurrence: 0,
+            keyword: "send".into(),
+            scope: "rule_body".into(),
+            family: "effect_operation".into(),
+            lowering: "capability.call".into(),
+            capability: "messaging.send".into(),
+        };
+        let edge = ProgramConstructEdge {
+            use_form: use_form.clone(),
+            registration_id: "messaging.send".into(),
+            library_id: "std.messaging".into(),
+            registration_version: "1".into(),
+            provider_package: "std.messaging".into(),
+            provider_source_digest: COMPILER.into(),
+            meaning: ProgramConstructMeaning::LiveDependency,
+        };
+        let mut checked = witness(LOCK);
+        let edges = vec![edge];
+        let edge_digest = crate::items::sha256_hex(&serde_json::to_string(&edges).unwrap());
+        checked.constructs = Some(ProgramConstructCapture {
+            scope: ProgramConstructScope::RuleEffect,
+            examined: vec![use_form],
+            edges,
+            edge_digest,
+        });
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let admitted = store
+            .create_program_version_with_import_witness(version("construct-checked"), &checked)
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+                .unwrap(),
+            Some(checked.clone())
+        );
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.operations.len(), 1);
+        assert_eq!(
+            roster.operations[0].witness_digest.as_deref(),
+            Some(admitted.witness_digest.as_str())
+        );
+
+        let mut malformed = checked;
+        malformed.constructs.as_mut().unwrap().edges[0].provider_source_digest =
+            "not-a-digest".into();
+        assert!(matches!(
+            store.create_program_version_with_import_witness(version("construct-invalid"), &malformed),
+            Err(StoreError::Conflict(message)) if message.contains("construct witness has incomplete or unordered edges")
+        ));
+        assert_eq!(store.program_import_operation_roster().unwrap(), roster);
+        malformed.constructs.as_mut().unwrap().edges[0].provider_source_digest = COMPILER.into();
+        malformed.constructs.as_mut().unwrap().edge_digest = LOCK.into();
+        assert!(matches!(
+            store.create_program_version_with_import_witness(version("construct-invalid"), &malformed),
+            Err(StoreError::Conflict(message)) if message.contains("construct witness edge digest differs")
+        ));
+        assert_eq!(store.program_import_operation_roster().unwrap(), roster);
     }
 
     #[test]

@@ -110,6 +110,7 @@ pub fn capture(
         examined: examined.into_iter().map(str::to_owned).collect(),
         edges,
         edge_digest: sha256_hex(&edge_json),
+        constructs: None,
     })
 }
 
@@ -276,7 +277,9 @@ mod tests {
             compiler_version: "test",
         };
         let admitted = kernel
-            .create_program_version_for_compiled_program_with_imports(input, &ir, None, &basis)
+            .create_program_version_for_compiled_program_with_imports(
+                input, &ir, None, &basis, None,
+            )
             .expect("admitted");
         let stored = kernel
             .store()
@@ -299,7 +302,7 @@ mod tests {
         };
         assert!(matches!(
             kernel.create_program_version_for_compiled_program_with_imports(
-                input, &ir, None, &missing
+                input, &ir, None, &missing, None
             ),
             Err(whipplescript_store::StoreError::Conflict(message))
                 if message.contains("unresolved local package import")

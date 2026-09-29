@@ -14834,10 +14834,19 @@ pub(crate) mod tests {
                     &serde_json::to_string(&edges).expect("fixture edge JSON"),
                 ),
                 edges,
+                constructs: None,
             }
         };
         let mut store = store();
-        let first_witness = witness(LOCK);
+        let mut first_witness = witness(LOCK);
+        first_witness.constructs = Some(
+            whipplescript_store::program_imports::ProgramConstructCapture {
+                scope: whipplescript_store::program_imports::ProgramConstructScope::RuleEffect,
+                examined: Vec::new(),
+                edges: Vec::new(),
+                edge_digest: whipplescript_store::items::sha256_hex("[]"),
+            },
+        );
         let full_source = store
             .create_program_version_with_import_witness(
                 NewProgramVersion {
@@ -14852,6 +14861,22 @@ pub(crate) mod tests {
                 .program_import_witness(&full_source.version_id, &full_source.witness_digest)
                 .unwrap(),
             Some(first_witness.clone())
+        );
+        let mut malformed_construct = first_witness.clone();
+        malformed_construct.constructs.as_mut().unwrap().edge_digest = LOCK.into();
+        assert!(store
+            .create_program_version_with_import_witness(
+                version("hosted-invalid-construct"),
+                &malformed_construct,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .len(),
+            1
         );
         let first = store
             .create_program_version_with_import_witness(version("paint"), &first_witness)
