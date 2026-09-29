@@ -6,7 +6,7 @@ use super::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
     FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
-    FlowingUnitOutcome,
+    FlowingCandidateWitness, FlowingUnitOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
@@ -32,6 +32,29 @@ fn read_receipt(
             ));
         }
         Ok(receipt)
+    })
+    .transpose()
+}
+
+fn read_witness(
+    connection: &Connection,
+    digest: &str,
+) -> StoreResult<Option<FlowingCandidateWitness>> {
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT witness_json FROM flowing_candidate_witnesses WHERE digest = ?1",
+            [digest],
+            |row| row.get(0),
+        )
+        .optional()?;
+    json.map(|json| {
+        let witness: FlowingCandidateWitness = serde_json::from_str(&json)?;
+        if witness.digest()? != digest {
+            return Err(StoreError::Conflict(
+                "flowing candidate witness differs from its digest key".into(),
+            ));
+        }
+        Ok(witness)
     })
     .transpose()
 }
@@ -101,6 +124,27 @@ impl FlowingAdmissions for BranchStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn record_candidate_witness(
+        &mut self,
+        witness: &FlowingCandidateWitness,
+    ) -> StoreResult<String> {
+        let digest = witness.digest()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO flowing_candidate_witnesses (digest, witness_json) VALUES (?1, ?2)",
+            params![&digest, serde_json::to_string(witness)?],
+        )?;
+        let _ = read_witness(&tx, &digest)?;
+        tx.commit()?;
+        Ok(digest)
+    }
+
+    fn candidate_witness(&self, digest: &str) -> StoreResult<Option<FlowingCandidateWitness>> {
+        read_witness(&self.connection, digest)
     }
 
     fn admit_flowing_prefix(
@@ -308,6 +352,13 @@ impl FlowingAdmissions for BranchStore {
             }
         }
 
+        let Some(witness) = read_witness(&tx, &request.candidate_witness_digest)? else {
+            return Ok(Refused(R::CandidateWitnessMissing));
+        };
+        if !witness.matches_request(request) {
+            return Ok(Refused(R::CandidateWitnessMismatch));
+        }
+
         let receipt = FlowingAdmissionReceipt {
             request: request.clone(),
         };
@@ -383,7 +434,7 @@ impl FlowingAdmissions for BranchStore {
                 if admitted.request.source_branch_id == request.source_branch_id
                     && admitted.request.source_incarnation_id == request.source_incarnation_id
                 {
-                    AlreadyAdmitted(admitted)
+                    AlreadyAdmitted(Box::new(admitted))
                 } else {
                     Refused(R::IdentityMismatch)
                 },
@@ -552,13 +603,37 @@ mod tests {
                     ('unit-b', 'basis-b', '[]', 't2');",
             )
             .unwrap();
+        for unit_id in ["unit-a", "unit-b"] {
+            store
+                .record_candidate_witness(&witness_for(&request(unit_id, "fixture")))
+                .unwrap();
+        }
         store
     }
 
+    fn witness_for(request: &FlowingAdmissionRequest) -> FlowingCandidateWitness {
+        FlowingCandidateWitness {
+            contribution_id: request.contribution_id.clone(),
+            revision_sequence: request.revision_sequence,
+            source_branch_id: request.source_branch_id.clone(),
+            source_incarnation_id: request.source_incarnation_id.clone(),
+            source_cut_id: request.source_cut_id.clone(),
+            source_manifest_hash: request.source_manifest_hash.clone(),
+            expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
+            candidate_cut_id: request.candidate_cut_id.clone(),
+            candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            source_atoms_digest: "sha256:fixture-source-atoms".into(),
+            units: request.units.clone(),
+        }
+    }
+
     fn request(unit_id: &str, op_id: &str) -> FlowingAdmissionRequest {
-        FlowingAdmissionRequest {
+        let mut request = FlowingAdmissionRequest {
             op_id: op_id.into(),
             certificate_handle: "certificate-a".into(),
+            candidate_witness_digest: String::new(),
+            contribution_id: "review-a".into(),
+            revision_sequence: 1,
             source_branch_id: "twig".into(),
             source_incarnation_id: "inc".into(),
             source_cut_id: "source".into(),
@@ -577,7 +652,76 @@ mod tests {
                 outcome: FlowingUnitOutcome::Applied,
             }],
             recorded_at: "t4".into(),
-        }
+        };
+        request.candidate_witness_digest = witness_for(&request).digest().unwrap();
+        request
+    }
+
+    #[test]
+    fn native_ref_requires_the_recorded_complete_candidate_witness() {
+        let mut store = fixture();
+        let mut attempt = request("unit-a", "admission-witness");
+        attempt.candidate_witness_digest = "sha256:missing".into();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CandidateWitnessMissing)
+        );
+
+        let mut complete = request("unit-a", "complete");
+        complete
+            .units
+            .push(request("unit-b", "second").units[0].clone());
+        let complete_digest = store
+            .record_candidate_witness(&witness_for(&complete))
+            .unwrap();
+        attempt.candidate_witness_digest = complete_digest;
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CandidateWitnessMismatch),
+            "an omitted unit cannot use the complete prefix's witness"
+        );
+        attempt = request("unit-a", "admission-witness");
+        attempt.revision_sequence += 1;
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CandidateWitnessMismatch)
+        );
+        assert!(store
+            .flowing_admission_receipt("admission-witness")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn native_ref_treats_a_changed_stored_witness_as_indeterminate() {
+        let mut store = fixture();
+        let attempt = request("unit-a", "admission-witness");
+        let mut changed = witness_for(&attempt);
+        changed.revision_sequence += 1;
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_candidate_witnesses SET witness_json = ?1 WHERE digest = ?2",
+                params![
+                    serde_json::to_string(&changed).unwrap(),
+                    &attempt.candidate_witness_digest
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt),
+            Err(StoreError::Conflict(message)) if message.contains("digest key")
+        ));
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -856,7 +1000,7 @@ mod tests {
             store
                 .cancel_flowing_attempt(&cancel("admission-a", "cancel-a"))
                 .unwrap(),
-            FlowingCancelOutcome::AlreadyAdmitted(receipt)
+            FlowingCancelOutcome::AlreadyAdmitted(Box::new(receipt))
         );
         assert!(store
             .flowing_cancellation_for_attempt("admission-a")
@@ -993,6 +1137,9 @@ mod tests {
         no_op.expected_trunk_cut_id = Some("candidate".into());
         no_op.candidate_cut_id = "candidate".into();
         no_op.units[0].outcome = FlowingUnitOutcome::Equivalent;
+        no_op.candidate_witness_digest = store
+            .record_candidate_witness(&witness_for(&no_op))
+            .unwrap();
         store
             .record_cut(CutRecord {
                 cut_id: "spurious-cut",

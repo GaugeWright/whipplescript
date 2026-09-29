@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::branches::flowing_admission::FlowingSelectedUnit;
 #[cfg(feature = "native")]
-use crate::branches::flowing_admission::{FlowingAdmissions, FlowingUnitOutcome};
+use crate::branches::flowing_admission::{
+    FlowingAdmissions, FlowingCandidateWitness, FlowingUnitOutcome,
+};
 use crate::branches::flowing_sources::{
     BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
     HandoffContribution, HandoffContributionOutcome,
@@ -169,6 +171,7 @@ pub struct NativeCandidate {
     pub candidate_cut_id: String,
     pub candidate_manifest_hash: String,
     pub source_atoms_digest: String,
+    pub candidate_witness_digest: String,
     pub units: Vec<FlowingSelectedUnit>,
 }
 
@@ -638,6 +641,22 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             candidate_cut_id,
             &selected_cut.manifest_hash,
         ))?;
+        let source_atoms_digest = format!("sha256:{}", crate::chunking::content_hash_hex(&witness));
+        let candidate_witness = FlowingCandidateWitness {
+            contribution_id: revision.contribution_id.clone(),
+            revision_sequence: revision.sequence,
+            source_branch_id: revision.source_branch_id.clone(),
+            source_incarnation_id: revision.source_incarnation_id.clone(),
+            source_cut_id: revision.source_cut_id.clone(),
+            source_manifest_hash: revision.source_manifest_hash.clone(),
+            expected_trunk_cut_id: expected_trunk_cut_id.map(str::to_owned),
+            candidate_cut_id: candidate_cut_id.into(),
+            candidate_manifest_hash: selected_cut.manifest_hash.clone(),
+            source_atoms_digest: source_atoms_digest.clone(),
+            units: outcomes.clone(),
+        };
+        let candidate_witness_digest =
+            self.branches.record_candidate_witness(&candidate_witness)?;
         Ok(R::Prepared(NativeCandidate {
             contribution_id: revision.contribution_id.clone(),
             revision_sequence: revision.sequence,
@@ -645,7 +664,8 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             expected_trunk_cut_id: expected_trunk_cut_id.map(str::to_owned),
             candidate_cut_id: candidate_cut_id.into(),
             candidate_manifest_hash: selected_cut.manifest_hash,
-            source_atoms_digest: format!("sha256:{}", crate::chunking::content_hash_hex(&witness)),
+            source_atoms_digest,
+            candidate_witness_digest,
             units: outcomes,
         }))
     }
@@ -1535,6 +1555,15 @@ mod tests {
             .iter()
             .all(|unit| unit.outcome == FlowingUnitOutcome::Applied));
         assert!(candidate.source_atoms_digest.starts_with("sha256:"));
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .expect("native candidate test")
+            .expect("candidate proof must be durable at the ref authority");
+        assert_eq!(witness.contribution_id, candidate.contribution_id);
+        assert_eq!(witness.revision_sequence, candidate.revision_sequence);
+        assert_eq!(witness.source_atoms_digest, candidate.source_atoms_digest);
+        assert_eq!(witness.units, candidate.units);
         assert_eq!(
             vcs.cut_manifest("candidate-a")
                 .expect("native candidate test")

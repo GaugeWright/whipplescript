@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 3] = [
+pub const SCHEMA: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -28,6 +28,10 @@ pub const SCHEMA: [&str; 3] = [
         admission_op_id TEXT PRIMARY KEY,
         cancel_op_id TEXT NOT NULL UNIQUE,
         request_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_candidate_witnesses (
+        digest TEXT PRIMARY KEY,
+        witness_json TEXT NOT NULL
     )",
 ];
 
@@ -48,6 +52,48 @@ pub struct FlowingSelectedUnit {
     pub outcome: FlowingUnitOutcome,
 }
 
+/// Durable output of the native VCS's complete-prefix proof. This is source
+/// evidence, not a fleet verdict or permission to admit. The ref store keeps
+/// the exact witness so an admission request cannot choose its own unit set
+/// or outcomes after candidate construction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingCandidateWitness {
+    pub contribution_id: String,
+    pub revision_sequence: i64,
+    pub source_branch_id: String,
+    pub source_incarnation_id: String,
+    pub source_cut_id: String,
+    pub source_manifest_hash: String,
+    pub expected_trunk_cut_id: Option<String>,
+    pub candidate_cut_id: String,
+    pub candidate_manifest_hash: String,
+    pub source_atoms_digest: String,
+    pub units: Vec<FlowingSelectedUnit>,
+}
+
+impl FlowingCandidateWitness {
+    pub fn digest(&self) -> crate::StoreResult<String> {
+        let bytes = serde_json::to_vec(&("native-candidate-witness-v1", self))?;
+        Ok(format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(&bytes)
+        ))
+    }
+
+    pub fn matches_request(&self, request: &FlowingAdmissionRequest) -> bool {
+        self.contribution_id == request.contribution_id
+            && self.revision_sequence == request.revision_sequence
+            && self.source_branch_id == request.source_branch_id
+            && self.source_incarnation_id == request.source_incarnation_id
+            && self.source_cut_id == request.source_cut_id
+            && self.source_manifest_hash == request.source_manifest_hash
+            && self.expected_trunk_cut_id == request.expected_trunk_cut_id
+            && self.candidate_cut_id == request.candidate_cut_id
+            && self.candidate_manifest_hash == request.candidate_manifest_hash
+            && self.units == request.units
+    }
+}
+
 /// Exact request that the coordinator has gated against a proposed trunk
 /// result. The store rechecks mutable ref and source facts at commit; the
 /// caller must hold the norm-ledger exclusion and establish the certificate.
@@ -55,6 +101,12 @@ pub struct FlowingSelectedUnit {
 pub struct FlowingAdmissionRequest {
     pub op_id: String,
     pub certificate_handle: String,
+    #[serde(default)]
+    pub candidate_witness_digest: String,
+    #[serde(default)]
+    pub contribution_id: String,
+    #[serde(default)]
+    pub revision_sequence: i64,
     pub source_branch_id: String,
     pub source_incarnation_id: String,
     pub source_cut_id: String,
@@ -98,6 +150,8 @@ pub enum FlowingAdmissionRefusal {
     TrunkStale { current: Option<String> },
     CandidateMissing,
     CandidateMismatch,
+    CandidateWitnessMissing,
+    CandidateWitnessMismatch,
     UnitMissing { unit_id: String },
     UnitBasisMissing { unit_id: String },
     UnitBasisMismatch { unit_id: String },
@@ -149,7 +203,7 @@ pub enum FlowingCancelOutcome {
     Cancelled(FlowingCancelReceipt),
     Existing(FlowingCancelReceipt),
     AlreadyCancelled(FlowingCancelReceipt),
-    AlreadyAdmitted(FlowingAdmissionReceipt),
+    AlreadyAdmitted(Box<FlowingAdmissionReceipt>),
     Refused(FlowingCancelRefusal),
 }
 
@@ -157,6 +211,17 @@ pub trait FlowingAdmissions {
     /// The ref authority's per-unit uniqueness index, read before preparing
     /// a candidate. Admission rechecks it under the trunk CAS.
     fn admitted_unit_operation(&self, unit_id: &str) -> crate::StoreResult<Option<String>>;
+    /// Called by the native candidate constructor after it has proved source
+    /// closure and retained the candidate cut. A host must not expose this
+    /// store-only issuer API to an untrusted caller.
+    fn record_candidate_witness(
+        &mut self,
+        witness: &FlowingCandidateWitness,
+    ) -> crate::StoreResult<String>;
+    fn candidate_witness(
+        &self,
+        digest: &str,
+    ) -> crate::StoreResult<Option<FlowingCandidateWitness>>;
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,
@@ -208,6 +273,11 @@ pub fn validate_request(request: &FlowingAdmissionRequest) -> Result<(), Flowing
     for (field, value) in [
         ("op_id", request.op_id.as_str()),
         ("certificate_handle", request.certificate_handle.as_str()),
+        (
+            "candidate_witness_digest",
+            request.candidate_witness_digest.as_str(),
+        ),
+        ("contribution_id", request.contribution_id.as_str()),
         ("source_branch_id", request.source_branch_id.as_str()),
         (
             "source_incarnation_id",
@@ -232,6 +302,11 @@ pub fn validate_request(request: &FlowingAdmissionRequest) -> Result<(), Flowing
     }
     if request.expected_eligibility_epoch < 0 || request.expected_owner_epoch < 0 {
         return Err(FlowingAdmissionRefusal::Invalid { field: "epoch" });
+    }
+    if request.revision_sequence < 1 {
+        return Err(FlowingAdmissionRefusal::Invalid {
+            field: "revision_sequence",
+        });
     }
     if request.units.is_empty() {
         return Err(FlowingAdmissionRefusal::Invalid { field: "units" });
@@ -291,6 +366,9 @@ mod tests {
         FlowingAdmissionRequest {
             op_id: "admit-1".into(),
             certificate_handle: "certificate-1".into(),
+            candidate_witness_digest: "sha256:witness-1".into(),
+            contribution_id: "review-1".into(),
+            revision_sequence: 1,
             source_branch_id: "twig-1".into(),
             source_incarnation_id: "incarnation-1".into(),
             source_cut_id: "source-cut".into(),
@@ -383,6 +461,24 @@ mod tests {
             validate_request(&missing_identity),
             Err(FlowingAdmissionRefusal::Invalid {
                 field: "certificate_handle"
+            })
+        );
+
+        let mut missing_witness = valid.clone();
+        missing_witness.candidate_witness_digest = " ".into();
+        assert_eq!(
+            validate_request(&missing_witness),
+            Err(FlowingAdmissionRefusal::Invalid {
+                field: "candidate_witness_digest"
+            })
+        );
+
+        let mut missing_revision = valid.clone();
+        missing_revision.revision_sequence = 0;
+        assert_eq!(
+            validate_request(&missing_revision),
+            Err(FlowingAdmissionRefusal::Invalid {
+                field: "revision_sequence"
             })
         );
 
