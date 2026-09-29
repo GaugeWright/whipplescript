@@ -8,9 +8,13 @@
 //! bind this projection to the exact admitted charter revision; this module
 //! does not certify a Home-wide consumer population or authorize routing.
 
+use std::collections::BTreeMap;
+
+use serde_json::Value;
 use whipplescript_core::vocabulary::{ReferenceForm, ValueType, VocabularyRef};
 
-use crate::norm::{NormCharter, NormView, NormVocabulary};
+use crate::norm::{EffectiveRevision, NormCharter, NormRecord, NormView, NormVocabulary};
+use crate::norm_relations::RelationFamilyView;
 use crate::{stable_hash_hex, StoreError, StoreResult};
 
 /// Meaning is declared at charter admission, never inferred from the
@@ -104,6 +108,217 @@ pub struct NormObservedReferenceActs {
     pub frontier: Vec<String>,
     pub charter_events: Vec<String>,
     pub admissions: Vec<NormReferenceAdmission>,
+}
+
+/// A typed reference in a record's current admitted content at one verified
+/// frontier. `meaning` is the class admitted with this vocabulary version;
+/// `role` describes structural interpretation, not update propagation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormObservedReference {
+    pub consumer: String,
+    pub consumer_revision: String,
+    pub consumer_status: String,
+    pub vocabulary: VocabularyRef,
+    pub field: String,
+    pub occurrence: String,
+    pub form: ReferenceForm,
+    pub target: String,
+    pub provider: String,
+    pub resolved_revision: Option<String>,
+    pub role: NormReferenceRole,
+    pub meaning: Option<NormReferenceMeaning>,
+}
+
+/// Local, read-only edge projection. It is an observation of this replay, not
+/// a closed Home consumer roster or a certificate for update routing. Family
+/// edges carry their structural validation basis separately from reference
+/// meaning; neither `derived_from` nor another relation becomes a live update
+/// dependency by appearing here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormObservedReferenceEdges {
+    pub ledger: String,
+    pub authority_head: String,
+    pub frontier: Vec<String>,
+    pub charter_events: Vec<String>,
+    pub relation_families: BTreeMap<String, RelationFamilyView>,
+    pub references: Vec<NormObservedReference>,
+    pub has_unclassified: bool,
+    pub historical_population_unknown: bool,
+}
+
+/// Project every typed reference of each record's current admitted content.
+/// An absent optional field contributes no value; a present malformed field
+/// or dangling reference refuses the projection instead of shrinking it.
+pub fn observed_edges_at(view: &NormView) -> StoreResult<NormObservedReferenceEdges> {
+    let mut references = Vec::new();
+    let mut has_unclassified = false;
+    for vocabulary in view.interpreted_vocabularies() {
+        let classes = view.reference_meaning_history.get(&(
+            vocabulary.definition.name.clone(),
+            vocabulary.definition.version.clone(),
+        ));
+        let mut fields = Vec::new();
+        for field in &vocabulary.definition.fields {
+            visit_field(vocabulary, &field.name, &field.value_type, &mut fields);
+        }
+        has_unclassified |= fields
+            .iter()
+            .any(|field| !classes.is_some_and(|classes| classes.contains_key(&field.path)));
+    }
+    for record in view.records.values() {
+        let vocabulary = view.interpretation(&record.vocabulary).ok_or_else(|| {
+            StoreError::Conflict("norm record has no admitted vocabulary interpretation".into())
+        })?;
+        let classes = view.reference_meaning_history.get(&(
+            vocabulary.definition.name.clone(),
+            vocabulary.definition.version.clone(),
+        ));
+        let fields = record
+            .fields
+            .as_object()
+            .ok_or_else(|| StoreError::Conflict("norm record fields are not an object".into()))?;
+        for field in &vocabulary.definition.fields {
+            let Some(value) = fields.get(&field.name) else {
+                if field.required {
+                    return Err(StoreError::Conflict(
+                        "norm record lacks a required declared field".into(),
+                    ));
+                }
+                continue;
+            };
+            project_value(
+                view,
+                record,
+                vocabulary,
+                &field.value_type,
+                value,
+                &field.name,
+                &field.name,
+                classes,
+                &mut references,
+            )?;
+        }
+    }
+    references.sort_by(|a, b| {
+        (&a.consumer, &a.field, &a.occurrence, &a.target).cmp(&(
+            &b.consumer,
+            &b.field,
+            &b.occurrence,
+            &b.target,
+        ))
+    });
+    Ok(NormObservedReferenceEdges {
+        ledger: view.ledger.clone(),
+        authority_head: view.authority_head.clone(),
+        frontier: view.frontier.iter().cloned().collect(),
+        charter_events: view.charter_events.clone(),
+        relation_families: view.relation_families()?,
+        references,
+        has_unclassified,
+        historical_population_unknown: view.charter_events.len() > 1,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_value(
+    view: &NormView,
+    record: &NormRecord,
+    vocabulary: &NormVocabulary,
+    kind: &ValueType,
+    value: &Value,
+    field: &str,
+    occurrence: &str,
+    classes: Option<&BTreeMap<String, NormReferenceMeaning>>,
+    output: &mut Vec<NormObservedReference>,
+) -> StoreResult<()> {
+    match kind {
+        ValueType::Reference { form } => {
+            let target = value.as_str().ok_or_else(|| {
+                StoreError::Conflict("admitted norm reference is not a string".into())
+            })?;
+            let (provider, resolved_revision) = match form {
+                ReferenceForm::Identity => {
+                    let named = view.records.get(target).ok_or_else(|| {
+                        StoreError::Conflict("norm identity reference does not resolve".into())
+                    })?;
+                    let current = match view.effective_revision(named) {
+                        EffectiveRevision::Active { record, .. } => Some(record.content_head),
+                        EffectiveRevision::Inactive | EffectiveRevision::Unspecified => None,
+                    };
+                    (named.id.clone(), current)
+                }
+                ReferenceForm::Revision => {
+                    let named = view.revision(target).ok_or_else(|| {
+                        StoreError::Conflict("norm revision reference does not resolve".into())
+                    })?;
+                    (named.id.clone(), Some(target.to_owned()))
+                }
+            };
+            output.push(NormObservedReference {
+                consumer: record.id.clone(),
+                consumer_revision: record.content_head.clone(),
+                consumer_status: record.status.clone(),
+                vocabulary: record.vocabulary.clone(),
+                field: field.to_owned(),
+                occurrence: occurrence.to_owned(),
+                form: *form,
+                target: target.to_owned(),
+                provider,
+                resolved_revision,
+                role: role(vocabulary, field),
+                meaning: classes.and_then(|classes| classes.get(field).copied()),
+            });
+        }
+        ValueType::List { item } => {
+            let items = value.as_array().ok_or_else(|| {
+                StoreError::Conflict("admitted norm reference list is not an array".into())
+            })?;
+            for (index, item_value) in items.iter().enumerate() {
+                project_value(
+                    view,
+                    record,
+                    vocabulary,
+                    item,
+                    item_value,
+                    &format!("{field}[]"),
+                    &format!("{occurrence}[{index}]"),
+                    classes,
+                    output,
+                )?;
+            }
+        }
+        ValueType::Object { fields } => {
+            let values = value.as_object().ok_or_else(|| {
+                StoreError::Conflict("admitted norm reference object is not an object".into())
+            })?;
+            for nested in fields {
+                let Some(nested_value) = values.get(&nested.name) else {
+                    if nested.required {
+                        return Err(StoreError::Conflict(
+                            "norm record lacks a required declared field".into(),
+                        ));
+                    }
+                    continue;
+                };
+                project_value(
+                    view,
+                    record,
+                    vocabulary,
+                    &nested.value_type,
+                    nested_value,
+                    &format!("{field}.{}", nested.name),
+                    &format!("{occurrence}.{}", nested.name),
+                    classes,
+                    output,
+                )?;
+            }
+        }
+        ValueType::Text { .. }
+        | ValueType::Boolean { .. }
+        | ValueType::Integer { .. }
+        | ValueType::Enum { .. } => {}
+    }
+    Ok(())
 }
 
 pub fn observed_acts_at(view: &NormView) -> NormObservedReferenceActs {

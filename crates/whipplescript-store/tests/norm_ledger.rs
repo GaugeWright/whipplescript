@@ -1364,7 +1364,37 @@ mod tests {
     #[test]
     fn norm_relations_bind_the_family_basis_and_keep_the_family_acyclic() {
         use whipplescript_store::norm_commands::NormCommandStore;
-        let c = NormCharter::bundled().unwrap();
+        let mut c = NormCharter::bundled().unwrap();
+        c.vocabularies
+            .iter_mut()
+            .find(|entry| entry.definition.name == "refines")
+            .unwrap()
+            .definition
+            .fields
+            .push(whipplescript_core::vocabulary::FieldDefinition {
+                name: "detail".into(),
+                required: false,
+                value_type: whipplescript_core::vocabulary::ValueType::Object {
+                    fields: vec![whipplescript_core::vocabulary::FieldDefinition {
+                        name: "anchor".into(),
+                        required: true,
+                        value_type: whipplescript_core::vocabulary::ValueType::Reference {
+                            form: whipplescript_core::vocabulary::ReferenceForm::Identity,
+                        },
+                        editorial: false,
+                    }],
+                },
+                editorial: false,
+            });
+        c.reference_classes.push(
+            whipplescript_store::norm_reference_inventory::NormReferenceClass {
+                vocabulary: "refines".into(),
+                vocabulary_version: "1".into(),
+                path: "source".into(),
+                meaning:
+                    whipplescript_store::norm_reference_inventory::NormReferenceMeaning::Provenance,
+            },
+        );
         let keys = Keys::new();
         let mut store = WorkItemStore::open_in_memory().unwrap();
         let ledger = store
@@ -1455,6 +1485,84 @@ mod tests {
         let ab = store
             .append_norm_event(&relate("ab", "refines", &a, &b, Some(&empty)), &keys)
             .unwrap();
+        let view = store.norm_state(&keys).unwrap();
+        let observed =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&view).unwrap();
+        assert_eq!(observed.relation_families["refinement"].basis, ab);
+        let source = observed
+            .references
+            .iter()
+            .find(|edge| edge.consumer == ab && edge.field == "source")
+            .expect("typed relation source");
+        assert_eq!(source.provider, a);
+        assert_eq!(
+            source.meaning,
+            Some(whipplescript_store::norm_reference_inventory::NormReferenceMeaning::Provenance),
+            "a declared provenance edge is not an update edge"
+        );
+        assert!(matches!(
+            &source.role,
+            whipplescript_store::norm_reference_inventory::NormReferenceRole::RelationEndpoint {
+                family
+            } if family == "refinement"
+        ));
+        let project_refusal = |view: &NormView, reason: &str| {
+            let error = whipplescript_store::norm_reference_inventory::observed_edges_at(view)
+                .expect_err("invalid local view must refuse projection");
+            assert!(format!("{error:?}").contains(reason), "{error:?}");
+        };
+        let mut unknown_vocabulary = view.clone();
+        unknown_vocabulary
+            .records
+            .get_mut(&ab)
+            .unwrap()
+            .vocabulary
+            .name = "not-admitted".into();
+        project_refusal(
+            &unknown_vocabulary,
+            "norm record has no admitted vocabulary interpretation",
+        );
+        let mut non_object = view.clone();
+        non_object.records.get_mut(&ab).unwrap().fields = json!(42);
+        project_refusal(&non_object, "norm record fields are not an object");
+        let mut missing_required = view.clone();
+        missing_required
+            .records
+            .get_mut(&ab)
+            .unwrap()
+            .fields
+            .as_object_mut()
+            .unwrap()
+            .remove("source");
+        project_refusal(
+            &missing_required,
+            "norm record lacks a required declared field",
+        );
+        let mut malformed = view.clone();
+        malformed.records.get_mut(&ab).unwrap().fields["source"] = json!(42);
+        project_refusal(&malformed, "admitted norm reference is not a string");
+        let mut dangling = view.clone();
+        dangling.records.get_mut(&ab).unwrap().fields["source"] = json!("f".repeat(64));
+        project_refusal(&dangling, "norm identity reference does not resolve");
+        let mut malformed_object = view.clone();
+        malformed_object.records.get_mut(&ab).unwrap().fields["detail"] = json!(42);
+        project_refusal(
+            &malformed_object,
+            "admitted norm reference object is not an object",
+        );
+        let mut missing_nested = view.clone();
+        missing_nested.records.get_mut(&ab).unwrap().fields["detail"] = json!({});
+        project_refusal(
+            &missing_nested,
+            "norm record lacks a required declared field",
+        );
+        let mut nested = view;
+        nested.records.get_mut(&ab).unwrap().fields["detail"] = json!({"anchor": a});
+        let projected =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&nested).unwrap();
+        assert!(projected.references.iter().any(|edge| {
+            edge.consumer == ab && edge.field == "detail.anchor" && edge.provider == a
+        }));
         // The basis moved; a candidate captured against the old one is refused
         // for re-evaluation, never admitted on a substituted token.
         refused(
@@ -1928,6 +2036,44 @@ mod tests {
                 &keys,
             )
             .unwrap();
+        let view = store.norm_state(&keys).unwrap();
+        let observed =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&view).unwrap();
+        let members: Vec<_> = observed
+            .references
+            .iter()
+            .filter(|edge| edge.consumer == complete && edge.field == "members[]")
+            .collect();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].occurrence, "members[0]");
+        assert_eq!(members[0].target, both[0]);
+        assert_eq!(members[0].provider, r1);
+        assert_eq!(
+            members[0].resolved_revision.as_deref(),
+            Some(both[0].as_str())
+        );
+        assert_eq!(members[1].occurrence, "members[1]");
+        assert_eq!(members[1].target, both[1]);
+        assert_eq!(members[1].provider, r2);
+        assert!(members.iter().all(|edge| {
+            edge.meaning.is_none()
+                && edge.role
+                    == whipplescript_store::norm_reference_inventory::NormReferenceRole::ManifestMember
+        }));
+        assert!(observed.has_unclassified);
+        let mut malformed_list = view.clone();
+        malformed_list.records.get_mut(&complete).unwrap().fields["members"] = json!(42);
+        let error =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&malformed_list)
+                .expect_err("malformed present member list must refuse projection");
+        assert!(format!("{error:?}").contains("admitted norm reference list is not an array"));
+        let mut dangling_revision = view;
+        dangling_revision.records.get_mut(&complete).unwrap().fields["members"][0] =
+            json!("f".repeat(64));
+        let error =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&dangling_revision)
+                .expect_err("unresolved revision member must refuse projection");
+        assert!(format!("{error:?}").contains("norm revision reference does not resolve"));
         // An exhaustive claim without a basis is refused; a bounded claim binds none.
         refused(
             store.append_norm_event(
@@ -2207,6 +2353,25 @@ mod tests {
             .unwrap();
         let view = store.norm_state(&keys).unwrap();
         assert_eq!(view.records[&split].status, "proposed");
+        let observed =
+            whipplescript_store::norm_reference_inventory::observed_edges_at(&view).unwrap();
+        let sides: Vec<_> = observed
+            .references
+            .iter()
+            .filter(|edge| edge.consumer == split)
+            .collect();
+        assert_eq!(sides.len(), 3);
+        assert_eq!(sides[0].field, "sources[]");
+        assert_eq!(sides[0].target, original[0]);
+        assert_eq!(sides[1].field, "targets[]");
+        assert_eq!(sides[1].target, successors[0]);
+        assert_eq!(sides[2].occurrence, "targets[1]");
+        assert_eq!(sides[2].target, successors[1]);
+        assert!(sides.iter().all(|edge| {
+            edge.meaning.is_none()
+                && edge.role
+                    == whipplescript_store::norm_reference_inventory::NormReferenceRole::CorrespondenceSide
+        }));
         assert_eq!(view.records[&r1].status, "proposed");
         assert_eq!(view.records[&r2].status, "proposed");
         assert!(!view.effective_records.contains_key(&r1));

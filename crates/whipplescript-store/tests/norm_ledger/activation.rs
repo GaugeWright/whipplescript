@@ -647,6 +647,12 @@ fn norm_charter_activation_migrates_live_records_and_keeps_history_replayable() 
     let reference_inventory = store.norm_reference_inventory(&keys).unwrap();
     assert_eq!(reference_inventory.charter_events, [view.ledger.clone(), activated.clone()]);
     assert!(reference_inventory.historical_population_unknown);
+    let observed = whipplescript_store::norm_reference_inventory::observed_edges_at(&view)
+        .expect("the activated view remains projectable");
+    assert_eq!(observed.frontier, view.frontier.iter().cloned().collect::<Vec<_>>());
+    assert!(observed.historical_population_unknown);
+    assert!(observed.has_unclassified, "retired decision@1 basis remains unknown");
+    assert!(observed.references.is_empty());
     let population = store.norm_observed_reference_acts(&keys).unwrap();
     assert_eq!(population.charter_events, reference_inventory.charter_events);
     assert!(population.admissions.iter().any(|act| {
