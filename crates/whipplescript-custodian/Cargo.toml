@@ -51,7 +51,7 @@ ureq = { version = "2", features = ["json", "native-certs"] }
 url = "2"
 # The stable line; 8.x is an alpha. Optional — see [features].
 tss-esapi = { version = "7.7", optional = true }
-cryptoki = { version = "0.12", optional = true }
+cryptoki = { version = "=0.12.1", optional = true }
 
 # `kill(pid, 0)` for the serving-marker liveness check, which decides whether a
 # direct-store write would be a lost update.
