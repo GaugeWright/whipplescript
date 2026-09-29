@@ -820,8 +820,18 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             // current compiler rather than strand the instance
             // (spec/agent-harness.md "Program identity across toolchains").
             if version.ir_hash != package.ir_hash {
+                let source_digest = package
+                    .checked_import_source_digest()
+                    .map_err(HostFacadeError::Resolver)?;
+                let compiler_artifact_digest =
+                    self.compiler_artifact_digest.as_deref().ok_or_else(|| {
+                        HostFacadeError::Resolver(
+                            "hosted program re-attestation requires the exact compiler artifact digest"
+                                .to_owned(),
+                        )
+                    })?;
                 self.kernel
-                    .reattest_instance_program(
+                    .reattest_instance_program_with_imports(
                         &instance.instance_id,
                         ProgramVersionInput {
                             program_name: &package.agent,
@@ -829,6 +839,14 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                             ir_hash: &package.ir_hash,
                             compiler_version: HOST_PROTOCOL,
                             ir_snapshot: None,
+                        },
+                        &package.program,
+                        &CheckedImportBasis {
+                            program_source_digest: &source_digest,
+                            version_source_digest: Some(&package.source_hash),
+                            lock_digest: NO_LOCK_DIGEST,
+                            compiler_artifact_digest,
+                            packages: &[],
                         },
                     )
                     .map_err(HostFacadeError::Store)?;
@@ -1066,5 +1084,103 @@ workflow Method {
             effects[0].input_json,
             serde_json::to_string(&turn).expect("serialize admitted turn")
         );
+    }
+
+    #[test]
+    fn changed_ir_replay_requires_compiler_identity_and_retains_a_checked_witness() {
+        let package = package();
+        let resolved = package
+            .resolve_package(package.version_ref())
+            .expect("resolved fixture package");
+        let mut host = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("store"),
+            7,
+            envelope(),
+        )
+        .expect("host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "replay-1".to_owned(),
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        let opened = host
+            .open_instance(&open, &package)
+            .expect("first admission");
+        let drifted = host
+            .kernel_mut()
+            .reattest_instance_program(
+                &opened.instance_ref,
+                ProgramVersionInput {
+                    program_name: &resolved.agent,
+                    source_hash: &resolved.source_hash,
+                    ir_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                },
+            )
+            .expect("model an earlier unwitnessed compiler move");
+        let before = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("operations before replay");
+        assert_eq!(
+            before.operations.last().expect("drift operation").kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Unwitnessed
+        );
+        let mut host =
+            GovernedHostFacade::from_verified_store(host.into_kernel().into_store(), 7, envelope())
+                .expect("reopened host without compiler artifact");
+        assert!(host
+            .open_instance(&open, &package)
+            .unwrap_err()
+            .to_string()
+            .contains("re-attestation requires the exact compiler artifact digest"));
+        assert_eq!(
+            host.kernel()
+                .store()
+                .program_import_operation_roster()
+                .expect("operations after refusal"),
+            before
+        );
+        assert_eq!(
+            host.kernel()
+                .store()
+                .get_instance(&opened.instance_ref)
+                .expect("instance")
+                .expect("recorded")
+                .version_id,
+            drifted.version_id
+        );
+        let mut host = host.with_compiler_artifact_digest("a".repeat(64));
+        assert_eq!(
+            host.open_instance(&open, &package).expect("checked replay"),
+            opened
+        );
+        let roster = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("operations after checked replay");
+        assert_eq!(roster.operations.len(), before.operations.len() + 1);
+        let operation = roster.operations.last().expect("checked move");
+        assert_eq!(
+            operation.kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let witness = host
+            .kernel()
+            .store()
+            .program_import_witness(
+                &operation.version_id,
+                operation.witness_digest.as_deref().expect("witness digest"),
+            )
+            .expect("witness lookup")
+            .expect("retained witness");
+        assert_eq!(witness.compiler_artifact_digest, "a".repeat(64));
+        assert_eq!(witness.version_source_digest, Some(resolved.source_hash));
+        assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
     }
 }

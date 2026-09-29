@@ -341,6 +341,59 @@ workflow Method {
             whipplescript_kernel::import_coverage::NO_LOCK_DIGEST
         );
         assert!(witness.examined.is_empty());
+        let drifted = host
+            .kernel_mut()
+            .reattest_instance_program(
+                &opened.instance_ref,
+                whipplescript_kernel::ProgramVersionInput {
+                    program_name: &checked_package.agent,
+                    source_hash: &checked_package.source_hash,
+                    ir_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                },
+            )
+            .expect("model an earlier unwitnessed compiler move");
+        assert_ne!(drifted.version_id, roster.operations[0].version_id);
+        assert_eq!(
+            host.open_instance(&open, &package).expect("checked replay"),
+            opened
+        );
+        let replay_roster = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("replay operations");
+        assert_eq!(
+            replay_roster
+                .operations
+                .last()
+                .expect("replay operation")
+                .kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let replay_operation = replay_roster.operations.last().expect("replay operation");
+        let replay_witness = host
+            .kernel()
+            .store()
+            .program_import_witness(
+                &replay_operation.version_id,
+                replay_operation
+                    .witness_digest
+                    .as_deref()
+                    .expect("replay witness digest"),
+            )
+            .expect("replay witness lookup")
+            .expect("replay witness");
+        assert_eq!(
+            replay_witness.program_source_digest,
+            witness.program_source_digest
+        );
+        assert_eq!(
+            replay_witness.version_source_digest,
+            witness.version_source_digest
+        );
+        assert_eq!(replay_witness.compiler_artifact_digest, compiler_digest);
         let turn = StartTurnCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             command_id: "turn-do-1".to_owned(),

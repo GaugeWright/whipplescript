@@ -5281,6 +5281,131 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     }
 }
 
+/// The version row, import operation, instance move and re-attestation event
+/// share one DO transaction. Callers without a witness retain an explicit
+/// unknown operation rather than silently inheriting an older witness.
+fn do_reattest_instance_program<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    version: NewProgramVersion<'_>,
+    witness: Option<&whipplescript_store::program_imports::ProgramImportWitness>,
+) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
+    use whipplescript_store::program_imports;
+
+    let recorded_rows = sql
+        .query(
+            "SELECT instances.program_id, instances.version_id, \
+             program_versions.source_hash, program_versions.ir_hash FROM instances \
+             JOIN program_versions ON program_versions.version_id = instances.version_id \
+             WHERE instances.instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let Some(row) = recorded_rows.first() else {
+        return Err(StoreError::Conflict(format!(
+            "cannot re-attest unknown instance {instance_id}"
+        )));
+    };
+    let program_id = as_text(&row[0]);
+    let from_version_id = as_text(&row[1]);
+    let recorded_source = as_text(&row[2]);
+    let recorded_ir = as_text(&row[3]);
+    if recorded_source != version.source_hash {
+        return Err(StoreError::Conflict(
+            "re-attestation requires the same authored program".to_owned(),
+        ));
+    }
+    if recorded_ir == version.ir_hash {
+        if witness.is_some() {
+            return Err(StoreError::Conflict(
+                "checked re-attestation requires changed compiler IR".into(),
+            ));
+        }
+        return Ok((
+            ProgramVersionRecord {
+                program_id,
+                version_id: from_version_id,
+            },
+            None,
+        ));
+    }
+    let encoded = witness
+        .map(|witness| {
+            if !program_imports::matches_source_id(witness, version.source_hash) {
+                return Err(StoreError::Conflict(
+                    "import witness program source differs from the version".into(),
+                ));
+            }
+            program_imports::encode(witness)
+        })
+        .transpose()?;
+    let mut record = None;
+    sql.atomic(&mut || {
+        let to_version_id = do_insert_program_version(sql, &program_id, version)?;
+        if let Some((digest, json)) = &encoded {
+            sql.execute(
+                "INSERT OR IGNORE INTO program_import_admissions \
+                 (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
+                &[text(&to_version_id), text(digest), text(json)],
+            )
+            .map_err(sql_err)?;
+        }
+        let payload = serde_json::json!({
+            "from_version_id": &from_version_id,
+            "to_version_id": &to_version_id,
+            "source_hash": version.source_hash,
+            "from_ir_hash": &recorded_ir,
+            "to_ir_hash": version.ir_hash,
+            "compiler_version": version.compiler_version,
+        })
+        .to_string();
+        let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
+        do_append_event_idempotent(
+            sql,
+            NewEvent {
+                instance_id,
+                event_type: "instance.program.reattested",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&idempotency),
+            },
+        )?;
+        sql.execute(
+            "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
+            &[text(&to_version_id), text(instance_id)],
+        )
+        .map_err(sql_err)?;
+        sql.execute(
+            "INSERT INTO program_import_operations \
+             (operation_id, version_id, witness_digest, kind) \
+             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+            &[
+                text(&to_version_id),
+                encoded
+                    .as_ref()
+                    .map_or(SqlValue::Null, |(digest, _)| text(digest)),
+                text(if encoded.is_some() {
+                    "checked"
+                } else {
+                    "unwitnessed"
+                }),
+            ],
+        )
+        .map_err(sql_err)?;
+        record = Some(ProgramVersionRecord {
+            program_id: program_id.clone(),
+            version_id: to_version_id,
+        });
+        Ok(())
+    })?;
+    Ok((
+        record.expect("the successful atomic body sets its re-attestation record"),
+        encoded.map(|(digest, _)| digest),
+    ))
+}
+
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn admit_host_action(
         &mut self,
@@ -5449,86 +5574,25 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        // Same semantics as `SqliteStore::reattest_instance_program`: the
-        // changed-IR writes below commit together in a DO SQL transaction.
-        let recorded_rows = self
-            .sql
-            .query(
-                "SELECT instances.program_id, instances.version_id, \
-                 program_versions.source_hash, program_versions.ir_hash FROM instances \
-                 JOIN program_versions ON program_versions.version_id = instances.version_id \
-                 WHERE instances.instance_id = ?1",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        let Some(row) = recorded_rows.first() else {
-            return Err(StoreError::Conflict(format!(
-                "cannot re-attest unknown instance {instance_id}"
-            )));
-        };
-        let program_id = as_text(&row[0]);
-        let from_version_id = as_text(&row[1]);
-        let recorded_source = as_text(&row[2]);
-        let recorded_ir = as_text(&row[3]);
-        if recorded_source != version.source_hash {
-            return Err(StoreError::Conflict(
-                "re-attestation requires the same authored program".to_owned(),
-            ));
-        }
-        if recorded_ir == version.ir_hash {
-            return Ok(ProgramVersionRecord {
-                program_id,
-                version_id: from_version_id,
-            });
-        }
-        // A changed-IR re-attestation accepts a new version. Its event,
-        // instance move and unknown import operation commit as one unit.
-        let mut record = None;
-        self.sql.atomic(&mut || {
-            let to_version_id = do_insert_program_version(&self.sql, &program_id, version)?;
-            let payload = serde_json::json!({
-                "from_version_id": &from_version_id,
-                "to_version_id": &to_version_id,
-                "source_hash": version.source_hash,
-                "from_ir_hash": &recorded_ir,
-                "to_ir_hash": version.ir_hash,
-                "compiler_version": version.compiler_version,
-            })
-            .to_string();
-            let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
-            do_append_event_idempotent(
-                &self.sql,
-                NewEvent {
-                    instance_id,
-                    event_type: "instance.program.reattested",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: None,
-                    correlation_id: None,
-                    idempotency_key: Some(&idempotency),
-                },
-            )?;
-            self.sql
-                .execute(
-                    "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
-                    &[text(&to_version_id), text(instance_id)],
-                )
-                .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "INSERT INTO program_import_operations \
-                 (operation_id, version_id, kind) \
-                 VALUES ('imp_' || lower(hex(randomblob(16))), ?1, 'unwitnessed')",
-                    &[text(&to_version_id)],
-                )
-                .map_err(sql_err)?;
-            record = Some(ProgramVersionRecord {
-                program_id: program_id.clone(),
-                version_id: to_version_id,
-            });
-            Ok(())
-        })?;
-        Ok(record.expect("the successful atomic body sets its re-attestation record"))
+        do_reattest_instance_program(&self.sql, instance_id, version, None)
+            .map(|(record, _)| record)
+    }
+
+    fn reattest_instance_program_with_import_witness(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &whipplescript_store::program_imports::ProgramImportWitness,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let (record, digest) =
+            do_reattest_instance_program(&self.sql, instance_id, version, Some(witness))?;
+        Ok(
+            whipplescript_store::program_imports::ProgramImportAdmissionRecord {
+                program_id: record.program_id,
+                version_id: record.version_id,
+                witness_digest: digest.expect("the supplied re-attestation witness was stored"),
+            },
+        )
     }
 
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
@@ -14869,6 +14933,123 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(as_i64(&reattestation_calls[0][0]), 1);
+        let before_checked_refusals = store.program_import_operation_roster().unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                "missing-instance",
+                NewProgramVersion {
+                    ir_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    ..version("paint")
+                },
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("unknown instance")
+        ));
+        let second_instance = store
+            .create_instance(NewInstance {
+                program_id: &first.program_id,
+                version_id: &first.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &second_instance.instance_id,
+                NewProgramVersion {
+                    source_hash: NEXT_LOCK,
+                    ir_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    ..version("paint")
+                },
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("same authored program")
+        ));
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &second_instance.instance_id,
+                version("paint"),
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("changed compiler IR")
+        ));
+        let mut wrong_reattest_source = witness(LOCK);
+        wrong_reattest_source.program_source_digest = NEXT_LOCK.into();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &second_instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    ..version("paint")
+                },
+                &wrong_reattest_source,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("program source differs")
+        ));
+        assert_eq!(
+            store.program_import_operation_roster().unwrap(),
+            before_checked_refusals
+        );
+        assert_eq!(
+            store
+                .get_instance(&second_instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            first.version_id
+        );
+        let checked = store
+            .reattest_instance_program_with_import_witness(
+                &second_instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    ..version("paint")
+                },
+                &witness(LOCK),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_instance(&second_instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            checked.version_id
+        );
+        assert_eq!(
+            store
+                .program_import_witness(&checked.version_id, &checked.witness_digest)
+                .unwrap(),
+            Some(witness(LOCK))
+        );
+        let checked_roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(
+            checked_roster.operations.last().unwrap().kind,
+            whipplescript_store::program_imports::ProgramImportOperationKind::Checked
+        );
+        let mut bad_reattest_witness = witness(LOCK);
+        bad_reattest_witness.edge_digest = NEXT_LOCK.into();
+        assert!(store
+            .reattest_instance_program_with_import_witness(
+                &second_instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    ..version("paint")
+                },
+                &bad_reattest_witness,
+            )
+            .is_err());
+        assert_eq!(
+            store.program_import_operation_roster().unwrap(),
+            checked_roster
+        );
+        assert_eq!(
+            store
+                .get_instance(&second_instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            checked.version_id
+        );
         let mut bad = witness(LOCK);
         bad.edge_digest = NEXT_LOCK.into();
         assert!(store

@@ -1470,6 +1470,38 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         )
     }
 
+    /// Re-attest changed compiler IR and its checked import basis as one
+    /// acceptance. The caller must retain the exact authored source and
+    /// compiler artifact that produced `program`.
+    pub fn reattest_instance_program_with_imports(
+        &mut self,
+        instance_id: &str,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let witness =
+            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        self.store.reattest_instance_program_with_import_witness(
+            instance_id,
+            NewProgramVersion {
+                program_name: input.program_name,
+                source_hash: input.source_hash,
+                ir_hash: input.ir_hash,
+                ir_snapshot: None,
+                compiler_version: input.compiler_version,
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            },
+            &witness,
+        )
+    }
+
     pub fn create_instance(
         &self,
         version: &ProgramVersionRecord,

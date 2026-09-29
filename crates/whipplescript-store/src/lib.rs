@@ -2209,14 +2209,32 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
-            .run(|| self.reattest_instance_program_retained(instance_id, version))
+            .run(|| self.reattest_instance_program_retained(instance_id, version, None))
+            .map(|(record, _)| record)
+    }
+
+    pub fn reattest_instance_program_with_import_witness(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        let (record, digest) = self
+            .retained_publication()
+            .run(|| self.reattest_instance_program_retained(instance_id, version, Some(witness)))?;
+        Ok(program_imports::ProgramImportAdmissionRecord {
+            program_id: record.program_id,
+            version_id: record.version_id,
+            witness_digest: digest.expect("the supplied re-attestation witness was stored"),
+        })
     }
 
     fn reattest_instance_program_retained(
         &mut self,
         instance_id: &str,
         version: NewProgramVersion<'_>,
-    ) -> StoreResult<ProgramVersionRecord> {
+        witness: Option<&program_imports::ProgramImportWitness>,
+    ) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2255,10 +2273,18 @@ impl SqliteStore {
             ));
         }
         if recorded_ir == version.ir_hash {
-            return Ok(ProgramVersionRecord {
-                program_id,
-                version_id: from_version_id,
-            });
+            if witness.is_some() {
+                return Err(StoreError::Conflict(
+                    "checked re-attestation requires changed compiler IR".into(),
+                ));
+            }
+            return Ok((
+                ProgramVersionRecord {
+                    program_id,
+                    version_id: from_version_id,
+                },
+                None,
+            ));
         }
         tx.execute(
             r#"
@@ -2318,6 +2344,22 @@ impl SqliteStore {
             params![&program_id, version.source_hash, version.ir_hash],
             |row| row.get::<_, String>(0),
         )?;
+        let witness_digest = if let Some(witness) = witness {
+            if !program_imports::matches_source_id(witness, version.source_hash) {
+                return Err(StoreError::Conflict(
+                    "import witness program source differs from the version".into(),
+                ));
+            }
+            let (digest, json) = program_imports::encode(witness)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO program_import_admissions \
+                 (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
+                params![&to_version_id, &digest, &json],
+            )?;
+            Some(digest)
+        } else {
+            None
+        };
         let payload = serde_json::json!({
             "from_version_id": &from_version_id,
             "to_version_id": &to_version_id,
@@ -2350,15 +2392,26 @@ impl SqliteStore {
         )?;
         tx.execute(
             "INSERT INTO program_import_operations \
-             (operation_id, version_id, kind) \
-             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, 'unwitnessed')",
-            [&to_version_id],
+             (operation_id, version_id, witness_digest, kind) \
+             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+            params![
+                &to_version_id,
+                &witness_digest,
+                if witness_digest.is_some() {
+                    "checked"
+                } else {
+                    "unwitnessed"
+                },
+            ],
         )?;
         tx.commit()?;
-        Ok(ProgramVersionRecord {
-            program_id,
-            version_id: to_version_id,
-        })
+        Ok((
+            ProgramVersionRecord {
+                program_id,
+                version_id: to_version_id,
+            },
+            witness_digest,
+        ))
     }
 
     pub fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
@@ -8546,6 +8599,14 @@ pub trait RuntimeStore {
         instance_id: &str,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord>;
+    /// Move an instance to changed compiler IR while recording the checked
+    /// import witness in the same transaction as the move and event.
+    fn reattest_instance_program_with_import_witness(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>>;
     fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord>;
     fn create_instance_with_authority(
@@ -9014,6 +9075,14 @@ impl RuntimeStore for SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.reattest_instance_program(instance_id, version)
+    }
+    fn reattest_instance_program_with_import_witness(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        self.reattest_instance_program_with_import_witness(instance_id, version, witness)
     }
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.get_program_version(version_id)

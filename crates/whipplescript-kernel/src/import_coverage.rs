@@ -144,14 +144,28 @@ pub fn current(
     compiler_artifact_digest: &str,
     packages: &[ResolvedLocalPackage<'_>],
 ) -> bool {
-    capture(
+    current_basis(
+        witness,
         program,
-        program_source_digest,
-        lock_digest,
-        compiler_artifact_digest,
-        packages,
+        &CheckedImportBasis {
+            program_source_digest,
+            version_source_digest: None,
+            lock_digest,
+            compiler_artifact_digest,
+            packages,
+        },
     )
-    .is_ok_and(|fresh| fresh == *witness)
+}
+
+/// Revalidate a checked admission that may use a composite host-version
+/// source identity. A current check must recapture both source identities from
+/// the same immutable program/package snapshot as the checked IR.
+pub fn current_basis(
+    witness: &ProgramImportWitness,
+    program: &IrProgram,
+    basis: &CheckedImportBasis<'_>,
+) -> bool {
+    capture_basis(program, basis).is_ok_and(|fresh| fresh == *witness)
 }
 
 #[cfg(test)]
@@ -182,6 +196,55 @@ mod tests {
         assert!(capture_basis(&ir, &basis)
             .unwrap_err()
             .contains("version source must have an exact lowercase SHA-256 digest"));
+    }
+
+    #[test]
+    fn composite_version_currentness_requires_both_source_identities() {
+        let ir = program("use local.x\nworkflow Checked\n");
+        let package = ResolvedLocalPackage {
+            name: "local.x",
+            package_id: "pkg-x",
+            version: "1",
+            source_digest: A,
+        };
+        let basis = CheckedImportBasis {
+            program_source_digest: A,
+            version_source_digest: Some(B),
+            lock_digest: C,
+            compiler_artifact_digest: D,
+            packages: &[package],
+        };
+        let witness = capture_basis(&ir, &basis).expect("composite witness");
+        assert!(current_basis(&witness, &ir, &basis));
+        assert!(!current(&witness, &ir, A, C, D, &[package]));
+        assert!(!current_basis(
+            &witness,
+            &ir,
+            &CheckedImportBasis {
+                version_source_digest: Some(A),
+                ..basis
+            }
+        ));
+        assert!(!current_basis(
+            &witness,
+            &ir,
+            &CheckedImportBasis {
+                program_source_digest: B,
+                ..basis
+            }
+        ));
+        let changed_source = ResolvedLocalPackage {
+            source_digest: B,
+            ..package
+        };
+        assert!(!current_basis(
+            &witness,
+            &ir,
+            &CheckedImportBasis {
+                packages: &[changed_source],
+                ..basis
+            }
+        ));
     }
 
     #[cfg(feature = "native")]

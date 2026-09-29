@@ -220,7 +220,7 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
-    use crate::{NewProgramVersion, SqliteStore};
+    use crate::{NewInstance, NewProgramVersion, SqliteStore};
 
     const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SOURCE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -487,6 +487,135 @@ mod tests {
             )
             .unwrap();
         assert_eq!(operations, 0);
+    }
+
+    #[test]
+    fn checked_reattestation_moves_the_instance_with_its_import_witness() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .create_program_version_with_import_witness(version("rechecked"), &witness(LOCK))
+            .unwrap();
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &first.program_id,
+                version_id: &first.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let before_checked_refusals = store.program_import_operation_roster().unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                "missing-instance",
+                NewProgramVersion {
+                    ir_hash: NEXT_LOCK,
+                    ..version("rechecked")
+                },
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("unknown instance")
+        ));
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                NewProgramVersion {
+                    source_hash: NEXT_LOCK,
+                    ir_hash: NEXT_LOCK,
+                    ..version("rechecked")
+                },
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("same authored program")
+        ));
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                version("rechecked"),
+                &witness(LOCK),
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("changed compiler IR")
+        ));
+        let mut wrong_source = witness(LOCK);
+        wrong_source.program_source_digest = NEXT_LOCK.into();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: NEXT_LOCK,
+                    ..version("rechecked")
+                },
+                &wrong_source,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("program source differs")
+        ));
+        assert_eq!(
+            store.program_import_operation_roster().unwrap(),
+            before_checked_refusals
+        );
+        assert_eq!(
+            store
+                .get_instance(&instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            first.version_id
+        );
+        let changed = NewProgramVersion {
+            ir_hash: NEXT_LOCK,
+            ..version("rechecked")
+        };
+        let checked = store
+            .reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                changed,
+                &witness(LOCK),
+            )
+            .unwrap();
+        assert_ne!(checked.version_id, first.version_id);
+        assert_eq!(
+            store
+                .get_instance(&instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            checked.version_id
+        );
+        assert_eq!(
+            store
+                .program_import_witness(&checked.version_id, &checked.witness_digest)
+                .unwrap(),
+            Some(witness(LOCK))
+        );
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.operations.len(), 2);
+        assert_eq!(
+            roster.operations[1].kind,
+            ProgramImportOperationKind::Checked
+        );
+        assert_eq!(
+            roster.operations[1].witness_digest.as_deref(),
+            Some(checked.witness_digest.as_str())
+        );
+
+        let mut bad = witness(LOCK);
+        bad.edge_digest = NEXT_LOCK.into();
+        let refused = store.reattest_instance_program_with_import_witness(
+            &instance.instance_id,
+            NewProgramVersion {
+                ir_hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                ..version("rechecked")
+            },
+            &bad,
+        );
+        assert!(refused.is_err());
+        assert_eq!(store.program_import_operation_roster().unwrap(), roster);
+        assert_eq!(
+            store
+                .get_instance(&instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            checked.version_id
+        );
     }
 
     #[test]
