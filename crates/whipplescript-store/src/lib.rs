@@ -79,6 +79,8 @@ pub mod tracker_result;
 pub use whipplescript_core::freshness;
 pub use whipplescript_core::selection;
 pub mod skill_frontmatter;
+#[cfg(feature = "native")]
+pub mod source_review;
 pub mod stat_cache;
 pub mod text_merge;
 pub mod transfer;
