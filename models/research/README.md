@@ -515,3 +515,27 @@ pending operations and requires an unchanged global journal revision. Under
 continuous admissions either condition can starve the gate. A usable design
 needs a sealed cut and an explicit rule for admissions after that cut, including
 their dependency and historical-pin obligations.
+
+`home_epoch_cut.py` probes one way to remove that global quiescence condition:
+
+```sh
+python3 models/research/home_epoch_cut.py
+```
+
+The Home atomically seals the set of already accepted operations in an epoch.
+Unfinished registrations retain their original epoch and are recognized as
+next-epoch work at completion; a shard write from before the seal needs
+revalidation before Home completion. New operations
+also enter the next epoch, while a run on an older exact version records a
+temporal pin obligation. The gate checks the immutable candidate cut and ref
+base, so later journal writes do not by themselves invalidate its work. The
+probe reaches 1,023 safe states through ten transitions and exposes six
+shortcuts: dropping a pending operation, allowing one to enter the sealed cut,
+skipping its recheck, omitting an already accepted operation, losing an old
+pin, and trusting a changed ref base. It models one seal and two operations.
+It assumes the Home alone controls when shard evidence becomes usable, that
+the epoch marker and accepted-set snapshot seal atomically, and that completed
+evidence cannot mutate. It does not prove exact dependency routing, what
+revalidation checks, migration/retention for old pins, policy revocation,
+norm-ledger composition, recovery from independent storage failures, or
+implementation cost. No epoch protocol has been selected.
