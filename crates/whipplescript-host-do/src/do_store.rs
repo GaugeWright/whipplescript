@@ -70,6 +70,17 @@ pub enum SqlValue {
     Text(String),
 }
 
+fn runtime_registry_cell(value: SqlValue) -> StoreResult<Option<String>> {
+    match value {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(text) => Ok(Some(text)),
+        SqlValue::Int(_) => Err(StoreError::Fault {
+            subject: "runtime registry digest".to_owned(),
+            detail: "registry query returned an integer column".to_owned(),
+        }),
+    }
+}
+
 /// The DO\'s synchronous SQLite, as the store needs it: run a statement, or run a
 /// query and get back rows of scalars. The Worker shell implements this over
 /// `state.storage.sql`; tests implement it over rusqlite so the ported SQL is
@@ -7118,6 +7129,23 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             Ok(())
         })?;
         Ok(package_ids)
+    }
+
+    fn runtime_registry_digest(&self) -> StoreResult<String> {
+        let mut tables = Vec::with_capacity(runtime_registry_basis::QUERIES.len());
+        for query in runtime_registry_basis::QUERIES {
+            let rows = self.sql.query(query.hosted_sql, &[]).map_err(sql_err)?;
+            let mut table = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut columns = Vec::with_capacity(row.len());
+                for value in row {
+                    columns.push(runtime_registry_cell(value)?);
+                }
+                table.push(columns);
+            }
+            tables.push(table);
+        }
+        runtime_registry_basis::digest(&tables)
     }
 
     fn register_capability_schema(
@@ -17091,6 +17119,78 @@ pub(crate) mod tests {
             store.register_package_manifests(&[valid]).unwrap(),
             ["pkg.first"]
         );
+    }
+
+    #[test]
+    fn runtime_registry_digest_tracks_effective_rows_on_native_and_hosted() {
+        let native = whipplescript_store::SqliteStore::open_in_memory().unwrap();
+        let hosted = store();
+        let with_provider = r#"{
+            "package_id": "pkg.demo", "name": "demo", "version": "1",
+            "capabilities": [{"id": "demo.read", "description": "read"}],
+            "providers": [{"id": "provider.demo", "provider_kind": "local",
+                           "effect_kind": "demo.read", "capability": "demo.read",
+                           "config": {"endpoint": "one"}}],
+            "profiles": [{"id": "profile.demo", "name": "demo-default",
+                          "allowed_capabilities": ["demo.read"]}],
+            "bindings": [{"id": "binding.demo", "capability": "demo.read",
+                          "provider": "local"}]
+        }"#;
+        let without_provider = r#"{
+            "package_id": "pkg.demo", "name": "demo", "version": "2",
+            "capabilities": [{"id": "demo.read", "description": "read"}],
+            "profiles": [{"id": "profile.demo", "name": "demo-default",
+                          "allowed_capabilities": ["demo.read"]}],
+            "bindings": [{"id": "binding.demo", "capability": "demo.read",
+                          "provider": "local"}]
+        }"#;
+
+        let native_empty = native.runtime_registry_digest().unwrap();
+        let hosted_empty = hosted.runtime_registry_digest().unwrap();
+        native.register_package_manifests([with_provider]).unwrap();
+        hosted.register_package_manifests(&[with_provider]).unwrap();
+        let native_first = native.runtime_registry_digest().unwrap();
+        let hosted_first = hosted.runtime_registry_digest().unwrap();
+        assert_ne!(native_empty, native_first);
+        assert_ne!(hosted_empty, hosted_first);
+        assert_eq!(native_first, native.runtime_registry_digest().unwrap());
+        assert_eq!(hosted_first, hosted.runtime_registry_digest().unwrap());
+
+        native
+            .register_package_manifests([without_provider])
+            .unwrap();
+        hosted
+            .register_package_manifests(&[without_provider])
+            .unwrap();
+        let native_stale = native.runtime_registry_digest().unwrap();
+        let hosted_stale = hosted.runtime_registry_digest().unwrap();
+        assert_ne!(native_first, native_stale);
+        assert_ne!(hosted_first, hosted_stale);
+
+        let native_fresh = whipplescript_store::SqliteStore::open_in_memory().unwrap();
+        native_fresh
+            .register_package_manifests([without_provider])
+            .unwrap();
+        let hosted_fresh = store();
+        hosted_fresh
+            .register_package_manifests(&[without_provider])
+            .unwrap();
+        assert_ne!(
+            native_stale,
+            native_fresh.runtime_registry_digest().unwrap()
+        );
+        assert_ne!(
+            hosted_stale,
+            hosted_fresh.runtime_registry_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_registry_digest_refuses_unexpected_integer_cell() {
+        assert!(matches!(
+            runtime_registry_cell(SqlValue::Int(1)),
+            Err(StoreError::Fault { subject, .. }) if subject == "runtime registry digest"
+        ));
     }
 
     /// DO package bootstrap (spec/durable-object-runtime-tracker.md): a fresh DO

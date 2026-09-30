@@ -66,6 +66,7 @@ pub mod reconcile;
 pub mod ref_authority;
 #[cfg(feature = "native")]
 mod runtime_protection;
+pub mod runtime_registry_basis;
 #[cfg(feature = "native")]
 pub use runtime_protection::RuntimeEventMetadata;
 pub mod tracker_closure;
@@ -8891,6 +8892,9 @@ pub trait RuntimeStore {
     /// Register a logical manifest set atomically, including its provider and
     /// binding fan-out. A failed member must leave none of the set installed.
     fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>>;
+    /// Digest the effective package, schema, provider, profile and binding rows
+    /// in one local store snapshot. This is not a Home coverage certificate.
+    fn runtime_registry_digest(&self) -> StoreResult<String>;
     fn register_capability_schema(
         &self,
         capability: CapabilitySchemaRegistration<'_>,
@@ -9653,6 +9657,9 @@ impl RuntimeStore for SqliteStore {
     }
     fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>> {
         SqliteStore::register_package_manifests(self, manifests.iter().copied())
+    }
+    fn runtime_registry_digest(&self) -> StoreResult<String> {
+        SqliteStore::runtime_registry_digest(self)
     }
     fn register_capability_schema(
         &self,

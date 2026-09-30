@@ -477,6 +477,10 @@ impl RuntimeStore for NativeStores {
             .register_package_manifests(manifests.iter().copied())
     }
 
+    fn runtime_registry_digest(&self) -> StoreResult<String> {
+        self.runtime.runtime_registry_digest()
+    }
+
     fn register_capability_schema(
         &self,
         capability: CapabilitySchemaRegistration<'_>,
