@@ -641,3 +641,19 @@ evidence, re-attestation, and item-to-operation use pin as atomic premises.
 GaugeDesk's in-process Workbench mutex and a filesystem directory scan do not
 establish those premises across processes or restores. The probe supplies a
 necessary cutover shape, not a product migration or Home-wide proof.
+
+`embedded_seed_coverage.py` isolates the embedded-standard-package seed from
+the program import operation:
+
+```sh
+python3 models/research/embedded_seed_coverage.py
+```
+
+It explores 24 safe states with one binary upgrade and one retained program.
+Five weakened paths expose a seed write without a Home pointer, pending use,
+binary-only coverage over mutable provider rows, stale retained use, and an
+unfenced provider mutation. This assumes exact effective-row readback and a
+use door; it does not prove either or choose between a journaled seed
+acceptance and exclusively owned artifact materialization. The [research
+note](../../spec/branch-trunk-gate-research-note.md#1210-embedded-package-bytes-are-not-the-live-provider-registry-2026-09-30-probe)
+records the two implementation shapes and their remaining obligations.
