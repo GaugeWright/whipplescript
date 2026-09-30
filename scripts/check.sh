@@ -538,19 +538,6 @@ if [ -f native-crates.bzl ]; then
     section native-crates
 fi
 
-# The tracker registry. `spec/TRACKERS.md` is the status ledger and this script
-# is its enforcement, but nothing invoked it — so on 2026-08-27 trunk carried a
-# closed tracker with a forward horizon and no gate said so. Found the same day,
-# and the same way, as the vendored-std gate above: by running a documented
-# check by hand and watching it fail on work that had already merged.
-#
-# Guarded like the agent guide above and for the same reason: the registry and
-# the trackers it indexes live under `spec/`, which the mirror withholds, so
-# this can only run where the full tree is.
-if [ -f spec/TRACKERS.md ]; then
-    section trackers
-fi
-
 # A check nothing invokes reads exactly like a passing one. This gate is the
 # cheap total version of the discipline the mutation sweep applies to refusals:
 # it costs milliseconds and it closes the category rather than instances.

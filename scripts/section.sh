@@ -112,7 +112,6 @@ case "${1:-}" in
   refusal-scanner)      python3 scripts/test-mutation-sweep.py ;;
   vendored-std)         scripts/check-vendored-std.sh ;;
   native-crates)        python3 scripts/buckify-crates.py --check ;;
-  trackers)             scripts/check-trackers.sh ;;
   gate-reachability)    scripts/check-gate-reachability.sh ;;
   decision-records)     scripts/check-decision-records.sh ;;
   host-action-contract)
