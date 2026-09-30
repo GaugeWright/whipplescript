@@ -504,6 +504,12 @@ mod tests {
         let exact = crate::RuntimeStore::program_import_operation(&store, OPERATION_ID)
             .unwrap()
             .unwrap();
+        assert!(crate::RuntimeStore::program_import_operation(
+            &store,
+            "imp_ffffffffffffffffffffffffffffffff"
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(exact.version_id, checked.version_id);
         assert_eq!(
             exact.witness_digest.as_deref(),

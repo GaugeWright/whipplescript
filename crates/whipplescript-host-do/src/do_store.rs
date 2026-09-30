@@ -5635,6 +5635,36 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         })
     }
 
+    fn program_import_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<whipplescript_store::program_imports::ProgramImportOperation>> {
+        use whipplescript_store::program_imports::ProgramImportOperation;
+
+        let rows = self
+            .sql
+            .query(
+                "SELECT sequence, operation_id, version_id, witness_digest, kind \
+                 FROM program_import_operations WHERE operation_id = ?1",
+                &[text(operation_id)],
+            )
+            .map_err(sql_err)?;
+        rows.first()
+            .map(|row| {
+                ProgramImportOperation::from_stored_row(
+                    as_i64(&row[0]),
+                    as_text(&row[1]),
+                    as_text(&row[2]),
+                    match &row[3] {
+                        SqlValue::Null => None,
+                        value => Some(as_text(value)),
+                    },
+                    &as_text(&row[4]),
+                )
+            })
+            .transpose()
+    }
+
     fn reattest_instance_program(
         &mut self,
         instance_id: &str,
@@ -15282,6 +15312,10 @@ pub(crate) mod tests {
             .program_import_operation(OPERATION_ID)
             .unwrap()
             .unwrap();
+        assert!(store
+            .program_import_operation("imp_ffffffffffffffffffffffffffffffff")
+            .unwrap()
+            .is_none());
         assert_eq!(exact.version_id, accepted.version_id);
         assert_eq!(
             exact.witness_digest.as_deref(),

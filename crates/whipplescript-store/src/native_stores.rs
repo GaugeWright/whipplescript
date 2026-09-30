@@ -207,6 +207,13 @@ impl RuntimeStore for NativeStores {
         self.runtime.program_import_operation_roster()
     }
 
+    fn program_import_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<crate::program_imports::ProgramImportOperation>> {
+        self.runtime.program_import_operation(operation_id)
+    }
+
     fn reattest_instance_program(
         &mut self,
         instance_id: &str,

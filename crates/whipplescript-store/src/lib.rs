@@ -2082,6 +2082,44 @@ impl SqliteStore {
         })
     }
 
+    /// Read one immutable accepting operation through its unique key. Home
+    /// pointer completion and retained use must not load every operation ever
+    /// admitted to this runtime just to verify one target row.
+    pub fn program_import_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportOperation>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT sequence, operation_id, version_id, witness_digest, kind \
+                 FROM program_import_operations WHERE operation_id = ?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(sequence, operation_id, version_id, witness_digest, kind)| {
+                program_imports::ProgramImportOperation::from_stored_row(
+                    sequence,
+                    operation_id,
+                    version_id,
+                    witness_digest,
+                    &kind,
+                )
+            },
+        )
+        .transpose()
+    }
+
     fn create_program_version_retained(
         &mut self,
         version: NewProgramVersion<'_>,
@@ -9173,6 +9211,12 @@ impl RuntimeStore for SqliteStore {
         &self,
     ) -> StoreResult<program_imports::ProgramImportOperationRoster> {
         self.program_import_operation_roster()
+    }
+    fn program_import_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportOperation>> {
+        self.program_import_operation(operation_id)
     }
     fn reattest_instance_program(
         &mut self,
