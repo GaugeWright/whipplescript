@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { makeBridge, recordExternalToolCall } from "./index";
 import { WasmDurableInstance } from "../pkg/whipplescript_host_do_bg.js";
+import * as runtimeBindings from "../pkg/whipplescript_host_do_bg.js";
 import { wasmArtifactDigest } from "../pkg/wasm-artifact-digest";
 import DO_SCHEMA from "../do_schema.sql";
 // workerd-production-object
@@ -809,6 +810,117 @@ describe("real WorkflowInstance hibernation", () => {
         status: 200,
         body: { outcome: "interrupted" },
       });
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
+  it.each(["running", "kernel-cancelled"])("recovers a public %s orphan after eviction without redispatch", async (phase) => {
+    const sessionId = `session-orphan-stop-${phase}`;
+    const requestId = "orphan";
+    const commandId = `public:${sessionId}:${requestId}`;
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const providerFetch = vi.fn(async () => new Response([
+      'data: {"type":"response.output_text.delta","delta":"next turn"}', "",
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1}}}', "",
+    ].join("\n"), { headers: { "content-type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", providerFetch);
+    const seed = await runInDurableObject(stub, async (instance, state) => {
+      const session = (await state.storage.get("public-session-state")) as {
+        instance_ref: string; package_version_ref: string; envelope_hash: string; policy_key_id?: string;
+        package: { manifest: string; source: string; system_prompt: string };
+        host_policy: { epoch: number; signed_envelope: string; expected_signer: string; signer_public_key_hex: string };
+      };
+      const admission = instance as unknown as {
+        sessionAdmissionCommand(session: unknown, command: string, body: Record<string, unknown>): Promise<Record<string, unknown> | Response>;
+      };
+      const reserved = await admission.sessionAdmissionCommand(session, "admit", { request_id: requestId });
+      if (reserved instanceof Response) throw new Error(`synthetic admission failed (${reserved.status})`);
+      runtimeBindings.host_begin_turn(
+        makeBridge(state.storage), session.host_policy.signed_envelope,
+        session.host_policy.expected_signer, session.host_policy.signer_public_key_hex,
+        JSON.stringify({ protocol: "whipplescript.host.v1", command_id: commandId,
+          run_ref: `public:run:${sessionId}:${requestId}`, instance_ref: session.instance_ref,
+          package_version_ref: session.package_version_ref,
+          policy: { epoch: session.host_policy.epoch, envelope_hash: session.envelope_hash, signer: session.host_policy.expected_signer, ...(session.policy_key_id ? { key_id: session.policy_key_id } : {}) },
+          actor_ref: "audience", input: { text: "orphan", images: [] }, resources: [],
+          provider_binding: { binding_id: "model", credential: { credential_id: "managed-openai" } }, placement_ceiling_ref: "do" }),
+        session.package.manifest, session.package.source, session.package.system_prompt,
+        undefined, "openai", "gpt-test", "https://api.openai.com/v1/responses",
+      );
+      const handle = runtimeBindings.WasmDurableInstance.attach_host(
+        makeBridge(state.storage), session.instance_ref, session.package.manifest,
+        session.package.source, session.package.system_prompt, undefined,
+        JSON.stringify({ provider: "openai", model: "gpt-test", base_url: "https://api.openai.com/v1/responses", api_key: "synthetic-unused-key" }),
+      );
+      const kind = JSON.parse(handle.step(undefined, Date.now())).kind;
+      handle.free();
+      const snapshot = JSON.parse(state.storage.sql.exec<{ snapshot_json: string }>(
+        "SELECT snapshot_json FROM agent_turn_snapshots WHERE effect_id=?1", commandId,
+      ).one().snapshot_json);
+      snapshot.usage = { input_tokens: 7, output_tokens: 3 }; // synthetic observed counters
+      state.storage.sql.exec("UPDATE agent_turn_snapshots SET snapshot_json=?1 WHERE effect_id=?2", JSON.stringify(snapshot), commandId);
+      state.storage.sql.exec("INSERT INTO public_turn_binding (singleton, request_id, command_id) VALUES (1, ?1, ?2)", requestId, commandId);
+      await state.storage.put("public-transcript", [{ type: "user", text: "orphan" }]);
+      if (phase === "kernel-cancelled") {
+        runtimeBindings.host_cancel_turn(makeBridge(state.storage), session.instance_ref, commandId, "public-audience");
+        const resumed = runtimeBindings.WasmDurableInstance.attach_host(
+          makeBridge(state.storage), session.instance_ref, session.package.manifest,
+          session.package.source, session.package.system_prompt, undefined, undefined,
+        );
+        const recovered = resumed.recover_cancelled_host_turn(commandId);
+        resumed.free();
+        if (!recovered) throw new Error("synthetic kernel settlement failed");
+      }
+      return { kind, instanceId: session.instance_ref, reservationRef: reserved.reservation_ref };
+    });
+    expect(seed.kind).toBe("needs_http");
+    await evictDurableObject(stub);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", snapshot: { active_turn: { request_id: requestId } } });
+    // Await the real handler on the authenticated, rehydrated server socket;
+    // this names a missing terminal directly without an arbitrary poll timeout.
+    const stopViaAttachedSocket = () => runInDurableObject(namespace.get(namespace.idFromName(sessionId)), async (instance, state) => {
+      await (instance as unknown as { webSocketMessage(socket: WebSocket, message: string): Promise<void> }).webSocketMessage(
+        state.getWebSockets()[0], JSON.stringify({ type: "stop", request_id: requestId }),
+      );
+    });
+    await stopViaAttachedSocket();
+    const recoveredState = async () => runInDurableObject(namespace.get(namespace.idFromName(sessionId)), async (_instance, state) => ({
+      terminal: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM public_session_events WHERE json_extract(event_json,'$.type')='turn_terminal' AND json_extract(event_json,'$.command_id')=?1", commandId).one().count,
+      kernelTerminal: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM events WHERE instance_id=?1 AND event_type='effect.terminal' AND json_extract(payload_json,'$.effect_id')=?2", seed.instanceId, commandId).one().count,
+      binding: state.storage.sql.exec("SELECT request_id FROM public_turn_binding WHERE request_id=?1", requestId).toArray().length,
+      projection: JSON.parse(runtimeBindings.host_project_turn(makeBridge(state.storage), seed.instanceId, commandId)),
+      result: await state.storage.get(`public-turn-result:${requestId}`),
+    }));
+    const recovered = await recoveredState();
+    expect(recovered).toMatchObject({ terminal: 1, kernelTerminal: 1, binding: 0,
+      projection: { receipt: { status: "cancelled" }, usage_observation: { input_tokens: 7, output_tokens: 3 } },
+      result: { type: "turn_terminal", body: { outcome: "interrupted", receipt: { status: "cancelled" } } } });
+    expect(providerFetch).not.toHaveBeenCalled();
+    const deploymentNamespace = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const admissionState = () => runInDurableObject(deploymentNamespace.get(deploymentNamespace.idFromName("theory-a-test")), async (_instance, state) => ({
+      reservationRef: await state.storage.get(`reservation:${sessionId}:${requestId}`),
+      release: await state.storage.get<number>(`operation:${sessionId}:release`),
+    }));
+    expect(await admissionState()).toEqual({ reservationRef: seed.reservationRef, release: 1 });
+    // Replay after projection (and after a kernel-only crash above) neither
+    // redispatches the provider nor duplicates the terminal evidence.
+    await stopViaAttachedSocket();
+    expect((await admissionState()).release).toBe(2);
+    expect(await recoveredState()).toMatchObject({ terminal: 1, kernelTerminal: 1, binding: 0 });
+    expect((await admissionState()).reservationRef).toBe(seed.reservationRef);
+    expect(providerFetch).not.toHaveBeenCalled();
+    socket.send(JSON.stringify({ type: "send_message", request_id: "after-recovery", text: "continue" }));
+    let nextTerminal: Record<string, unknown> | undefined;
+    for (let index = 0; index < 50; index++) {
+      const message = await nextMessage(socket);
+      if (message.type === "turn_terminal" && message.request_id === "after-recovery") { nextTerminal = message; break; }
+      if (message.type === "error") throw new Error(`public follow-up failed: ${JSON.stringify(message)}`);
+    }
+    expect(nextTerminal).toMatchObject({ status: 200, body: { outcome: "terminal" } });
+    expect(providerFetch).toHaveBeenCalledOnce();
     vi.unstubAllGlobals();
     socket.close(1000, "done");
   });

@@ -1,3 +1,4 @@
+import { HostedTurnLifetimes } from "./hosted-turn-lifetimes";
 import { transportFailureObservation } from "./transport-failure";
 import { ExecutorController } from "./executor-controller";
 import { ExecutorControllerRoutes } from "./executor-controller-routes";
@@ -1509,6 +1510,7 @@ function isMediaType(value: unknown): value is string {
 export class WorkflowInstance implements DurableObject {
   private executorLifetimeRun?: Promise<void>;
   private readonly liveModelContext = new LiveModelContext();
+  private readonly hostedTurnLifetimes = new HostedTurnLifetimes();
   private readonly turnStreams = new Map<
     string,
     Set<ReadableStreamDefaultController<Uint8Array>>
@@ -1799,6 +1801,9 @@ export class WorkflowInstance implements DurableObject {
             "gaugedesk-control-plane",
           ),
         );
+        const instanceId = decodeURIComponent(cancel[1]);
+        const commandId = decodeURIComponent(cancel[2]);
+        await this.recoverCancelledHostedTurn(instanceId, commandId);
         await this.scheduleExecutorLifetimes();
         await this.armAlarm();
         return Response.json(receipt, { status: 202 });
@@ -2972,14 +2977,15 @@ export class WorkflowInstance implements DurableObject {
         }
         const commandId = publicCommandId(publicSession.session_id, requestId);
         this.publishPublicActivity(commandId, "stopping");
-        const receipt = JSON.parse(
-          hostFunctions.host_cancel_turn(
-            makeBridge(this.ctx.storage),
-            instanceId,
-            commandId,
-            "public-audience",
-          ),
-        );
+        const projection = JSON.parse(hostFunctions.host_project_turn(
+          makeBridge(this.ctx.storage), instanceId, commandId,
+        )) as { receipt?: { status?: unknown } };
+        const receipt = projection.receipt?.status === "cancelled"
+          ? projection.receipt
+          : JSON.parse(hostFunctions.host_cancel_turn(
+            makeBridge(this.ctx.storage), instanceId, commandId, "public-audience",
+          ));
+        const recovered = await this.recoverCancelledHostedTurn(instanceId, commandId, true);
         await this.scheduleExecutorLifetimes();
         await this.armAlarm();
         this.appendPublicEvent({
@@ -2998,6 +3004,9 @@ export class WorkflowInstance implements DurableObject {
           receipt,
           compatibility_alias: true,
         }, `turn-stopped-compat:${commandId}`);
+        if (recovered) {
+          await this.publishRecoveredPublicCancellation(publicSession, requestId, commandId);
+        }
         return;
       }
       if (attachment?.publicSession) {
@@ -3016,6 +3025,66 @@ export class WorkflowInstance implements DurableObject {
           : {}),
       }));
     }
+  }
+
+  private async recoverCancelledHostedTurn(
+    instanceId: string,
+    commandId: string,
+    includeSettledCancellation = false,
+  ): Promise<boolean> {
+    const packageDocs = await this.ctx.storage.get<HostPackageDocuments>(`host-package:${instanceId}`);
+    if (!packageDocs) return false;
+    const recovered = this.hostedTurnLifetimes.recoverIfIdle(`${instanceId}\0${commandId}`, () => {
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage), instanceId, packageDocs.manifest,
+        packageDocs.source, packageDocs.system_prompt, packageDocs.project_context,
+        undefined,
+      );
+      try {
+        if (instance.recover_cancelled_host_turn(commandId)) return true;
+        if (!includeSettledCancellation) return false;
+        // Retry the narrow crash window after kernel settlement but before the
+        // public reservation/terminal projection. The kernel remains authoritative.
+        const projection = JSON.parse(hostFunctions.host_project_turn(
+          makeBridge(this.ctx.storage), instanceId, commandId,
+        )) as { receipt?: { status?: unknown } };
+        return projection.receipt?.status === "cancelled";
+      } finally {
+        instance.free();
+      }
+    });
+    if (recovered) {
+      this.liveModelContext.clear(`${instanceId}\0${commandId}`);
+      this.ctx.storage.sql.exec(
+        "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+        instanceId, commandId,
+      );
+      this.finishHostTurnStream(instanceId, commandId);
+    }
+    return recovered;
+  }
+
+  private async publishRecoveredPublicCancellation(
+    session: PublicSessionState,
+    requestId: string,
+    commandId: string,
+  ): Promise<void> {
+    // A running public effect was admitted before it was dispatched. Replaying
+    // that exact request retrieves its existing reservation even after expiry;
+    // the admission owner releases it idempotently, without new provider spend.
+    const reservation = await this.sessionAdmissionCommand(session, "admit", { request_id: requestId });
+    if (reservation instanceof Response) throw new Error(`cancellation reservation lookup failed (${reservation.status})`);
+    const released = await this.sessionAdmissionCommand(session, "release", {
+      reservation_ref: reservation.reservation_ref,
+    });
+    if (released instanceof Response) throw new Error(`cancellation reservation release failed (${released.status})`);
+    const projection = JSON.parse(hostFunctions.host_project_turn(
+      makeBridge(this.ctx.storage), session.instance_ref, commandId,
+    )) as { receipt?: { status?: unknown } };
+    if (projection.receipt?.status !== "cancelled") throw new Error("public cancellation requires kernel settlement");
+    await this.publishPublicTurnResult(session.instance_ref, requestId, Response.json({
+      admitted: true, command_id: commandId, outcome: "interrupted", receipt: projection.receipt,
+    }));
   }
 
   private async publishPublicTurnResult(
@@ -3039,7 +3108,8 @@ export class WorkflowInstance implements DurableObject {
       command_id: commandId,
       status: result.status,
       body,
-    });
+    }, (body as { receipt?: { status?: unknown } } | null)?.receipt?.status === "cancelled"
+      ? `turn-terminal:${commandId}` : undefined);
     await this.ctx.storage.put(`public-turn-result:${requestId}`, terminal);
     return terminal;
   }
@@ -5384,7 +5454,7 @@ export class WorkflowInstance implements DurableObject {
         }),
         ...this.normGate(),
       );
-      const driven = await this.driveInstance(
+      const driven = await this.hostedTurnLifetimes.drive(`${instanceId}\0${commandId}`, () => this.driveInstance(
         instance,
         instanceId,
         binding,
@@ -5393,7 +5463,7 @@ export class WorkflowInstance implements DurableObject {
         (activity) => this.publishPublicActivity(commandId, activity),
         managedTokenLimit,
         sourceHandles,
-      );
+      ));
       this.liveModelContext.clear(`${instanceId}\0${commandId}`);
       const runtimeProjection = JSON.parse(
         hostFunctions.host_project_turn(

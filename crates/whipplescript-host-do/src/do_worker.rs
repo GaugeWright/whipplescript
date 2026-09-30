@@ -838,6 +838,119 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         self.coerce.as_ref().map(|config| config.backend)
     }
 
+    /// Settle an abandoned in-isolate agent turn after its durable cancellation.
+    /// The Worker must prove there is no active drive for this exact turn before
+    /// attaching this handle. No model/tool dispatch occurs on this path.
+    pub fn recover_cancelled_host_turn(&mut self, command_id: &str) -> Result<bool, String> {
+        use whipplescript_kernel::harness_loop::{
+            provider_result_from_brokered_turn, BrokeredTurnOutcome, BrokeredTurnSnapshot,
+            TurnStatus,
+        };
+        if self.in_flight.is_some() {
+            return Err("cancellation recovery requires an inactive host handle".to_owned());
+        }
+        let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+        let effect = kernel
+            .store()
+            .list_effects(&self.instance_id)
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .find(|effect| effect.effect_id == command_id)
+            .ok_or("cancelled hosted turn effect not found")?;
+        if matches!(
+            effect.status.as_str(),
+            "completed" | "failed" | "timed_out" | "cancelled"
+        ) {
+            return Ok(false);
+        }
+        if effect.kind != "agent.tell" || effect.status != "running" {
+            // These retain their existing owner/cooperative cancellation path.
+            // This recovery operation owns only abandoned in-isolate turns.
+            return Ok(false);
+        }
+        if !kernel
+            .store()
+            .effect_has_open_cancellation_request(&self.instance_id, command_id)
+            .map_err(|error| format!("{error:?}"))?
+        {
+            return Err("cancellation recovery requires a durable cancellation request".to_owned());
+        }
+        let runs: Vec<_> = kernel
+            .store()
+            .list_runs(&self.instance_id)
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .filter(|run| run.effect_id == command_id && run.status == "running")
+            .collect();
+        if runs.len() != 1 {
+            return Err("cancellation recovery requires one in-isolate agent run".to_owned());
+        }
+        if runs[0].provider != "agent" || runs[0].worker_id != "whip-worker" {
+            // Executor/container runs are settled by their own reconciliation.
+            return Ok(false);
+        }
+        let run = &runs[0];
+        let json = crate::do_store::do_load_agent_snapshot(&kernel.store().sql, command_id)
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or("cancellation recovery requires a durable agent snapshot")?;
+        let snapshot: BrokeredTurnSnapshot = serde_json::from_str(&json)
+            .map_err(|_| "cancellation recovery cannot read the durable agent snapshot")?;
+        if !snapshot.started {
+            return Err("cancellation recovery requires a started agent snapshot".to_owned());
+        }
+        // Retain observed usage and transcript provenance. An unobserved model
+        // reply is never fabricated as success or as measured zero usage.
+        if snapshot.message_provenance.len() == snapshot.messages.len() {
+            let hash = whipplescript_kernel::exec_http::sha256_hex(
+                whipplescript_kernel::harness_loop::chat_messages_to_json(&snapshot.messages)
+                    .to_string()
+                    .as_bytes(),
+            );
+            let labels = serde_json::to_string(&snapshot.message_provenance)
+                .map_err(|_| "cancellation recovery cannot encode source identities")?;
+            crate::do_store::do_save_agent_source_identities(
+                &kernel.store().sql,
+                command_id,
+                &hash,
+                &labels,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        }
+        let outcome = BrokeredTurnOutcome {
+            status: TurnStatus::Cancelled,
+            summary: "turn cancelled by request".to_owned(),
+            steps: snapshot.step,
+            observations: snapshot.observations,
+            usage: snapshot.usage,
+            last_input_tokens: snapshot.last_input_tokens,
+            structured_result_json: None,
+        };
+        let result = provider_result_from_brokered_turn(&outcome);
+        let lease = idempotency_key(&[&self.instance_id, command_id, "agent-lease"]);
+        kernel
+            .settle_provider_run_result(
+                whipplescript_kernel::AgentTurnExecution {
+                    instance_id: &self.instance_id,
+                    effect_id: command_id,
+                    run_id: &run.run_id,
+                    provider: &run.provider,
+                    worker_id: &run.worker_id,
+                    lease_id: &lease,
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    agent: effect.target.as_deref().unwrap_or("agent"),
+                    profile: None,
+                    input_json: &effect.input_json,
+                    skill_names: &[],
+                },
+                &run.metadata_json,
+                &result,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        crate::do_store::do_delete_agent_snapshot(&kernel.store().sql, command_id)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(true)
+    }
+
     /// Capture a restorable consistent-cut checkpoint (DO parity P3 — the
     /// operator-command counterpart to the CLI `whip checkpoint`). Refuses if an
     /// effect is mid-run.
@@ -1094,6 +1207,350 @@ fn test_ports() -> DurableEffectPorts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stranded_host_turn_fixture() -> (
+        crate::do_store::test_support::RusqliteDoSql,
+        DurableInstance<crate::do_store::test_support::RusqliteDoSql>,
+        String,
+        String,
+    ) {
+        struct NeverFetch;
+        impl HttpModelClient for NeverFetch {
+            fn build_request(
+                &self,
+                _: &[whipplescript_kernel::harness_loop::ChatMessage],
+                _: &[whipplescript_kernel::harness_loop::ToolSpec],
+            ) -> HttpRequest {
+                HttpRequest {
+                    url: "https://synthetic.invalid/model".into(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({}),
+                    model_provenance: None,
+                }
+            }
+            fn parse_response(
+                &self,
+                _: Result<HttpResponse, TransportError>,
+            ) -> Result<
+                whipplescript_kernel::harness_loop::ModelReply,
+                whipplescript_kernel::harness_loop::HarnessModelError,
+            > {
+                panic!("orphaned cancellation must never call a model");
+            }
+        }
+        let source = r#"workflow AgentRecovery
+output result Done
+class Done { ok int }
+agent helper { provider owned profile "repo-reader" capacity 1 }
+rule go when started => {
+  tell helper as reply "Held synthetic turn"
+  after reply succeeds { complete result { ok 1 } }
+  after reply fails { complete result { ok 0 } }
+}
+"#;
+        let base = store();
+        for statement in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('agent.tell', 'Run agent', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] { base.sql.execute(statement, &[]).expect("seed provider"); }
+        let sql = base.sql;
+        let mut instance = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/AgentRecovery",
+            DurableEffectPorts {
+                agent_model: Some(Box::new(NeverFetch)),
+                ..test_ports()
+            },
+            &[],
+            &[],
+        )
+        .expect("create");
+        assert!(matches!(
+            instance.step(None, 0),
+            DurableStepOutcome::NeedsHttp(_)
+        ));
+        let effect = instance
+            .kernel
+            .as_ref()
+            .unwrap()
+            .store()
+            .list_effects(&instance.instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|effect| effect.status == "running")
+            .unwrap();
+        (sql, instance, source.to_owned(), effect.effect_id)
+    }
+
+    fn request_fixture_cancellation(
+        sql: &crate::do_store::test_support::RusqliteDoSql,
+        instance: &str,
+        effect: &str,
+    ) {
+        let mut store = DoSqliteStore::new(sql.clone());
+        store
+            .request_effect_cancellation(whipplescript_store::EffectCancellationRequest {
+                instance_id: instance,
+                effect_id: effect,
+                revision_id: None,
+                reason: Some("synthetic stop"),
+                requested_by: "test",
+                causation_event_id: None,
+                idempotency_key: Some("cancel-existing-turn"),
+            })
+            .expect("request cancellation");
+    }
+
+    #[test]
+    fn persisted_cancelled_host_turn_recovers_once_without_bootstrap_or_model() {
+        use crate::do_store::SqlValue;
+        let (sql, mut old, source, effect) = stranded_host_turn_fixture();
+        let instance_id = old.instance_id.clone();
+        request_fixture_cancellation(&sql, &instance_id, &effect);
+        assert_eq!(
+            old.recover_cancelled_host_turn(&effect).unwrap_err(),
+            "cancellation recovery requires an inactive host handle"
+        );
+        assert!(old
+            .checkpoint("before-recovery")
+            .err()
+            .expect("running effect must refuse checkpoint")
+            .contains("quiescent"));
+        let json = crate::do_store::do_load_agent_snapshot(&sql, &effect)
+            .unwrap()
+            .unwrap();
+        let mut snapshot: whipplescript_kernel::harness_loop::BrokeredTurnSnapshot =
+            serde_json::from_str(&json).unwrap();
+        snapshot.usage = serde_json::json!({"input_tokens":7,"output_tokens":3});
+        crate::do_store::do_save_agent_snapshot(
+            &sql,
+            &effect,
+            &serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+        drop(old);
+        let path =
+            std::env::temp_dir().join(format!("ws-cancel-reopen-{}.sqlite", std::process::id()));
+        sql.execute(
+            "VACUUM INTO ?1",
+            &[SqlValue::Text(path.to_string_lossy().into_owned())],
+        )
+        .unwrap();
+        drop(sql);
+        let sql = crate::do_store::test_support::RusqliteDoSql::open_existing_file(&path);
+        let ir = whipplescript_parser::compile_program(&source).ir.unwrap();
+        let mut resumed = DurableInstance::attach(
+            sql.clone(),
+            ir,
+            &instance_id,
+            "synthetic".into(),
+            8,
+            test_ports(),
+        )
+        .unwrap();
+        assert!(resumed.recover_cancelled_host_turn(&effect).unwrap());
+        assert!(!resumed.recover_cancelled_host_turn(&effect).unwrap());
+        let store = resumed.kernel.as_ref().unwrap().store();
+        assert_eq!(
+            store
+                .list_effects(&instance_id)
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.effect_id == effect)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        let runs = store.list_runs(&instance_id).unwrap();
+        assert_eq!(runs[0].status, "cancelled");
+        assert!(
+            runs[0].metadata_json.contains("\"input_tokens\":7"),
+            "{}",
+            runs[0].metadata_json
+        );
+        assert_eq!(
+            store
+                .list_effect_cancellation_requests(&instance_id)
+                .unwrap()[0]
+                .status,
+            "terminal"
+        );
+        assert_eq!(
+            store
+                .list_events(&instance_id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal")
+                .count(),
+            1
+        );
+        assert!(crate::do_store::do_load_agent_snapshot(&sql, &effect)
+            .unwrap()
+            .is_none());
+        resumed
+            .checkpoint("after-recovery")
+            .expect("settled turn permits checkpoint");
+        drop(resumed);
+        drop(sql);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_host_recovery_refuses_unknown_or_unproved_state() {
+        use crate::do_store::SqlValue;
+        for (case, expected) in [
+            ("unknown", "cancelled hosted turn effect not found"),
+            (
+                "no-request",
+                "cancellation recovery requires a durable cancellation request",
+            ),
+            (
+                "wrong-kind",
+                "cancellation recovery requires a running in-isolate agent turn",
+            ),
+            (
+                "queued",
+                "cancellation recovery requires a running in-isolate agent turn",
+            ),
+            (
+                "wrong-worker",
+                "cancellation recovery requires one in-isolate agent run",
+            ),
+            (
+                "missing-run",
+                "cancellation recovery requires one in-isolate agent run",
+            ),
+            (
+                "missing-snapshot",
+                "cancellation recovery requires a durable agent snapshot",
+            ),
+            (
+                "invalid-snapshot",
+                "cancellation recovery cannot read the durable agent snapshot",
+            ),
+            (
+                "unstarted-snapshot",
+                "cancellation recovery requires a started agent snapshot",
+            ),
+        ] {
+            let (sql, old, source, effect) = stranded_host_turn_fixture();
+            let instance_id = old.instance_id.clone();
+            if case != "no-request" {
+                request_fixture_cancellation(&sql, &instance_id, &effect);
+            }
+            let values = [SqlValue::Text(effect.clone())];
+            match case {
+                "wrong-kind" => {
+                    sql.execute(
+                        "UPDATE effects SET kind='exec.command' WHERE effect_id=?1",
+                        &values,
+                    )
+                    .unwrap();
+                }
+                "queued" => {
+                    sql.execute(
+                        "UPDATE effects SET status='queued' WHERE effect_id=?1",
+                        &values,
+                    )
+                    .unwrap();
+                }
+                "wrong-worker" => {
+                    sql.execute(
+                        "UPDATE runs SET worker_id='external-worker' WHERE effect_id=?1",
+                        &values,
+                    )
+                    .unwrap();
+                }
+                "missing-run" => {
+                    sql.execute(
+                        "UPDATE runs SET status='completed' WHERE effect_id=?1",
+                        &values,
+                    )
+                    .unwrap();
+                }
+                "missing-snapshot" => {
+                    crate::do_store::do_delete_agent_snapshot(&sql, &effect).unwrap();
+                }
+                "invalid-snapshot" => {
+                    crate::do_store::do_save_agent_snapshot(&sql, &effect, "not-json").unwrap();
+                }
+                "unstarted-snapshot" => {
+                    let json = crate::do_store::do_load_agent_snapshot(&sql, &effect)
+                        .unwrap()
+                        .unwrap();
+                    let mut snapshot: whipplescript_kernel::harness_loop::BrokeredTurnSnapshot =
+                        serde_json::from_str(&json).unwrap();
+                    snapshot.started = false;
+                    crate::do_store::do_save_agent_snapshot(
+                        &sql,
+                        &effect,
+                        &serde_json::to_string(&snapshot).unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            drop(old);
+            let ir = whipplescript_parser::compile_program(&source).ir.unwrap();
+            let mut resumed = DurableInstance::attach(
+                sql.clone(),
+                ir,
+                &instance_id,
+                "synthetic".into(),
+                8,
+                test_ports(),
+            )
+            .unwrap();
+            let before = resumed
+                .kernel
+                .as_ref()
+                .unwrap()
+                .store()
+                .list_events(&instance_id)
+                .unwrap()
+                .len();
+            let result = resumed.recover_cancelled_host_turn(if case == "unknown" {
+                "absent"
+            } else {
+                &effect
+            });
+            if matches!(case, "wrong-kind" | "queued" | "wrong-worker") {
+                assert!(
+                    !result.expect("other owners retain cooperative cancellation"),
+                    "{case}"
+                );
+                assert_eq!(
+                    resumed
+                        .kernel
+                        .as_ref()
+                        .unwrap()
+                        .store()
+                        .list_effect_cancellation_requests(&instance_id)
+                        .unwrap()[0]
+                        .status,
+                    "requested"
+                );
+            } else {
+                assert_eq!(result.unwrap_err(), expected, "{case}");
+            }
+            assert_eq!(
+                resumed
+                    .kernel
+                    .as_ref()
+                    .unwrap()
+                    .store()
+                    .list_events(&instance_id)
+                    .unwrap()
+                    .len(),
+                before,
+                "{case} must not append partial evidence"
+            );
+        }
+    }
 
     #[test]
     fn hosted_package_context_is_registered_once_across_reattach() {

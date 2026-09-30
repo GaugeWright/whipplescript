@@ -21,6 +21,8 @@ import {
   type TestEnv,
 } from "./integration-helpers";
 import runtimeSurface from "../contracts/runtime-route-surface.json";
+import { makeBridge } from "./index";
+import * as runtimeBindings from "../pkg/whipplescript_host_do_bg.js";
 
 // A `:v2` attestation (DR-0063 §5): the signature covers the policy epoch and
 // the authority as well, so the hosted path reads the epoch from the signature
@@ -1398,6 +1400,141 @@ describe("real WorkflowInstance hibernation", () => {
       status: "completed",
     });
     expect(brokerFetch).toHaveBeenCalledTimes(3);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("recovers an orphaned cancelled hosted turn after real placement eviction", async () => {
+    const packageDocs = await packageDocuments();
+    const brokerFetch = vi.fn(() => { throw new Error("recovery must not call provider"); });
+    vi.stubGlobal("fetch", brokerFetch);
+async function placementFetch(
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (!headers.has("authorization")) {
+    headers.set("authorization", "Bearer control-token");
+  }
+  if (init.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return SELF.fetch(
+    `https://runtime.test/v1/tenants/tenant-recovery/placements/placement-recovery${path}`,
+    { ...init, headers },
+  );
+}
+    const policy = await placementFetch("/host/policy", {
+      method: "POST",
+      body: JSON.stringify({
+        epoch: 1,
+        signed_envelope: SIGNED_ENVELOPE,
+      }),
+    });
+    expect(policy.status, await policy.clone().text()).toBe(201);
+    expect(await policy.json()).toMatchObject({
+      envelope_hash: POLICY_REF.envelope_hash,
+      signer: SIGNER,
+    });
+
+    const openCommand = {
+      protocol: HOST_PROTOCOL,
+      request_id: "open-placement-recovery",
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+    };
+    const openedResponse = await placementFetch("/host/instances/open", {
+      method: "POST",
+      body: JSON.stringify({
+        command: openCommand,
+        package: packageDocs,
+      }),
+    });
+    expect(
+      openedResponse.status,
+      await openedResponse.clone().text(),
+    ).toBe(201);
+    const opened = await openedResponse.json<{
+      instance_ref: string;
+      opened_at: { sequence: number };
+    }>();
+    expect(opened.instance_ref).toBeTruthy();
+    expect(opened.opened_at.sequence).toBeGreaterThan(0);
+    const instancePath =
+      `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
+
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const turnCommand = {
+      protocol: HOST_PROTOCOL,
+      command_id: "unused",
+      run_ref: "gaugedesk:run:placement-journey",
+      instance_ref: opened.instance_ref,
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+      actor_ref: "audience",
+      input: { text: "hello from the placement route", images: [] },
+      resources: [],
+      provider_binding: {
+        binding_id: "model",
+        credential: { credential_id: "managed-openai" },
+      },
+      placement_ceiling_ref: "do",
+    };
+    // Persist a model suspension, then lose every handle without supplying
+    // the final transport observation: the historical stranded-effect shape.
+    const orphanCommandId = "turn-placement-orphaned-cancellation";
+    const recoveryStub = namespace.get(namespace.idFromName("tenant:tenant-recovery:placement:placement-recovery"));
+    const seed = await runInDurableObject(recoveryStub, async (_instance, state) => {
+      const bootstrapAbsent = (await state.storage.get("bootstrap")) === undefined;
+      runtimeBindings.host_begin_turn(
+        makeBridge(state.storage), SIGNED_ENVELOPE, SIGNER, PUBLIC_KEY,
+        JSON.stringify({ ...turnCommand, command_id: orphanCommandId,
+          run_ref: "gaugedesk:run:orphaned-cancellation" }),
+        packageDocs.manifest, packageDocs.source, packageDocs.system_prompt,
+        undefined, "openai", "gpt-test", "https://api.openai.com/v1/responses",
+      );
+      const handle = runtimeBindings.WasmDurableInstance.attach_host(
+        makeBridge(state.storage), opened.instance_ref, packageDocs.manifest,
+        packageDocs.source, packageDocs.system_prompt, undefined,
+        JSON.stringify({ provider: "openai", model: "gpt-test",
+          base_url: "https://api.openai.com/v1/responses",
+          api_key: "synthetic-unused-provider-key" }),
+      );
+      const kind = JSON.parse(handle.step(undefined, Date.now())).kind;
+      handle.free();
+      return { bootstrapAbsent, kind };
+    });
+    expect(seed).toEqual({ bootstrapAbsent: true, kind: "needs_http" });
+    await evictDurableObject(recoveryStub);
+    const strandedCheckpoint = await placementFetch(`${instancePath}/checkpoint`, {
+      method: "POST", body: JSON.stringify({ cut_id: "before-orphan-recovery" }),
+    });
+    expect(strandedCheckpoint.status).toBe(400);
+    expect(await strandedCheckpoint.text()).toContain("quiescent");
+    for (let retry = 0; retry < 2; retry++) {
+      const recoveredCancellation = await placementFetch(
+        `${instancePath}/turns/${orphanCommandId}/cancel`, { method: "POST", body: "{}" },
+      );
+      // The existing cancellation API refuses terminal work on replay;
+      // settlement remains idempotent and must not emit a second terminal.
+      expect(recoveredCancellation.status, await recoveredCancellation.clone().text()).toBe(retry === 0 ? 202 : 400);
+      await recoveredCancellation.text();
+    }
+    const recoveredProjection = await placementFetch(`${instancePath}/turns/${orphanCommandId}`);
+    expect(await recoveredProjection.json()).toMatchObject({ status: "cancelled" });
+    const recoveredCheckpoint = await placementFetch(`${instancePath}/checkpoint`, {
+      method: "POST", body: JSON.stringify({ cut_id: "after-orphan-recovery" }),
+    });
+    expect(recoveredCheckpoint.status, await recoveredCheckpoint.clone().text()).toBe(200);
+    await recoveredCheckpoint.text();
+    const terminalCount = await runInDurableObject(namespace.get(namespace.idFromName("tenant:tenant-recovery:placement:placement-recovery")), async (_instance, state) =>
+      state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM events WHERE instance_id=?1 AND event_type='effect.terminal' AND json_extract(payload_json,'$.effect_id')=?2",
+        opened.instance_ref, orphanCommandId,
+      ).one().count,
+    );
+    expect(terminalCount).toBe(1);
+    expect(brokerFetch).not.toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });

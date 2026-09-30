@@ -11427,6 +11427,13 @@ pub mod test_support {
         pub(crate) fn from_store_schema() -> Self {
             store().sql
         }
+
+        /// Reopen a fixture copied to disk, dropping every old runtime handle.
+        pub(crate) fn open_existing_file(path: &std::path::Path) -> Self {
+            Self {
+                conn: std::rc::Rc::new(Connection::open(path).expect("reopen sqlite")),
+            }
+        }
     }
 
     fn to_value(v: &SqlValue) -> Value {

@@ -1322,7 +1322,9 @@ where
             } else {
                 model_error_summary(&HarnessModelError::RetryBudgetExhausted(message))
             },
-            steps: self.step + usize::from(!cancelled),
+            // Compaction is infrastructure overhead; only an attempted main
+            // round advances the agent-step counter, as on ordinary failure.
+            steps: self.step + usize::from(!cancelled && self.awaiting == Awaiting::Main),
             observations: std::mem::take(&mut self.observations),
             usage: std::mem::take(&mut self.usage),
             last_input_tokens: self.last_input_tokens,
@@ -3329,6 +3331,7 @@ mod tests {
             BrokeredTurnMachine::new(&model, &executor, &turn, &mut checkpoint, &NoopCompactor);
         assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
         machine.awaiting = Awaiting::Summary;
+        machine.step = 2;
         machine.pending_compaction = Some(SummarizationRequest {
             request_messages: machine.messages.clone(),
             anchors: vec![],
@@ -3344,6 +3347,7 @@ mod tests {
             outcome.summary,
             "transport retry budget exhausted: summary transport lost"
         );
+        assert_eq!(outcome.steps, 2, "summary overhead is not an agent step");
     }
 
     #[test]
@@ -3367,6 +3371,10 @@ mod tests {
         );
         assert!(matches!(out.status, TurnStatus::Failed), "{out:?}");
         assert_eq!(out.summary, "transport retry budget exhausted: lost reply");
+        assert_eq!(
+            out.steps, 1,
+            "the attempted main round remains an agent step"
+        );
     }
 
     /// Cooperative cancel (pi-conformance §3): a cancellation request arriving

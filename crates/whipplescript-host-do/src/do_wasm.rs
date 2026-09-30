@@ -1930,6 +1930,13 @@ impl WasmDurableInstance {
     /// Capture a restorable checkpoint (P3 — the DO operator command). Returns
     /// the checkpoint report as JSON, or a JS error if the instance is not
     /// quiescent.
+    /// Recover only a cancelled turn whose Worker drive no longer exists.
+    pub fn recover_cancelled_host_turn(&mut self, command_id: &str) -> Result<bool, JsValue> {
+        self.inner
+            .recover_cancelled_host_turn(command_id)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     pub fn checkpoint(&mut self, cut_id: &str) -> Result<String, JsValue> {
         let report = self
             .inner
