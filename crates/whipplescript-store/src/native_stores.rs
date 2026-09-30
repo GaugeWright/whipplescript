@@ -472,6 +472,11 @@ impl RuntimeStore for NativeStores {
         self.runtime.register_package_manifest(manifest_json)
     }
 
+    fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>> {
+        self.runtime
+            .register_package_manifests(manifests.iter().copied())
+    }
+
     fn register_capability_schema(
         &self,
         capability: CapabilitySchemaRegistration<'_>,

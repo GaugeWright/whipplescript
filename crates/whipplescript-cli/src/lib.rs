@@ -250,16 +250,13 @@ pub mod std_manifests {
 
     /// Seed every embedded std manifest into `store`.
     ///
-    /// Idempotent: `register_package_manifest` is `ON CONFLICT DO UPDATE`, so
-    /// calling this on an already-seeded store is a no-op. A caller holding a
-    /// package lock should register the lock first and skip names it covers —
-    /// the lock is authoritative for any name it shares.
+    /// Idempotent in content: the whole set commits or rolls back together.
+    /// A caller holding a package lock should register the lock first and skip
+    /// names it covers, since the lock is authoritative for any shared name.
     pub fn register_all(
         store: &whipplescript_store::SqliteStore,
     ) -> Result<(), whipplescript_store::StoreError> {
-        for (_, json) in EMBEDDED_STD_MANIFESTS {
-            store.register_package_manifest(json)?;
-        }
+        store.register_package_manifests(EMBEDDED_STD_MANIFESTS.iter().map(|(_, json)| *json))?;
         Ok(())
     }
 }

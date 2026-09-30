@@ -8888,6 +8888,9 @@ pub trait RuntimeStore {
     fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool>;
     fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()>;
     fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String>;
+    /// Register a logical manifest set atomically, including its provider and
+    /// binding fan-out. A failed member must leave none of the set installed.
+    fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>>;
     fn register_capability_schema(
         &self,
         capability: CapabilitySchemaRegistration<'_>,
@@ -9647,6 +9650,9 @@ impl RuntimeStore for SqliteStore {
     }
     fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
         self.register_package_manifest(manifest_json)
+    }
+    fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>> {
+        SqliteStore::register_package_manifests(self, manifests.iter().copied())
     }
     fn register_capability_schema(
         &self,

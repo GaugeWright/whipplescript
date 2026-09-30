@@ -6,7 +6,7 @@
 //! for coordination / file / tracker / ingress kinds — an unbound kind blocks as
 //! `blocked_by_capability` rather than being waved through by a builtin
 //! exemption. This module is the DO counterpart: the same always-embedded
-//! manifest set, registered via the DO store's `register_package_manifest`
+//! manifest set, registered via the DO store's atomic manifest batch
 //! (which fans a manifest out into the capability/provider/profile/binding
 //! tables exactly as the native store does, skipping operator-plane rows).
 //!
@@ -98,13 +98,15 @@ pub fn construct_registry_for_ir(program: &IrProgram) -> Result<ContractRegistry
 }
 
 /// Seed the embedded std manifests into the DO store so the admission gate is
-/// real for their effect kinds. Idempotent: `register_package_manifest` writes
-/// `ON CONFLICT DO UPDATE`, so a rehydrated isolate re-seeding is a no-op. Call
+/// real for their effect kinds. The whole set commits or rolls back together;
+/// re-seeding is idempotent in content. Call
 /// at instance setup, before the first worker pass admits any effect.
 pub fn register_embedded_std_packages<S: RuntimeStore>(store: &S) -> Result<(), StoreError> {
-    for (_name, json) in EMBEDDED_STD_MANIFESTS {
-        store.register_package_manifest(json)?;
-    }
+    let manifests: Vec<&str> = EMBEDDED_STD_MANIFESTS
+        .iter()
+        .map(|(_, json)| *json)
+        .collect();
+    store.register_package_manifests(&manifests)?;
     Ok(())
 }
 

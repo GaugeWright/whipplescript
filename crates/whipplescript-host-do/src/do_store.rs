@@ -7108,6 +7108,18 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(package_id)
     }
 
+    fn register_package_manifests(&self, manifests: &[&str]) -> StoreResult<Vec<String>> {
+        let mut package_ids = Vec::with_capacity(manifests.len());
+        self.sql.atomic(&mut || {
+            package_ids.clear();
+            for manifest in manifests {
+                package_ids.push(self.register_package_manifest(manifest)?);
+            }
+            Ok(())
+        })?;
+        Ok(package_ids)
+    }
+
     fn register_capability_schema(
         &self,
         capability: CapabilitySchemaRegistration<'_>,
@@ -17048,6 +17060,37 @@ pub(crate) mod tests {
         assert!(store
             .register_package_manifest(r#"{"name": "x", "version": "1"}"#)
             .is_err());
+    }
+
+    #[test]
+    fn manifest_batch_rolls_back_every_row_after_a_later_member_refuses() {
+        let store = store();
+        let valid = r#"{
+            "package_id": "pkg.first", "name": "first", "version": "1",
+            "capabilities": [{"id": "first.read", "description": "read"}],
+            "providers": [{"id": "provider.first", "provider_kind": "local",
+                           "effect_kind": "first.read", "capability": "first.read"}]
+        }"#;
+        let invalid = r#"{
+            "package_id": "pkg.second", "name": "second", "version": "1",
+            "capabilities": [{}]
+        }"#;
+        assert!(store.register_package_manifests(&[valid, invalid]).is_err());
+        for table in [
+            "package_registrations",
+            "capability_schemas",
+            "effect_providers",
+        ] {
+            let rows = store
+                .sql
+                .query(&format!("SELECT 1 FROM {table}"), &[])
+                .expect("registry query");
+            assert!(rows.is_empty(), "{table} retained a partial batch");
+        }
+        assert_eq!(
+            store.register_package_manifests(&[valid]).unwrap(),
+            ["pkg.first"]
+        );
     }
 
     /// DO package bootstrap (spec/durable-object-runtime-tracker.md): a fresh DO
