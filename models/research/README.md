@@ -255,8 +255,9 @@ disable with the ref-owned Hold epoch:
 python3 models/research/flowing_full_seam.py
 ```
 
-It explores 17,278 safe branch states through twelve transitions and 476
-direct-twig states through nine transitions. Scenarios show a CAS winning
+It explores 17,278 safe branch states and 12,863 safe abstract mixed-transport
+states through twelve transitions, plus 476 direct-twig states through nine.
+Scenarios show a CAS winning
 before close disable, a second member's unit parked at close, disable blocking
 a passed candidate, and a later member handoff making that candidate's source
 cut stale. The combined candidate now binds three fixed source atoms to two
@@ -274,6 +275,13 @@ gate work or releasing it before recovery lets collection lose a still-needed
 cut. Four earlier
 weakenings admit a CAS without unit accounting, omit the ref fence at disable,
 trust the stale branch cut, or close before recovering an accepted receipt.
+The mixed mode carries one selected unit's atom through B→C→D beside the same
+norm/ref CAS, pin and accounting state. It checks every recorded origin's
+current Hold and policy epoch there. A Hold blocks a passed candidate, and a
+release needs a fresh certificate. Three weakenings lose B on transport,
+check only D at CAS, or reuse the pre-Hold epoch; each reaches a forbidden
+admission. The transport events do not derive real output cuts or persist
+lineage, and the fixed atom is the only transported unit in this mode.
 The source atoms and read relation are fixed model inputs: actual cut-to-atom
 derivation, actual blob-closure and collector transactions, semantic edge
 discovery, failed/cancelled attempt pin release, source revisions through all

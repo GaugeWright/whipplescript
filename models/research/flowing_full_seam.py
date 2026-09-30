@@ -10,6 +10,10 @@ that neutralization in the certificate and the ref admission. An equivalent
 no-op still gets a checked admission and per-unit receipt. The model still
 abstracts real cut contents, semantic edge discovery, physical lock scheduling
 and independently failing stores.
+The mixed-source mode additionally carries one unit through B, C and D, and
+checks each origin's Hold and policy epoch at the same norm/ref CAS. Transport
+and policy storage are abstract here; the source atoms and receipt must still
+be derived from real cuts in production.
 """
 
 from collections import deque
@@ -33,6 +37,21 @@ ATOMS = (
     Atom("u1:x", 1, "x", 1, 0),
     Atom("u1:y", 1, "y", 0, 1),
 )
+BRANCHES = ("B", "C", "D")
+
+
+def holder_kind(source_kind: str) -> str:
+    return "branch" if source_kind == "mixed" else source_kind
+
+
+def policy_clear(state, lineage: tuple[str, ...]) -> bool:
+    return all(not state.held[BRANCHES.index(branch)] for branch in lineage)
+
+
+def policy_current(state, candidate, lineage: tuple[str, ...]) -> bool:
+    return all(candidate.policy_epochs[BRANCHES.index(branch)]
+               == state.policy_epochs[BRANCHES.index(branch)]
+               for branch in lineage)
 
 
 @dataclass(frozen=True)
@@ -46,6 +65,9 @@ class Candidate:
     after: tuple[int, int]
     outcomes: tuple[str, ...]
     output_change_id: str
+    actual_lineage: tuple[str, ...]
+    certificate_lineage: tuple[str, ...]
+    policy_epochs: tuple[int, int, int]
 
 
 def source_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
@@ -53,7 +75,9 @@ def source_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
 
 
 def candidate_for(selected: tuple[int, ...], cut: int,
-                  before: tuple[int, int], defect: str = "") -> Candidate:
+                  before: tuple[int, int], actual_lineage: tuple[str, ...],
+                  recorded_lineage: tuple[str, ...],
+                  policy_epochs: tuple[int, int, int], defect: str = "") -> Candidate:
     roots = source_atoms(selected)
     output_change_id = f"mixed-output:{cut}"
     certificate = ((output_change_id,) if defect == "output_id_as_witness"
@@ -70,7 +94,8 @@ def candidate_for(selected: tuple[int, ...], cut: int,
         selected, before, roots, certificate, output,
         (2 if defect == "stale_dependent_basis" else 1) if 1 in selected else None,
         (0, 1) if selected == (0, 1) else (1, before[1]),
-        outcomes, output_change_id,
+        outcomes, output_change_id, actual_lineage, recorded_lineage,
+        policy_epochs,
     )
 
 
@@ -109,7 +134,7 @@ def candidate_error(candidate: Candidate) -> str | None:
 
 @dataclass(frozen=True)
 class State:
-    source_kind: str = "branch"  # named branch or one direct twig
+    source_kind: str = "branch"  # named branch, mixed transport, or direct twig
     trunk_content: tuple[int, int] = (0, 0)
     admission: gate.State = field(default_factory=gate.State)
     obligations: work.State = field(default_factory=work.State)
@@ -123,13 +148,51 @@ class State:
     source_available: bool = True
     candidate_available: bool = False
     frontier_reconciled: bool = False
+    transport_stage: int = 0
+    actual_lineage: tuple[str, ...] = ("D",)
+    recorded_lineage: tuple[str, ...] = ("D",)
+    policy_epochs: tuple[int, int, int] = (0, 0, 0)
+    held: tuple[bool, bool, bool] = (False, False, False)
+    hold_used: bool = False
+    release_used: bool = False
+    admitted_policy_epochs: tuple[int, int, int] | None = None
+    admitted_held: tuple[bool, bool, bool] | None = None
 
 
 def steps(state: State, defect: str = ""):
     a, w = state.admission, state.obligations
+    if state.source_kind == "mixed" and not a.admission:
+        if state.transport_stage == 0 and w.units[0] == "branch":
+            yield "transport_B_to_C", replace(
+                state, transport_stage=1, actual_lineage=("B", "C"),
+                recorded_lineage=("B", "C"),
+            )
+        if state.transport_stage == 1:
+            yield "transport_C_to_D", replace(
+                state, transport_stage=2, actual_lineage=("B", "C", "D"),
+                recorded_lineage=(("C", "D") if defect == "lose_origin"
+                                  else ("B", "C", "D")),
+            )
+    if state.source_kind == "mixed" and state.transport_stage == 2 and not a.admission:
+        if not state.hold_used:
+            yield "hold_B", replace(
+                state, hold_used=True,
+                held=(True, state.held[1], state.held[2]),
+                policy_epochs=(state.policy_epochs[0] + 1,
+                               state.policy_epochs[1], state.policy_epochs[2]),
+            )
+        if state.held[0] and not state.release_used:
+            yield "release_B", replace(
+                state, release_used=True,
+                held=(False, state.held[1], state.held[2]),
+                policy_epochs=(state.policy_epochs[0] + 1,
+                               state.policy_epochs[1], state.policy_epochs[2]),
+            )
     for event, next_a in gate.steps(a):
         if event == "gate_pass":
-            if state.source_kind == "branch":
+            if state.source_kind == "mixed" and state.transport_stage != 2:
+                continue
+            if state.source_kind != "twig":
                 if w.units[0] != "branch" or not w.branch_pins[0]:
                     continue
                 source_cut = w.branch_cut
@@ -143,7 +206,12 @@ def steps(state: State, defect: str = ""):
                 selections += ((0, 1),)
             for selected in selections:
                 candidate = candidate_for(selected, source_cut,
-                                          state.trunk_content, defect)
+                                          state.trunk_content,
+                                          state.actual_lineage,
+                                          state.recorded_lineage,
+                                          state.policy_epochs, defect)
+                if not policy_clear(state, candidate.certificate_lineage):
+                    continue
                 if candidate_error(candidate) and defect not in (
                     "omit_source_atom", "omit_predecessor_effect",
                     "stale_dependent_basis", "misstate_neutralization",
@@ -162,22 +230,33 @@ def steps(state: State, defect: str = ""):
             # the same eligibility effect and can race a candidate.
             yield event, replace(state, admission=next_a)
         elif event.startswith("cas_owner"):
-            source_cut = (w.branch_cut if state.source_kind == "branch"
+            source_cut = (w.branch_cut if state.source_kind != "twig"
                           else w.twig_cuts[0])
             if not w.ref_up or (source_cut != state.candidate_source_cut and
                                 defect != "trust_stale_branch_cut"):
                 continue
             if not state.source_available or not state.candidate_available:
                 continue
+            if state.candidate is None:
+                continue
+            checked_lineage = (("D",) if defect == "current_branch_only"
+                               else state.candidate.certificate_lineage)
+            if not policy_clear(state, checked_lineage):
+                continue
+            if (defect != "ignore_origin_epoch" and
+                    not policy_current(state, state.candidate, checked_lineage)):
+                continue
             if defect == "disable_without_ref_fence" and not w.ref_enabled:
                 yield event, replace(state, admission=next_a,
-                                     admitted_source_cut=source_cut)
+                                     admitted_source_cut=source_cut,
+                                     admitted_policy_epochs=state.policy_epochs,
+                                     admitted_held=state.held)
             elif (w.ref_enabled and state.candidate is not None and
-                  all(w.units[i] == state.source_kind
+                  all(w.units[i] == holder_kind(state.source_kind)
                       for i in state.candidate.selected)):
                 next_w = w
                 if defect != "cas_omits_unit_accounting":
-                    if state.source_kind == "branch":
+                    if state.source_kind != "twig":
                         for unit in state.candidate.selected:
                             next_w = work.admit(next_w, unit)
                     else:
@@ -190,6 +269,8 @@ def steps(state: State, defect: str = ""):
                                      obligations=next_w,
                                      admitted_source_cut=source_cut,
                                      admitted_candidate=state.candidate,
+                                     admitted_policy_epochs=state.policy_epochs,
+                                     admitted_held=state.held,
                                      admitted_trunk_before=state.trunk_content,
                                      trunk_content=(state.trunk_content
                                                     if defect == "cas_omits_output"
@@ -263,6 +344,17 @@ def violation(state: State):
         candidate = state.admitted_candidate
         if candidate is None:
             return "trunk admission lacks its exact candidate"
+        if candidate.certificate_lineage != candidate.actual_lineage:
+            return "transport omitted an origin from the certificate"
+        if state.admitted_policy_epochs is None or state.admitted_held is None:
+            return "trunk admission lacks its policy snapshot"
+        if any(state.admitted_held[BRANCHES.index(branch)]
+               for branch in candidate.actual_lineage):
+            return "origin Hold was bypassed at trunk CAS"
+        if any(candidate.policy_epochs[BRANCHES.index(branch)]
+               != state.admitted_policy_epochs[BRANCHES.index(branch)]
+               for branch in candidate.actual_lineage):
+            return "stale origin policy epoch was admitted"
         if problem := candidate_error(candidate):
             return problem
         if candidate.before != state.admitted_trunk_before:
@@ -359,6 +451,45 @@ def scenarios():
     stale = scenario(prefix + ("write1", "declare1", "handoff1",
                                "lock_and_validate_owner0"))
     assert not any(name.startswith("cas_owner") for name, _ in steps(stale))
+
+    mixed_prefix = ("write0", "declare0", "handoff0",
+                    "transport_B_to_C", "transport_C_to_D")
+    mixed = scenario(mixed_prefix + ("gate_pass", "lock_and_validate_owner0",
+                                     "cas_owner0", "recover_receipt"),
+                     State(source_kind="mixed"))
+    assert mixed.admitted_candidate.actual_lineage == ("B", "C", "D")
+    assert mixed.admitted_candidate.source_atoms == ("u0:x",)
+    held_origin = scenario(mixed_prefix + ("gate_pass", "hold_B",
+                                           "lock_and_validate_owner0"),
+                           State(source_kind="mixed"))
+    assert not any(name.startswith("cas_owner") for name, _ in steps(held_origin))
+    released_origin = scenario(mixed_prefix + ("hold_B", "release_B",
+                                               "gate_pass", "lock_and_validate_owner0",
+                                               "cas_owner0"),
+                               State(source_kind="mixed"))
+    assert released_origin.admitted_candidate.policy_epochs[0] == 2
+
+
+def lineage_mutants():
+    prefix = ("write0", "declare0", "handoff0",
+              "transport_B_to_C", "transport_C_to_D", "gate_pass")
+    for defect, tail, expected in (
+        ("lose_origin", ("lock_and_validate_owner0", "cas_owner0"),
+         "transport omitted an origin from the certificate"),
+        ("current_branch_only", ("hold_B", "lock_and_validate_owner0", "cas_owner0"),
+         "origin Hold was bypassed at trunk CAS"),
+        ("ignore_origin_epoch", ("hold_B", "release_B",
+                                  "lock_and_validate_owner0", "cas_owner0"),
+         "stale origin policy epoch was admitted"),
+    ):
+        state = State(source_kind="mixed")
+        for event in prefix + tail:
+            matches = [successor for name, successor in steps(state, defect)
+                       if name == event]
+            assert len(matches) == 1, (defect, event, state)
+            state = matches[0]
+        assert violation(state) == expected, (defect, violation(state))
+        print(f"{defect}: {expected}; " + " -> ".join(prefix + tail))
 
 
 def witness_mutants():
@@ -459,12 +590,16 @@ def explore(defect="", depth=12, source_kind="branch"):
 def main():
     scenarios()
     witness_mutants()
+    lineage_mutants()
     count, problem, _ = explore(depth=9, source_kind="twig")
     assert problem is None, problem
     print(f"direct twig lifecycle: {count} safe states through depth 9")
     count, problem, trace = explore("cas_omits_unit_accounting", 6, "twig")
     assert problem == "trunk CAS and selected-unit accounting split", problem
     print(f"direct twig accounting mutant: {problem}; " + " -> ".join(trace))
+    count, problem, _ = explore(depth=12, source_kind="mixed")
+    assert problem is None, problem
+    print(f"mixed transport lifecycle: {count} safe states through depth 12")
     for label, defect, depth in (
         ("composed lifecycle", "", 12),
         ("CAS omits selected-unit accounting", "cas_omits_unit_accounting", 7),
