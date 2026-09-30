@@ -52,6 +52,28 @@ test("private Durable workflow grant is exact and short-lived", () => {
   longLived.expires_at = now + 901;
   assert.match(validateDurableWorkflowGrant(longLived, now) ?? "", /short-lived/);
 });
+
+test("Agent authoring is an explicit non-project command subject", () => {
+  const authoring = grant();
+  authoring.project_id = "";
+  authoring.work_target_basis = "";
+  authoring.agent_authoring = {
+    agent_id: "agent:one",
+    target_id: "authoring-target:one",
+    target_main_basis: "cut:one",
+  };
+  assert.equal(validateDurableWorkflowGrant(authoring, now), undefined);
+  assert.notEqual(durableWorkflowObjectName(authoring), durableWorkflowObjectName(grant()));
+  const mixed = structuredClone(authoring);
+  mixed.project_id = "project:invented";
+  assert.match(validateDurableWorkflowGrant(mixed, now) ?? "", /authoring execution subject/);
+  const missingBasis = structuredClone(authoring);
+  missingBasis.agent_authoring!.target_main_basis = "";
+  assert.match(validateDurableWorkflowGrant(missingBasis, now) ?? "", /authoring execution subject/);
+  const missingAgent = structuredClone(authoring);
+  delete (missingAgent.agent_authoring as { agent_id?: string }).agent_id;
+  assert.match(validateDurableWorkflowGrant(missingAgent, now) ?? "", /authoring execution subject/);
+});
 test("P-256 signature binds every private grant field", async () => {
   const pair = await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },

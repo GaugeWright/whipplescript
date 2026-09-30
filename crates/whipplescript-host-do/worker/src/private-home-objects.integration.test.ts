@@ -15,11 +15,17 @@ import { durableWorkflowObjectName, privateObjectStorageKey } from "./private-ho
 const HOME = "home-objects";
 const TENANT = "tenant-objects";
 const PROJECT = "project-objects";
+const AGENT = "agent-objects";
+const TARGET = "authoring-target-objects";
 const COMMAND = "command-objects";
 const EPOCH = 1;
 
 const baseFor = (command = COMMAND, epoch = EPOCH) =>
   `/v1/homes/${HOME}/tenants/${TENANT}/projects/${PROJECT}` +
+  `/commands/${command}/attempts/${epoch}`;
+
+const agentBaseFor = (command: string, epoch = EPOCH) =>
+  `/v1/homes/${HOME}/tenants/${TENANT}/agents/${AGENT}/authoring-targets/${TARGET}` +
   `/commands/${command}/attempts/${epoch}`;
 
 const storageKeyFor = (id: string, command = COMMAND) => privateObjectStorageKey({
@@ -60,6 +66,7 @@ async function grantFor(
     epoch = EPOCH,
     packageRef = "package:test@1",
     retirementAuthorized = false,
+    agentAuthoring = false,
 ): Promise<Record<string, string>> {
     const fixture = await homeFixture();
     const now = Math.floor(Date.now() / 1000);
@@ -69,8 +76,13 @@ async function grantFor(
         governance_signer: fixture.signer,
         home_id: HOME,
         tenant_id: TENANT,
-        project_id: PROJECT,
-        work_target_basis: "whipple:cut:private-objects",
+        project_id: agentAuthoring ? "" : PROJECT,
+        work_target_basis: agentAuthoring ? "" : "whipple:cut:private-objects",
+        ...(agentAuthoring ? { agent_authoring: {
+            agent_id: AGENT,
+            target_id: TARGET,
+            target_main_basis: "cut:agent-objects",
+        } } : {}),
         command_id: command,
         attempt_id: `attempt:${command}:${epoch}`,
         payload_digest: `sha256:${"1".repeat(64)}`,
@@ -259,6 +271,59 @@ describe("the private Home's byte route", () => {
         });
         expect(retained.status).toBe(200);
         expect(new Uint8Array(await retained.arrayBuffer())).toEqual(bytes);
+    });
+
+    // signed-agent-authoring-route
+    it("keeps Agent-authoring bytes and retirement in their non-project command", async () => {
+        const command = "agent-authoring-object";
+        const bytes = new Uint8Array([6, 1, 2, 6]);
+        const digest = await sha256Hex(bytes);
+        const id = digest.slice(0, 32);
+        const inner = `/host/objects/${id}`;
+        const placed = await SELF.fetch(`https://runtime.test${agentBaseFor(command)}${inner}`, {
+            method: "POST",
+            body: bytes,
+            headers: {
+                ...(await grantFor(inner, "POST", digest, command, EPOCH, "package:test@1", false, true)),
+                "content-length": String(bytes.length),
+            },
+        });
+        expect(placed.status, await placed.clone().text()).toBe(201);
+        const storageKey = await privateObjectStorageKey({
+            home_id: HOME, tenant_id: TENANT, project_id: "", command_id: command,
+            agent_authoring: { agent_id: AGENT, target_id: TARGET, target_main_basis: "cut:agent-objects" },
+        }, id);
+        expect(await env.WHIP_OBJECTS.head(storageKey)).not.toBeNull();
+        const readGrant = await grantFor(inner, "GET", digest, command, EPOCH, "package:test@1", false, true);
+        const read = await SELF.fetch(`https://runtime.test${agentBaseFor(command)}${inner}`, {
+            method: "GET", headers: readGrant,
+        });
+        expect(read.status).toBe(200);
+        expect(new Uint8Array(await read.arrayBuffer())).toEqual(bytes);
+        const replay = await SELF.fetch(`https://runtime.test${baseFor(command)}${inner}`, {
+            method: "GET", headers: readGrant,
+        });
+        expect(replay.status).toBe(403);
+        const retirement = "/host/private/retire";
+        const receipt = JSON.stringify({
+            version: 1, attempt_id: `attempt:${command}:${EPOCH}`, epoch: EPOCH,
+            terminal_phase: "completed", terminal_receipt_sha256: "a".repeat(64),
+        });
+        const retired = await SELF.fetch(`https://runtime.test${agentBaseFor(command)}${retirement}`, {
+            method: "POST",
+            headers: {
+                ...(await grantFor(retirement, "POST", await sha256Hex(new TextEncoder().encode(receipt)),
+                    command, EPOCH, "package:test@1", true, true)),
+                "content-type": "application/json",
+            },
+            body: receipt,
+        });
+        expect(retired.status, await retired.clone().text()).toBe(200);
+        expect(await env.WHIP_OBJECTS.head(storageKey)).toBeNull();
+        const late = await SELF.fetch(`https://runtime.test${agentBaseFor(command)}${inner}`, {
+            method: "GET", headers: readGrant,
+        });
+        expect(late.status).toBe(410);
     });
 
     // private-command-retirement

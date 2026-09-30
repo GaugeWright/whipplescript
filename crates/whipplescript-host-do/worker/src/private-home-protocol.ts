@@ -6,6 +6,12 @@ export interface DurableWorkflowGrant {
   tenant_id: string;
   project_id: string;
   work_target_basis: string;
+  /** Explicit non-project command subject; both project fields must be empty. */
+  agent_authoring?: {
+    agent_id: string;
+    target_id: string;
+    target_main_basis: string;
+  };
   command_id: string;
   attempt_id: string;
   payload_digest: string;
@@ -53,9 +59,19 @@ export function parsePrivateRetirementReceipt(value: unknown): PrivateRetirement
 export function durableWorkflowObjectName(
   grant: Pick<
     DurableWorkflowGrant,
-    "home_id" | "tenant_id" | "project_id" | "command_id"
+    "home_id" | "tenant_id" | "project_id" | "agent_authoring" | "command_id"
   >,
 ): string {
+  if (grant.agent_authoring) {
+    return JSON.stringify([
+      "private-home-agent-v1",
+      grant.home_id,
+      grant.tenant_id,
+      grant.agent_authoring.agent_id,
+      grant.agent_authoring.target_id,
+      grant.command_id,
+    ]);
+  }
   return JSON.stringify([
     "private-home-v2",
     grant.home_id,
@@ -72,7 +88,7 @@ export function durableWorkflowObjectName(
  * The `s-` shape is the host's existing narrow opaque-key namespace.
  */
 export async function privateObjectStorageKey(
-  grant: Pick<DurableWorkflowGrant, "home_id" | "tenant_id" | "project_id" | "command_id">,
+  grant: Pick<DurableWorkflowGrant, "home_id" | "tenant_id" | "project_id" | "agent_authoring" | "command_id">,
   contentId: string,
 ): Promise<string> {
   const basis = new TextEncoder().encode(
@@ -82,6 +98,8 @@ export async function privateObjectStorageKey(
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/;
+const validId = (value: unknown): value is string =>
+  typeof value === "string" && ID.test(value);
 const SHA256 = /^[a-f0-9]{64}$/;
 const FORBIDDEN_CAPABILITY =
   /^(?:bash|build|command|container|docker|exec|filesystem|network|posix|process|shell|test|workspace)(?:[.:/]|$)/;
@@ -193,8 +211,6 @@ export function validateDurableWorkflowGrant(
     grant.governance_signer,
     grant.home_id,
     grant.tenant_id,
-    grant.project_id,
-    grant.work_target_basis,
     grant.command_id,
     grant.attempt_id,
     grant.payload_digest,
@@ -202,8 +218,24 @@ export function validateDurableWorkflowGrant(
     grant.credential_class,
     grant.callback_ref,
   ];
-  if (identities.some((identity) => !ID.test(identity))) {
+  if (identities.some((identity) => !validId(identity))) {
     return "invalid execution identity";
+  }
+  if (grant.agent_authoring === undefined) {
+    if (!validId(grant.project_id) || !validId(grant.work_target_basis)) {
+      return "invalid project execution subject";
+    }
+  } else if (
+    grant.project_id !== "" ||
+    grant.work_target_basis !== "" ||
+    !grant.agent_authoring ||
+    typeof grant.agent_authoring !== "object" ||
+    Array.isArray(grant.agent_authoring) ||
+    !validId(grant.agent_authoring.agent_id) ||
+    !validId(grant.agent_authoring.target_id) ||
+    !validId(grant.agent_authoring.target_main_basis)
+  ) {
+    return "invalid Agent authoring execution subject";
   }
   try {
     const callback = new URL(grant.callback_ref);

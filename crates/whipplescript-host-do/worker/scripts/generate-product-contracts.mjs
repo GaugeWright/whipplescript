@@ -43,6 +43,9 @@ const hostOperations = [
   ["runtime.private-home.object.place", "POST", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "mutation", "critical"],
   ["runtime.private-home.object.read", "GET", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "none", "important"],
   ["runtime.private-home.retire", "POST", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/private/retire", "http-json", "mutation", "critical"],
+  ["runtime.private-home.agent.object.place", "POST", "/v1/homes/:home/tenants/:tenant/agents/:agent/authoring-targets/:target/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "mutation", "critical"],
+  ["runtime.private-home.agent.object.read", "GET", "/v1/homes/:home/tenants/:tenant/agents/:agent/authoring-targets/:target/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "none", "important"],
+  ["runtime.private-home.agent.retire", "POST", "/v1/homes/:home/tenants/:tenant/agents/:agent/authoring-targets/:target/commands/:command/attempts/:epoch/host/private/retire", "http-json", "mutation", "critical"],
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],
@@ -101,6 +104,22 @@ const gatewayOperations = [
     "mutation",
     "critical",
   ],
+  [
+    "runtime.private-home.agent.forward.get",
+    "GET",
+    "/v1/homes/:home/tenants/:tenant/agents/:agent/authoring-targets/:target/commands/:command/attempts/:epoch/host/:operation",
+    "internal-callback",
+    "stream",
+    "critical",
+  ],
+  [
+    "runtime.private-home.agent.forward.post",
+    "POST",
+    "/v1/homes/:home/tenants/:tenant/agents/:agent/authoring-targets/:target/commands/:command/attempts/:epoch/host/:operation",
+    "internal-callback",
+    "mutation",
+    "critical",
+  ],
   ["runtime.legacy.start", "POST", "/start", "http-json", "session", "internal"],
 ];
 
@@ -110,6 +129,8 @@ function samplePath(path) {
     .replace(":placement", "placement-canary")
     .replace(":home", "home-canary")
     .replace(":project", "project-canary")
+    .replace(":agent", "agent-canary")
+    .replace(":target", "target-canary")
     .replace(":command", "command-canary")
     .replace(":epoch", "1")
     .replace(":instance", "instance-canary")
@@ -120,6 +141,12 @@ function samplePath(path) {
 }
 
 function evidenceFor(id) {
+  if (id.startsWith("runtime.private-home.agent.")) {
+    const authoring = id.includes(".forward.")
+      ? "src/authenticated-host.integration.test.ts#signed-agent-authoring-route"
+      : "src/private-home-objects.integration.test.ts#signed-agent-authoring-route";
+    return { contract: [authoring], authority: [authoring], journey: [authoring], deployed: [], property: [authoring] };
+  }
   if (id === "runtime.private-home.retire" || id.startsWith("runtime.private-home.retirement.")) {
     const retirement = "src/private-home-objects.integration.test.ts#private-command-retirement";
     return { contract: [retirement], authority: [retirement], journey: [retirement], deployed: [], property: [retirement] };
@@ -222,6 +249,7 @@ function operation(row) {
   const [id, method, path, transport, sideEffect, risk] = row;
   const publicSession = id.startsWith("runtime.public.");
   const privateHome = id.startsWith("runtime.private-home.");
+  const agentAuthoring = id.startsWith("runtime.private-home.agent.");
   const privateBinding = id === "runtime.private-home.object.binding" || id.startsWith("runtime.private-home.object.intent.") || id.startsWith("runtime.private-home.retirement.");
   const placement = id.startsWith("runtime.placement.");
   return {
@@ -259,7 +287,7 @@ function operation(row) {
     scope: publicSession
       ? "deployment-session"
       : privateHome
-        ? "home-tenant-project-command"
+        ? agentAuthoring ? "home-tenant-agent-authoring-command" : "home-tenant-project-command"
         : "tenant-placement",
     capability: publicSession ? "session-control" : "workflow-control",
     requestSchema: `typescript:whipplescript-runtime/${id}/request`,
