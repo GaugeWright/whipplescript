@@ -1,6 +1,7 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 import { WORKERD_TEST_TIMEOUT_MS } from "./src/test-bounds.ts";
+import { WORKERD_TEST_POOL } from "./src/workerd-test-pool.ts";
 
 export default defineConfig({
   plugins: [
@@ -9,6 +10,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    ...WORKERD_TEST_POOL,
     include: [
       "src/session.integration.test.ts",
       "src/executor-broker.integration.test.ts",

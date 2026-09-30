@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 import { WORKERD_TEST_TIMEOUT_MS } from "./src/test-bounds.ts";
+import { WORKERD_TEST_POOL } from "./src/workerd-test-pool.ts";
 
 export default defineConfig({
   plugins: [
@@ -17,6 +18,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    ...WORKERD_TEST_POOL,
     include: [
       "src/authenticated-host.integration.test.ts",
       "src/norm-impact.integration.test.ts",
