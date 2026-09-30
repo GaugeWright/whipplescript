@@ -80,6 +80,7 @@ pub mod source_action;
 #[cfg(feature = "native")]
 pub mod source_admission;
 pub mod source_merge;
+pub mod source_process;
 pub mod stats;
 pub mod time_pass;
 pub mod trace;

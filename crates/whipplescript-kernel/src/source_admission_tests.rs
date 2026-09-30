@@ -464,3 +464,164 @@ fn a_workspace_without_admitted_policy_cannot_produce_an_empty_success() {
             .contains("no admitted norm policy")
     );
 }
+
+#[test]
+fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
+    use crate::source_process::*;
+    struct EmptyHome {
+        basis: ProcessBasis,
+        reads: std::cell::Cell<usize>,
+        change_on: usize,
+        norm_binding: bool,
+    }
+    impl ProcessCaptureAuthority for EmptyHome {
+        fn basis(&self, _: &str) -> Result<ProcessBasis, String> {
+            self.reads.set(self.reads.get() + 1);
+            let mut basis = self.basis.clone();
+            if self.reads.get() >= self.change_on {
+                basis.policy.version = "changed".into();
+            }
+            Ok(basis)
+        }
+        fn observe(
+            &self,
+            _: &ProcessBasis,
+            _: CutSide,
+            _: &ReferenceScope,
+        ) -> Result<ScopeObservation, String> {
+            Err("no captured scope".into())
+        }
+        fn verify_boundary(
+            &self,
+            _: &ProcessBasis,
+            _: CutSide,
+            _: &ReferenceScope,
+            _: &ScopeObservation,
+        ) -> Result<VerifiedScopeBoundary, String> {
+            Err("no installed boundary".into())
+        }
+        fn verify_norm_basis(
+            &self,
+            _: &ProcessBasis,
+            _: &whipplescript_store::norm_history::NormReadAnchor,
+            _: &EvidenceVersion,
+        ) -> Result<(), String> {
+            if self.norm_binding {
+                Ok(())
+            } else {
+                Err("norm policy binding is stale".into())
+            }
+        }
+        fn owner_validation(
+            &self,
+            _: &ProcessBasis,
+            _: CutSide,
+            _: &ReferenceScope,
+            _: &DependencyIdentity,
+        ) -> Result<Option<OwnerValidation>, String> {
+            Ok(None)
+        }
+    }
+    let native = NativeFixture::new();
+    let runtime = SqliteStore::open_in_memory().unwrap();
+    let (store, record) = f::fixture(Some(f::template()), true);
+    let configuration = configuration(&store, &record);
+    let policy = policy();
+    let verify = |_: &PythonRuntime| Ok(());
+    let host = AdmissionHost {
+        now: None,
+        verifier: &Boundary,
+        configuration: &configuration,
+        runtime: &runtime,
+        policy: &policy,
+        verify_runtime: &verify,
+    };
+    let version = |name: &str| EvidenceVersion {
+        name: name.into(),
+        version: "1".into(),
+        digest: name.into(),
+    };
+    let cut = |name: &str| StructuralCut {
+        cut: name.into(),
+        registry: version("registry"),
+        population: version("roster"),
+        resolutions: BTreeMap::new(),
+        scopes: BTreeMap::new(),
+    };
+    let mut authority = EmptyHome {
+        basis: ProcessBasis {
+            home: "home".into(),
+            candidate_witness_digest: native.witness.clone(),
+            native_base_cut: None,
+            native_candidate_cut: "candidate".into(),
+            seal: version("seal"),
+            policy: version("policy"),
+            before: cut("before"),
+            after: cut("after"),
+        },
+        reads: std::cell::Cell::new(0),
+        change_on: usize::MAX,
+        norm_binding: true,
+    };
+    let plan = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert!(!plan.judgment().references.required_classes.is_empty());
+    assert!(plan.judgment().blockers.iter().any(|gap| gap
+        .reason
+        .contains("omits a locally required reference scope")));
+    assert!(plan.judgment().dependencies.is_some());
+    assert!(plan.to_json()["judgment"]["dependencies"]["coverage"].is_array());
+    authority.basis.native_candidate_cut = "another-candidate".into();
+    let wrong_native = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert!(wrong_native
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/structural-cut"));
+    authority.basis.native_candidate_cut = "candidate".into();
+    authority.norm_binding = false;
+    let wrong_norm = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert!(wrong_norm
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/norm-basis"));
+    authority.norm_binding = true;
+    authority.reads.set(0);
+    // Dependency capture's two reads agree. Only the final joined source/norm
+    // recheck sees a relevant policy movement; no changed plan may escape.
+    authority.change_on = 3;
+    assert!(plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority
+    )
+    .unwrap_err()
+    .contains("Home source-admission basis changed during derivation"));
+}

@@ -24,6 +24,9 @@ use whipplescript_store::RuntimeStore;
 use crate::norm_admission::{AdmissionHost, AdmissionLedger};
 use crate::norm_impact::{ImpactBasis, ImpactWork};
 use crate::norm_planning::{ImpactQuery, Planned};
+use crate::source_process::{
+    DependencyIdentity, ProcessCaptureAuthority, ProcessImpact, ReferenceScope,
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceAdmissionSubject {
@@ -53,6 +56,7 @@ pub struct SourceObligation {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ReferenceClassObservation {
+    pub contract: EvidenceVersion,
     pub vocabulary: String,
     pub version: String,
     pub field: String,
@@ -98,6 +102,7 @@ pub struct SourceAdmissionJudgment {
     pub norm: serde_json::Value,
     pub obligations: BTreeMap<String, SourceObligation>,
     pub references: LocalReferenceObservation,
+    pub dependencies: Option<ProcessImpact>,
     pub blockers: BTreeSet<LocatedBlocker>,
 }
 
@@ -187,6 +192,38 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
     witness_digest: &str,
     attempt_id: &str,
 ) -> Result<SourceAdmissionPlan, String> {
+    derive_native(vcs, ledger, host, witness_digest, attempt_id, None)
+}
+
+/// Compose the product Home's authoritative dependency capture. The installed
+/// Home reader must bind its norm and reference bases; an injected graph or a
+/// complete-looking extraction list cannot replace that authority.
+pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
+    vcs: &NativeWorkspaceVcs,
+    ledger: &L,
+    host: AdmissionHost<'_, S>,
+    witness_digest: &str,
+    attempt_id: &str,
+    authority: &dyn ProcessCaptureAuthority,
+) -> Result<SourceAdmissionPlan, String> {
+    derive_native(
+        vcs,
+        ledger,
+        host,
+        witness_digest,
+        attempt_id,
+        Some(authority),
+    )
+}
+
+fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
+    vcs: &NativeWorkspaceVcs,
+    ledger: &L,
+    host: AdmissionHost<'_, S>,
+    witness_digest: &str,
+    attempt_id: &str,
+    authority: Option<&dyn ProcessCaptureAuthority>,
+) -> Result<SourceAdmissionPlan, String> {
     let captured = vcs
         .capture_native_gate_subject(witness_digest, attempt_id)
         .map_err(|error| format!("{error:?}"))?;
@@ -231,12 +268,17 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
         ledger: inventory.ledger,
         authority_head: inventory.authority_head,
         frontier: inventory.frontier,
-        charter_digest: inventory.charter_digest,
+        charter_digest: inventory.charter_digest.clone(),
         charter_events: inventory.charter_events,
         required_classes: inventory
             .fields
             .iter()
             .map(|field| ReferenceClassObservation {
+                contract: EvidenceVersion {
+                    name: format!("norm/{}/{}", field.vocabulary, field.path),
+                    version: field.vocabulary_version.clone(),
+                    digest: format!("sha256:{}", inventory.charter_digest),
+                },
                 vocabulary: field.vocabulary.clone(),
                 version: field.vocabulary_version.clone(),
                 field: field.path.clone(),
@@ -265,10 +307,82 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
             .collect(),
         historical_population_unknown: inventory.historical_population_unknown,
     };
-    let mut blockers = BTreeSet::from([LocatedBlocker {
-        scope: "home/reference-population".into(),
-        reason: "no authoritative Home operation population, sealed cut or enforced scope boundary was captured".into(),
-    }]);
+    let mut blockers = BTreeSet::new();
+    let dependencies = match authority {
+        None => {
+            blockers.insert(LocatedBlocker {
+                scope: "home/reference-population".into(),
+                reason: "no authoritative Home operation population, sealed cut or enforced scope boundary was captured".into(),
+            });
+            None
+        }
+        Some(authority) => match crate::source_process::capture_impact(authority, witness_digest) {
+            Err(reason) => {
+                blockers.insert(LocatedBlocker {
+                    scope: "home/reference-population".into(),
+                    reason,
+                });
+                None
+            }
+            Ok(impact) => {
+                if impact.basis.native_base_cut != witness.expected_trunk_cut_id
+                    || impact.basis.native_candidate_cut != witness.candidate_cut_id
+                {
+                    blockers.insert(LocatedBlocker {
+                        scope: "home/structural-cut".into(),
+                        reason: "Home structural vector names another native base or candidate"
+                            .into(),
+                    });
+                }
+                if let Err(reason) = authority.verify_norm_basis(
+                    &impact.basis,
+                    &planned.anchor,
+                    &planned.plan.policy,
+                ) {
+                    blockers.insert(LocatedBlocker {
+                        scope: "home/norm-basis".into(),
+                        reason,
+                    });
+                }
+                for class in &references.required_classes {
+                    let scope = ReferenceScope {
+                        class: class.contract.clone(),
+                        consumer_scope: format!("norm/{}", references.ledger),
+                    };
+                    let population = impact.basis.after.scopes.get(&scope);
+                    let records = view.records.values().filter(|record| {
+                        record.vocabulary.name == class.vocabulary
+                            && record.vocabulary.version == class.version
+                    });
+                    let mut missing = population.is_none();
+                    for record in records {
+                        let consumer = DependencyIdentity {
+                            authority: references.ledger.clone(),
+                            identity: record.id.clone(),
+                        };
+                        missing |= !population.is_some_and(|members| members.contains(&consumer))
+                            || impact.basis.after.resolutions.get(&consumer) != Some(&record.head);
+                    }
+                    if missing {
+                        blockers.insert(LocatedBlocker {
+                            scope: format!("home/norm/{}/{}/{}", references.ledger, class.vocabulary, class.field),
+                            reason: "Home registry or exact consumer population omits a locally required reference scope".into(),
+                        });
+                    }
+                }
+                for gap in &impact.blockers {
+                    blockers.insert(LocatedBlocker {
+                        scope: format!(
+                            "home/{}/{}/{:?}",
+                            impact.basis.home, gap.scope.consumer_scope, gap.side
+                        ),
+                        reason: gap.reason.clone(),
+                    });
+                }
+                Some(impact)
+            }
+        },
+    };
     for class in &references.required_classes {
         if class.meaning.is_none() {
             blockers.insert(LocatedBlocker {
@@ -317,6 +431,7 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
         norm: planned.to_json(),
         obligations: obligations(witness_digest, &planned)?,
         references,
+        dependencies,
         blockers,
     };
     // Detect change during derivation. This is not the final publication fence.
@@ -335,6 +450,11 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
     .map_err(|error| format!("{error:?}"))?;
     if current != captured || current_history.anchor() != planned.anchor {
         return Err("source-admission premises changed during derivation".into());
+    }
+    if let (Some(authority), Some(impact)) = (authority, &judgment.dependencies) {
+        if authority.basis(witness_digest)? != impact.basis {
+            return Err("Home source-admission basis changed during derivation".into());
+        }
     }
     Ok(SourceAdmissionPlan {
         identity: identity(&judgment)?,
