@@ -187,8 +187,23 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     "host action admission requires the exact compiler artifact digest".to_owned(),
                 )
             })?;
-        self.kernel
-            .admit_compiled_host_action(action, &admission, compiler_artifact_digest)
+        let construct_registry = self
+            .embedded_std_manifests
+            .map(|manifests| embedded_std_registry_for_program(action.program(), manifests))
+            .transpose()
+            .map_err(HostFacadeError::Resolver)?;
+        let construct_basis = construct_registry
+            .as_ref()
+            .map(|registry| CheckedConstructBasis {
+                registry,
+                sources: &[],
+            });
+        self.kernel.admit_compiled_host_action(
+            action,
+            &admission,
+            compiler_artifact_digest,
+            construct_basis.as_ref(),
+        )
     }
 
     /// Execute one ordinary file effect under freshly verified current authority.

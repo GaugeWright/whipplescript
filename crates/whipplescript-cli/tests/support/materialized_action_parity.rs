@@ -76,7 +76,8 @@ rule begin
         .expect("typed facade")
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        );
+        )
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS);
     let mut outcomes = Vec::new();
     for actor in ["person:1", "agent:1"] {
         let command = HostActionCommand {
@@ -175,7 +176,8 @@ rule begin
         .expect("reconstructed embedding")
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        );
+        )
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS);
         assert_eq!(
             facade
                 .admit_action_with_inputs(
@@ -287,6 +289,18 @@ rule begin
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         assert!(witness.examined.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .expect("checked constructs")
+            .edges
+            .is_empty());
+        assert!(witness
+            .declarations
+            .as_ref()
+            .expect("checked declarations")
+            .edges
+            .is_empty());
     }
     outcomes
 }

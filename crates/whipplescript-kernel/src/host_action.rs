@@ -5,6 +5,7 @@ use whipplescript_store::host_actions::HostActionStart;
 use whipplescript_store::log_append::LogAppend;
 use whipplescript_store::{NewFact, NewInstance, NewInstanceAuthority, RuntimeStore};
 
+use crate::construct_coverage::CheckedConstructBasis;
 use crate::host_facade::HostFacadeError;
 use crate::host_protocol::action::{
     ActionAdmissionReceipt, HostActionCommand, VerifiedActionAdmission, HOST_ACTION_PROTOCOL,
@@ -177,9 +178,16 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         action: &CompiledHostAction,
         admission: &VerifiedActionAdmission,
         compiler_artifact_digest: &str,
+        construct_basis: Option<&CheckedConstructBasis<'_>>,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let facts = action.validate_inputs(admission)?;
-        self.admit_host_action_inputs(action, admission, facts, compiler_artifact_digest)
+        self.admit_host_action_inputs(
+            action,
+            admission,
+            facts,
+            compiler_artifact_digest,
+            construct_basis,
+        )
     }
 
     pub(crate) fn admit_host_action_inputs(
@@ -188,6 +196,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         admission: &VerifiedActionAdmission,
         facts: Vec<WorkflowInputFact>,
         compiler_artifact_digest: &str,
+        construct_basis: Option<&CheckedConstructBasis<'_>>,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let source_hash = self
             .store()
@@ -195,25 +204,35 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
             .map_err(HostFacadeError::Store)?;
         let ir_hash = whipplescript_store::stable_hash_hex(&action.identity);
         let source_digest = crate::exec_http::sha256_hex(action.source.as_bytes());
-        let version_admission = self
-            .create_program_version_for_program_with_imports(
-                ProgramVersionInput {
-                    program_name: &action.program.workflow,
-                    source_hash: &source_hash,
-                    ir_hash: &ir_hash,
-                    ir_snapshot: Some(&action.identity),
-                    compiler_version: whipplescript_core::version(),
-                },
+        let input = ProgramVersionInput {
+            program_name: &action.program.workflow,
+            source_hash: &source_hash,
+            ir_hash: &ir_hash,
+            ir_snapshot: Some(&action.identity),
+            compiler_version: whipplescript_core::version(),
+        };
+        let import_basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest,
+            packages: &[],
+        };
+        let version_admission = if let Some(construct_basis) = construct_basis {
+            self.create_program_version_for_program_with_imports_and_constructs(
+                input,
                 &action.program,
-                &CheckedImportBasis {
-                    program_source_digest: &source_digest,
-                    version_source_digest: None,
-                    lock_digest: NO_LOCK_DIGEST,
-                    compiler_artifact_digest,
-                    packages: &[],
-                },
+                &import_basis,
+                construct_basis,
             )
-            .map_err(HostFacadeError::Store)?;
+        } else {
+            self.create_program_version_for_program_with_imports(
+                input,
+                &action.program,
+                &import_basis,
+            )
+        }
+        .map_err(HostFacadeError::Store)?;
         let command = admission.command();
         let command_json = serde_json::to_string(command).map_err(HostFacadeError::Json)?;
         let input_json = serde_json::to_string(&command.inputs).map_err(HostFacadeError::Json)?;
@@ -576,6 +595,57 @@ rule echo
             first
         );
         assert_eq!(facade.kernel().store().list_instances().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn host_action_retains_compiler_checked_file_store_declaration() {
+        const EMBEDDED_FILES: &[(&str, &str)] = &[(
+            "std.files",
+            include_str!("../../../std/manifests/files.json"),
+        )];
+        let source = format!(
+            "file store project {{\n  root \".\"\n  allow read [\"**\"]\n  allow write [\"**\"]\n}}\n{SOURCE}"
+        );
+        let action = CompiledHostAction::compile("reference.echo", &source, None)
+            .expect("compiled action with declaration");
+        let (_, mut command, facade) = fixture();
+        command.program_version_ref = action.version_ref().into();
+        command.input_schema_ref = action.input_schema_ref().into();
+        let verifier = ExactAdmission(command.signing_bytes().unwrap());
+        let mut facade = facade.with_embedded_std_manifests(EMBEDDED_FILES);
+        facade
+            .admit_action(command, &action, &verifier, b"authenticated fixture")
+            .expect("checked action admission");
+        let roster = facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("action operations");
+        let operation = roster.operations.last().expect("checked operation");
+        let witness = facade
+            .kernel()
+            .store()
+            .program_import_witness(
+                &operation.version_id,
+                operation.witness_digest.as_deref().expect("witness digest"),
+            )
+            .expect("witness lookup")
+            .expect("checked witness");
+        assert!(witness
+            .constructs
+            .expect("rule constructs examined")
+            .edges
+            .is_empty());
+        assert_eq!(
+            witness
+                .declarations
+                .expect("declarations examined")
+                .edges
+                .iter()
+                .map(|edge| edge.registration_id.as_str())
+                .collect::<Vec<_>>(),
+            ["files.file_store"]
+        );
     }
 
     #[test]

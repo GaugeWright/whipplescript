@@ -92,7 +92,8 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
         .expect("facade")
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        );
+        )
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS);
     let source = r#"
 workflow ParityAction
 input content InputReference
@@ -334,6 +335,18 @@ rule echo
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         assert!(witness.examined.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .expect("checked constructs")
+            .edges
+            .is_empty());
+        assert!(witness
+            .declarations
+            .as_ref()
+            .expect("checked declarations")
+            .edges
+            .is_empty());
     }
     outcomes
 }
