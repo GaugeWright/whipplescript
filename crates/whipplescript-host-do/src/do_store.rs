@@ -5512,14 +5512,46 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     &[text(&version_id), text(&digest), text(&json)],
                 )
                 .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "INSERT INTO program_import_operations \
-                     (operation_id, version_id, witness_digest, kind) \
-                     VALUES (?1, ?2, ?3, 'checked')",
-                    &[text(operation_id), text(&version_id), text(&digest)],
+            let prior = self
+                .sql
+                .query(
+                    "SELECT version_id, IFNULL(witness_digest, ''), kind \
+                     FROM program_import_operations WHERE operation_id = ?1",
+                    &[text(operation_id)],
                 )
                 .map_err(sql_err)?;
+            if let Some(existing) = prior.first() {
+                if as_text(&existing[0]) != version_id
+                    || as_text(&existing[1]) != digest
+                    || as_text(&existing[2]) != "checked"
+                {
+                    return Err(StoreError::Conflict(
+                        "program import operation identity has different evidence".into(),
+                    ));
+                }
+                let stored = self
+                    .sql
+                    .query(
+                        "SELECT witness_json FROM program_import_admissions \
+                         WHERE version_id = ?1 AND witness_digest = ?2",
+                        &[text(&version_id), text(&digest)],
+                    )
+                    .map_err(sql_err)?;
+                if stored.first().map(|row| as_text(&row[0])) != Some(json.clone()) {
+                    return Err(StoreError::Conflict(
+                        "program import retry has different stored witness bytes".into(),
+                    ));
+                }
+            } else {
+                self.sql
+                    .execute(
+                        "INSERT INTO program_import_operations \
+                         (operation_id, version_id, witness_digest, kind) \
+                         VALUES (?1, ?2, ?3, 'checked')",
+                        &[text(operation_id), text(&version_id), text(&digest)],
+                    )
+                    .map_err(sql_err)?;
+            }
             record = Some(
                 whipplescript_store::program_imports::ProgramImportAdmissionRecord {
                     program_id,
@@ -15255,6 +15287,27 @@ pub(crate) mod tests {
             exact.witness_digest.as_deref(),
             Some(accepted.witness_digest.as_str())
         );
+        assert_eq!(
+            store
+                .create_program_version_with_import_witness_at_id(
+                    version("home-chosen"),
+                    &witness,
+                    OPERATION_ID,
+                )
+                .unwrap(),
+            accepted,
+            "an exact hosted retry returns the original target operation"
+        );
+        let mut changed_witness = witness.clone();
+        changed_witness.lock_digest =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        assert!(store
+            .create_program_version_with_import_witness_at_id(
+                version("home-chosen"),
+                &changed_witness,
+                OPERATION_ID,
+            )
+            .is_err());
         assert!(store
             .create_program_version_with_import_witness_at_id(
                 version("another-program"),
@@ -15287,6 +15340,24 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(as_i64(&rows[0][0]), 0);
+        store
+            .sql
+            .execute(
+                "UPDATE program_import_admissions SET witness_json = '{}' \
+                 WHERE version_id = ?1 AND witness_digest = ?2",
+                &[text(&accepted.version_id), text(&accepted.witness_digest)],
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_program_version_with_import_witness_at_id(
+                    version("home-chosen"),
+                    &witness,
+                    OPERATION_ID,
+                )
+                .is_err(),
+            "an exact hosted retry must inspect retained witness bytes"
+        );
     }
 
     /// The ported core methods run their real SQL against a real engine.

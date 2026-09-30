@@ -1988,7 +1988,8 @@ impl SqliteStore {
 
     /// Use a Home-registered operation identity in the same transaction as the
     /// checked witness. The caller registers this identity before any target
-    /// write, so recovery can look up one exact operation after a crash.
+    /// write. An exact retry returns the original operation without appending
+    /// another; reuse with a different version or witness is refused.
     pub fn create_program_version_with_import_witness_at_id(
         &mut self,
         version: NewProgramVersion<'_>,
@@ -2201,21 +2202,58 @@ impl SqliteStore {
                 row.get(0)
             })?
         };
-        tx.execute(
-            "INSERT INTO program_import_operations \
-             (operation_id, version_id, witness_digest, kind) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                &operation_id,
-                &version_id,
-                &witness_digest,
-                if witness_digest.is_some() {
-                    "checked"
-                } else {
-                    "unwitnessed"
-                },
-            ],
-        )?;
+        let existing: Option<(String, Option<String>, String)> = if requested_operation_id.is_some()
+        {
+            tx.query_row(
+                "SELECT version_id, witness_digest, kind FROM program_import_operations \
+                 WHERE operation_id = ?1",
+                [&operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        if let Some((prior_version, prior_digest, prior_kind)) = existing {
+            if prior_version != version_id
+                || prior_digest != witness_digest
+                || prior_kind != "checked"
+            {
+                return Err(StoreError::Conflict(
+                    "program import operation identity has different evidence".into(),
+                ));
+            }
+            let (_, expected_json) = program_imports::encode(
+                witness.expect("a requested operation identity always supplies a witness"),
+            )?;
+            let stored_json: String = tx.query_row(
+                "SELECT witness_json FROM program_import_admissions \
+                 WHERE version_id = ?1 AND witness_digest = ?2",
+                params![&version_id, &witness_digest],
+                |row| row.get(0),
+            )?;
+            if stored_json != expected_json {
+                return Err(StoreError::Conflict(
+                    "program import retry has different stored witness bytes".into(),
+                ));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO program_import_operations \
+                 (operation_id, version_id, witness_digest, kind) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &operation_id,
+                    &version_id,
+                    &witness_digest,
+                    if witness_digest.is_some() {
+                        "checked"
+                    } else {
+                        "unwitnessed"
+                    },
+                ],
+            )?;
+        }
         tx.commit()?;
 
         Ok((

@@ -1357,7 +1357,8 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
 
     /// Admit a checked host program under an operation identity registered by
     /// its Home before any runtime write. This makes cross-store crash recovery
-    /// an exact operation lookup rather than a version or witness guess.
+    /// an exact operation lookup rather than a version or witness guess. The
+    /// store returns the original operation on an exact retry.
     pub fn create_program_version_for_program_with_imports_at_id(
         &mut self,
         input: ProgramVersionInput<'_>,

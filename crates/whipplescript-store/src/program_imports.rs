@@ -510,6 +510,24 @@ mod tests {
             Some(checked.witness_digest.as_str())
         );
         assert_eq!(exact.kind, ProgramImportOperationKind::Checked);
+        assert_eq!(
+            store
+                .create_program_version_with_import_witness_at_id(
+                    version("home-chosen"),
+                    &witness(LOCK),
+                    OPERATION_ID,
+                )
+                .unwrap(),
+            checked,
+            "an exact retry recovers the one immutable target operation"
+        );
+        assert!(store
+            .create_program_version_with_import_witness_at_id(
+                version("home-chosen"),
+                &witness(COMPILER),
+                OPERATION_ID,
+            )
+            .is_err());
 
         assert!(store
             .create_program_version_with_import_witness_at_id(
@@ -526,7 +544,11 @@ mod tests {
             )
             .is_err());
         let roster = store.program_import_operation_roster().unwrap();
-        assert_eq!(roster.operations.len(), 1, "both refused writes roll back");
+        assert_eq!(
+            roster.operations.len(),
+            1,
+            "retries never mint another operation"
+        );
         assert!(store
             .connection
             .query_row(
@@ -537,6 +559,24 @@ mod tests {
             .optional()
             .unwrap()
             .is_none());
+        store
+            .connection
+            .execute(
+                "UPDATE program_import_admissions SET witness_json = '{}' \
+                 WHERE version_id = ?1 AND witness_digest = ?2",
+                rusqlite::params![checked.version_id, checked.witness_digest],
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_program_version_with_import_witness_at_id(
+                    version("home-chosen"),
+                    &witness(LOCK),
+                    OPERATION_ID,
+                )
+                .is_err(),
+            "an exact retry must inspect retained witness bytes"
+        );
     }
 
     #[test]
