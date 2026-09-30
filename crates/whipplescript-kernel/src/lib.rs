@@ -1394,6 +1394,26 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         )
     }
 
+    /// The same checked construct/import operation under an identity the
+    /// accepting Home registered before any target-store write.
+    pub fn create_program_version_for_program_with_imports_and_constructs_at_id(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        self.create_program_version_for_program_with_imports_basis(
+            input,
+            program,
+            basis,
+            Some(construct_basis),
+            Some(operation_id),
+        )
+    }
+
     fn create_program_version_for_program_with_imports_basis(
         &mut self,
         input: ProgramVersionInput<'_>,

@@ -1,5 +1,8 @@
 use super::*;
 use crate::gov::{ExternalAttestation, GovernanceAttestationVerifier, SignedEnvelope};
+use crate::host_action::{
+    HostActionHomeJournal, HostActionOperationBasis, HostActionOperationEvidence,
+};
 use crate::host_protocol::action::{
     tests::{command, ExactAdmission},
     ActionInput,
@@ -129,6 +132,273 @@ fn admit(
         b"authenticated fixture",
         custody,
     )
+}
+
+struct TestHomeJournal {
+    calls: Vec<&'static str>,
+    refuse: Option<&'static str>,
+}
+
+impl TestHomeJournal {
+    fn new(refuse: Option<&'static str>) -> Self {
+        Self {
+            calls: Vec::new(),
+            refuse,
+        }
+    }
+
+    fn check(&self, phase: &'static str) -> Result<(), HostFacadeError> {
+        if self.refuse == Some(phase) {
+            Err(HostFacadeError::Incomplete(format!("Home {phase} refused")))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl HostActionHomeJournal for TestHomeJournal {
+    fn register(
+        &mut self,
+        basis: &HostActionOperationBasis<'_>,
+    ) -> Result<String, HostFacadeError> {
+        assert_eq!(basis.source_digest.len(), 64);
+        assert_eq!(basis.ir_hash.len(), 32);
+        assert_eq!(basis.facts_digest.len(), 64);
+        assert_eq!(basis.compiler_artifact_digest, COMPILER_DIGEST);
+        assert_eq!(basis.policy.epoch, 7);
+        self.calls.push("register");
+        self.check("register")?;
+        Ok("imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+    }
+
+    fn complete_for_use(
+        &mut self,
+        evidence: &HostActionOperationEvidence<'_>,
+    ) -> Result<(), HostFacadeError> {
+        assert_eq!(
+            evidence.operation_id,
+            "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(evidence.witness_digest.len(), 64);
+        self.calls.push("complete");
+        self.check("complete")
+    }
+
+    fn allow_retained_use(
+        &mut self,
+        _instance_ref: &str,
+        _command_fingerprint: &str,
+        version_id: &str,
+    ) -> Result<(), HostFacadeError> {
+        assert!(!version_id.is_empty());
+        self.calls.push("retained");
+        self.check("retained")
+    }
+}
+
+#[test]
+fn materialized_home_journal_orders_pending_target_completion_and_retained_use() {
+    let (action, command, mut facade) = fixture(policy(), SOURCE);
+    let custody = Custody::new(&command);
+    let verify = ExactAdmission(command.signing_bytes().unwrap());
+    let admit_with = |facade: &mut GovernedHostFacade<NativeStores>,
+                      journal: &mut TestHomeJournal| {
+        facade.admit_action_with_inputs_and_home_journal(
+            command.clone(),
+            &action,
+            &verify,
+            b"authenticated fixture",
+            &custody,
+            journal,
+        )
+    };
+
+    let mut journal = TestHomeJournal::new(Some("register"));
+    assert!(admit_with(&mut facade, &mut journal).is_err());
+    assert_eq!(journal.calls, ["register"]);
+    assert!(facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .unwrap()
+        .operations
+        .is_empty());
+    assert!(facade.kernel().store().list_instances().unwrap().is_empty());
+
+    let mut journal = TestHomeJournal::new(Some("complete"));
+    assert!(admit_with(&mut facade, &mut journal).is_err());
+    assert_eq!(journal.calls, ["register", "complete"]);
+    let operations = facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .unwrap();
+    assert_eq!(operations.operations.len(), 1);
+    assert_eq!(
+        operations.operations[0].operation_id,
+        "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(facade.kernel().store().list_instances().unwrap().is_empty());
+
+    let mut journal = TestHomeJournal::new(None);
+    let receipt = admit_with(&mut facade, &mut journal).unwrap();
+    assert_eq!(journal.calls, ["register", "complete"]);
+    assert_eq!(
+        facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .len(),
+        1
+    );
+
+    let mut journal = TestHomeJournal::new(Some("retained"));
+    assert!(admit_with(&mut facade, &mut journal).is_err());
+    assert_eq!(journal.calls, ["retained"]);
+    let mut journal = TestHomeJournal::new(None);
+    assert_eq!(admit_with(&mut facade, &mut journal).unwrap(), receipt);
+    assert_eq!(journal.calls, ["retained"]);
+}
+
+#[test]
+fn ordinary_action_uses_the_same_home_journal_door() {
+    let (_, mut command, mut facade) = fixture(policy(), SOURCE);
+    let action = CompiledHostAction::compile(
+        "workflow.launch",
+        "workflow Empty() -> bool\nrule done\n when external.started\n=> { complete result true }",
+        None,
+    )
+    .unwrap();
+    command.program_version_ref = action.version_ref().into();
+    command.input_schema_ref = action.input_schema_ref().into();
+    command.inputs.clear();
+    let verify = ExactAdmission(command.signing_bytes().unwrap());
+    let admit_with = |facade: &mut GovernedHostFacade<NativeStores>,
+                      journal: &mut TestHomeJournal| {
+        facade.admit_action_with_home_journal(
+            command.clone(),
+            &action,
+            &verify,
+            b"authenticated fixture",
+            journal,
+        )
+    };
+    let mut journal = TestHomeJournal::new(Some("register"));
+    assert!(admit_with(&mut facade, &mut journal).is_err());
+    assert!(facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .unwrap()
+        .operations
+        .is_empty());
+    let mut journal = TestHomeJournal::new(None);
+    let first = admit_with(&mut facade, &mut journal).unwrap();
+    assert_eq!(journal.calls, ["register", "complete"]);
+    let mut journal = TestHomeJournal::new(Some("retained"));
+    assert!(admit_with(&mut facade, &mut journal).is_err());
+    assert_eq!(journal.calls, ["retained"]);
+    let mut journal = TestHomeJournal::new(None);
+    assert_eq!(admit_with(&mut facade, &mut journal).unwrap(), first);
+    assert_eq!(journal.calls, ["retained"]);
+    assert_eq!(
+        facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn home_journal_refuses_retained_admission_with_a_missing_instance() {
+    for materialized in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "whip-home-missing-{}-{}-{materialized}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime_path = root.join("runtime.db");
+        let open = || {
+            GovernedHostFacade::from_verified_store(
+                NativeStores::open(&runtime_path, root.join("coord.db"), root.join("items.db"))
+                    .unwrap(),
+                7,
+                envelope(policy(), 7),
+            )
+            .unwrap()
+            .with_compiler_artifact_digest(COMPILER_DIGEST)
+        };
+        let (materialized_action, mut command, _) = fixture(policy(), SOURCE);
+        let ordinary_action = CompiledHostAction::compile(
+            "workflow.launch",
+            "workflow Empty() -> bool\nrule done\n when external.started\n=> { complete result true }",
+            None,
+        )
+        .unwrap();
+        let action = if materialized {
+            &materialized_action
+        } else {
+            command.program_version_ref = ordinary_action.version_ref().into();
+            command.input_schema_ref = ordinary_action.input_schema_ref().into();
+            command.inputs.clear();
+            &ordinary_action
+        };
+        let custody = Custody::new(&command);
+        let verify = ExactAdmission(command.signing_bytes().unwrap());
+        let admit_with = |facade: &mut GovernedHostFacade<NativeStores>,
+                          journal: &mut TestHomeJournal| {
+            if materialized {
+                facade.admit_action_with_inputs_and_home_journal(
+                    command.clone(),
+                    action,
+                    &verify,
+                    b"authenticated fixture",
+                    &custody,
+                    journal,
+                )
+            } else {
+                facade.admit_action_with_home_journal(
+                    command.clone(),
+                    action,
+                    &verify,
+                    b"authenticated fixture",
+                    journal,
+                )
+            }
+        };
+        let mut facade = open();
+        let receipt = admit_with(&mut facade, &mut TestHomeJournal::new(None)).unwrap();
+        drop(facade);
+        let conn = rusqlite::Connection::open(&runtime_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM instances WHERE instance_id = ?1",
+                [receipt.instance_ref.as_str()],
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        let mut facade = open();
+        let mut journal = TestHomeJournal::new(None);
+        let error = admit_with(&mut facade, &mut journal).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("retained host action instance is missing"));
+        assert!(journal.calls.is_empty());
+        drop(facade);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 #[test]

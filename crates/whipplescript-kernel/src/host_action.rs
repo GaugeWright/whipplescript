@@ -15,6 +15,52 @@ use crate::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use crate::workflow_input::{validate_workflow_start_input, WorkflowInputFact};
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
+/// Exact checked-action basis offered to the Home before this runtime writes
+/// content or a program version. The Home also supplies the target-store
+/// identity, which is outside the kernel's knowledge.
+pub struct HostActionOperationBasis<'a> {
+    pub instance_ref: &'a str,
+    pub command_fingerprint: &'a str,
+    pub version_ref: &'a str,
+    pub program_name: &'a str,
+    pub source_digest: &'a str,
+    pub ir_hash: &'a str,
+    pub compiler_artifact_digest: &'a str,
+    pub facts_digest: &'a str,
+    pub policy: &'a crate::host_protocol::PolicyEpochRef,
+    pub construct_basis: Option<&'a CheckedConstructBasis<'a>>,
+}
+
+/// The immutable target evidence to which a pending Home pointer is completed.
+pub struct HostActionOperationEvidence<'a> {
+    pub instance_ref: &'a str,
+    pub command_fingerprint: &'a str,
+    pub operation_id: &'a str,
+    pub program_id: &'a str,
+    pub version_id: &'a str,
+    pub witness_digest: &'a str,
+}
+
+/// Product-owned durable Home journal and use door. `register` must persist a
+/// pending pointer before returning its operation ID and return that same ID
+/// on an exact retry. `complete_for_use` binds the checked program operation's
+/// evidence and enforces the current epoch before an instance can start.
+/// Retained instances need their original Home admission checked again.
+pub trait HostActionHomeJournal {
+    fn register(&mut self, basis: &HostActionOperationBasis<'_>)
+        -> Result<String, HostFacadeError>;
+    fn complete_for_use(
+        &mut self,
+        evidence: &HostActionOperationEvidence<'_>,
+    ) -> Result<(), HostFacadeError>;
+    fn allow_retained_use(
+        &mut self,
+        instance_ref: &str,
+        command_fingerprint: &str,
+        version_id: &str,
+    ) -> Result<(), HostFacadeError>;
+}
+
 /// Only the compiler can construct this value. Hosts cannot inject a graph or
 /// mutate the program after its source, schema and IR identity were checked.
 pub struct CompiledHostAction {
@@ -179,6 +225,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         admission: &VerifiedActionAdmission,
         compiler_artifact_digest: &str,
         construct_basis: Option<&CheckedConstructBasis<'_>>,
+        journal: Option<&mut dyn HostActionHomeJournal>,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let facts = action.validate_inputs(admission)?;
         self.admit_host_action_inputs(
@@ -187,6 +234,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
             facts,
             compiler_artifact_digest,
             construct_basis,
+            journal,
         )
     }
 
@@ -197,13 +245,62 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         facts: Vec<WorkflowInputFact>,
         compiler_artifact_digest: &str,
         construct_basis: Option<&CheckedConstructBasis<'_>>,
+        mut journal: Option<&mut dyn HostActionHomeJournal>,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
+        if let Some(journal) = journal.as_deref_mut() {
+            if let Some(receipt) = self.existing_action_admission(admission)? {
+                let instance = self
+                    .store()
+                    .get_instance(admission.instance_ref())
+                    .map_err(HostFacadeError::Store)?
+                    .ok_or_else(|| {
+                        HostFacadeError::Incomplete(
+                            "retained host action instance is missing".into(),
+                        )
+                    })?;
+                journal.allow_retained_use(
+                    admission.instance_ref(),
+                    admission.fingerprint(),
+                    &instance.version_id,
+                )?;
+                return Ok(receipt);
+            }
+        }
+        let ir_hash = whipplescript_store::stable_hash_hex(&action.identity);
+        let source_digest = crate::exec_http::sha256_hex(action.source.as_bytes());
+        let facts_digest = crate::exec_http::sha256_hex(
+            &serde_json::to_vec(
+                &facts
+                    .iter()
+                    .map(|fact| (&fact.name, &fact.key, &fact.value_json))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(HostFacadeError::Json)?,
+        );
+        let operation_id = if let Some(journal) = journal.as_deref_mut() {
+            let basis = HostActionOperationBasis {
+                instance_ref: admission.instance_ref(),
+                command_fingerprint: admission.fingerprint(),
+                version_ref: action.version_ref(),
+                program_name: &action.program.workflow,
+                source_digest: &source_digest,
+                ir_hash: &ir_hash,
+                compiler_artifact_digest,
+                facts_digest: &facts_digest,
+                policy: &admission.command().policy,
+                construct_basis,
+            };
+            let id = journal.register(&basis)?;
+            whipplescript_store::program_imports::validate_operation_id(&id)
+                .map_err(HostFacadeError::Store)?;
+            Some(id)
+        } else {
+            None
+        };
         let source_hash = self
             .store()
             .put_content(&action.source)
             .map_err(HostFacadeError::Store)?;
-        let ir_hash = whipplescript_store::stable_hash_hex(&action.identity);
-        let source_digest = crate::exec_http::sha256_hex(action.source.as_bytes());
         let input = ProgramVersionInput {
             program_name: &action.program.workflow,
             source_hash: &source_hash,
@@ -218,21 +315,45 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
             compiler_artifact_digest,
             packages: &[],
         };
-        let version_admission = if let Some(construct_basis) = construct_basis {
-            self.create_program_version_for_program_with_imports_and_constructs(
+        let version_admission = match (construct_basis, operation_id.as_deref()) {
+            (Some(construct_basis), Some(id)) => self
+                .create_program_version_for_program_with_imports_and_constructs_at_id(
+                    input,
+                    &action.program,
+                    &import_basis,
+                    construct_basis,
+                    id,
+                ),
+            (Some(construct_basis), None) => self
+                .create_program_version_for_program_with_imports_and_constructs(
+                    input,
+                    &action.program,
+                    &import_basis,
+                    construct_basis,
+                ),
+            (None, Some(id)) => self.create_program_version_for_program_with_imports_at_id(
                 input,
                 &action.program,
                 &import_basis,
-                construct_basis,
-            )
-        } else {
-            self.create_program_version_for_program_with_imports(
+                id,
+            ),
+            (None, None) => self.create_program_version_for_program_with_imports(
                 input,
                 &action.program,
                 &import_basis,
-            )
+            ),
         }
         .map_err(HostFacadeError::Store)?;
+        if let Some(journal) = journal {
+            journal.complete_for_use(&HostActionOperationEvidence {
+                instance_ref: admission.instance_ref(),
+                command_fingerprint: admission.fingerprint(),
+                operation_id: &version_admission.operation_id,
+                program_id: &version_admission.program_id,
+                version_id: &version_admission.version_id,
+                witness_digest: &version_admission.witness_digest,
+            })?;
+        }
         let command = admission.command();
         let command_json = serde_json::to_string(command).map_err(HostFacadeError::Json)?;
         let input_json = serde_json::to_string(&command.inputs).map_err(HostFacadeError::Json)?;

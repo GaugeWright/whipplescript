@@ -73,6 +73,45 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     where
         S: LogAppend,
     {
+        self.admit_action_with_inputs_inner(command, action, verifier, proof, resolver, None)
+    }
+
+    /// Materialize governed inputs and admit their program operation through
+    /// the Home journal before this runtime makes any reference-bearing write.
+    pub fn admit_action_with_inputs_and_home_journal<R: ActionInputResolver>(
+        &mut self,
+        command: HostActionCommand,
+        action: &CompiledHostAction,
+        verifier: &dyn ActionAdmissionVerifier,
+        proof: &[u8],
+        resolver: &R,
+        journal: &mut dyn crate::host_action::HostActionHomeJournal,
+    ) -> Result<ActionAdmissionReceipt, HostFacadeError>
+    where
+        S: LogAppend,
+    {
+        self.admit_action_with_inputs_inner(
+            command,
+            action,
+            verifier,
+            proof,
+            resolver,
+            Some(journal),
+        )
+    }
+
+    fn admit_action_with_inputs_inner<R: ActionInputResolver>(
+        &mut self,
+        command: HostActionCommand,
+        action: &CompiledHostAction,
+        verifier: &dyn ActionAdmissionVerifier,
+        proof: &[u8],
+        resolver: &R,
+        mut journal: Option<&mut dyn crate::host_action::HostActionHomeJournal>,
+    ) -> Result<ActionAdmissionReceipt, HostFacadeError>
+    where
+        S: LogAppend,
+    {
         self.require_policy(&command.policy)?;
         let admission = VerifiedActionAdmission::verify(command, &self.envelope, verifier, proof)?;
         action.validate_command(admission.command())?;
@@ -91,6 +130,23 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         )?;
         self.check_program_ifc(action.program())?;
         if let Some(receipt) = self.kernel.existing_action_admission(&admission)? {
+            if let Some(journal) = journal.as_deref_mut() {
+                let instance = self
+                    .kernel
+                    .store()
+                    .get_instance(admission.instance_ref())
+                    .map_err(HostFacadeError::Store)?
+                    .ok_or_else(|| {
+                        HostFacadeError::Incomplete(
+                            "retained host action instance is missing".into(),
+                        )
+                    })?;
+                journal.allow_retained_use(
+                    admission.instance_ref(),
+                    admission.fingerprint(),
+                    &instance.version_id,
+                )?;
+            }
             return Ok(receipt);
         }
         let compiler_artifact_digest = self.compiler_artifact_digest.clone().ok_or_else(|| {
@@ -133,6 +189,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     facts,
                     &compiler_artifact_digest,
                     construct_basis.as_ref(),
+                    journal,
                 )
             })
             .map_err(|_| {

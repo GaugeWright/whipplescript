@@ -167,6 +167,36 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     where
         S: whipplescript_store::log_append::LogAppend,
     {
+        self.admit_action_inner(command, action, verifier, proof, None)
+    }
+
+    /// Admit through the authenticated Home's pending/completed operation
+    /// journal. The product must use this door for a Home-wide coverage claim.
+    pub fn admit_action_with_home_journal(
+        &mut self,
+        command: crate::host_protocol::action::HostActionCommand,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::action::ActionAdmissionVerifier,
+        proof: &[u8],
+        journal: &mut dyn crate::host_action::HostActionHomeJournal,
+    ) -> Result<crate::host_protocol::action::ActionAdmissionReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
+        self.admit_action_inner(command, action, verifier, proof, Some(journal))
+    }
+
+    fn admit_action_inner(
+        &mut self,
+        command: crate::host_protocol::action::HostActionCommand,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::action::ActionAdmissionVerifier,
+        proof: &[u8],
+        journal: Option<&mut dyn crate::host_action::HostActionHomeJournal>,
+    ) -> Result<crate::host_protocol::action::ActionAdmissionReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
         self.require_policy(&command.policy)?;
         let admission = crate::host_protocol::action::VerifiedActionAdmission::verify(
             command,
@@ -203,6 +233,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             &admission,
             compiler_artifact_digest,
             construct_basis.as_ref(),
+            journal,
         )
     }
 
