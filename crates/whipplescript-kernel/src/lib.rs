@@ -77,6 +77,8 @@ pub mod rule_pass;
 pub mod sansio;
 pub mod save_reconciliation;
 pub mod source_action;
+#[cfg(feature = "native")]
+pub mod source_admission;
 pub mod source_merge;
 pub mod stats;
 pub mod time_pass;

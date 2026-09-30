@@ -2344,6 +2344,25 @@ mod tests {
     }
 
     #[test]
+    fn native_gate_subject_reader_refuses_missing_coordinates_and_witness() {
+        let vcs = workspace();
+        for (witness, attempt) in [("", "attempt"), ("witness", "")] {
+            assert!(format!(
+                "{:?}",
+                vcs.capture_native_gate_subject(witness, attempt)
+                    .unwrap_err()
+            )
+            .contains("candidate or attempt identity is incomplete"));
+        }
+        assert!(format!(
+            "{:?}",
+            vcs.capture_native_gate_subject("missing", "attempt")
+                .unwrap_err()
+        )
+        .contains("candidate witness is missing"));
+    }
+
+    #[test]
     fn native_gate_refuses_changed_attempt_and_cut_basis() {
         let (mut vcs, mut reviews) = reviewed_two_unit_twig();
         upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);

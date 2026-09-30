@@ -15,19 +15,19 @@ use whipplescript_store::norm_commands::NormArtifactCapture;
 use whipplescript_store::norm_history::CapturedNormHistory;
 use whipplescript_store::RuntimeStore;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigurationWire {
     capability: String,
     roles: Vec<Role>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Role {
     vocabulary: VocabularyRef,
     interpretation: Interpretation,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Interpretation {
     Context,
@@ -164,6 +164,7 @@ impl Planned {
 
 /// Validated embedding configuration, never part of a query request.
 pub struct PlanningConfiguration {
+    identity: EvidenceVersion,
     capability: String,
     roles: BTreeMap<VocabularyRef, ProjectionRole>,
     reservations: std::collections::BTreeSet<VocabularyRef>,
@@ -171,11 +172,24 @@ pub struct PlanningConfiguration {
 }
 impl PlanningConfiguration {
     pub fn parse(configured: &str) -> Result<Self, String> {
-        let configuration: ConfigurationWire =
+        let mut configuration: ConfigurationWire =
             serde_json::from_str(configured).map_err(|error| error.to_string())?;
         if configuration.capability.trim().is_empty() {
             return Err("norm planning requires a named installed capability".into());
         }
+        configuration
+            .roles
+            .sort_by(|left, right| left.vocabulary.cmp(&right.vocabulary));
+        let identity = EvidenceVersion {
+            name: "whipplescript.norm.planning".into(),
+            version: "1".into(),
+            digest: format!(
+                "sha256:{}",
+                whipplescript_store::stable_hash_bytes_hex(
+                    &serde_json::to_vec(&configuration).map_err(|error| error.to_string())?
+                )
+            ),
+        };
         let mut roles = BTreeMap::new();
         let mut reservations = std::collections::BTreeSet::new();
         let mut reliability = crate::norm_reliability::ReliabilityVocabularies::default();
@@ -215,6 +229,7 @@ impl PlanningConfiguration {
             }
         }
         Ok(Self {
+            identity,
             capability: configuration.capability,
             roles,
             reservations,
@@ -231,6 +246,11 @@ impl PlanningConfiguration {
     /// The vocabularies the host interprets as reservations.
     pub fn reservation_vocabularies(&self) -> &std::collections::BTreeSet<VocabularyRef> {
         &self.reservations
+    }
+
+    /// Exact host interpretation, independent of configuration role order.
+    pub fn identity(&self) -> &EvidenceVersion {
+        &self.identity
     }
 }
 

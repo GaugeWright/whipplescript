@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use super::NativeWorkspaceVcs;
 use crate::branches::flowing_admission::{
-    FlowingAdmissions, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateCheck,
-    FlowingGateEvidence,
+    FlowingAdmissions, FlowingAttemptPin, FlowingCandidateWitness, FlowingGateCertificate,
+    FlowingGateCheck, FlowingGateEvidence,
 };
-use crate::branches::flowing_fence::FlowingFence;
+use crate::branches::flowing_fence::{FlowingFence, FlowingFenceState};
 use crate::branches::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
 use crate::materialize::materialize_manifest;
 use crate::{StoreError, StoreResult};
@@ -53,6 +53,28 @@ pub trait NativeGatePlanAuthority {
     ) -> StoreResult<NativeGatePlan>;
 }
 
+/// Read from the ref authority, never deserialized from an attempted plan.
+/// This proves a currently retained native subject, not policy or dependency
+/// coverage. The final ref door still has to fence these mutable premises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedNativeGateSubject {
+    witness: FlowingCandidateWitness,
+    pin: FlowingAttemptPin,
+    fence: FlowingFenceState,
+}
+
+impl CapturedNativeGateSubject {
+    pub fn witness(&self) -> &FlowingCandidateWitness {
+        &self.witness
+    }
+    pub fn attempt_id(&self) -> &str {
+        &self.pin.op_id
+    }
+    pub fn fence(&self) -> &FlowingFenceState {
+        &self.fence
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeGateRun {
     pub handle: String,
@@ -79,6 +101,71 @@ fn invalid(reason: &str) -> StoreError {
 }
 
 impl NativeWorkspaceVcs {
+    /// Capture a live retained candidate without executing or creating work.
+    /// A source tail may advance; the immutable selected prefix stays exact.
+    pub fn capture_native_gate_subject(
+        &self,
+        witness_digest: &str,
+        attempt_op_id: &str,
+    ) -> StoreResult<CapturedNativeGateSubject> {
+        if witness_digest.trim().is_empty() || attempt_op_id.trim().is_empty() {
+            return Err(invalid("candidate or attempt identity is incomplete"));
+        }
+        let Some(witness) = self.branches.candidate_witness(witness_digest)? else {
+            return Err(invalid("candidate witness is missing"));
+        };
+        let Some(pin) = self.branches.flowing_attempt_pin(attempt_op_id)? else {
+            return Err(invalid("candidate attempt is not retained"));
+        };
+        if pin.released_at.is_some()
+            || pin.witness_digest != witness_digest
+            || pin.source_cut_id != witness.source_cut_id
+            || pin.candidate_cut_id != witness.candidate_cut_id
+        {
+            return Err(invalid("candidate attempt pin differs from witness"));
+        }
+        if self
+            .branches
+            .flowing_cancellation_for_attempt(attempt_op_id)?
+            .is_some()
+        {
+            return Err(invalid("candidate attempt was cancelled"));
+        }
+        let Some(fence) = self.branches.flowing_source(&witness.source_branch_id)? else {
+            return Err(invalid("source fence is missing"));
+        };
+        if fence.incarnation_id != witness.source_incarnation_id
+            || !fence.admission_enabled
+            || fence.held
+            || fence.revision.is_some()
+        {
+            return Err(invalid("source eligibility or coordinator changed"));
+        }
+        let Some(trunk) = self.branches.get_branch(MAINLINE_BRANCH_ID)? else {
+            return Err(invalid("trunk is missing"));
+        };
+        if trunk.status != BranchStatus::Active
+            || trunk.head_cut_id != witness.expected_trunk_cut_id
+        {
+            return Err(invalid("trunk base changed"));
+        }
+        let Some(cut) = self.branches.get_cut(&witness.candidate_cut_id)? else {
+            return Err(invalid("candidate cut is missing"));
+        };
+        if cut.branch_id != MAINLINE_BRANCH_ID
+            || cut.manifest_hash != witness.candidate_manifest_hash
+            || (witness.expected_trunk_cut_id.as_deref() != Some(witness.candidate_cut_id.as_str())
+                && cut.parent_cut_id != witness.expected_trunk_cut_id)
+        {
+            return Err(invalid("candidate cut differs from retained witness"));
+        }
+        Ok(CapturedNativeGateSubject {
+            witness,
+            pin,
+            fence,
+        })
+    }
+
     /// Run every planned check in its own fresh projection of the retained
     /// candidate cut. A failure is recorded as Failed, and a process that
     /// cannot start is Unrun; neither can authorize ref admission. The scratch
@@ -122,53 +209,13 @@ impl NativeWorkspaceVcs {
         if scratch.exists() {
             return Err(invalid("scratch path must be absent"));
         }
-        let Some(pin) = self.branches.flowing_attempt_pin(&plan.attempt_op_id)? else {
-            return Err(invalid("candidate attempt is not retained"));
-        };
-        if pin.released_at.is_some()
-            || pin.witness_digest != witness_digest
-            || pin.source_cut_id != witness.source_cut_id
-            || pin.candidate_cut_id != witness.candidate_cut_id
-        {
-            return Err(invalid("candidate attempt pin differs from witness"));
-        }
-        if self
-            .branches
-            .flowing_cancellation_for_attempt(&plan.attempt_op_id)?
-            .is_some()
-        {
-            return Err(invalid("candidate attempt was cancelled"));
-        }
-        let Some(fence) = self.branches.flowing_source(&witness.source_branch_id)? else {
-            return Err(invalid("source fence is missing"));
-        };
-        if fence.incarnation_id != witness.source_incarnation_id
-            || fence.owner != plan.coordinator
-            || !fence.admission_enabled
-            || fence.held
-            || fence.revision.is_some()
-        {
+        let subject = self.capture_native_gate_subject(witness_digest, attempt_op_id)?;
+        let pin = subject.pin;
+        let fence = subject.fence;
+        if fence.owner != plan.coordinator {
             return Err(invalid("source eligibility or coordinator changed"));
         }
-        let Some(trunk) = self.branches.get_branch(MAINLINE_BRANCH_ID)? else {
-            return Err(invalid("trunk is missing"));
-        };
-        if trunk.status != BranchStatus::Active
-            || trunk.head_cut_id != witness.expected_trunk_cut_id
-        {
-            return Err(invalid("trunk base changed"));
-        }
-        let Some(cut) = self.branches.get_cut(&witness.candidate_cut_id)? else {
-            return Err(invalid("candidate cut is missing"));
-        };
-        if cut.branch_id != MAINLINE_BRANCH_ID
-            || cut.manifest_hash != witness.candidate_manifest_hash
-            || (witness.expected_trunk_cut_id.as_deref() != Some(witness.candidate_cut_id.as_str())
-                && cut.parent_cut_id != witness.expected_trunk_cut_id)
-        {
-            return Err(invalid("candidate cut differs from retained witness"));
-        }
-        let manifest = self.load_manifest(Some(&cut.manifest_hash))?;
+        let manifest = self.load_manifest(Some(&witness.candidate_manifest_hash))?;
         std::fs::create_dir(scratch).map_err(|error| {
             invalid(&format!(
                 "cannot create scratch {}: {error}",
