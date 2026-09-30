@@ -114,11 +114,109 @@ fn read_attempt_pin(
         .map_err(Into::into)
 }
 
+struct HandoffHolder {
+    target_branch: String,
+    target_cut: String,
+    target_manifest: String,
+    source_branch: String,
+    source_cut: String,
+    source_manifest: String,
+    source_basis: String,
+    original_principal: String,
+}
+
 fn missing_unit_holder(
     connection: &Connection,
     witness: &FlowingCandidateWitness,
 ) -> StoreResult<Option<String>> {
     for unit in &witness.units {
+        let handoff: Option<HandoffHolder> = connection
+            .query_row(
+                "SELECT target_branch_id, target_after_cut_id, target_after_manifest_hash, \
+                     source_branch_id, source_cut_id, source_manifest_hash, \
+                     source_basis_digest, original_principal \
+                     FROM flowing_handoffs WHERE unit_id = ?1",
+                [&unit.unit_id],
+                |row| {
+                    Ok(HandoffHolder {
+                        target_branch: row.get(0)?,
+                        target_cut: row.get(1)?,
+                        target_manifest: row.get(2)?,
+                        source_branch: row.get(3)?,
+                        source_cut: row.get(4)?,
+                        source_manifest: row.get(5)?,
+                        source_basis: row.get(6)?,
+                        original_principal: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(handoff) = handoff {
+            let declaration: Option<(String, String, String, String, String, String)> = connection
+                .query_row(
+                    "SELECT c.source_branch_id, c.source_cut_id, c.source_manifest_hash, \
+                     c.principal, c.intent, b.basis_digest \
+                     FROM flowing_contributions c \
+                     JOIN flowing_contribution_basis b ON b.unit_id = c.unit_id \
+                     WHERE c.unit_id = ?1",
+                    [&unit.unit_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((declared_branch, declared_cut, declared_manifest, principal, intent, basis)) =
+                declaration
+            else {
+                return Ok(Some(unit.unit_id.clone()));
+            };
+            let source_row = BranchStore::row_by_id(connection, &handoff.source_branch)?;
+            let Some(target_row) = BranchStore::row_by_id(connection, &handoff.target_branch)?
+            else {
+                return Ok(Some(unit.unit_id.clone()));
+            };
+            let Some(target_head) = target_row.head_cut_id.as_deref() else {
+                return Ok(Some(unit.unit_id.clone()));
+            };
+            let source_cut_row = BranchStore::cut_by_id(connection, &handoff.source_cut)?;
+            let target_cut_row = BranchStore::cut_by_id(connection, &handoff.target_cut)?;
+            let held = handoff.target_branch == witness.source_branch_id
+                && handoff.source_branch == declared_branch
+                && handoff.source_cut == declared_cut
+                && handoff.source_manifest == declared_manifest
+                && handoff.source_basis == basis
+                && handoff.source_basis == unit.basis_digest
+                && handoff.original_principal == principal
+                && principal == unit.principal
+                && intent == unit.intent
+                && source_row.as_ref().is_some_and(|row| {
+                    row.name.is_none()
+                        && row.parent_branch_id.as_deref() == Some(handoff.target_branch.as_str())
+                })
+                && target_row.status == BranchStatus::Active
+                && target_row.name.is_some()
+                && source_cut_row.as_ref().is_some_and(|cut| {
+                    cut.branch_id == handoff.source_branch
+                        && cut.manifest_hash == handoff.source_manifest
+                })
+                && target_cut_row.as_ref().is_some_and(|cut| {
+                    cut.branch_id == handoff.target_branch
+                        && cut.manifest_hash == handoff.target_manifest
+                })
+                && ancestor(connection, &handoff.target_cut, &witness.source_cut_id)?
+                && ancestor(connection, &witness.source_cut_id, target_head)?;
+            if !held {
+                return Ok(Some(unit.unit_id.clone()));
+            }
+            continue;
+        }
         let cut: Option<String> = connection
             .query_row(
                 "SELECT c.source_cut_id \

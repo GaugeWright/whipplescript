@@ -114,33 +114,38 @@ fn read_handoff(
         }
     };
     let row: Option<(HandoffReceipt, String)> = connection
-        .query_row(query, params![value], |row| {
-            Ok((
-                HandoffReceipt {
-                    op_id: row.get(0)?,
-                    unit_id: row.get(1)?,
-                    source_branch_id: row.get(2)?,
-                    source_cut_id: row.get(3)?,
-                    source_manifest_hash: row.get(4)?,
-                    source_basis_digest: row.get(5)?,
-                    target_branch_id: row.get(6)?,
-                    target_before_cut_id: row.get(7)?,
-                    target_after_cut_id: row.get(8)?,
-                    target_after_manifest_hash: row.get(9)?,
-                    effects: Vec::new(),
-                    original_principal: row.get(11)?,
-                    actor: row.get(12)?,
-                    recorded_at: row.get(13)?,
-                },
-                row.get(10)?,
-            ))
-        })
+        .query_row(query, params![value], handoff_row)
         .optional()?;
-    row.map(|(mut receipt, effects_json)| {
-        receipt.effects = serde_json::from_str(&effects_json)?;
-        Ok(receipt)
-    })
-    .transpose()
+    row.map(decode_handoff).transpose()
+}
+
+fn handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(HandoffReceipt, String)> {
+    Ok((
+        HandoffReceipt {
+            op_id: row.get(0)?,
+            unit_id: row.get(1)?,
+            source_branch_id: row.get(2)?,
+            source_cut_id: row.get(3)?,
+            source_manifest_hash: row.get(4)?,
+            source_basis_digest: row.get(5)?,
+            target_branch_id: row.get(6)?,
+            target_before_cut_id: row.get(7)?,
+            target_after_cut_id: row.get(8)?,
+            target_after_manifest_hash: row.get(9)?,
+            effects: Vec::new(),
+            original_principal: row.get(11)?,
+            actor: row.get(12)?,
+            recorded_at: row.get(13)?,
+        },
+        row.get(10)?,
+    ))
+}
+
+fn decode_handoff(
+    (mut receipt, effects_json): (HandoffReceipt, String),
+) -> StoreResult<HandoffReceipt> {
+    receipt.effects = serde_json::from_str(&effects_json)?;
+    Ok(receipt)
 }
 
 impl FlowingSources for BranchStore {
@@ -586,6 +591,21 @@ impl FlowingSources for BranchStore {
 
     fn contribution_handoff(&self, unit_id: &str) -> StoreResult<Option<HandoffReceipt>> {
         read_handoff(&self.connection, HandoffLookup::Unit, unit_id)
+    }
+
+    fn target_handoffs(&self, target_branch_id: &str) -> StoreResult<Vec<HandoffReceipt>> {
+        let mut statement = self.connection.prepare(
+            "SELECT op_id, unit_id, source_branch_id, source_cut_id, \
+             source_manifest_hash, source_basis_digest, target_branch_id, \
+             target_before_cut_id, target_after_cut_id, target_after_manifest_hash, \
+             effects_json, original_principal, actor, recorded_at \
+             FROM flowing_handoffs WHERE target_branch_id = ?1 ORDER BY op_id",
+        )?;
+        let receipts = statement
+            .query_map([target_branch_id], handoff_row)?
+            .map(|row| decode_handoff(row?))
+            .collect();
+        receipts
     }
 
     fn release_private_cut(

@@ -225,8 +225,9 @@ pub struct CutRow {
     pub recorded_at: String,
 }
 
-/// Request to record a cut's identity + provenance. Idempotent per
-/// `cut_id` (first record wins; retries are no-ops).
+/// Request to record a cut's identity + provenance. A flowing cut's exact retry
+/// is a no-op and changed identity refuses. Legacy v1 import/promotion still
+/// use first-record-wins until their compatibility boundary is migrated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CutRecord<'a> {
     pub cut_id: &'a str,
@@ -238,6 +239,22 @@ pub struct CutRecord<'a> {
     pub actor: Option<&'a str>,
     pub intent: Option<&'a str>,
     pub recorded_at: &'a str,
+}
+
+impl CutRow {
+    /// The content and provenance that a flowing retry must reproduce. Hosted
+    /// and native stores use the same comparison after their first-wins insert.
+    pub fn matches_record(&self, record: CutRecord<'_>) -> bool {
+        self.cut_id == record.cut_id
+            && self.change_id == record.change_id
+            && self.branch_id == record.branch_id
+            && self.manifest_hash == record.manifest_hash
+            && self.parent_cut_id.as_deref() == record.parent_cut_id
+            && self.origin.as_deref() == record.origin
+            && self.actor.as_deref() == record.actor
+            && self.intent.as_deref() == record.intent
+            && self.recorded_at == record.recorded_at
+    }
 }
 
 /// One persisted change-unit row (DR-0052 L4): the per-path delta of
@@ -1665,6 +1682,16 @@ impl Branches for BranchStore {
                 cut.recorded_at
             ],
         )?;
+        let recorded = Self::cut_by_id(&self.connection, cut.cut_id)?;
+        let recorded = StoreError::written_row(recorded, "recorded cut")?;
+        let flowing = flowing_fence::native::read_state(&self.connection, cut.branch_id)?.is_some()
+            || flowing_fence::native::read_state(&self.connection, &recorded.branch_id)?.is_some();
+        if flowing && !recorded.matches_record(cut) {
+            return Err(StoreError::Conflict(format!(
+                "flowing cut `{}` identity already records different substance or provenance",
+                cut.cut_id
+            )));
+        }
         Ok(())
     }
 
@@ -2190,6 +2217,7 @@ impl Branches for BranchStore {
 
 #[cfg(all(test, feature = "native"))]
 mod tests {
+    use super::flowing_fence::{FlowingFence, FlowingSourceKind, OpenFlowingSource};
     use super::*;
 
     fn store() -> BranchStore {
@@ -2222,6 +2250,96 @@ mod tests {
                 recorded_at: "t1",
             })
             .expect("cut records");
+    }
+
+    #[test]
+    fn cut_id_exact_retry_preserves_identity_and_changed_retry_refuses() {
+        let mut store = store();
+        store.ensure_mainline("t0").unwrap();
+        store
+            .create_branch(create("branch-a", MAINLINE_BRANCH_ID))
+            .unwrap();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch-a".into(),
+                incarnation_id: "incarnation-a".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "person:a".into(),
+                opened_at: "t0".into(),
+            })
+            .unwrap();
+        let original = CutRecord {
+            cut_id: "cut-identity",
+            change_id: "change-a",
+            branch_id: "branch-a",
+            manifest_hash: "manifest-a",
+            parent_cut_id: None,
+            origin: Some("transport:source-a"),
+            actor: Some("person:a"),
+            intent: Some("unit:a"),
+            recorded_at: "t1",
+        };
+        store.record_cut(original).unwrap();
+        let first = store.get_cut(original.cut_id).unwrap();
+        store.record_cut(original).unwrap();
+        for changed in [
+            CutRecord {
+                change_id: "change-b",
+                ..original
+            },
+            CutRecord {
+                branch_id: "branch-b",
+                ..original
+            },
+            CutRecord {
+                manifest_hash: "manifest-b",
+                ..original
+            },
+            CutRecord {
+                parent_cut_id: Some("parent-b"),
+                ..original
+            },
+            CutRecord {
+                origin: Some("transport:source-b"),
+                ..original
+            },
+            CutRecord {
+                actor: Some("person:b"),
+                ..original
+            },
+            CutRecord {
+                intent: Some("unit:b"),
+                ..original
+            },
+            CutRecord {
+                recorded_at: "t2",
+                ..original
+            },
+        ] {
+            assert!(matches!(
+                store.record_cut(changed),
+                Err(StoreError::Conflict(_))
+            ));
+            assert_eq!(store.get_cut(original.cut_id).unwrap(), first);
+        }
+        store.record_cut(original).unwrap();
+
+        // V1's first-record-wins bundle/import behavior is a separate
+        // compatibility contract until those callers are migrated.
+        let legacy = CutRecord {
+            cut_id: "legacy-cut",
+            branch_id: "legacy",
+            ..original
+        };
+        store.record_cut(legacy).unwrap();
+        let old = store.get_cut(legacy.cut_id).unwrap();
+        store
+            .record_cut(CutRecord {
+                manifest_hash: "legacy-reimport",
+                ..legacy
+            })
+            .unwrap();
+        assert_eq!(store.get_cut(legacy.cut_id).unwrap(), old);
     }
 
     fn one_head(instance: &str, sequence: i64, digest: &str) -> event_chain::LogHeads {

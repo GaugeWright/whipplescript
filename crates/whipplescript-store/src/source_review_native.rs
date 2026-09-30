@@ -15,7 +15,7 @@ use crate::branches::flowing_sources::FlowingSources;
 use crate::branches::{BranchStatus, Branches};
 use crate::content::ContentBlobs;
 use crate::source_review::{ReviewError, ReviewResult, ReviewStore, SourceKind};
-use crate::vcs::{NativeCandidateOutcome, WorkspaceVcs};
+use crate::vcs::{FlowingBranchLineageOutcome, NativeCandidateOutcome, WorkspaceVcs};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeUnitRef {
@@ -60,6 +60,32 @@ pub struct NativeCandidateRequest<'a> {
     pub recorded_at: &'a str,
 }
 
+fn checked_named_upload_retry(
+    existing: NativeRevision,
+    actor: &str,
+    source_branch_id: &str,
+    source_cut_id: &str,
+    unit_ids: &[&str],
+    exact_units: Option<&[NativeUnitRef]>,
+) -> ReviewResult<NativeRevision> {
+    if existing.actor == actor
+        && existing.source_branch_id == source_branch_id
+        && existing.source_cut_id == source_cut_id
+        && existing
+            .units
+            .iter()
+            .map(|unit| unit.unit_id.as_str())
+            .eq(unit_ids.iter().copied())
+        && exact_units.is_none_or(|units| existing.units == units)
+    {
+        Ok(existing)
+    } else {
+        Err(ReviewError::Conflict(
+            "upload id already names another revision".into(),
+        ))
+    }
+}
+
 impl ReviewStore {
     /// Construct a candidate from a persisted revision and the current exact
     /// trunk base. The VCS proves complete source-unit coverage and records
@@ -84,13 +110,27 @@ impl ReviewStore {
             ));
         }
         let revision = self.native_revision(request.contribution_id, request.sequence)?;
-        Ok(vcs.prepare_native_review_candidate(
-            &revision,
-            request.expected_trunk_cut_id,
-            request.candidate_cut_id,
-            request.actor,
-            request.recorded_at,
-        )?)
+        let branch_source = vcs
+            .branch_store()
+            .flowing_source(&revision.source_branch_id)?
+            .is_some_and(|source| source.kind == FlowingSourceKind::Branch);
+        Ok(if branch_source {
+            vcs.prepare_named_branch_candidate(
+                &revision,
+                request.expected_trunk_cut_id,
+                request.candidate_cut_id,
+                request.actor,
+                request.recorded_at,
+            )?
+        } else {
+            vcs.prepare_native_review_candidate(
+                &revision,
+                request.expected_trunk_cut_id,
+                request.candidate_cut_id,
+                request.actor,
+                request.recorded_at,
+            )?
+        })
     }
 
     /// The caller authenticates `actor`. This checks the VCS's retained unit
@@ -294,6 +334,146 @@ impl ReviewStore {
             source_incarnation_id: fence.incarnation_id,
             source_cut_id: source_cut_id.into(),
             source_manifest_hash: cut.manifest_hash,
+            units,
+        };
+        tx.execute(
+            "INSERT INTO native_revisions (contribution_id, sequence, upload_id, revision_json) VALUES (?1, ?2, ?3, ?4)",
+            params![contribution_id, sequence, upload_id, serde_json::to_string(&revision).map_err(|err| ReviewError::Corrupt(err.to_string()))?],
+        )?;
+        tx.commit()?;
+        Ok(revision)
+    }
+
+    /// Snapshot a complete, content-verified simple handoff prefix from a
+    /// named branch. The review revision is a durable proposal; candidate
+    /// construction repeats the lineage and read-basis proof at its exact
+    /// trunk base, and ref admission remains separately fenced.
+    pub fn upload_named_branch_revision<
+        B: Branches + FlowingSources + FlowingAdmissions,
+        C: ContentBlobs,
+    >(
+        &mut self,
+        vcs: &WorkspaceVcs<B, C>,
+        request: NativeUpload<'_>,
+    ) -> ReviewResult<NativeRevision> {
+        let NativeUpload {
+            contribution_id,
+            upload_id,
+            actor,
+            source_branch_id,
+            source_cut_id,
+            unit_ids,
+        } = request;
+        if upload_id.is_empty()
+            || upload_id.len() > 64
+            || !upload_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || actor.trim().is_empty()
+            || unit_ids.is_empty()
+        {
+            return Err(ReviewError::Invalid(
+                "upload id, actor and selected units are required".into(),
+            ));
+        }
+        let contribution = self.contribution(contribution_id)?;
+        if contribution.source_kind != SourceKind::Native
+            || contribution.target_scope != crate::branches::MAINLINE_BRANCH_ID
+            || contribution.author != actor
+        {
+            return Err(ReviewError::Invalid(
+                "named branch upload needs its author's native trunk contribution".into(),
+            ));
+        }
+        if let Some(existing) = self.native_revision_by_upload(contribution_id, upload_id)? {
+            return checked_named_upload_retry(
+                existing,
+                actor,
+                source_branch_id,
+                source_cut_id,
+                unit_ids,
+                None,
+            );
+        }
+        let branch = vcs
+            .branch_store()
+            .get_branch(source_branch_id)?
+            .ok_or_else(|| ReviewError::Missing(format!("source branch {source_branch_id}")))?;
+        let fence = vcs
+            .branch_store()
+            .flowing_source(source_branch_id)?
+            .ok_or_else(|| ReviewError::Missing(format!("flowing source {source_branch_id}")))?;
+        if branch.status != BranchStatus::Active
+            || branch.name.is_none()
+            || branch.parent_branch_id.as_deref() != Some(crate::branches::MAINLINE_BRANCH_ID)
+            || fence.kind != FlowingSourceKind::Branch
+            || !fence.admission_enabled
+            || fence.revision.is_some()
+            || fence.owner != actor
+        {
+            return Err(ReviewError::Invalid(
+                "source needs an eligible named branch owned by the uploader".into(),
+            ));
+        }
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage(source_branch_id)?
+        else {
+            return Err(ReviewError::Invalid(
+                "source branch handoff lineage is incomplete".into(),
+            ));
+        };
+        let prefix = lineage.prefix_through(source_cut_id).ok_or_else(|| {
+            ReviewError::Invalid("selected cut is not a handoff receipt boundary".into())
+        })?;
+        if prefix
+            .selected_handoffs()
+            .iter()
+            .map(|receipt| receipt.unit_id.as_str())
+            .ne(unit_ids.iter().copied())
+        {
+            return Err(ReviewError::Invalid(
+                "selected units must be the complete ordered handoff prefix".into(),
+            ));
+        }
+        let units = prefix
+            .selected_sources()
+            .iter()
+            .map(|source| NativeUnitRef {
+                unit_id: source.unit_id.clone(),
+                source_cut_id: source.source_cut_id.clone(),
+                pin_id: source.pin_id.clone(),
+                basis_digest: source.basis_digest.clone(),
+                principal: source.principal.clone(),
+                intent: source.intent.clone(),
+            })
+            .collect::<Vec<_>>();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = revision_by_upload(&tx, contribution_id, upload_id)? {
+            return checked_named_upload_retry(
+                existing,
+                actor,
+                source_branch_id,
+                source_cut_id,
+                unit_ids,
+                Some(&units),
+            );
+        }
+        let sequence: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM native_revisions WHERE contribution_id=?1",
+            [contribution_id],
+            |row| row.get(0),
+        )?;
+        let revision = NativeRevision {
+            contribution_id: contribution_id.into(),
+            sequence,
+            upload_id: upload_id.into(),
+            actor: actor.into(),
+            source_branch_id: source_branch_id.into(),
+            source_incarnation_id: fence.incarnation_id,
+            source_cut_id: source_cut_id.into(),
+            source_manifest_hash: prefix.selected_manifest_hash().into(),
             units,
         };
         tx.execute(

@@ -14,13 +14,16 @@ use crate::branches::flowing_admission::{
 use crate::branches::flowing_admission::{FlowingCandidateWitness, FlowingUnitOutcome};
 use crate::branches::flowing_sources::{
     BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
-    HandoffContribution, HandoffContributionOutcome,
+    HandoffContribution, HandoffContributionOutcome, HandoffReceipt,
 };
 use crate::branches::{BranchStatus, Branches, CutRecord, CutRow};
 use crate::content::ContentBlobs;
 use crate::selection::{self, SelAtom, SelExpr};
 #[cfg(feature = "native")]
 use crate::source_review_native::NativeRevision;
+
+#[cfg(feature = "native")]
+mod named_branch_candidate;
 use crate::{StoreError, StoreResult};
 
 use super::{RawManifest, WorkspaceVcs};
@@ -187,6 +190,117 @@ pub enum NativeCandidateOutcome {
     CandidateMismatch,
 }
 
+/// A receiving branch's complete currently reachable handoff chain. This is
+/// a read-only content proof, not a gate certificate or permission to move a
+/// ref. A later admission must recapture the exact branch head and fences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingBranchLineage {
+    branch_id: String,
+    head_cut_id: Option<String>,
+    head_manifest_hash: Option<String>,
+    handoffs: Vec<HandoffReceipt>,
+    sources: Vec<FlowingHandoffSource>,
+}
+
+/// Source facts captured by the same lineage inspection that verifies each
+/// receipt. Review upload uses these facts rather than rereading the unit after
+/// the content proof, which would mix two observations in one revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingHandoffSource {
+    pub unit_id: String,
+    pub source_cut_id: String,
+    pub pin_id: String,
+    pub basis_digest: String,
+    pub principal: String,
+    pub intent: String,
+}
+
+/// One complete handoff prefix chosen at an actual branch cut. Later units
+/// remain visible and owed; this value does not move either branch ref.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingBranchPrefix {
+    branch_id: String,
+    selected_cut_id: String,
+    selected_manifest_hash: String,
+    selected_handoffs: Vec<HandoffReceipt>,
+    selected_sources: Vec<FlowingHandoffSource>,
+    later_handoffs: Vec<HandoffReceipt>,
+    observed_head_cut_id: Option<String>,
+}
+
+impl FlowingBranchLineage {
+    pub fn branch_id(&self) -> &str {
+        &self.branch_id
+    }
+    pub fn head_cut_id(&self) -> Option<&str> {
+        self.head_cut_id.as_deref()
+    }
+    pub fn head_manifest_hash(&self) -> Option<&str> {
+        self.head_manifest_hash.as_deref()
+    }
+    pub fn handoffs(&self) -> &[HandoffReceipt] {
+        &self.handoffs
+    }
+
+    /// A selected cut must be one of this verified chain's receipt boundaries.
+    /// Selecting a branch point with no units would mint no review obligation.
+    pub fn prefix_through(&self, selected_cut_id: &str) -> Option<FlowingBranchPrefix> {
+        let position = self
+            .handoffs
+            .iter()
+            .position(|receipt| receipt.target_after_cut_id == selected_cut_id)?;
+        let (selected, later) = self.handoffs.split_at(position + 1);
+        let (selected_sources, _) = self.sources.split_at(position + 1);
+        Some(FlowingBranchPrefix {
+            branch_id: self.branch_id.clone(),
+            selected_cut_id: selected_cut_id.to_owned(),
+            selected_manifest_hash: selected.last()?.target_after_manifest_hash.clone(),
+            selected_handoffs: selected.to_vec(),
+            selected_sources: selected_sources.to_vec(),
+            later_handoffs: later.to_vec(),
+            observed_head_cut_id: self.head_cut_id.clone(),
+        })
+    }
+}
+
+impl FlowingBranchPrefix {
+    pub fn branch_id(&self) -> &str {
+        &self.branch_id
+    }
+    pub fn selected_cut_id(&self) -> &str {
+        &self.selected_cut_id
+    }
+    pub fn selected_manifest_hash(&self) -> &str {
+        &self.selected_manifest_hash
+    }
+    pub fn selected_handoffs(&self) -> &[HandoffReceipt] {
+        &self.selected_handoffs
+    }
+    pub fn selected_sources(&self) -> &[FlowingHandoffSource] {
+        &self.selected_sources
+    }
+    pub fn later_handoffs(&self) -> &[HandoffReceipt] {
+        &self.later_handoffs
+    }
+    pub fn observed_head_cut_id(&self) -> Option<&str> {
+        self.observed_head_cut_id.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingBranchLineageOutcome {
+    Verified(FlowingBranchLineage),
+    BranchMissing,
+    NotFlowingBranch,
+    CutMissing { cut_id: String },
+    CutMismatch { cut_id: String },
+    CyclicLineage { cut_id: String },
+    MissingReceipt { cut_id: String },
+    UnreachableReceipt { op_id: String },
+    ReceiptMismatch { op_id: String },
+    EffectsUnproved { unit_id: String },
+}
+
 /// The complete VCS snapshot a source unit says it read when it began.
 /// The host records this at declaration; candidate preparation recomputes it
 /// from the immutable cut immediately before that unit's first write.
@@ -221,6 +335,170 @@ type NetSourcePaths<'a> = BTreeMap<&'a str, (Option<&'a str>, Option<&'a str>)>;
 type NetSourceResult<'a> = StoreResult<Result<NetSourcePaths<'a>, FlowingTargetEffectsOutcome>>;
 
 impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Match every cut reachable from a named branch's head to its branch
+    /// point with one immutable handoff receipt, and rederive each receipt's
+    /// effects from the bound source atoms and actual target content. Any
+    /// local edit, rewrite, orphan receipt or omitted target cut refuses until
+    /// constituent transport lineage can account for it explicitly.
+    pub fn inspect_flowing_branch_lineage(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<FlowingBranchLineageOutcome>
+    where
+        B: FlowingAdmissions,
+    {
+        use FlowingBranchLineageOutcome as R;
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(R::BranchMissing);
+        };
+        let Some(fence) = self.branches.flowing_source(branch_id)? else {
+            return Ok(R::NotFlowingBranch);
+        };
+        if branch.name.is_none()
+            || fence.kind != crate::branches::flowing_fence::FlowingSourceKind::Branch
+        {
+            return Ok(R::NotFlowingBranch);
+        }
+        match branch.branch_point_cut_id.as_deref() {
+            Some(base_id) => {
+                let Some(base) = self.branches.get_cut(base_id)? else {
+                    return Ok(R::CutMissing {
+                        cut_id: base_id.to_owned(),
+                    });
+                };
+                if branch.branch_point_manifest_hash.as_deref() != Some(base.manifest_hash.as_str())
+                {
+                    return Ok(R::CutMismatch {
+                        cut_id: base_id.to_owned(),
+                    });
+                }
+            }
+            None if branch.branch_point_manifest_hash.is_some() => {
+                return Ok(R::CutMismatch {
+                    cut_id: branch.branch_id.clone(),
+                });
+            }
+            None => {}
+        }
+        let mut by_cut = BTreeMap::new();
+        for receipt in self.branches.target_handoffs(branch_id)? {
+            if by_cut
+                .insert(receipt.target_after_cut_id.clone(), receipt.clone())
+                .is_some()
+            {
+                return Ok(R::ReceiptMismatch {
+                    op_id: receipt.op_id,
+                });
+            }
+        }
+        let mut reverse = Vec::new();
+        let mut reverse_sources = Vec::new();
+        let mut cursor = branch.head_cut_id.clone();
+        let mut expected_manifest = branch.head_manifest_hash.clone();
+        let mut seen = BTreeSet::new();
+        while cursor != branch.branch_point_cut_id {
+            let Some(cut_id) = cursor else {
+                return Ok(R::CutMismatch {
+                    cut_id: branch.branch_id.clone(),
+                });
+            };
+            if !seen.insert(cut_id.clone()) {
+                return Ok(R::CyclicLineage { cut_id });
+            }
+            let Some(cut) = self.branches.get_cut(&cut_id)? else {
+                return Ok(R::CutMissing { cut_id });
+            };
+            if cut.branch_id != branch_id
+                || expected_manifest.as_deref() != Some(cut.manifest_hash.as_str())
+            {
+                return Ok(R::CutMismatch { cut_id });
+            }
+            let Some(receipt) = by_cut.remove(&cut_id) else {
+                return Ok(R::MissingReceipt { cut_id });
+            };
+            if receipt.target_branch_id != branch_id
+                || receipt.target_before_cut_id != cut.parent_cut_id
+                || receipt.target_after_manifest_hash != cut.manifest_hash
+                || cut.origin.as_deref()
+                    != Some(format!("transport:{}", receipt.source_branch_id).as_str())
+                || cut.actor.as_deref() != Some(receipt.actor.as_str())
+            {
+                return Ok(R::ReceiptMismatch {
+                    op_id: receipt.op_id,
+                });
+            }
+            let Some(unit) = self.branches.contribution_declaration(&receipt.unit_id)? else {
+                return Ok(R::ReceiptMismatch {
+                    op_id: receipt.op_id,
+                });
+            };
+            let Some(basis) = self.branches.contribution_basis(&receipt.unit_id)? else {
+                return Ok(R::EffectsUnproved {
+                    unit_id: receipt.unit_id,
+                });
+            };
+            if receipt.source_branch_id != unit.source_branch_id
+                || receipt.source_cut_id != unit.source_cut_id
+                || receipt.source_manifest_hash != unit.source_manifest_hash
+                || receipt.source_basis_digest != basis.basis_digest
+                || receipt.original_principal != unit.principal
+            {
+                return Ok(R::ReceiptMismatch {
+                    op_id: receipt.op_id,
+                });
+            }
+            let FlowingTargetEffectsOutcome::Verified(effects) =
+                self.verify_private_target_effects(&receipt.unit_id, &cut_id)?
+            else {
+                return Ok(R::EffectsUnproved {
+                    unit_id: receipt.unit_id,
+                });
+            };
+            if effects.effects() != receipt.effects
+                || effects.target_before_cut_id() != receipt.target_before_cut_id.as_deref()
+                || effects.target_after_manifest_hash() != receipt.target_after_manifest_hash
+            {
+                return Ok(R::ReceiptMismatch {
+                    op_id: receipt.op_id,
+                });
+            }
+            expected_manifest = match cut.parent_cut_id.as_deref() {
+                Some(parent_id) => self
+                    .branches
+                    .get_cut(parent_id)?
+                    .map(|parent| parent.manifest_hash),
+                None => None,
+            };
+            cursor = cut.parent_cut_id;
+            reverse_sources.push(FlowingHandoffSource {
+                unit_id: receipt.unit_id.clone(),
+                source_cut_id: unit.source_cut_id,
+                pin_id: unit.pin_id,
+                basis_digest: basis.basis_digest,
+                principal: unit.principal,
+                intent: unit.intent,
+            });
+            reverse.push(receipt);
+        }
+        if let Some((_, extra)) = by_cut.into_iter().next() {
+            return Ok(R::UnreachableReceipt { op_id: extra.op_id });
+        }
+        if expected_manifest != branch.branch_point_manifest_hash {
+            return Ok(R::CutMismatch {
+                cut_id: branch.branch_id,
+            });
+        }
+        reverse.reverse();
+        reverse_sources.reverse();
+        Ok(R::Verified(FlowingBranchLineage {
+            branch_id: branch_id.to_owned(),
+            head_cut_id: branch.head_cut_id,
+            head_manifest_hash: branch.head_manifest_hash,
+            handoffs: reverse,
+            sources: reverse_sources,
+        }))
+    }
+
     /// Retain the exact review source and candidate while a gate attempt is
     /// outstanding. The same content publication exclusion covers the ref
     /// row and every constituent body, including writes neutralized in the
@@ -1024,9 +1302,8 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 recorded_at,
             })?;
         }
-        // `record_cut` is first-writer-wins for its identity. A concurrent
-        // writer can win between the preceding read and this write; re-read
-        // before giving the caller a witness for that identity.
+        // Another writer can win between the preceding read and record, so
+        // re-read before giving the caller a witness for this cut identity.
         if !self
             .branches
             .get_cut(target_cut_id)?
@@ -3129,6 +3406,11 @@ mod tests {
     #[test]
     fn handoff_to_flowing_branch_obeys_its_ref_owned_fence() {
         let mut allowed = bound_unit_with_flowing_target(true);
+        assert!(matches!(
+            allowed.inspect_flowing_branch_lineage("branch").unwrap(),
+            FlowingBranchLineageOutcome::Verified(FlowingBranchLineage { handoffs, .. })
+                if handoffs.is_empty()
+        ));
         let witness = prepare_target(&mut allowed, "target-a");
         assert!(matches!(
             allowed
@@ -3136,6 +3418,23 @@ mod tests {
                 .unwrap(),
             HandoffContributionOutcome::Transferred(_)
         ));
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            allowed.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("the target cut and durable receipt must form one checked chain")
+        };
+        assert_eq!(lineage.head_cut_id.as_deref(), Some("target-a"));
+        assert_eq!(lineage.handoffs.len(), 1);
+        assert_eq!(lineage.handoffs[0].unit_id, "unit-a");
+        allowed
+            .write("branch", "other.txt", Some("other"), "unreceipted", "t6")
+            .unwrap();
+        assert_eq!(
+            allowed.inspect_flowing_branch_lineage("branch").unwrap(),
+            FlowingBranchLineageOutcome::MissingReceipt {
+                cut_id: "unreceipted".into()
+            }
+        );
 
         let mut closed = bound_unit_with_flowing_target(true);
         let witness = prepare_target(&mut closed, "target-a");
@@ -3174,6 +3473,116 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+    }
+
+    #[test]
+    fn branch_lineage_orders_two_handoffs_by_cut_ancestry() {
+        let mut vcs = bound_unit_with_flowing_target(true);
+        let first = prepare_target(&mut vcs, "target-a");
+        assert!(matches!(
+            vcs.handoff_private_selection("handoff-z", &first, "mediator", "t5")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+        vcs.create_branch("twig-b", None, "branch", "t6").unwrap();
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig-b".into(),
+                    incarnation_id: "twig-b-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t6".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        vcs.write("twig-b", "b.txt", Some("B"), "twig-b-cut", "t7")
+            .unwrap();
+        let source = vcs.branches.get_cut("twig-b-cut").unwrap().unwrap();
+        assert_eq!(
+            vcs.branches
+                .pin_private_cut(PinPrivateCut {
+                    pin_id: "pin-b",
+                    twig_branch_id: "twig-b",
+                    cut_id: "twig-b-cut",
+                    manifest_hash: &source.manifest_hash,
+                    principal: "s:author",
+                    retained_at: "t8",
+                })
+                .unwrap(),
+            PinPrivateCutOutcome::Pinned
+        );
+        assert_eq!(
+            vcs.branches
+                .declare_contribution(DeclareContribution {
+                    unit_id: "unit-b",
+                    pin_id: "pin-b",
+                    principal: "s:author",
+                    intent: "second change",
+                    read_basis_digest: "reads-b",
+                    dependency_basis_digest: "deps-b",
+                    scope_digest: "scope-b",
+                    declared_at: "t8",
+                })
+                .unwrap(),
+            DeclareContributionOutcome::Declared
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-b", &selection::parse("path(b.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("second source cut must be selectable")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-b", &selection, "t9")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let FlowingTargetEffectsOutcome::Verified(second) = vcs
+            .prepare_private_handoff_target("unit-b", "target-b", "mediator", "t10")
+            .unwrap()
+        else {
+            panic!("second target must derive from the first handoff")
+        };
+        assert!(matches!(
+            vcs.handoff_private_selection("handoff-a", &second, "mediator", "t11")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("both target cuts must be accounted by exact source units")
+        };
+        assert_eq!(lineage.head_cut_id.as_deref(), Some("target-b"));
+        assert_eq!(
+            lineage
+                .handoffs
+                .iter()
+                .map(|receipt| receipt.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unit-a", "unit-b"]
+        );
+        let first = lineage.prefix_through("target-a").unwrap();
+        assert_eq!(first.selected_handoffs.len(), 1);
+        assert_eq!(first.selected_handoffs[0].unit_id, "unit-a");
+        assert_eq!(first.later_handoffs.len(), 1);
+        assert_eq!(first.later_handoffs[0].unit_id, "unit-b");
+        assert_eq!(first.observed_head_cut_id.as_deref(), Some("target-b"));
+        assert_eq!(
+            first.selected_manifest_hash,
+            first.selected_handoffs[0].target_after_manifest_hash
+        );
+        assert_eq!(
+            lineage
+                .prefix_through("target-b")
+                .unwrap()
+                .later_handoffs
+                .len(),
+            0
+        );
+        assert!(lineage.prefix_through("not-a-cut").is_none());
     }
 
     fn prepare_target(
@@ -3216,6 +3625,7 @@ mod tests {
         let mut vcs = bound_unit();
         vcs.write("twig", "b.txt", Some("B"), "twig-tail", "t4")
             .unwrap();
+        assert!(vcs.branches.target_handoffs("branch").unwrap().is_empty());
         let witness = prepare_target(&mut vcs, "target-a");
         let HandoffContributionOutcome::Transferred(receipt) = vcs
             .handoff_private_selection("handoff-a", &witness, "mediator", "t5")
@@ -3226,6 +3636,11 @@ mod tests {
         assert_eq!(receipt.source_cut_id, "twig-a");
         assert_eq!(receipt.target_after_cut_id, "target-a");
         assert_eq!(receipt.effects, witness.effects());
+        assert_eq!(
+            vcs.branches.target_handoffs("branch").unwrap(),
+            vec![receipt.clone()]
+        );
+        assert!(vcs.branches.target_handoffs("twig").unwrap().is_empty());
         assert_eq!(
             vcs.branches
                 .get_branch("branch")

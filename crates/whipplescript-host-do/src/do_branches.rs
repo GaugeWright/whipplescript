@@ -889,6 +889,15 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 ],
             )
             .map_err(sql_err)?;
+        let recorded = StoreError::written_row(self.get_cut(cut.cut_id)?, "recorded cut")?;
+        let flowing = flowing_fence::read_state(&self.sql, cut.branch_id)?.is_some()
+            || flowing_fence::read_state(&self.sql, &recorded.branch_id)?.is_some();
+        if flowing && !recorded.matches_record(cut) {
+            return Err(StoreError::Conflict(format!(
+                "flowing cut `{}` identity already records different substance or provenance",
+                cut.cut_id
+            )));
+        }
         Ok(())
     }
 
@@ -2166,6 +2175,105 @@ mod tests {
     use super::*;
     use crate::do_store::test_support::RusqliteDoSql;
     use std::rc::Rc;
+    use whipplescript_store::branches::flowing_fence::{
+        FlowingFence, FlowingSourceKind, OpenFlowingSource,
+    };
+
+    #[test]
+    fn hosted_cut_id_exact_retry_preserves_identity_and_changed_retry_refuses() {
+        let sql = Rc::new(RusqliteDoSql::in_memory());
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        branches
+            .create_branch(CreateBranch {
+                branch_id: "branch-a",
+                name: None,
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t0",
+                idempotency_key: None,
+            })
+            .unwrap();
+        branches
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch-a".into(),
+                incarnation_id: "incarnation-a".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "person:a".into(),
+                opened_at: "t0".into(),
+            })
+            .unwrap();
+        let original = CutRecord {
+            cut_id: "cut-identity",
+            change_id: "change-a",
+            branch_id: "branch-a",
+            manifest_hash: "manifest-a",
+            parent_cut_id: None,
+            origin: Some("transport:source-a"),
+            actor: Some("person:a"),
+            intent: Some("unit:a"),
+            recorded_at: "t1",
+        };
+        branches.record_cut(original).unwrap();
+        let first = branches.get_cut(original.cut_id).unwrap();
+        branches.record_cut(original).unwrap();
+        for changed in [
+            CutRecord {
+                change_id: "change-b",
+                ..original
+            },
+            CutRecord {
+                branch_id: "branch-b",
+                ..original
+            },
+            CutRecord {
+                manifest_hash: "manifest-b",
+                ..original
+            },
+            CutRecord {
+                parent_cut_id: Some("parent-b"),
+                ..original
+            },
+            CutRecord {
+                origin: Some("transport:source-b"),
+                ..original
+            },
+            CutRecord {
+                actor: Some("person:b"),
+                ..original
+            },
+            CutRecord {
+                intent: Some("unit:b"),
+                ..original
+            },
+            CutRecord {
+                recorded_at: "t2",
+                ..original
+            },
+        ] {
+            assert!(matches!(
+                branches.record_cut(changed),
+                Err(StoreError::Conflict(_))
+            ));
+            assert_eq!(branches.get_cut(original.cut_id).unwrap(), first);
+        }
+        branches.record_cut(original).unwrap();
+
+        let legacy = CutRecord {
+            cut_id: "legacy-cut",
+            branch_id: "legacy",
+            ..original
+        };
+        branches.record_cut(legacy).unwrap();
+        let old = branches.get_cut(legacy.cut_id).unwrap();
+        branches
+            .record_cut(CutRecord {
+                manifest_hash: "legacy-reimport",
+                ..legacy
+            })
+            .unwrap();
+        assert_eq!(branches.get_cut(legacy.cut_id).unwrap(), old);
+    }
 
     /// **The hosted decoder fails closed on a status text it cannot read.**
     ///

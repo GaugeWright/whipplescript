@@ -125,26 +125,26 @@ fn read_handoff<S: DoSql>(
             &[text(value)],
         )
         .map_err(sql_err)?;
-    rows.first()
-        .map(|row| {
-            Ok(HandoffReceipt {
-                op_id: as_text(&row[0]),
-                unit_id: as_text(&row[1]),
-                source_branch_id: as_text(&row[2]),
-                source_cut_id: as_text(&row[3]),
-                source_manifest_hash: as_text(&row[4]),
-                source_basis_digest: as_text(&row[5]),
-                target_branch_id: as_text(&row[6]),
-                target_before_cut_id: as_opt_text(&row[7]),
-                target_after_cut_id: as_text(&row[8]),
-                target_after_manifest_hash: as_text(&row[9]),
-                effects: serde_json::from_str(&as_text(&row[10]))?,
-                original_principal: as_text(&row[11]),
-                actor: as_text(&row[12]),
-                recorded_at: as_text(&row[13]),
-            })
-        })
-        .transpose()
+    rows.first().map(|row| decode_handoff(row)).transpose()
+}
+
+fn decode_handoff(row: &[SqlValue]) -> StoreResult<HandoffReceipt> {
+    Ok(HandoffReceipt {
+        op_id: as_text(&row[0]),
+        unit_id: as_text(&row[1]),
+        source_branch_id: as_text(&row[2]),
+        source_cut_id: as_text(&row[3]),
+        source_manifest_hash: as_text(&row[4]),
+        source_basis_digest: as_text(&row[5]),
+        target_branch_id: as_text(&row[6]),
+        target_before_cut_id: as_opt_text(&row[7]),
+        target_after_cut_id: as_text(&row[8]),
+        target_after_manifest_hash: as_text(&row[9]),
+        effects: serde_json::from_str(&as_text(&row[10]))?,
+        original_principal: as_text(&row[11]),
+        actor: as_text(&row[12]),
+        recorded_at: as_text(&row[13]),
+    })
 }
 
 impl<S: DoSql> FlowingSources for DoBranches<S> {
@@ -580,6 +580,21 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
 
     fn contribution_handoff(&self, unit_id: &str) -> StoreResult<Option<HandoffReceipt>> {
         read_handoff(&self.sql, HandoffLookup::Unit, unit_id)
+    }
+
+    fn target_handoffs(&self, target_branch_id: &str) -> StoreResult<Vec<HandoffReceipt>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT op_id, unit_id, source_branch_id, source_cut_id, \
+                 source_manifest_hash, source_basis_digest, target_branch_id, \
+                 target_before_cut_id, target_after_cut_id, target_after_manifest_hash, \
+                 effects_json, original_principal, actor, recorded_at \
+                 FROM flowing_handoffs WHERE target_branch_id = ?1 ORDER BY op_id",
+                &[text(target_branch_id)],
+            )
+            .map_err(sql_err)?;
+        rows.iter().map(|row| decode_handoff(row)).collect()
     }
 
     fn release_private_cut(
@@ -1077,7 +1092,8 @@ mod tests {
         };
         use whipplescript_store::selection::parse;
         use whipplescript_store::vcs::{
-            FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
+            FlowingBranchLineageOutcome, FlowingSelectionOutcome, FlowingTargetEffectsOutcome,
+            WorkspaceVcs,
         };
 
         let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
@@ -1178,7 +1194,34 @@ mod tests {
                 .unwrap(),
             HandoffContributionOutcome::Transferred(_)
         ));
-        assert!(branches.handoff_receipt("op-b").unwrap().is_some());
+        let receipt = branches.handoff_receipt("op-b").unwrap().unwrap();
+        assert_eq!(branches.target_handoffs("branch").unwrap(), vec![receipt]);
+        assert!(branches.target_handoffs("twig").unwrap().is_empty());
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("the hosted cut and receipt must form one checked chain")
+        };
+        assert_eq!(lineage.head_cut_id(), Some("target-b"));
+        assert_eq!(lineage.handoffs().len(), 1);
+        sql.execute(
+            "UPDATE flowing_handoffs SET effects_json = '[]' WHERE op_id = ?1",
+            &[text("op-b")],
+        )
+        .unwrap();
+        assert!(matches!(
+            vcs.inspect_flowing_branch_lineage("branch").unwrap(),
+            FlowingBranchLineageOutcome::ReceiptMismatch { op_id } if op_id == "op-b"
+        ));
+        sql.execute(
+            "DELETE FROM flowing_handoffs WHERE op_id = ?1",
+            &[text("op-b")],
+        )
+        .unwrap();
+        assert!(matches!(
+            vcs.inspect_flowing_branch_lineage("branch").unwrap(),
+            FlowingBranchLineageOutcome::MissingReceipt { cut_id } if cut_id == "target-b"
+        ));
     }
 
     #[test]

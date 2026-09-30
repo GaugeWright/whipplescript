@@ -253,7 +253,7 @@ impl<'a> HandoffContribution<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct HandoffReceipt {
     pub op_id: String,
     pub unit_id: String,
@@ -346,6 +346,10 @@ pub trait FlowingSources {
     ) -> crate::StoreResult<HandoffContributionOutcome>;
     fn handoff_receipt(&self, op_id: &str) -> crate::StoreResult<Option<HandoffReceipt>>;
     fn contribution_handoff(&self, unit_id: &str) -> crate::StoreResult<Option<HandoffReceipt>>;
+    /// Exact handoff inventory for one receiving branch. The caller must
+    /// compare this roster with the branch's actual cut lineage before using
+    /// it as a source-unit frontier; a receipt alone does not prove content.
+    fn target_handoffs(&self, target_branch_id: &str) -> crate::StoreResult<Vec<HandoffReceipt>>;
     /// Only an explicit release can end an undeclared pin. A declared unit
     /// keeps the pin until an exact handoff or admission receipt transfers
     /// responsibility under a later operation.

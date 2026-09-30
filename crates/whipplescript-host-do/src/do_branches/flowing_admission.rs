@@ -177,6 +177,76 @@ impl<S: DoSql> DoBranches<S> {
         witness: &FlowingCandidateWitness,
     ) -> StoreResult<Option<String>> {
         for unit in &witness.units {
+            let handoffs = self
+                .sql
+                .query(
+                    "SELECT target_branch_id, target_after_cut_id, target_after_manifest_hash, \
+                 source_branch_id, source_cut_id, source_manifest_hash, \
+                 source_basis_digest, original_principal \
+                 FROM flowing_handoffs WHERE unit_id = ?1",
+                    &[text(&unit.unit_id)],
+                )
+                .map_err(sql_err)?;
+            if let Some(handoff) = handoffs.first() {
+                let target_branch = as_text(&handoff[0]);
+                let target_cut = as_text(&handoff[1]);
+                let target_manifest = as_text(&handoff[2]);
+                let source_branch = as_text(&handoff[3]);
+                let source_cut = as_text(&handoff[4]);
+                let source_manifest = as_text(&handoff[5]);
+                let source_basis = as_text(&handoff[6]);
+                let original_principal = as_text(&handoff[7]);
+                let declarations = self
+                    .sql
+                    .query(
+                        "SELECT c.source_branch_id, c.source_cut_id, c.source_manifest_hash, \
+                     c.principal, c.intent, b.basis_digest \
+                     FROM flowing_contributions c \
+                     JOIN flowing_contribution_basis b ON b.unit_id = c.unit_id \
+                     WHERE c.unit_id = ?1",
+                        &[text(&unit.unit_id)],
+                    )
+                    .map_err(sql_err)?;
+                let Some(declared) = declarations.first() else {
+                    return Ok(Some(unit.unit_id.clone()));
+                };
+                let source_row = self.get_branch(&source_branch)?;
+                let Some(target_row) = self.get_branch(&target_branch)? else {
+                    return Ok(Some(unit.unit_id.clone()));
+                };
+                let Some(target_head) = target_row.head_cut_id.as_deref() else {
+                    return Ok(Some(unit.unit_id.clone()));
+                };
+                let source_cut_row = self.get_cut(&source_cut)?;
+                let target_cut_row = self.get_cut(&target_cut)?;
+                let held = target_branch == witness.source_branch_id
+                    && source_branch == as_text(&declared[0])
+                    && source_cut == as_text(&declared[1])
+                    && source_manifest == as_text(&declared[2])
+                    && source_basis == as_text(&declared[5])
+                    && source_basis == unit.basis_digest
+                    && original_principal == as_text(&declared[3])
+                    && original_principal == unit.principal
+                    && as_text(&declared[4]) == unit.intent
+                    && source_row.as_ref().is_some_and(|row| {
+                        row.name.is_none()
+                            && row.parent_branch_id.as_deref() == Some(target_branch.as_str())
+                    })
+                    && target_row.status == BranchStatus::Active
+                    && target_row.name.is_some()
+                    && source_cut_row.as_ref().is_some_and(|cut| {
+                        cut.branch_id == source_branch && cut.manifest_hash == source_manifest
+                    })
+                    && target_cut_row.as_ref().is_some_and(|cut| {
+                        cut.branch_id == target_branch && cut.manifest_hash == target_manifest
+                    })
+                    && self.flowing_ancestor(&target_cut, &witness.source_cut_id)?
+                    && self.flowing_ancestor(&witness.source_cut_id, target_head)?;
+                if !held {
+                    return Ok(Some(unit.unit_id.clone()));
+                }
+                continue;
+            }
             let rows = self
                 .sql
                 .query(
@@ -1603,6 +1673,118 @@ mod tests {
             coordinator: "coordinator".into(),
             recorded_at: "t4".into(),
         }
+    }
+
+    #[test]
+    fn hosted_attempt_retains_a_handed_unit_after_private_pin_release() {
+        let (sql, mut store) = fixture();
+        store
+            .create_branch(CreateBranch {
+                branch_id: "branch",
+                name: Some("feature"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t3",
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "coordinator".into(),
+                    opened_at: "t3".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        sql.execute(
+            "UPDATE branches SET parent_branch_id = 'branch' WHERE branch_id = 'twig'",
+            &[],
+        )
+        .unwrap();
+        store
+            .record_cut(CutRecord {
+                cut_id: "branch-cut",
+                change_id: "handoff",
+                branch_id: "branch",
+                manifest_hash: "branch-manifest",
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t4",
+            })
+            .unwrap();
+        store
+            .advance_head("branch", None, "branch-cut", "branch-manifest", "t4")
+            .unwrap();
+        sql.execute(
+            "INSERT INTO flowing_handoffs \
+             (op_id, unit_id, source_branch_id, source_cut_id, source_manifest_hash, \
+              source_basis_digest, target_branch_id, target_before_cut_id, \
+              target_after_cut_id, target_after_manifest_hash, effects_json, \
+              original_principal, actor, recorded_at) VALUES \
+             ('handoff', 'unit-a', 'twig', 'source', 'source-manifest', \
+              'basis-a', 'branch', NULL, 'branch-cut', 'branch-manifest', '[]', \
+              'author', 'mediator', 't4')",
+            &[],
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE flowing_private_pins SET released_at = 't5' WHERE pin_id = 'pin'",
+            &[],
+        )
+        .unwrap();
+        let mut witness = witness_for(&request("unit-a", "fixture"));
+        witness.source_branch_id = "branch".into();
+        witness.source_incarnation_id = "branch-inc".into();
+        witness.source_cut_id = "branch-cut".into();
+        witness.source_manifest_hash = "branch-manifest".into();
+        let digest = store.record_candidate_witness(&witness).unwrap();
+        assert!(matches!(
+            store
+                .retain_flowing_attempt("branch-attempt", &digest, "t6")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        assert!(matches!(
+            store
+                .cancel_flowing_attempt(&FlowingCancelRequest {
+                    cancel_op_id: "cancel-branch".into(),
+                    admission_op_id: "branch-attempt".into(),
+                    source_branch_id: "branch".into(),
+                    source_incarnation_id: "branch-inc".into(),
+                    expected_owner_epoch: 0,
+                    coordinator: "coordinator".into(),
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            store
+                .release_terminal_flowing_attempt("branch-attempt", "t8")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Released
+        );
+        assert!(store.pinned_cuts("t8").unwrap().contains("source"));
+        sql.execute(
+            "UPDATE flowing_handoffs SET target_after_manifest_hash = 'wrong' \
+             WHERE unit_id = 'unit-a'",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .retain_flowing_attempt("changed-handoff", &digest, "t7")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::UnitHolderMissing {
+                unit_id: "unit-a".into()
+            }
+        );
     }
 
     #[test]

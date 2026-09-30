@@ -27,9 +27,10 @@ pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
 pub use flowing_selection::{
-    native_dependency_basis_digest, native_read_basis_digest, FlowingEffectDisposition,
-    FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect,
-    FlowingTargetEffects, FlowingTargetEffectsOutcome, NativeCandidate, NativeCandidateOutcome,
+    native_dependency_basis_digest, native_read_basis_digest, FlowingBranchLineage,
+    FlowingBranchLineageOutcome, FlowingBranchPrefix, FlowingEffectDisposition, FlowingSelection,
+    FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect, FlowingTargetEffects,
+    FlowingTargetEffectsOutcome, NativeCandidate, NativeCandidateOutcome,
 };
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 
@@ -1092,6 +1093,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             intent: None,
             pending_facts: Vec::new(),
         }
+    }
+
+    pub(crate) fn branch_store(&self) -> &B {
+        &self.branches
     }
 
     /// Install the host's declaration-granularity source merger (the
