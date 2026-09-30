@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Compose private-pin/closure and norm/ref CAS probes at one branch head.
+"""Compose pinned source atoms, dependent basis, closure and norm/ref CAS.
 
 Run: python3 models/research/flowing_full_seam.py
-One selected unit, a second member twig, one candidate and two coordinators.
-Content reconciliation, dependency coverage and physical lock scheduling remain
-outside this bounded product.
+Two member twigs and source units, one candidate, two coordinators. Unit 1
+depends on the version of unit 0 it read. When selected together, unit 1
+neutralizes unit 0's x write but applies a y write. The exact source atoms,
+their path effects, dependent read basis and per-unit outcomes must survive
+that neutralization in the certificate and the ref admission. An equivalent
+no-op still gets a checked admission and per-unit receipt. The model still
+abstracts real cut contents, semantic edge discovery, physical lock scheduling
+and independently failing stores.
 """
 
 from collections import deque
@@ -15,46 +20,191 @@ import private_pin_closure as work
 
 
 @dataclass(frozen=True)
+class Atom:
+    identity: str
+    unit: int
+    path: str
+    before: int
+    after: int
+
+
+ATOMS = (
+    Atom("u0:x", 0, "x", 0, 1),
+    Atom("u1:x", 1, "x", 1, 0),
+    Atom("u1:y", 1, "y", 0, 1),
+)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    selected: tuple[int, ...]
+    before: tuple[int, int]
+    source_atoms: tuple[str, ...]
+    certificate_atoms: tuple[str, ...]
+    output_atoms: tuple[str, ...]
+    dependent_read_basis: int | None
+    after: tuple[int, int]
+    outcomes: tuple[str, ...]
+    output_change_id: str
+
+
+def source_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
+    return tuple(atom.identity for atom in ATOMS if atom.unit in selected)
+
+
+def candidate_for(selected: tuple[int, ...], cut: int,
+                  before: tuple[int, int], defect: str = "") -> Candidate:
+    roots = source_atoms(selected)
+    output_change_id = f"mixed-output:{cut}"
+    certificate = ((output_change_id,) if defect == "output_id_as_witness"
+                   else roots[1:] if defect == "omit_source_atom" else roots)
+    output = roots[1:] if defect == "omit_predecessor_effect" else roots
+    normal_outcomes = (
+        ("equivalent" if before[0] == 1 else "neutralized", "applied")
+        if selected == (0, 1) else
+        ("equivalent" if before[0] == 1 else "applied",)
+    )
+    outcomes = (("applied", "applied") if defect == "misstate_neutralization"
+                else normal_outcomes)
+    return Candidate(
+        selected, before, roots, certificate, output,
+        (2 if defect == "stale_dependent_basis" else 1) if 1 in selected else None,
+        (0, 1) if selected == (0, 1) else (1, before[1]),
+        outcomes, output_change_id,
+    )
+
+
+def candidate_error(candidate: Candidate) -> str | None:
+    expected = source_atoms(candidate.selected)
+    if candidate.source_atoms != expected or candidate.certificate_atoms != expected:
+        return "certificate omitted a selected source atom"
+    if candidate.output_atoms != expected:
+        return "candidate omitted a selected source effect"
+    content = {"x": candidate.before[0], "y": candidate.before[1]}
+    predecessor = None
+    for identity in candidate.output_atoms:
+        atom = next((item for item in ATOMS if item.identity == identity), None)
+        if atom is None or atom.unit not in candidate.selected:
+            return "candidate includes an unselected source atom"
+        if atom.unit == 1 and predecessor is None:
+            predecessor = content["x"]
+        if content[atom.path] not in (atom.before, atom.after):
+            return "candidate path effects do not compose"
+        content[atom.path] = atom.after
+    if candidate.dependent_read_basis is not None and (
+        0 not in candidate.selected or candidate.dependent_read_basis != predecessor
+    ):
+        return "dependent read basis differs from realized predecessor"
+    if (content["x"], content["y"]) != candidate.after:
+        return "candidate cut differs from selected source effects"
+    outcomes = (
+        ("equivalent" if candidate.before[0] == 1 else "neutralized", "applied")
+        if candidate.selected == (0, 1) else
+        ("equivalent" if candidate.before[0] == 1 else "applied",)
+    )
+    if candidate.outcomes != outcomes:
+        return "per-unit outcome misstates source realization"
+    return None
+
+
+@dataclass(frozen=True)
 class State:
+    source_kind: str = "branch"  # named branch or one direct twig
+    trunk_content: tuple[int, int] = (0, 0)
     admission: gate.State = field(default_factory=gate.State)
     obligations: work.State = field(default_factory=work.State)
-    candidate_branch_cut: int = -1
-    admitted_branch_cut: int = -1
+    candidate_source_cut: int = -1
+    admitted_source_cut: int = -1
+    candidate: Candidate | None = None
+    admitted_candidate: Candidate | None = None
+    admitted_trunk_before: tuple[int, int] | None = None
+    source_attempt_pin: bool = False
+    candidate_attempt_pin: bool = False
+    source_available: bool = True
+    candidate_available: bool = False
+    frontier_reconciled: bool = False
 
 
 def steps(state: State, defect: str = ""):
     a, w = state.admission, state.obligations
     for event, next_a in gate.steps(a):
         if event == "gate_pass":
-            if w.units[0] != "branch" or not w.branch_pins[0]:
-                continue
-            yield event, replace(state, admission=next_a,
-                                 candidate_branch_cut=w.branch_cut)
+            if state.source_kind == "branch":
+                if w.units[0] != "branch" or not w.branch_pins[0]:
+                    continue
+                source_cut = w.branch_cut
+            else:
+                if w.units[0] != "twig" or not w.twig_pins[0]:
+                    continue
+                source_cut = w.twig_cuts[0]
+            selections = ((0,),)
+            if (state.source_kind == "branch" and
+                    w.units[1] == "branch" and w.branch_pins[1]):
+                selections += ((0, 1),)
+            for selected in selections:
+                candidate = candidate_for(selected, source_cut,
+                                          state.trunk_content, defect)
+                if candidate_error(candidate) and defect not in (
+                    "omit_source_atom", "omit_predecessor_effect",
+                    "stale_dependent_basis", "misstate_neutralization",
+                    "output_id_as_witness",
+                ):
+                    continue
+                name = "gate_pass_both" if len(selected) == 2 else event
+                yield name, replace(state, admission=next_a,
+                                    candidate_source_cut=source_cut,
+                                    candidate=candidate,
+                                    source_attempt_pin=True,
+                                    candidate_attempt_pin=(defect != "drop_candidate_pin"),
+                                    candidate_available=True)
         elif event == "hold":
             # Close uses this ref-owned mutation below. A separate Hold has
             # the same eligibility effect and can race a candidate.
             yield event, replace(state, admission=next_a)
         elif event.startswith("cas_owner"):
-            if not w.ref_up or (
-                w.branch_cut != state.candidate_branch_cut
-                and defect != "trust_stale_branch_cut"
-            ):
+            source_cut = (w.branch_cut if state.source_kind == "branch"
+                          else w.twig_cuts[0])
+            if not w.ref_up or (source_cut != state.candidate_source_cut and
+                                defect != "trust_stale_branch_cut"):
+                continue
+            if not state.source_available or not state.candidate_available:
                 continue
             if defect == "disable_without_ref_fence" and not w.ref_enabled:
                 yield event, replace(state, admission=next_a,
-                                     admitted_branch_cut=w.branch_cut)
-            elif w.ref_enabled and w.units[0] == "branch":
-                next_w = (w if defect == "cas_omits_unit_accounting"
-                          else work.admit(w, 0))
+                                     admitted_source_cut=source_cut)
+            elif (w.ref_enabled and state.candidate is not None and
+                  all(w.units[i] == state.source_kind
+                      for i in state.candidate.selected)):
+                next_w = w
+                if defect != "cas_omits_unit_accounting":
+                    if state.source_kind == "branch":
+                        for unit in state.candidate.selected:
+                            next_w = work.admit(next_w, unit)
+                    else:
+                        next_w = replace(
+                            w, units=work.at(w.units, 0, "accounted"),
+                            twig_pins=work.at(w.twig_pins, 0, False),
+                            trunk_receipts=w.trunk_receipts + (0,),
+                        )
                 yield event, replace(state, admission=next_a,
                                      obligations=next_w,
-                                     admitted_branch_cut=w.branch_cut)
+                                     admitted_source_cut=source_cut,
+                                     admitted_candidate=state.candidate,
+                                     admitted_trunk_before=state.trunk_content,
+                                     trunk_content=(state.trunk_content
+                                                    if defect == "cas_omits_output"
+                                                    else state.candidate.after))
         else:
             yield event, replace(state, admission=next_a)
 
     for event, next_w in work.steps(w):
         if event.startswith("admit"):
             continue  # Only the ref CAS above may account a unit.
+        if state.source_kind == "twig" and (
+            event.endswith("1") or event in ("request_close", "disable", "close") or
+            event.startswith(("park", "resolve", "handoff"))
+        ):
+            continue  # A direct twig has no branch handoff or member closure.
         if event == "disable":
             if defect == "disable_without_ref_fence":
                 yield event, replace(state, obligations=next_w)
@@ -72,6 +222,25 @@ def steps(state: State, defect: str = ""):
         else:
             yield event, replace(state, obligations=next_w)
 
+    if state.candidate is not None:
+        if not state.candidate_attempt_pin and state.candidate_available:
+            yield "collect_candidate", replace(state, candidate_available=False)
+        source_holder_pin = any(
+            w.draft_pins[i] or w.twig_pins[i] or w.branch_pins[i] or
+            w.parked_pins[i] for i in state.candidate.selected
+        )
+        if (not state.source_attempt_pin and not source_holder_pin and
+                state.source_available):
+            yield "collect_source", replace(state, source_available=False)
+    if a.admission and not state.frontier_reconciled:
+        yield "reconcile_frontier", replace(state, frontier_reconciled=True)
+    if (a.admission and (a.receipt and state.frontier_reconciled or
+                         defect == "release_before_reconciliation") and
+            (state.source_attempt_pin or state.candidate_attempt_pin)):
+        yield "release_attempt_pins", replace(
+            state, source_attempt_pin=False, candidate_attempt_pin=False,
+        )
+
 
 def violation(state: State):
     a, w = state.admission, state.obligations
@@ -79,17 +248,36 @@ def violation(state: State):
         return problem
     if problem := work.violation(w):
         return problem
-    if (a.trunk == 1) != (0 in w.trunk_receipts):
+    if state.candidate is not None and (
+        not a.admission or not a.receipt or not state.frontier_reconciled
+    ):
+        if not state.source_available:
+            return "selected source cut was collected before recovery finished"
+        if not state.candidate_available:
+            return "candidate cut was collected before recovery finished"
+    if (a.trunk == 1) != bool(w.trunk_receipts):
         return "trunk CAS and selected-unit accounting split"
-    if a.trunk and state.admitted_branch_cut != state.candidate_branch_cut:
+    if a.trunk and state.admitted_source_cut != state.candidate_source_cut:
         return "stale branch cut admitted"
+    if a.trunk:
+        candidate = state.admitted_candidate
+        if candidate is None:
+            return "trunk admission lacks its exact candidate"
+        if problem := candidate_error(candidate):
+            return problem
+        if candidate.before != state.admitted_trunk_before:
+            return "candidate was checked against a different trunk base"
+        if state.trunk_content != candidate.after:
+            return "trunk CAS omitted the checked candidate content"
+        if set(w.trunk_receipts) != set(candidate.selected):
+            return "trunk receipt omitted a selected source unit"
     if w.close == "closed" and a.admission and not a.receipt:
         return "closure omitted recovery of the accepted admission"
     return None
 
 
-def scenario(events):
-    state = State()
+def scenario(events, initial=None):
+    state = State() if initial is None else initial
     for wanted in events:
         matches = [successor for event, successor in steps(state)
                    if event == wanted]
@@ -107,6 +295,44 @@ def scenarios():
     ))
     assert integrated.obligations.close == "closed"
     assert integrated.obligations.units[0] == "accounted"
+
+    recovered = scenario((
+        "write0", "declare0", "handoff0", "cleanup0", "gate_pass",
+        "crash_operator0", "takeover", "lock_and_validate_owner1",
+        "cas_owner1", "reconcile_frontier", "recover_receipt",
+        "release_attempt_pins", "collect_candidate", "collect_source",
+    ))
+    assert not recovered.candidate_available and not recovered.source_available
+    assert recovered.admission.receipt and recovered.frontier_reconciled
+
+    direct = scenario((
+        "write0", "declare0", "gate_pass", "lock_and_validate_owner0",
+        "cas_owner0", "recover_receipt",
+    ), State(source_kind="twig"))
+    assert direct.obligations.units == ("accounted", "none")
+    assert direct.obligations.trunk_receipts == (0,)
+
+    both = scenario((
+        "write0", "declare0", "handoff0", "write1", "declare1",
+        "handoff1", "gate_pass_both", "lock_and_validate_owner0",
+        "cas_owner0", "recover_receipt",
+    ))
+    assert both.admitted_candidate is not None
+    assert both.admitted_candidate.source_atoms == ("u0:x", "u1:x", "u1:y")
+    assert both.admitted_candidate.outcomes == ("neutralized", "applied")
+    assert both.admitted_candidate.after == (0, 1)
+    assert both.trunk_content == (0, 1)
+    assert both.obligations.trunk_receipts == (0, 1)
+
+    equivalent = scenario((
+        "write0", "declare0", "handoff0", "gate_pass",
+        "lock_and_validate_owner0", "cas_owner0", "recover_receipt",
+    ), State(trunk_content=(1, 0)))
+    assert equivalent.admitted_candidate is not None
+    assert equivalent.admitted_candidate.before == equivalent.admitted_candidate.after
+    assert equivalent.admitted_candidate.outcomes == ("equivalent",)
+    assert equivalent.trunk_content == (1, 0)
+    assert equivalent.obligations.trunk_receipts == (0,)
 
     # A close request does not itself beat an already eligible CAS.
     winner = scenario(prefix + (
@@ -135,8 +361,86 @@ def scenarios():
     assert not any(name.startswith("cas_owner") for name, _ in steps(stale))
 
 
-def explore(defect="", depth=12):
-    initial = State()
+def witness_mutants():
+    prefix = (
+        "write0", "declare0", "handoff0", "write1", "declare1",
+        "handoff1", "gate_pass_both", "lock_and_validate_owner0", "cas_owner0",
+    )
+    for defect, expected in (
+        ("omit_source_atom", "certificate omitted a selected source atom"),
+        ("output_id_as_witness", "certificate omitted a selected source atom"),
+        ("omit_predecessor_effect", "candidate omitted a selected source effect"),
+        ("stale_dependent_basis", "dependent read basis differs from realized predecessor"),
+        ("misstate_neutralization", "per-unit outcome misstates source realization"),
+    ):
+        state = State()
+        for event in prefix:
+            matches = [successor for name, successor in steps(state, defect)
+                       if name == event]
+            assert len(matches) == 1, (defect, event, state)
+            state = matches[0]
+        assert violation(state) == expected, (defect, violation(state))
+        print(f"{defect}: {expected}; " + " -> ".join(prefix))
+
+    no_op = State(trunk_content=(1, 0))
+    no_op_trace = (
+        "write0", "declare0", "handoff0", "gate_pass",
+        "lock_and_validate_owner0", "cas_owner0",
+    )
+    for event in no_op_trace:
+        matches = [successor for name, successor in
+                   steps(no_op, "cas_omits_unit_accounting") if name == event]
+        assert len(matches) == 1, (event, no_op)
+        no_op = matches[0]
+    assert no_op.admitted_candidate is not None
+    assert no_op.admitted_candidate.before == no_op.admitted_candidate.after
+    assert violation(no_op) == "trunk CAS and selected-unit accounting split"
+    print("no-op accounting mutant: equivalent cut lost its unit receipt; " +
+          " -> ".join(no_op_trace))
+
+    missed_output = State()
+    output_trace = (
+        "write0", "declare0", "handoff0", "gate_pass",
+        "lock_and_validate_owner0", "cas_owner0",
+    )
+    for event in output_trace:
+        matches = [successor for name, successor in
+                   steps(missed_output, "cas_omits_output") if name == event]
+        assert len(matches) == 1, (event, missed_output)
+        missed_output = matches[0]
+    assert violation(missed_output) == "trunk CAS omitted the checked candidate content"
+    print("CAS output mutant: accounted units but omitted candidate content; " +
+          " -> ".join(output_trace))
+
+    early_release = State()
+    release_trace = (
+        "write0", "declare0", "handoff0", "gate_pass",
+        "lock_and_validate_owner0", "cas_owner0",
+        "release_attempt_pins", "collect_candidate",
+    )
+    for event in release_trace:
+        matches = [successor for name, successor in
+                   steps(early_release, "release_before_reconciliation") if name == event]
+        assert len(matches) == 1, (event, early_release)
+        early_release = matches[0]
+    assert violation(early_release) == "candidate cut was collected before recovery finished"
+    print("early pin release mutant: candidate lost before receipt and reconciliation; " +
+          " -> ".join(release_trace))
+
+    missing_pin = State()
+    missing_trace = ("write0", "declare0", "handoff0", "gate_pass", "collect_candidate")
+    for event in missing_trace:
+        matches = [successor for name, successor in
+                   steps(missing_pin, "drop_candidate_pin") if name == event]
+        assert len(matches) == 1, (event, missing_pin)
+        missing_pin = matches[0]
+    assert violation(missing_pin) == "candidate cut was collected before recovery finished"
+    print("missing candidate pin mutant: gate work lost its cut; " +
+          " -> ".join(missing_trace))
+
+
+def explore(defect="", depth=12, source_kind="branch"):
+    initial = State(source_kind=source_kind)
     queue = deque([(initial, ())])
     seen = {initial}
     while queue:
@@ -154,6 +458,13 @@ def explore(defect="", depth=12):
 
 def main():
     scenarios()
+    witness_mutants()
+    count, problem, _ = explore(depth=9, source_kind="twig")
+    assert problem is None, problem
+    print(f"direct twig lifecycle: {count} safe states through depth 9")
+    count, problem, trace = explore("cas_omits_unit_accounting", 6, "twig")
+    assert problem == "trunk CAS and selected-unit accounting split", problem
+    print(f"direct twig accounting mutant: {problem}; " + " -> ".join(trace))
     for label, defect, depth in (
         ("composed lifecycle", "", 12),
         ("CAS omits selected-unit accounting", "cas_omits_unit_accounting", 7),

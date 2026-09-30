@@ -255,16 +255,32 @@ disable with the ref-owned Hold epoch:
 python3 models/research/flowing_full_seam.py
 ```
 
-It explores 13,470 safe states through twelve transitions for one selected
-unit, a second member twig, two coordinators and one candidate. Scenarios
-show a CAS winning before close disable, a second member's unit parked at
-close, disable blocking a passed candidate, and a later member handoff making
-that candidate's branch cut stale. Four
+It explores 17,278 safe branch states through twelve transitions and 476
+direct-twig states through nine transitions. Scenarios show a CAS winning
+before close disable, a second member's unit parked at close, disable blocking
+a passed candidate, and a later member handoff making that candidate's source
+cut stale. The combined candidate now binds three fixed source atoms to two
+selected units, replays their path effects, checks the dependent's read basis
+at the realized predecessor, and accounts both units even when the dependent
+neutralizes the predecessor's write. An equivalent no-op keeps its source atom
+and receives a checked unit receipt. Five witness weakenings admit a missing
+atom, an output id substituted for roots, omitted candidate content, stale
+dependent basis or false neutralized outcome; a separate no-op weakening drops
+its unit receipt, and a CAS weakening records unit receipts without moving the
+checked output content. Durable attempt pins now keep the source and candidate
+available through a coordinator crash, ref CAS, receipt recovery and frontier
+reconciliation; collection follows release. Dropping the candidate pin during
+gate work or releasing it before recovery lets collection lose a still-needed
+cut. Four earlier
 weakenings admit a CAS without unit accounting, omit the ref fence at disable,
 trust the stale branch cut, or close before recovering an accepted receipt.
-The product still abstracts content reconciliation, dependency coverage,
-physical lock scheduling and independently failing stores; it does not prove
-the native or hosted transactions implement these synchronized transitions.
+The source atoms and read relation are fixed model inputs: actual cut-to-atom
+derivation, actual blob-closure and collector transactions, semantic edge
+discovery, failed/cancelled attempt pin release, source revisions through all
+mutation doors, certificate digest/authenticity at the ref authority, physical
+lock scheduling and independently failing stores remain open.
+The model does not prove the native or hosted transactions implement these
+synchronized transitions.
 
 `contribution_lifecycle.py` probes one branch with two declared contributions,
 where `u1` depends on `u0`. It separates the durable holder of each unit from
