@@ -1411,6 +1411,73 @@ mod tests {
     use crate::content::ContentStore;
     use crate::source_review::{ReviewError, ReviewStore};
     use crate::source_review_native::{NativeCandidateRequest, NativeUpload};
+    use crate::vcs::flowing_gate::{
+        NativeGateCommand, NativeGateExecution, NativeGateExecutor, NativeGatePlan,
+    };
+
+    struct LocalProcessFixture;
+
+    impl NativeGateExecutor for LocalProcessFixture {
+        fn run(
+            &mut self,
+            check: &NativeGateCommand,
+            cut_root: &std::path::Path,
+        ) -> NativeGateExecution {
+            match std::process::Command::new(&check.program)
+                .args(&check.args)
+                .current_dir(cut_root)
+                .output()
+            {
+                Ok(output) => NativeGateExecution {
+                    exit_code: output.status.code(),
+                    started: true,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    run_error: None,
+                },
+                Err(error) => NativeGateExecution {
+                    exit_code: None,
+                    started: false,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    run_error: Some(error.to_string()),
+                },
+            }
+        }
+    }
+
+    struct MoveTrunkDuringCheck(rusqlite::Connection);
+
+    impl NativeGateExecutor for MoveTrunkDuringCheck {
+        fn run(
+            &mut self,
+            _check: &NativeGateCommand,
+            _cut_root: &std::path::Path,
+        ) -> NativeGateExecution {
+            self.0
+                .execute(
+                    "UPDATE branches SET head_cut_id = 'moved' WHERE branch_id = ?1",
+                    [MAINLINE_BRANCH_ID],
+                )
+                .expect("move trunk during gate");
+            NativeGateExecution {
+                exit_code: Some(0),
+                started: true,
+                stdout: b"passed\n".to_vec(),
+                stderr: Vec::new(),
+                run_error: None,
+            }
+        }
+    }
+
+    fn expect_gate_refusal<T: std::fmt::Debug>(result: StoreResult<T>, reason: &str) {
+        match result {
+            Err(StoreError::Conflict(message)) => {
+                assert_eq!(message, format!("native candidate gate refuses: {reason}"));
+            }
+            other => panic!("expected native gate refusal `{reason}`, got {other:?}"),
+        }
+    }
 
     fn workspace() -> WorkspaceVcs<BranchStore, ContentStore> {
         WorkspaceVcs::from_parts(
@@ -1722,6 +1789,418 @@ mod tests {
             .expect("native candidate test")
             .head_cut_id
             .is_none());
+    }
+
+    #[test]
+    fn native_gate_runs_the_retained_cut_and_records_each_result() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        vcs.write("twig", "later.txt", Some("not selected"), "twig-tail", "t8")
+            .expect("append later source tail");
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .expect("prepare exact prefix");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("complete prefix must prepare: {prepared:?}")
+        };
+        assert!(matches!(
+            vcs.retain_review_attempt("gate-attempt-a", &candidate.candidate_witness_digest, "t7")
+                .expect("pin exact gate attempt"),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        let plan = NativeGatePlan {
+            attempt_op_id: "gate-attempt-a".into(),
+            coordinator: "coordinator".into(),
+            policy_digest: "policy-v1".into(),
+            rules_digest: "rules-v1".into(),
+            graph_coverage_digest: "full-prefix-v1".into(),
+            checks: vec![
+                NativeGateCommand {
+                    check_id: "cut-content".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "test \"$(cat a.txt)\" = A && test \"$(cat b.txt)\" = B && test ! -e later.txt && echo exact-cut && echo changed > a.txt".into()],
+                },
+                NativeGateCommand {
+                    check_id: "failed-check".into(),
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "test \"$(cat a.txt)\" = A || exit 9; echo refused >&2; exit 7".into()],
+                },
+                NativeGateCommand {
+                    check_id: "unrun-check".into(),
+                    program: "/whip/nonexistent-gate-check".into(),
+                    args: vec![],
+                },
+            ],
+        };
+        let scratch = std::env::temp_dir().join(format!(
+            "whip-native-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut executor = LocalProcessFixture;
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate("sha256:missing", &plan, &scratch, &mut executor),
+            "candidate witness is missing",
+        );
+        assert!(!scratch.exists());
+        let empty = NativeGatePlan {
+            checks: Vec::new(),
+            ..plan.clone()
+        };
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &empty,
+                &scratch,
+                &mut executor,
+            ),
+            "plan is incomplete",
+        );
+        assert!(!scratch.exists());
+        let run = vcs
+            .run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            )
+            .expect("record every result");
+        assert_eq!(
+            run.certificate.admission_refusal(),
+            Some(crate::branches::flowing_admission::FlowingAdmissionRefusal::GateFailed)
+        );
+        assert_eq!(
+            run.certificate
+                .checks
+                .iter()
+                .map(|check| check.verdict)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::branches::flowing_admission::FlowingGateVerdict::Passed,
+                crate::branches::flowing_admission::FlowingGateVerdict::Failed,
+                crate::branches::flowing_admission::FlowingGateVerdict::Unrun,
+            ]
+        );
+        assert_eq!(
+            vcs.branches
+                .native_gate_certificate(&run.handle)
+                .expect("read certificate"),
+            Some(run.certificate.clone())
+        );
+        let first = vcs
+            .branches
+            .native_gate_evidence(&run.certificate.checks[0].evidence_digest)
+            .expect("read output")
+            .expect("output retained");
+        assert_eq!(first.stdout, b"exact-cut\n");
+        assert!(first.started);
+        assert_eq!(first.exit_code, Some(0));
+        let second = vcs
+            .branches
+            .native_gate_evidence(&run.certificate.checks[1].evidence_digest)
+            .expect("read failed check")
+            .expect("failed output retained");
+        assert_eq!(second.exit_code, Some(7));
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "scratch path must be absent",
+        );
+        std::fs::remove_dir_all(&scratch).expect("remove test scratch");
+
+        let passing = NativeGatePlan {
+            checks: vec![plan.checks[0].clone()],
+            ..plan
+        };
+        let passed = vcs
+            .run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &passing,
+                &scratch,
+                &mut executor,
+            )
+            .expect("run passing check against exact cut");
+        assert_eq!(passed.certificate.admission_refusal(), None);
+        assert_ne!(passed.handle, run.handle);
+        std::fs::remove_dir_all(&scratch).expect("remove test scratch");
+
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "hold-after-gate".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    expected_eligibility_epoch: 0,
+                    expected_owner_epoch: 0,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::Hold,
+                    recorded_at: "t9".into(),
+                })
+                .expect("hold source"),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &passing,
+                &scratch,
+                &mut executor,
+            ),
+            "source eligibility or coordinator changed",
+        );
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn native_gate_refuses_changed_attempt_and_cut_basis() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .expect("prepare native candidate");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("candidate must prepare: {prepared:?}")
+        };
+        assert!(matches!(
+            vcs.retain_review_attempt("gate-op", &candidate.candidate_witness_digest, "t7")
+                .expect("retain gate attempt"),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        let plan = NativeGatePlan {
+            attempt_op_id: "gate-op".into(),
+            coordinator: "coordinator".into(),
+            policy_digest: "policy".into(),
+            rules_digest: "rules".into(),
+            graph_coverage_digest: "coverage".into(),
+            checks: vec![NativeGateCommand {
+                check_id: "check".into(),
+                program: "sh".into(),
+                args: vec!["-c".into(), "true".into()],
+            }],
+        };
+        let root = std::env::temp_dir().join(format!(
+            "whip-gate-basis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("fixture root");
+        let scratch = root.join("scratch");
+        let mut executor = LocalProcessFixture;
+
+        let duplicate = NativeGatePlan {
+            checks: vec![plan.checks[0].clone(), plan.checks[0].clone()],
+            ..plan.clone()
+        };
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &duplicate,
+                &scratch,
+                &mut executor,
+            ),
+            "check identity or command is incomplete",
+        );
+        let missing_pin = NativeGatePlan {
+            attempt_op_id: "missing-pin".into(),
+            ..plan.clone()
+        };
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &missing_pin,
+                &scratch,
+                &mut executor,
+            ),
+            "candidate attempt is not retained",
+        );
+        let mut foreign_witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .unwrap()
+            .unwrap();
+        foreign_witness.contribution_id = "another-review".into();
+        let foreign_digest = vcs
+            .branches
+            .record_candidate_witness(&foreign_witness)
+            .expect("record distinct witness");
+        assert!(matches!(
+            vcs.retain_review_attempt("foreign-op", &foreign_digest, "t8")
+                .expect("retain foreign attempt"),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        let foreign_pin = NativeGatePlan {
+            attempt_op_id: "foreign-op".into(),
+            ..plan.clone()
+        };
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &foreign_pin,
+                &scratch,
+                &mut executor,
+            ),
+            "candidate attempt pin differs from witness",
+        );
+
+        vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_fence AS SELECT * FROM flowing_source_fences WHERE source_branch_id = 'twig'; DELETE FROM flowing_source_fences WHERE source_branch_id = 'twig';")
+            .unwrap();
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "source fence is missing",
+        );
+        vcs.branches.test_connection().execute_batch("INSERT INTO flowing_source_fences SELECT * FROM saved_fence; DROP TABLE saved_fence;")
+            .unwrap();
+
+        vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_trunk AS SELECT * FROM branches WHERE branch_id = 'main'; DELETE FROM branches WHERE branch_id = 'main';")
+            .unwrap();
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "trunk is missing",
+        );
+        vcs.branches
+            .test_connection()
+            .execute_batch(
+                "INSERT INTO branches SELECT * FROM saved_trunk; DROP TABLE saved_trunk;",
+            )
+            .unwrap();
+
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE branches SET head_cut_id = 'moved' WHERE branch_id = ?1",
+                [MAINLINE_BRANCH_ID],
+            )
+            .unwrap();
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "trunk base changed",
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE branches SET head_cut_id = NULL WHERE branch_id = ?1",
+                [MAINLINE_BRANCH_ID],
+            )
+            .unwrap();
+
+        vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_candidate AS SELECT * FROM cuts WHERE cut_id = 'candidate-a'; DELETE FROM cuts WHERE cut_id = 'candidate-a';")
+            .unwrap();
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "candidate cut is missing",
+        );
+        vcs.branches
+            .test_connection()
+            .execute_batch(
+                "INSERT INTO cuts SELECT * FROM saved_candidate; DROP TABLE saved_candidate;",
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = 'wrong' WHERE cut_id = 'candidate-a'",
+                [],
+            )
+            .unwrap();
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "candidate cut differs from retained witness",
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = ?1 WHERE cut_id = 'candidate-a'",
+                [&candidate.candidate_manifest_hash],
+            )
+            .unwrap();
+        assert!(!scratch.exists());
+
+        let db_path = root.join("branches.sqlite");
+        vcs.branches
+            .test_connection()
+            .execute("VACUUM INTO ?1", [db_path.to_str().unwrap()])
+            .unwrap();
+        vcs.branches = BranchStore::open(&db_path).expect("reopen branch fixture from disk");
+        let mut moving = MoveTrunkDuringCheck(rusqlite::Connection::open(&db_path).unwrap());
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut moving,
+            ),
+            "trunk or source changed during checks",
+        );
+        std::fs::remove_dir_all(&scratch).expect("remove projection");
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE branches SET head_cut_id = NULL WHERE branch_id = ?1",
+                [MAINLINE_BRANCH_ID],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            vcs.branches
+                .cancel_flowing_attempt(&crate::branches::flowing_admission::FlowingCancelRequest {
+                    cancel_op_id: "cancel-gate-op".into(),
+                    admission_op_id: "gate-op".into(),
+                    source_branch_id: "twig".into(),
+                    source_incarnation_id: "inc-1".into(),
+                    expected_owner_epoch: 0,
+                    coordinator: "coordinator".into(),
+                    recorded_at: "t9".into(),
+                })
+                .expect("cancel attempt"),
+            crate::branches::flowing_admission::FlowingCancelOutcome::Cancelled(_)
+        ));
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "candidate attempt was cancelled",
+        );
+        drop(moving);
+        drop(vcs);
+        std::fs::remove_dir_all(root).expect("remove gate fixture");
     }
 
     #[test]

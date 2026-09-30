@@ -807,6 +807,11 @@ impl BranchStore {
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_connection(&self) -> &Connection {
+        &self.connection
+    }
+
     fn advance_head_leased(
         &mut self,
         lease: Option<&str>,

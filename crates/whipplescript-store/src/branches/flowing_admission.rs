@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 8] = [
+pub const SCHEMA: [&str; 9] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -36,6 +36,10 @@ pub const SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS flowing_gate_certificates (
         handle TEXT PRIMARY KEY,
         certificate_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_gate_evidence (
+        digest TEXT PRIMARY KEY,
+        evidence_json TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS flowing_attempt_pins (
         op_id TEXT PRIMARY KEY,
@@ -203,6 +207,42 @@ pub struct FlowingGateCheck {
     pub input_digest: String,
     pub evidence_digest: String,
     pub verdict: FlowingGateVerdict,
+}
+
+/// Exact process output behind a check digest. A process that cannot start is
+/// unrun; a process that runs and exits unsuccessfully is failed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingGateEvidence {
+    pub attempt_op_id: String,
+    pub check_id: String,
+    pub input_digest: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub started: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub run_error: Option<String>,
+}
+
+impl FlowingGateEvidence {
+    pub fn digest(&self) -> crate::StoreResult<String> {
+        let bytes = serde_json::to_vec(&("native-gate-evidence-v1", self))?;
+        Ok(format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(&bytes)
+        ))
+    }
+
+    pub fn verdict(&self) -> FlowingGateVerdict {
+        if !self.started {
+            FlowingGateVerdict::Unrun
+        } else if self.exit_code == Some(0) {
+            FlowingGateVerdict::Passed
+        } else {
+            FlowingGateVerdict::Failed
+        }
+    }
 }
 
 /// An exact gate result envelope. No production issuer writes this table yet:

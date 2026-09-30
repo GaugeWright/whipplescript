@@ -7,8 +7,9 @@ use super::{
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
     FlowingAttemptFinishOutcome, FlowingAttemptFinishReceipt, FlowingAttemptFinishRefusal,
     FlowingAttemptPin, FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal,
-    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateVerdict,
-    FlowingUnitOutcome, ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
+    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateEvidence,
+    FlowingGateVerdict, FlowingUnitOutcome, ReleaseFlowingAttemptOutcome,
+    RetainFlowingAttemptOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
@@ -172,6 +173,103 @@ fn read_gate_certificate(
         Ok(certificate)
     })
     .transpose()
+}
+
+impl BranchStore {
+    /// Trusted native gate writer. The certificate and every raw result are
+    /// committed together; a retry may reuse the same handle but cannot
+    /// replace bytes under an existing digest.
+    pub(crate) fn record_native_gate_certificate(
+        &mut self,
+        certificate: &FlowingGateCertificate,
+        evidence: &[FlowingGateEvidence],
+    ) -> StoreResult<String> {
+        if certificate.required_checks.len() != evidence.len()
+            || certificate.admission_refusal() == Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        {
+            return Err(StoreError::Conflict(
+                "native gate plan is incomplete".into(),
+            ));
+        }
+        for (check, result) in certificate.checks.iter().zip(evidence) {
+            if check.check_id != result.check_id
+                || check.input_digest != result.input_digest
+                || check.evidence_digest != result.digest()?
+                || check.verdict != result.verdict()
+                || result.started == result.run_error.is_some()
+                || (!result.started
+                    && (result.exit_code.is_some()
+                        || !result.stdout.is_empty()
+                        || !result.stderr.is_empty()
+                        || result.run_error.as_deref().is_none_or(str::is_empty)))
+            {
+                return Err(StoreError::Conflict(
+                    "native gate result differs from its evidence".into(),
+                ));
+            }
+        }
+        let handle = certificate.handle()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for result in evidence {
+            let digest = result.digest()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO flowing_gate_evidence (digest, evidence_json) VALUES (?1, ?2)",
+                params![&digest, serde_json::to_string(result)?],
+            )?;
+            let stored: String = tx.query_row(
+                "SELECT evidence_json FROM flowing_gate_evidence WHERE digest = ?1",
+                [&digest],
+                |row| row.get(0),
+            )?;
+            let stored: FlowingGateEvidence = serde_json::from_str(&stored)?;
+            if stored != *result || stored.digest()? != digest {
+                return Err(StoreError::Conflict(
+                    "native gate evidence differs from its digest key".into(),
+                ));
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO flowing_gate_certificates (handle, certificate_json) VALUES (?1, ?2)",
+            params![&handle, serde_json::to_string(certificate)?],
+        )?;
+        if read_gate_certificate(&tx, &handle)?.as_ref() != Some(certificate) {
+            return Err(StoreError::Conflict(
+                "native gate certificate differs from its handle".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(handle)
+    }
+
+    pub fn native_gate_certificate(
+        &self,
+        handle: &str,
+    ) -> StoreResult<Option<FlowingGateCertificate>> {
+        read_gate_certificate(&self.connection, handle)
+    }
+
+    pub fn native_gate_evidence(&self, digest: &str) -> StoreResult<Option<FlowingGateEvidence>> {
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM flowing_gate_evidence WHERE digest = ?1",
+                [digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.map(|json| {
+            let result: FlowingGateEvidence = serde_json::from_str(&json)?;
+            if result.digest()? != digest {
+                return Err(StoreError::Conflict(
+                    "native gate evidence differs from its digest key".into(),
+                ));
+            }
+            Ok(result)
+        })
+        .transpose()
+    }
 }
 
 fn read_cancellation(
@@ -1027,6 +1125,105 @@ mod tests {
                 verdict: FlowingGateVerdict::Passed,
             }],
         }
+    }
+
+    fn issued_gate_fixture() -> (FlowingGateCertificate, FlowingGateEvidence) {
+        let mut certificate = certificate_for(&request("unit-a", "gate-op"));
+        let evidence = FlowingGateEvidence {
+            attempt_op_id: "gate-op".into(),
+            check_id: "full-workspace-bar".into(),
+            input_digest: "sha256:fixture-input".into(),
+            program: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            exit_code: Some(0),
+            started: true,
+            stdout: b"passed\n".to_vec(),
+            stderr: Vec::new(),
+            run_error: None,
+        };
+        certificate.checks[0].evidence_digest = evidence.digest().unwrap();
+        (certificate, evidence)
+    }
+
+    #[test]
+    fn native_gate_writer_refuses_incomplete_mismatched_and_corrupt_evidence() {
+        let (certificate, evidence) = issued_gate_fixture();
+        let mut store = BranchStore::open_in_memory().unwrap();
+        let mut incomplete = certificate.clone();
+        incomplete.required_checks.clear();
+        assert!(store
+            .record_native_gate_certificate(&incomplete, std::slice::from_ref(&evidence))
+            .is_err());
+        assert!(store
+            .native_gate_certificate(&incomplete.handle().unwrap())
+            .unwrap()
+            .is_none());
+
+        let mut mismatch = evidence.clone();
+        mismatch.stdout = b"different\n".to_vec();
+        assert!(store
+            .record_native_gate_certificate(&certificate, &[mismatch])
+            .is_err());
+        assert!(store
+            .native_gate_certificate(&certificate.handle().unwrap())
+            .unwrap()
+            .is_none());
+
+        let handle = store
+            .record_native_gate_certificate(&certificate, std::slice::from_ref(&evidence))
+            .expect("record exact result");
+        assert_eq!(
+            store.native_gate_certificate(&handle).unwrap(),
+            Some(certificate.clone())
+        );
+        assert_eq!(
+            store
+                .native_gate_evidence(&evidence.digest().unwrap())
+                .unwrap(),
+            Some(evidence.clone())
+        );
+
+        let mut corrupt = evidence.clone();
+        corrupt.stdout = b"changed after record\n".to_vec();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_gate_evidence SET evidence_json = ?1 WHERE digest = ?2",
+                params![
+                    serde_json::to_string(&corrupt).unwrap(),
+                    evidence.digest().unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(store
+            .native_gate_evidence(&evidence.digest().unwrap())
+            .is_err());
+        assert!(store
+            .record_native_gate_certificate(&certificate, std::slice::from_ref(&evidence))
+            .is_err());
+
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_gate_evidence SET evidence_json = ?1 WHERE digest = ?2",
+                params![
+                    serde_json::to_string(&evidence).unwrap(),
+                    evidence.digest().unwrap()
+                ],
+            )
+            .unwrap();
+        let mut foreign = certificate.clone();
+        foreign.policy_digest = "sha256:foreign-policy".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_gate_certificates SET certificate_json = ?1 WHERE handle = ?2",
+                params![serde_json::to_string(&foreign).unwrap(), &handle],
+            )
+            .unwrap();
+        assert!(store
+            .record_native_gate_certificate(&certificate, &[evidence])
+            .is_err());
     }
 
     fn record_gate_certificate(store: &BranchStore, request: &FlowingAdmissionRequest) {
