@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use super::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
-    FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
-    FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
+    FlowingAttemptPin, FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal,
+    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
+    ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
@@ -57,6 +58,68 @@ fn read_witness(
         Ok(witness)
     })
     .transpose()
+}
+
+fn read_attempt_pin(
+    connection: &Connection,
+    op_id: &str,
+) -> StoreResult<Option<FlowingAttemptPin>> {
+    connection
+        .query_row(
+            "SELECT op_id, witness_digest, source_cut_id, candidate_cut_id, \
+             retained_at, released_at FROM flowing_attempt_pins WHERE op_id = ?1",
+            [op_id],
+            |row| {
+                Ok(FlowingAttemptPin {
+                    op_id: row.get(0)?,
+                    witness_digest: row.get(1)?,
+                    source_cut_id: row.get(2)?,
+                    candidate_cut_id: row.get(3)?,
+                    retained_at: row.get(4)?,
+                    released_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn missing_unit_holder(
+    connection: &Connection,
+    witness: &FlowingCandidateWitness,
+) -> StoreResult<Option<String>> {
+    for unit in &witness.units {
+        let cut: Option<String> = connection
+            .query_row(
+                "SELECT c.source_cut_id \
+                     FROM flowing_contributions c \
+                     JOIN flowing_contribution_basis b ON b.unit_id = c.unit_id \
+                     JOIN flowing_private_pins p ON p.pin_id = c.pin_id \
+                     WHERE c.unit_id = ?1 AND c.source_branch_id = ?2 \
+                     AND c.principal = ?3 AND c.intent = ?4 \
+                     AND b.basis_digest = ?5 \
+                     AND p.twig_branch_id = c.source_branch_id \
+                     AND p.cut_id = c.source_cut_id \
+                     AND p.manifest_hash = c.source_manifest_hash \
+                     AND p.released_at IS NULL",
+                params![
+                    &unit.unit_id,
+                    &witness.source_branch_id,
+                    &unit.principal,
+                    &unit.intent,
+                    &unit.basis_digest
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(cut) = cut else {
+            return Ok(Some(unit.unit_id.clone()));
+        };
+        if !ancestor(connection, &cut, &witness.source_cut_id)? {
+            return Ok(Some(unit.unit_id.clone()));
+        }
+    }
+    Ok(None)
 }
 
 fn read_gate_certificate(
@@ -168,6 +231,129 @@ impl FlowingAdmissions for BranchStore {
 
     fn candidate_witness(&self, digest: &str) -> StoreResult<Option<FlowingCandidateWitness>> {
         read_witness(&self.connection, digest)
+    }
+
+    fn retain_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        witness_digest: &str,
+        retained_at: &str,
+    ) -> StoreResult<RetainFlowingAttemptOutcome> {
+        use RetainFlowingAttemptOutcome as O;
+        for (field, value) in [
+            ("op_id", op_id),
+            ("witness_digest", witness_digest),
+            ("retained_at", retained_at),
+        ] {
+            if value.trim().is_empty() {
+                return Ok(O::Invalid { field });
+            }
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(pin) = read_attempt_pin(&tx, op_id)? {
+            return Ok(
+                if pin.witness_digest != witness_digest || pin.retained_at != retained_at {
+                    O::IdentityMismatch
+                } else if pin.released_at.is_some() {
+                    O::Released
+                } else {
+                    O::Existing(pin)
+                },
+            );
+        }
+        if read_receipt(&tx, op_id)?.is_some()
+            || read_cancellation(&tx, "admission_op_id", op_id)?.is_some()
+        {
+            return Ok(O::AttemptTerminal);
+        }
+        let Some(witness) = read_witness(&tx, witness_digest)? else {
+            return Ok(O::WitnessMissing);
+        };
+        if witness.units.is_empty() {
+            return Ok(O::Invalid { field: "units" });
+        }
+        let Some(source) = BranchStore::cut_by_id(&tx, &witness.source_cut_id)? else {
+            return Ok(O::SourceCutMissing);
+        };
+        if source.branch_id != witness.source_branch_id
+            || source.manifest_hash != witness.source_manifest_hash
+        {
+            return Ok(O::SourceCutMismatch);
+        }
+        let Some(candidate) = BranchStore::cut_by_id(&tx, &witness.candidate_cut_id)? else {
+            return Ok(O::CandidateCutMissing);
+        };
+        if candidate.branch_id != MAINLINE_BRANCH_ID
+            || candidate.manifest_hash != witness.candidate_manifest_hash
+        {
+            return Ok(O::CandidateCutMismatch);
+        }
+        if let Some(unit_id) = missing_unit_holder(&tx, &witness)? {
+            return Ok(O::UnitHolderMissing { unit_id });
+        }
+        tx.execute(
+            "INSERT INTO flowing_attempt_pins \
+             (op_id, witness_digest, source_cut_id, candidate_cut_id, retained_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                op_id,
+                witness_digest,
+                &witness.source_cut_id,
+                &witness.candidate_cut_id,
+                retained_at
+            ],
+        )?;
+        let pin = read_attempt_pin(&tx, op_id)?.expect("inserted attempt pin");
+        tx.commit()?;
+        Ok(O::Retained(pin))
+    }
+
+    fn flowing_attempt_pin(&self, op_id: &str) -> StoreResult<Option<FlowingAttemptPin>> {
+        read_attempt_pin(&self.connection, op_id)
+    }
+
+    fn release_cancelled_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        released_at: &str,
+    ) -> StoreResult<ReleaseFlowingAttemptOutcome> {
+        use ReleaseFlowingAttemptOutcome as O;
+        for (field, value) in [("op_id", op_id), ("released_at", released_at)] {
+            if value.trim().is_empty() {
+                return Ok(O::Invalid { field });
+            }
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(pin) = read_attempt_pin(&tx, op_id)? else {
+            return Ok(O::Missing);
+        };
+        if pin.released_at.is_some() {
+            return Ok(O::AlreadyReleased);
+        }
+        if read_receipt(&tx, op_id)?.is_some() {
+            return Ok(O::Admitted);
+        }
+        if read_cancellation(&tx, "admission_op_id", op_id)?.is_none() {
+            return Ok(O::NotCancelled);
+        }
+        let Some(witness) = read_witness(&tx, &pin.witness_digest)? else {
+            return Err(StoreError::Conflict(
+                "retained flowing attempt lost its witness".into(),
+            ));
+        };
+        if let Some(unit_id) = missing_unit_holder(&tx, &witness)? {
+            return Ok(O::UnitHolderMissing { unit_id });
+        }
+        tx.execute(
+            "UPDATE flowing_attempt_pins SET released_at = ?2 WHERE op_id = ?1",
+            params![op_id, released_at],
+        )?;
+        tx.commit()?;
+        Ok(O::Released)
     }
 
     fn admit_flowing_prefix(
@@ -1086,6 +1272,245 @@ mod tests {
             coordinator: "coordinator".into(),
             recorded_at: "t4".into(),
         }
+    }
+
+    #[test]
+    fn cancelled_attempt_releases_only_its_own_cut_roots() {
+        let mut store = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        let first = store
+            .retain_flowing_attempt("attempt-a", &witness, "t3")
+            .unwrap();
+        assert!(matches!(first, RetainFlowingAttemptOutcome::Retained(_)));
+        assert!(matches!(
+            store
+                .retain_flowing_attempt("attempt-a", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Existing(_)
+        ));
+        assert_eq!(
+            store
+                .retain_flowing_attempt("attempt-a", &witness, "changed")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::IdentityMismatch
+        );
+        assert!(matches!(
+            store
+                .retain_flowing_attempt("attempt-b", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        assert!(store.pinned_cuts("t4").unwrap().contains("candidate"));
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::NotCancelled
+        );
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Released
+        );
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t6")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::AlreadyReleased
+        );
+        assert_eq!(
+            store
+                .retain_flowing_attempt("attempt-a", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Released
+        );
+        store
+            .cancel_flowing_attempt(&cancel("attempt-b", "cancel-b"))
+            .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-b", "t6")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Released
+        );
+        let roots = store.pinned_cuts("t6").unwrap();
+        assert!(
+            roots.contains("source"),
+            "the private unit still owns its cut"
+        );
+        assert!(
+            !roots.contains("candidate"),
+            "both attempt pins were released"
+        );
+        assert_eq!(store.admitted_unit_operation("unit-a").unwrap(), None);
+    }
+
+    #[test]
+    fn cancelled_attempt_cannot_release_a_lost_source_holder() {
+        let mut store = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        store
+            .retain_flowing_attempt("attempt-a", &witness, "t3")
+            .unwrap();
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_private_pins SET released_at = 't4' WHERE pin_id = 'pin'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::UnitHolderMissing {
+                unit_id: "unit-a".into()
+            }
+        );
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn cancelled_attempt_cannot_release_a_lost_witness() {
+        let mut store = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        store
+            .retain_flowing_attempt("attempt-a", &witness, "t3")
+            .unwrap();
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_candidate_witnesses WHERE digest = ?1",
+                [&witness],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.release_cancelled_flowing_attempt("attempt-a", "t5"),
+            Err(StoreError::Conflict(message)) if message.contains("lost its witness")
+        ));
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+    }
+
+    #[test]
+    fn admitted_attempt_keeps_its_roots_until_receipt_reconciliation() {
+        let mut store = fixture();
+        let request = request("unit-a", "fixture");
+        store
+            .retain_flowing_attempt(&request.op_id, &request.candidate_witness_digest, "t3")
+            .unwrap();
+        assert!(matches!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt(&request.op_id, "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Admitted
+        );
+        assert!(store
+            .flowing_attempt_pin(&request.op_id)
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn native_attempt_retention_refuses_missing_or_changed_witness_bases() {
+        let mut store = fixture();
+        let request = request("unit-a", "fixture");
+        assert_eq!(
+            store
+                .retain_flowing_attempt("attempt", "missing", "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::WitnessMissing
+        );
+        assert_eq!(
+            store
+                .retain_flowing_attempt("", &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Invalid { field: "op_id" }
+        );
+        for (change, expected) in [
+            (
+                "source_missing",
+                RetainFlowingAttemptOutcome::SourceCutMissing,
+            ),
+            (
+                "source_mismatch",
+                RetainFlowingAttemptOutcome::SourceCutMismatch,
+            ),
+            (
+                "candidate_missing",
+                RetainFlowingAttemptOutcome::CandidateCutMissing,
+            ),
+            (
+                "candidate_mismatch",
+                RetainFlowingAttemptOutcome::CandidateCutMismatch,
+            ),
+            (
+                "holder",
+                RetainFlowingAttemptOutcome::UnitHolderMissing {
+                    unit_id: "unit-a".into(),
+                },
+            ),
+            (
+                "empty",
+                RetainFlowingAttemptOutcome::Invalid { field: "units" },
+            ),
+        ] {
+            let mut witness = witness_for(&request);
+            match change {
+                "source_missing" => witness.source_cut_id = "missing".into(),
+                "source_mismatch" => witness.source_manifest_hash = "wrong".into(),
+                "candidate_missing" => witness.candidate_cut_id = "missing".into(),
+                "candidate_mismatch" => witness.candidate_manifest_hash = "wrong".into(),
+                "holder" => witness.units[0].basis_digest = "wrong".into(),
+                "empty" => witness.units.clear(),
+                _ => unreachable!(),
+            }
+            let digest = store.record_candidate_witness(&witness).unwrap();
+            assert_eq!(
+                store
+                    .retain_flowing_attempt(&format!("attempt-{change}"), &digest, "t3")
+                    .unwrap(),
+                expected,
+                "{change}"
+            );
+        }
+        store
+            .cancel_flowing_attempt(&cancel("terminal", "cancel-terminal"))
+            .unwrap();
+        assert_eq!(
+            store
+                .retain_flowing_attempt("terminal", &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::AttemptTerminal
+        );
     }
 
     #[test]

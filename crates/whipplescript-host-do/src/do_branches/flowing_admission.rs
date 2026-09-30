@@ -3,12 +3,13 @@ use std::collections::BTreeSet;
 use super::flowing_fence;
 use super::flowing_sources::exact_atomic;
 use super::DoBranches;
-use crate::do_store::{as_text, sql_err, text, DoSql};
+use crate::do_store::{as_opt_text, as_text, sql_err, text, DoSql};
 use whipplescript_store::branches::flowing_admission::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
-    FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
-    FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
+    FlowingAttemptPin, FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal,
+    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
+    ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
 };
 use whipplescript_store::branches::flowing_fence::FlowingSourceKind;
 use whipplescript_store::branches::{
@@ -52,6 +53,25 @@ fn read_witness<S: DoSql>(sql: &S, digest: &str) -> StoreResult<Option<FlowingCa
         Ok(witness)
     })
     .transpose()
+}
+
+fn read_attempt_pin<S: DoSql>(sql: &S, op_id: &str) -> StoreResult<Option<FlowingAttemptPin>> {
+    Ok(sql
+        .query(
+            "SELECT op_id, witness_digest, source_cut_id, candidate_cut_id, \
+             retained_at, released_at FROM flowing_attempt_pins WHERE op_id = ?1",
+            &[text(op_id)],
+        )
+        .map_err(sql_err)?
+        .first()
+        .map(|row| FlowingAttemptPin {
+            op_id: as_text(&row[0]),
+            witness_digest: as_text(&row[1]),
+            source_cut_id: as_text(&row[2]),
+            candidate_cut_id: as_text(&row[3]),
+            retained_at: as_text(&row[4]),
+            released_at: as_opt_text(&row[5]),
+        }))
 }
 
 fn read_gate_certificate<S: DoSql>(
@@ -126,6 +146,44 @@ impl<S: DoSql> DoBranches<S> {
         }
         Ok(false)
     }
+
+    fn missing_attempt_unit_holder(
+        &self,
+        witness: &FlowingCandidateWitness,
+    ) -> StoreResult<Option<String>> {
+        for unit in &witness.units {
+            let rows = self
+                .sql
+                .query(
+                    "SELECT c.source_cut_id \
+                     FROM flowing_contributions c \
+                     JOIN flowing_contribution_basis b ON b.unit_id = c.unit_id \
+                     JOIN flowing_private_pins p ON p.pin_id = c.pin_id \
+                     WHERE c.unit_id = ?1 AND c.source_branch_id = ?2 \
+                     AND c.principal = ?3 AND c.intent = ?4 \
+                     AND b.basis_digest = ?5 \
+                     AND p.twig_branch_id = c.source_branch_id \
+                     AND p.cut_id = c.source_cut_id \
+                     AND p.manifest_hash = c.source_manifest_hash \
+                     AND p.released_at IS NULL",
+                    &[
+                        text(&unit.unit_id),
+                        text(&witness.source_branch_id),
+                        text(&unit.principal),
+                        text(&unit.intent),
+                        text(&unit.basis_digest),
+                    ],
+                )
+                .map_err(sql_err)?;
+            let Some(row) = rows.first() else {
+                return Ok(Some(unit.unit_id.clone()));
+            };
+            if !self.flowing_ancestor(&as_text(&row[0]), &witness.source_cut_id)? {
+                return Ok(Some(unit.unit_id.clone()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
@@ -160,6 +218,130 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
 
     fn candidate_witness(&self, digest: &str) -> StoreResult<Option<FlowingCandidateWitness>> {
         read_witness(&self.sql, digest)
+    }
+
+    fn retain_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        witness_digest: &str,
+        retained_at: &str,
+    ) -> StoreResult<RetainFlowingAttemptOutcome> {
+        use RetainFlowingAttemptOutcome as O;
+        for (field, value) in [
+            ("op_id", op_id),
+            ("witness_digest", witness_digest),
+            ("retained_at", retained_at),
+        ] {
+            if value.trim().is_empty() {
+                return Ok(O::Invalid { field });
+            }
+        }
+        exact_atomic(&self.sql, "flowing attempt retention", || {
+            if let Some(pin) = read_attempt_pin(&self.sql, op_id)? {
+                return Ok(
+                    if pin.witness_digest != witness_digest || pin.retained_at != retained_at {
+                        O::IdentityMismatch
+                    } else if pin.released_at.is_some() {
+                        O::Released
+                    } else {
+                        O::Existing(pin)
+                    },
+                );
+            }
+            if read_receipt(&self.sql, op_id)?.is_some()
+                || read_cancellation(&self.sql, "admission_op_id", op_id)?.is_some()
+            {
+                return Ok(O::AttemptTerminal);
+            }
+            let Some(witness) = read_witness(&self.sql, witness_digest)? else {
+                return Ok(O::WitnessMissing);
+            };
+            if witness.units.is_empty() {
+                return Ok(O::Invalid { field: "units" });
+            }
+            let Some(source) = self.get_cut(&witness.source_cut_id)? else {
+                return Ok(O::SourceCutMissing);
+            };
+            if source.branch_id != witness.source_branch_id
+                || source.manifest_hash != witness.source_manifest_hash
+            {
+                return Ok(O::SourceCutMismatch);
+            }
+            let Some(candidate) = self.get_cut(&witness.candidate_cut_id)? else {
+                return Ok(O::CandidateCutMissing);
+            };
+            if candidate.branch_id != MAINLINE_BRANCH_ID
+                || candidate.manifest_hash != witness.candidate_manifest_hash
+            {
+                return Ok(O::CandidateCutMismatch);
+            }
+            if let Some(unit_id) = self.missing_attempt_unit_holder(&witness)? {
+                return Ok(O::UnitHolderMissing { unit_id });
+            }
+            self.sql
+                .execute(
+                    "INSERT INTO flowing_attempt_pins \
+                     (op_id, witness_digest, source_cut_id, candidate_cut_id, retained_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        text(op_id),
+                        text(witness_digest),
+                        text(&witness.source_cut_id),
+                        text(&witness.candidate_cut_id),
+                        text(retained_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(O::Retained(
+                read_attempt_pin(&self.sql, op_id)?.expect("inserted attempt pin"),
+            ))
+        })
+    }
+
+    fn flowing_attempt_pin(&self, op_id: &str) -> StoreResult<Option<FlowingAttemptPin>> {
+        read_attempt_pin(&self.sql, op_id)
+    }
+
+    fn release_cancelled_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        released_at: &str,
+    ) -> StoreResult<ReleaseFlowingAttemptOutcome> {
+        use ReleaseFlowingAttemptOutcome as O;
+        for (field, value) in [("op_id", op_id), ("released_at", released_at)] {
+            if value.trim().is_empty() {
+                return Ok(O::Invalid { field });
+            }
+        }
+        exact_atomic(&self.sql, "flowing attempt pin release", || {
+            let Some(pin) = read_attempt_pin(&self.sql, op_id)? else {
+                return Ok(O::Missing);
+            };
+            if pin.released_at.is_some() {
+                return Ok(O::AlreadyReleased);
+            }
+            if read_receipt(&self.sql, op_id)?.is_some() {
+                return Ok(O::Admitted);
+            }
+            if read_cancellation(&self.sql, "admission_op_id", op_id)?.is_none() {
+                return Ok(O::NotCancelled);
+            }
+            let Some(witness) = read_witness(&self.sql, &pin.witness_digest)? else {
+                return Err(StoreError::Conflict(
+                    "retained flowing attempt lost its witness".into(),
+                ));
+            };
+            if let Some(unit_id) = self.missing_attempt_unit_holder(&witness)? {
+                return Ok(O::UnitHolderMissing { unit_id });
+            }
+            self.sql
+                .execute(
+                    "UPDATE flowing_attempt_pins SET released_at = ?2 WHERE op_id = ?1",
+                    &[text(op_id), text(released_at)],
+                )
+                .map_err(sql_err)?;
+            Ok(O::Released)
+        })
     }
 
     fn admit_flowing_prefix(
@@ -851,6 +1033,221 @@ mod tests {
             coordinator: "coordinator".into(),
             recorded_at: "t4".into(),
         }
+    }
+
+    #[test]
+    fn hosted_cancelled_attempt_roots_survive_reopen_and_release_independently() {
+        let (sql, mut store) = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        assert!(matches!(
+            store
+                .retain_flowing_attempt("attempt-a", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        assert!(matches!(
+            store
+                .retain_flowing_attempt("attempt-b", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        drop(store);
+        let mut store = DoBranches::new(sql).unwrap();
+        assert!(store.flowing_attempt_pin("attempt-a").unwrap().is_some());
+        assert!(store.pinned_cuts("t4").unwrap().contains("candidate"));
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::NotCancelled
+        );
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Released
+        );
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+        assert_eq!(
+            store
+                .retain_flowing_attempt("attempt-a", &witness, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Released
+        );
+        store
+            .cancel_flowing_attempt(&cancel("attempt-b", "cancel-b"))
+            .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-b", "t6")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Released
+        );
+        let roots = store.pinned_cuts("t6").unwrap();
+        assert!(roots.contains("source"));
+        assert!(!roots.contains("candidate"));
+    }
+
+    #[test]
+    fn hosted_cancelled_attempt_keeps_its_roots_when_source_holder_is_lost() {
+        let (sql, mut store) = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        store
+            .retain_flowing_attempt("attempt-a", &witness, "t3")
+            .unwrap();
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        sql.execute(
+            "UPDATE flowing_private_pins SET released_at = 't4' WHERE pin_id = 'pin'",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::UnitHolderMissing {
+                unit_id: "unit-a".into()
+            }
+        );
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn hosted_cancelled_attempt_cannot_release_a_lost_witness() {
+        let (sql, mut store) = fixture();
+        let witness = request("unit-a", "fixture").candidate_witness_digest;
+        store
+            .retain_flowing_attempt("attempt-a", &witness, "t3")
+            .unwrap();
+        store
+            .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
+            .unwrap();
+        sql.execute(
+            "DELETE FROM flowing_candidate_witnesses WHERE digest = ?1",
+            &[text(&witness)],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.release_cancelled_flowing_attempt("attempt-a", "t5"),
+            Err(StoreError::Conflict(message)) if message.contains("lost its witness")
+        ));
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+    }
+
+    #[test]
+    fn hosted_admitted_attempt_cannot_release_before_receipt_reconciliation() {
+        let (_sql, mut store) = fixture();
+        let request = request("unit-a", "fixture");
+        store
+            .retain_flowing_attempt(&request.op_id, &request.candidate_witness_digest, "t3")
+            .unwrap();
+        assert!(matches!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .release_cancelled_flowing_attempt(&request.op_id, "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::Admitted
+        );
+        assert!(store
+            .flowing_attempt_pin(&request.op_id)
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn hosted_attempt_retention_refuses_missing_or_changed_witness_bases() {
+        let (_sql, mut store) = fixture();
+        let request = request("unit-a", "fixture");
+        assert_eq!(
+            store
+                .retain_flowing_attempt("attempt", "missing", "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::WitnessMissing
+        );
+        assert_eq!(
+            store
+                .retain_flowing_attempt("", &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Invalid { field: "op_id" }
+        );
+        for (change, expected) in [
+            (
+                "source_missing",
+                RetainFlowingAttemptOutcome::SourceCutMissing,
+            ),
+            (
+                "source_mismatch",
+                RetainFlowingAttemptOutcome::SourceCutMismatch,
+            ),
+            (
+                "candidate_missing",
+                RetainFlowingAttemptOutcome::CandidateCutMissing,
+            ),
+            (
+                "candidate_mismatch",
+                RetainFlowingAttemptOutcome::CandidateCutMismatch,
+            ),
+            (
+                "holder",
+                RetainFlowingAttemptOutcome::UnitHolderMissing {
+                    unit_id: "unit-a".into(),
+                },
+            ),
+            (
+                "empty",
+                RetainFlowingAttemptOutcome::Invalid { field: "units" },
+            ),
+        ] {
+            let mut witness = witness_for(&request);
+            match change {
+                "source_missing" => witness.source_cut_id = "missing".into(),
+                "source_mismatch" => witness.source_manifest_hash = "wrong".into(),
+                "candidate_missing" => witness.candidate_cut_id = "missing".into(),
+                "candidate_mismatch" => witness.candidate_manifest_hash = "wrong".into(),
+                "holder" => witness.units[0].basis_digest = "wrong".into(),
+                "empty" => witness.units.clear(),
+                _ => unreachable!(),
+            }
+            let digest = store.record_candidate_witness(&witness).unwrap();
+            assert_eq!(
+                store
+                    .retain_flowing_attempt(&format!("attempt-{change}"), &digest, "t3")
+                    .unwrap(),
+                expected,
+                "{change}"
+            );
+        }
+        store
+            .cancel_flowing_attempt(&cancel("terminal", "cancel-terminal"))
+            .unwrap();
+        assert_eq!(
+            store
+                .retain_flowing_attempt("terminal", &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::AttemptTerminal
+        );
     }
 
     #[test]

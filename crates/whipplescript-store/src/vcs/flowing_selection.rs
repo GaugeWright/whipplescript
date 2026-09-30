@@ -7,11 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::branches::flowing_admission::FlowingSelectedUnit;
-#[cfg(feature = "native")]
 use crate::branches::flowing_admission::{
-    FlowingAdmissions, FlowingCandidateWitness, FlowingUnitOutcome,
+    FlowingAdmissions, FlowingSelectedUnit, RetainFlowingAttemptOutcome,
 };
+#[cfg(feature = "native")]
+use crate::branches::flowing_admission::{FlowingCandidateWitness, FlowingUnitOutcome};
 use crate::branches::flowing_sources::{
     BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
     HandoffContribution, HandoffContributionOutcome,
@@ -221,6 +221,76 @@ type NetSourcePaths<'a> = BTreeMap<&'a str, (Option<&'a str>, Option<&'a str>)>;
 type NetSourceResult<'a> = StoreResult<Result<NetSourcePaths<'a>, FlowingTargetEffectsOutcome>>;
 
 impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Retain the exact review source and candidate while a gate attempt is
+    /// outstanding. The same content publication exclusion covers the ref
+    /// row and every constituent body, including writes neutralized in the
+    /// final candidate. A ref-only caller cannot establish this closure.
+    pub fn retain_review_attempt(
+        &mut self,
+        op_id: &str,
+        witness_digest: &str,
+        retained_at: &str,
+    ) -> StoreResult<RetainFlowingAttemptOutcome>
+    where
+        B: FlowingAdmissions,
+    {
+        use RetainFlowingAttemptOutcome as R;
+        let Some(witness) = self.branches.candidate_witness(witness_digest)? else {
+            return self
+                .branches
+                .retain_flowing_attempt(op_id, witness_digest, retained_at);
+        };
+        let mut ids = BTreeSet::new();
+        for manifest_hash in [
+            &witness.source_manifest_hash,
+            &witness.candidate_manifest_hash,
+        ] {
+            let Some(manifest) = self.load_manifest_opt_raw(manifest_hash)? else {
+                return Ok(R::MissingContent {
+                    content_id: manifest_hash.clone(),
+                });
+            };
+            ids.insert(manifest_hash.clone());
+            match manifest {
+                RawManifest::Tree(_) => {
+                    ids.extend(crate::manifest_tree::reachable_ids(
+                        &self.content,
+                        manifest_hash,
+                    )?);
+                }
+                RawManifest::Flat(files) => ids.extend(files.into_values()),
+            }
+        }
+        for unit in &witness.units {
+            let Some(basis) = self.branches.contribution_basis(&unit.unit_id)? else {
+                return Ok(R::UnitBasisMissing {
+                    unit_id: unit.unit_id.clone(),
+                });
+            };
+            if basis.basis_digest != unit.basis_digest {
+                return Ok(R::UnitBasisMismatch {
+                    unit_id: unit.unit_id.clone(),
+                });
+            }
+            for atom in basis.atoms {
+                ids.extend(atom.before);
+                ids.extend(atom.after);
+            }
+        }
+        for id in &ids {
+            if !self.content.cached_read_available(id)? {
+                return Ok(R::MissingContent {
+                    content_id: id.clone(),
+                });
+            }
+        }
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        let branches = &mut self.branches;
+        self.content.publish_retained(&ids, || {
+            branches.retain_flowing_attempt(op_id, witness_digest, retained_at)
+        })
+    }
+
     fn net_source_paths<'a>(&self, basis: &'a ContributionBasis) -> NetSourceResult<'a> {
         let mut selected = BTreeMap::new();
         for atom in &basis.atoms {
@@ -1615,6 +1685,23 @@ mod tests {
         assert_eq!(witness.revision_sequence, candidate.revision_sequence);
         assert_eq!(witness.source_atoms_digest, candidate.source_atoms_digest);
         assert_eq!(witness.units, candidate.units);
+        assert!(matches!(
+            vcs.retain_review_attempt("gate-attempt-a", &candidate.candidate_witness_digest, "t7",)
+                .expect("retain exact source and candidate closure"),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        let pin = vcs
+            .branches
+            .flowing_attempt_pin("gate-attempt-a")
+            .expect("read retained attempt")
+            .expect("attempt pin is durable");
+        assert_eq!(pin.source_cut_id, "twig-b");
+        assert_eq!(pin.candidate_cut_id, "candidate-a");
+        assert!(vcs
+            .branches
+            .pinned_cuts("t8")
+            .expect("collector roots")
+            .contains("candidate-a"));
         assert_eq!(
             vcs.cut_manifest("candidate-a")
                 .expect("native candidate test")
@@ -1635,6 +1722,38 @@ mod tests {
             .expect("native candidate test")
             .head_cut_id
             .is_none());
+    }
+
+    #[test]
+    fn review_attempt_refuses_a_lost_body_without_creating_a_pin() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .expect("prepare complete candidate");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("candidate must be ready: {prepared:?}")
+        };
+        let lost_body = vcs
+            .cut_manifest("candidate-a")
+            .expect("candidate manifest")
+            .expect("candidate manifest exists")["a.txt"]
+            .clone();
+        assert!(matches!(
+            vcs.content.erase(&lost_body, "t8").expect("erase body"),
+            crate::content::EraseOutcome::Erased { .. }
+        ));
+        assert_eq!(
+            vcs.retain_review_attempt("gate-attempt-a", &candidate.candidate_witness_digest, "t9")
+                .expect("refuse incomplete closure"),
+            RetainFlowingAttemptOutcome::MissingContent {
+                content_id: lost_body
+            }
+        );
+        assert_eq!(
+            vcs.branches.flowing_attempt_pin("gate-attempt-a").unwrap(),
+            None
+        );
     }
 
     #[test]

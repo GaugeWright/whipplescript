@@ -922,7 +922,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
                  UNION SELECT cut_id FROM flowing_private_pins \
                  WHERE released_at IS NULL \
                  UNION SELECT source_cut_id FROM flowing_handoffs \
-                 UNION SELECT target_after_cut_id FROM flowing_handoffs",
+                 UNION SELECT target_after_cut_id FROM flowing_handoffs \
+                 UNION SELECT source_cut_id FROM flowing_attempt_pins \
+                 WHERE released_at IS NULL \
+                 UNION SELECT candidate_cut_id FROM flowing_attempt_pins \
+                 WHERE released_at IS NULL",
                 &[text(now)],
             )
             .map_err(sql_err)?;

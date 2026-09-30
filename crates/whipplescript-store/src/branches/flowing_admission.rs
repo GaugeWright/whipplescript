@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 5] = [
+pub const SCHEMA: [&str; 7] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -37,7 +37,62 @@ pub const SCHEMA: [&str; 5] = [
         handle TEXT PRIMARY KEY,
         certificate_json TEXT NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS flowing_attempt_pins (
+        op_id TEXT PRIMARY KEY,
+        witness_digest TEXT NOT NULL,
+        source_cut_id TEXT NOT NULL,
+        candidate_cut_id TEXT NOT NULL,
+        retained_at TEXT NOT NULL,
+        released_at TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS flowing_attempt_pins_live_idx
+        ON flowing_attempt_pins(source_cut_id, candidate_cut_id)
+        WHERE released_at IS NULL",
 ];
+
+/// A durable, attempt-owned pair of cut roots. The source holder still owns
+/// every selected unit; this row preserves the exact review basis and output
+/// across a gate worker crash. A cancelled attempt may release only this row
+/// after the ref authority confirms its cancellation and the source holder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingAttemptPin {
+    pub op_id: String,
+    pub witness_digest: String,
+    pub source_cut_id: String,
+    pub candidate_cut_id: String,
+    pub retained_at: String,
+    pub released_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetainFlowingAttemptOutcome {
+    Retained(FlowingAttemptPin),
+    Existing(FlowingAttemptPin),
+    IdentityMismatch,
+    Released,
+    AttemptTerminal,
+    WitnessMissing,
+    SourceCutMissing,
+    SourceCutMismatch,
+    CandidateCutMissing,
+    CandidateCutMismatch,
+    UnitHolderMissing { unit_id: String },
+    UnitBasisMissing { unit_id: String },
+    UnitBasisMismatch { unit_id: String },
+    MissingContent { content_id: String },
+    Invalid { field: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReleaseFlowingAttemptOutcome {
+    Released,
+    AlreadyReleased,
+    Missing,
+    NotCancelled,
+    Admitted,
+    UnitHolderMissing { unit_id: String },
+    Invalid { field: &'static str },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +384,21 @@ pub trait FlowingAdmissions {
         &self,
         digest: &str,
     ) -> crate::StoreResult<Option<FlowingCandidateWitness>>;
+    fn retain_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        witness_digest: &str,
+        retained_at: &str,
+    ) -> crate::StoreResult<RetainFlowingAttemptOutcome>;
+    fn flowing_attempt_pin(&self, op_id: &str) -> crate::StoreResult<Option<FlowingAttemptPin>>;
+    /// Release a cancelled attempt only after its selected units still have
+    /// their durable source holder. An admitted attempt needs the separate
+    /// receipt/frontier reconciliation protocol before these roots can move.
+    fn release_cancelled_flowing_attempt(
+        &mut self,
+        op_id: &str,
+        released_at: &str,
+    ) -> crate::StoreResult<ReleaseFlowingAttemptOutcome>;
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,

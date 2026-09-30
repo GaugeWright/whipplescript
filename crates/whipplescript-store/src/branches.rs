@@ -1707,7 +1707,11 @@ impl Branches for BranchStore {
                       UNION SELECT cut_id FROM flowing_private_pins \
                       WHERE released_at IS NULL \
                       UNION SELECT source_cut_id FROM flowing_handoffs \
-                      UNION SELECT target_after_cut_id FROM flowing_handoffs",
+                      UNION SELECT target_after_cut_id FROM flowing_handoffs \
+                      UNION SELECT source_cut_id FROM flowing_attempt_pins \
+                      WHERE released_at IS NULL \
+                      UNION SELECT candidate_cut_id FROM flowing_attempt_pins \
+                      WHERE released_at IS NULL",
         )?;
         let cuts = statement
             .query_map(params![now], |row| row.get::<_, String>(0))?
