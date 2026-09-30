@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod diagnostic_code_register;
 pub mod freshness;
+pub mod improve_selection;
 pub mod json;
 pub mod norm_buck2_report;
 pub mod norm_compatibility;

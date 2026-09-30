@@ -64,13 +64,6 @@ const MIN_SCENARIOS_FOR_SEALING: usize = 4;
 /// NOT a surface: the operator's levers are the spend cap and the campaign
 /// verbs, never a sample count.
 const MAX_PROPOSAL_ROUNDS: usize = 4;
-/// Default relative indifference band for the built-in resource gauges
-/// (design note §2 amendment: their noise floor degenerates toward zero).
-const RESOURCE_BAND_PERCENT: f64 = 5.0;
-/// Minimum absolute band for quality gauges when the sample is too small
-/// for a meaningful noise floor.
-const QUALITY_BAND_FLOOR: f64 = 0.02;
-
 pub(crate) fn improve_store_path() -> PathBuf {
     std::env::var("WHIPPLESCRIPT_IMPROVE_STORE")
         .map(PathBuf::from)
@@ -2608,15 +2601,6 @@ impl GaugeAggregate {
         (!self.passes.is_empty())
             .then(|| self.passes.iter().filter(|p| **p).count() as f64 / self.passes.len() as f64)
     }
-    fn quantile(&self, q: f64) -> Option<f64> {
-        if self.scores.is_empty() {
-            return None;
-        }
-        let mut sorted = self.scores.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let index = ((sorted.len() - 1) as f64 * q).round() as usize;
-        Some(sorted[index.min(sorted.len() - 1)])
-    }
     /// The operating point compared by the dominance check: pass rate when
     /// the gauge is chance-shaped, mean score otherwise.
     fn operating_point(&self) -> Option<f64> {
@@ -2637,99 +2621,7 @@ fn aggregate(observations: &[RunObservation], gauge: &str) -> GaugeAggregate {
     aggregate
 }
 
-fn bar_stat(aggregate: &GaugeAggregate, bar: &BarSpec) -> Option<f64> {
-    if bar.chance_field.is_some() {
-        return aggregate.pass_rate();
-    }
-    match bar.stat.as_deref() {
-        Some("mean") | None => aggregate.mean(),
-        Some(stat) => {
-            let quantile = stat.strip_prefix('p')?.parse::<f64>().ok()? / 100.0;
-            aggregate.quantile(quantile)
-        }
-    }
-}
-
-fn bar_met(aggregate: &GaugeAggregate, bar: &BarSpec) -> Option<bool> {
-    let value = bar_stat(aggregate, bar)?;
-    Some(if bar.ge {
-        value >= bar.threshold
-    } else {
-        value <= bar.threshold
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Delta {
-    Better,
-    InBand,
-    Worse,
-    Unmeasured,
-}
-
-/// The indifference band around the baseline operating point: the gauge's
-/// noise floor by default (a pooled-SE minimal detectable effect), relative
-/// bands for resource gauges (their noise floor degenerates toward zero),
-/// `--within` / campaign `guard` overrides in percent of baseline.
-fn indifference_band(
-    spec: &GaugeSpec,
-    base: &GaugeAggregate,
-    cand: &GaugeAggregate,
-    within_percent: Option<f64>,
-    baseline_point: f64,
-) -> f64 {
-    if let Some(percent) = within_percent {
-        return (baseline_point.abs() * percent / 100.0).max(f64::EPSILON);
-    }
-    if spec.builtin {
-        return (baseline_point.abs() * RESOURCE_BAND_PERCENT / 100.0).max(f64::EPSILON);
-    }
-    // Noise floor: 1.96 * pooled standard error over the compared samples.
-    let se = |aggregate: &GaugeAggregate| -> f64 {
-        let n = aggregate.n().max(1) as f64;
-        if let Some(rate) = aggregate.pass_rate() {
-            (rate * (1.0 - rate) / n).sqrt()
-        } else if let Some(mean) = aggregate.mean() {
-            let variance = aggregate
-                .scores
-                .iter()
-                .map(|score| (score - mean).powi(2))
-                .sum::<f64>()
-                / n;
-            (variance / n).sqrt()
-        } else {
-            0.0
-        }
-    };
-    let pooled = (se(base).powi(2) + se(cand).powi(2)).sqrt();
-    (1.96 * pooled).max(QUALITY_BAND_FLOOR)
-}
-
-fn delta_verdict(
-    spec: &GaugeSpec,
-    base: &GaugeAggregate,
-    cand: &GaugeAggregate,
-    within_percent: Option<f64>,
-) -> (Delta, f64, f64) {
-    let (Some(base_point), Some(cand_point)) = (base.operating_point(), cand.operating_point())
-    else {
-        return (Delta::Unmeasured, 0.0, 0.0);
-    };
-    let band = indifference_band(spec, base, cand, within_percent, base_point);
-    let signed = if spec.direction_up {
-        cand_point - base_point
-    } else {
-        base_point - cand_point
-    };
-    let verdict = if signed > band {
-        Delta::Better
-    } else if signed < -band {
-        Delta::Worse
-    } else {
-        Delta::InBand
-    };
-    (verdict, cand_point - base_point, band)
-}
+use whipplescript_core::improve_selection::Delta;
 
 #[derive(Clone, Debug)]
 struct GaugeVerdictLine {
@@ -2827,174 +2719,113 @@ fn dominance_verdict(
     base: &[RunObservation],
     cand: &[RunObservation],
 ) -> CandidateVerdict {
-    let ascend_names: BTreeMap<&str, Option<&ReachTarget>> = campaign
-        .ascend
+    use whipplescript_core::improve_selection as shared;
+
+    let evidence = specs
         .iter()
-        .map(|(name, reach)| (name.as_str(), reach.as_ref()))
-        .collect();
-    let sacrificed: BTreeSet<&str> = campaign.sacrifice.iter().map(String::as_str).collect();
-    let mut lines = Vec::new();
-    let mut reasons = Vec::new();
-    let mut focus_up = false;
-    let mut focus_down = false;
-    let mut guard_broken = false;
-    let mut bar_violated = false;
-    let mut bar_restored = false;
-    for spec in specs {
-        let base_aggregate = aggregate(base, &spec.name);
-        let cand_aggregate = aggregate(cand, &spec.name);
-        if base_aggregate.n() == 0 && cand_aggregate.n() == 0 {
-            continue;
-        }
-        let within = campaign.within_percent.get(&spec.name).copied();
-        let (delta, _, band) = delta_verdict(spec, &base_aggregate, &cand_aggregate, within);
-        let bar_status = spec
-            .bar
-            .as_ref()
-            .and_then(|bar| bar_met(&cand_aggregate, bar));
-        let baseline_bar_status = spec
-            .bar
-            .as_ref()
-            .and_then(|bar| bar_met(&base_aggregate, bar));
-        if bar_status == Some(false) {
-            bar_violated = true;
-            reasons.push(format!("`{}` violates its declared bar", spec.name));
-        }
-        if baseline_bar_status == Some(false) && bar_status == Some(true) {
-            bar_restored = true;
-        }
-        let reach = ascend_names.get(spec.name.as_str()).copied().flatten();
-        let reach_met = reach.and_then(|reach| {
-            cand_aggregate.operating_point().map(|point| {
-                if reach.ge {
-                    point >= reach.threshold
-                } else {
-                    point <= reach.threshold
-                }
-            })
-        });
-        let role;
-        if ascend_names.contains_key(spec.name.as_str()) {
-            role = "ascend";
-            match delta {
-                Delta::Better => focus_up = true,
-                Delta::Worse => {
-                    focus_down = true;
-                    reasons.push(format!("`{}` regressed (its own focus)", spec.name));
-                }
-                _ => {}
-            }
-            // Ratchet: a reach target the baseline had already achieved is
-            // a hard bound; dropping back below it is a refusal even if the
-            // movement sits inside the band.
-            if let Some(reach) = reach {
-                let baseline_met = base_aggregate.operating_point().map(|point| {
-                    if reach.ge {
-                        point >= reach.threshold
-                    } else {
-                        point <= reach.threshold
-                    }
-                });
-                if baseline_met == Some(true) && reach_met == Some(false) {
-                    bar_violated = true;
-                    reasons.push(format!(
-                        "`{}` dropped below its achieved reach target (ratchet)",
-                        spec.name
-                    ));
-                }
-            }
-        } else if sacrificed.contains(spec.name.as_str()) {
-            role = "sacrifice";
-        } else {
-            role = "guard";
-            // Stage-ratchet floor (improve note §3): a completed earlier
-            // stage's achieved level is a hard bound for later stages —
-            // regression past it refuses even inside the band.
-            if let Some((ge, floor)) = campaign.floors.get(&spec.name) {
-                if let Some(point) = cand_aggregate.operating_point() {
-                    let held = if *ge {
-                        point >= *floor
-                    } else {
-                        point <= *floor
-                    };
-                    if !held {
-                        bar_violated = true;
-                        reasons.push(format!(
-                            "`{}` fell past its stage-ratchet floor (achieved by a completed `then` stage)",
-                            spec.name
-                        ));
-                    }
-                }
-            }
-            if delta == Delta::Worse {
-                guard_broken = true;
-                reasons.push(format!(
-                    "`{}` regressed beyond its indifference band and was not sacrificed",
-                    spec.name
-                ));
-            }
-            // Fail closed: a guarded gauge that was measured at baseline but
-            // became unmeasurable on the candidate cannot certify
-            // non-regression — refuse rather than silently pass.
-            if delta == Delta::Unmeasured && base_aggregate.n() > 0 && cand_aggregate.n() == 0 {
-                guard_broken = true;
-                reasons.push(format!(
-                    "`{}` became unmeasurable on the candidate (guarded gauges fail closed)",
-                    spec.name
-                ));
-            }
-        }
-        // The belief-update readout over the comparable pairs: family A
-        // (paired sign test) when every pair carries bar verdicts,
-        // family B (Student-t on paired deltas) otherwise.
-        let verdict_pairs: Vec<(bool, bool)> = base
-            .iter()
-            .zip(cand.iter())
-            .filter_map(|(b, c)| {
-                let control = b.readings.get(&spec.name)?.passed?;
-                let treatment = c.readings.get(&spec.name)?.passed?;
-                Some((control, treatment))
-            })
-            .collect();
-        let score_deltas: Vec<f64> = base
-            .iter()
-            .zip(cand.iter())
-            .filter_map(|(b, c)| {
-                Some(c.readings.get(&spec.name)?.score - b.readings.get(&spec.name)?.score)
-            })
-            .collect();
-        let p_better = if !verdict_pairs.is_empty() && verdict_pairs.len() == score_deltas.len() {
-            p_better_sign(&verdict_pairs)
-        } else {
-            p_better_t(&score_deltas, spec.direction_up)
-        };
-        lines.push(GaugeVerdictLine {
-            gauge: spec.name.clone(),
-            role,
-            delta,
-            baseline: base_aggregate.operating_point(),
-            candidate: cand_aggregate.operating_point(),
-            band,
-            bar_met: bar_status,
-            reach_met,
+        .map(|spec| shared::GaugeEvidence {
+            name: spec.name.clone(),
             direction_up: spec.direction_up,
-            p_better,
-        });
-    }
-    // Repair mode: proposable iff a bar the BASELINE violated is restored
-    // and nothing moved beyond band — a no-op on a healthy program repairs
-    // nothing and is refused.
-    let proposable = if campaign.repair {
-        bar_restored && !bar_violated && !guard_broken
-    } else {
-        focus_up && !focus_down && !guard_broken && !bar_violated
-    };
-    let tradeoff = focus_up && guard_broken && !bar_violated && !focus_down;
+            resource: spec.builtin,
+            bar: spec.bar.as_ref().map(|bar| shared::Bar {
+                chance: bar.chance_field.is_some(),
+                stat: bar.stat.clone(),
+                ge: bar.ge,
+                threshold: bar.threshold,
+            }),
+            baseline: base
+                .iter()
+                .filter_map(|observation| observation.readings.get(&spec.name))
+                .map(|reading| shared::Reading {
+                    score: reading.score,
+                    passed: reading.passed,
+                })
+                .collect(),
+            candidate: cand
+                .iter()
+                .filter_map(|observation| observation.readings.get(&spec.name))
+                .map(|reading| shared::Reading {
+                    score: reading.score,
+                    passed: reading.passed,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let selection = shared::select(
+        &evidence,
+        &shared::Campaign {
+            ascend: campaign
+                .ascend
+                .iter()
+                .map(|(name, reach)| {
+                    (
+                        name.clone(),
+                        reach.as_ref().map(|reach| shared::Reach {
+                            ge: reach.ge,
+                            threshold: reach.threshold,
+                        }),
+                    )
+                })
+                .collect(),
+            sacrifice: campaign.sacrifice.iter().cloned().collect(),
+            within_percent: campaign.within_percent.clone(),
+            floors: campaign.floors.clone(),
+            repair: campaign.repair,
+        },
+    );
+    let lines = selection
+        .lines
+        .into_iter()
+        .map(|line| {
+            // The posterior is a readout, not the dominance decision. Keep it
+            // over the original scenario-aligned pairs, including missing
+            // readings, rather than flattening the selection input vectors.
+            let verdict_pairs: Vec<(bool, bool)> = base
+                .iter()
+                .zip(cand.iter())
+                .filter_map(|(b, c)| {
+                    Some((
+                        b.readings.get(&line.gauge)?.passed?,
+                        c.readings.get(&line.gauge)?.passed?,
+                    ))
+                })
+                .collect();
+            let score_deltas: Vec<f64> = base
+                .iter()
+                .zip(cand.iter())
+                .filter_map(|(b, c)| {
+                    Some(c.readings.get(&line.gauge)?.score - b.readings.get(&line.gauge)?.score)
+                })
+                .collect();
+            let p_better = if !verdict_pairs.is_empty() && verdict_pairs.len() == score_deltas.len()
+            {
+                p_better_sign(&verdict_pairs)
+            } else {
+                p_better_t(&score_deltas, line.direction_up)
+            };
+            GaugeVerdictLine {
+                gauge: line.gauge,
+                role: match line.role {
+                    shared::Role::Ascend => "ascend",
+                    shared::Role::Sacrifice => "sacrifice",
+                    shared::Role::Guard => "guard",
+                },
+                delta: line.delta,
+                baseline: line.baseline,
+                candidate: line.candidate,
+                band: line.band,
+                bar_met: line.bar_met,
+                reach_met: line.reach_met,
+                direction_up: line.direction_up,
+                p_better,
+            }
+        })
+        .collect();
     CandidateVerdict {
         lines,
-        proposable,
-        tradeoff,
-        reasons,
+        proposable: selection.proposable,
+        tradeoff: selection.tradeoff,
+        reasons: selection.reasons,
     }
 }
 
@@ -7690,34 +7521,6 @@ mod tests {
     }
 
     #[test]
-    fn resource_gauge_uses_relative_band_and_descends() {
-        let spec = GaugeSpec {
-            name: "std.latency".to_owned(),
-            judge: JudgeSpec::Builtin,
-            bar: None,
-            inputs: Vec::new(),
-            direction_up: false,
-            builtin: true,
-        };
-        let base = GaugeAggregate {
-            scores: vec![1000.0, 1000.0],
-            passes: Vec::new(),
-        };
-        let better = GaugeAggregate {
-            scores: vec![800.0, 800.0],
-            passes: Vec::new(),
-        };
-        let noise = GaugeAggregate {
-            scores: vec![1020.0, 1020.0],
-            passes: Vec::new(),
-        };
-        let (verdict, _, _) = delta_verdict(&spec, &base, &better, None);
-        assert_eq!(verdict, Delta::Better, "lower latency is better");
-        let (verdict, _, _) = delta_verdict(&spec, &base, &noise, None);
-        assert_eq!(verdict, Delta::InBand, "+2% sits inside the 5% band");
-    }
-
-    #[test]
     fn sealing_respects_floor_and_degeneracy() {
         let scenario = |name: &str| ScenarioRow {
             name: name.to_owned(),
@@ -8635,23 +8438,6 @@ mod tests {
         assert_eq!(walk.level, 0, "contrary evidence floors at zero");
         walk.observe(true);
         assert!(walk.observe(true), "the floor does not owe a debt");
-    }
-
-    #[test]
-    fn bar_stat_quantiles() {
-        let aggregate = GaugeAggregate {
-            scores: (1..=100).map(|value| value as f64).collect(),
-            passes: Vec::new(),
-        };
-        let bar = BarSpec {
-            chance_field: None,
-            stat: Some("p90".to_owned()),
-            ge: false,
-            threshold: 95.0,
-        };
-        let value = bar_stat(&aggregate, &bar).expect("p90 computes");
-        assert!((value - 90.0).abs() <= 1.0);
-        assert_eq!(bar_met(&aggregate, &bar), Some(true));
     }
 
     #[test]
