@@ -282,6 +282,26 @@ lock scheduling and independently failing stores remain open.
 The model does not prove the native or hosted transactions implement these
 synchronized transitions.
 
+`flowing_lineage_policy.py` isolates a missing part of that composition: one
+unit moves from branch B through mixed outputs on C and D, retaining its
+original source atom and all three policy ancestors. The gate captures their
+epochs; the ref CAS checks every ancestor's current Hold and epoch, the exact
+source revision, and the source atom rather than a mixed output id:
+
+```sh
+python3 models/research/flowing_lineage_policy.py
+```
+
+The bounded search finds 179 safe states through ten transitions. Positive
+traces admit the transported unit, block an origin Hold, require a fresh gate
+after release or revision, and refuse during policy or ref outage. Six mutants
+admit lost origin lineage, a check of only the current branch, a pre-Hold
+certificate reused after release, an output id in place of the source atom,
+an old candidate after revision, or an outage treated as a clear policy answer.
+The derivation graph and cut contents are fixed abstractions here; the model
+does not prove transport persistence, every head mutation, certificate
+authenticity, independent store locks or native/hosted implementation.
+
 `flowing_attempt_pins.py` probes the failed/cancelled attempt lifetime with
 two coordinators selecting the same still-owed unit:
 
