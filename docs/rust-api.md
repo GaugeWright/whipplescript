@@ -56,6 +56,15 @@ A shell `mv` of a presented root moves no files. It is reported as a
 refused. An admitted rename is presented for the rest of the turn, and the
 host's next turn reference is expected to carry the new name.
 
+A Durable Object turn cannot ask its host mid-command. A host that sets
+`"workspace_root_renames": "recorded"` in the agent configuration has the
+placement install `do_tools::root_rename_recorder`: it admits a rename of a
+writable presented root to a name no other presented root holds (ignoring
+case) and records the `RootRename` as JSON at
+`.whipplescript/root-renames/<n>.json` in the instance workspace, outside every
+selected root. The host reads, ratifies and drops those records when it pulls
+the workspace; a rename it refuses leaves the old name for the next turn.
+
 The `host_runtime::GovernedHostRuntime` type is the native facade that persists:
 
 | Item | Meaning |

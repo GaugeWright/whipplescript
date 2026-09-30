@@ -143,6 +143,12 @@ impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
         (**self).query(sql, params)
     }
+    // Forwarded like every other method: the executor holds its handle as an
+    // `Rc`, so an unforwarded default here refused every external tool before
+    // the placement's implementation was ever asked.
+    fn external_tool(&self, name: &str, call_id: &str, arguments: &str) -> Result<String, String> {
+        (**self).external_tool(name, call_id, arguments)
+    }
     fn activity(&self, kind: &str, detail: Option<&str>) {
         (**self).activity(kind, detail)
     }

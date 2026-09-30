@@ -19,6 +19,15 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- A Durable Object host can now admit presented-root renames: a host that sets
+  `"workspace_root_renames": "recorded"` has the placement admit a rename of a
+  writable root to a free name and record it at
+  `.whipplescript/root-renames/<n>.json` for the host to ratify (DR-0148).
+  Without the setting, hosted renames are still refused.
+- A Durable Object's authored external tools reach the placement's
+  implementation again. The shared SQL handle did not forward
+  `external_tool`, so every call was refused before the placement was asked.
+
 - A file-store `ResourceRef` may present its selected root to the model at
   another path, `presented_as` (DR-0148). The native and Durable Object hosts
   map every file tool and the virtual shell through one `file_view` module,

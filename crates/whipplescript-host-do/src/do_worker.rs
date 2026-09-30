@@ -110,6 +110,11 @@ pub struct DurableEffectPorts {
     /// the default in-isolate executor serves only these selectors and honors
     /// their write attenuation.
     pub agent_workspace_resources: Option<Vec<ResourceRef>>,
+    /// The host takes back each presented-root rename this placement admits
+    /// and ratifies it (DR-0148): the executor admits a rename of a writable
+    /// presented root and records it for the host. Off, every rename is
+    /// refused, because this placement cannot ask its host mid-command.
+    pub record_root_renames: bool,
     /// Live inspection labels supplied by the authenticated owning host. They
     /// are kept only in this attached worker and never written to the event log.
     pub initial_model_provenance: Option<whipplescript_kernel::sansio::InitialModelProvenance>,
@@ -259,7 +264,19 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                         .with_workspace_source(workspace_source);
                 match ports.agent_workspace_resources.as_deref() {
                     Some(resources) => {
-                        Box::new(executor.with_resources(resources)?) as Box<dyn ToolExecutor>
+                        let executor = executor.with_resources(resources)?;
+                        let executor = if ports.record_root_renames {
+                            executor.with_root_rename_admission(
+                                crate::do_tools::root_rename_recorder(
+                                    Rc::clone(&sql),
+                                    instance_id,
+                                    resources,
+                                ),
+                            )
+                        } else {
+                            executor
+                        };
+                        Box::new(executor) as Box<dyn ToolExecutor>
                     }
                     None => Box::new(executor) as Box<dyn ToolExecutor>,
                 }

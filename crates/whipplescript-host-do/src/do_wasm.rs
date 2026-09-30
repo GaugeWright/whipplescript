@@ -1708,6 +1708,18 @@ impl WasmDurableInstance {
             .transpose()
             .map_err(|error| JsValue::from_str(&error))?
             .flatten();
+        // DR-0148: the host takes back and ratifies the renames this placement
+        // admits, since it cannot be asked mid-command.
+        let record_root_renames = agent_config_json
+            .as_deref()
+            .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
+            .and_then(|config| {
+                config
+                    .get("workspace_root_renames")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|mode| mode == "recorded")
+            })
+            .unwrap_or(false);
         let initial_model_provenance = agent_config_json
             .as_deref()
             .map(parse_initial_model_provenance)
@@ -1730,6 +1742,7 @@ impl WasmDurableInstance {
             DurableEffectPorts {
                 agent_model,
                 agent_workspace_resources,
+                record_root_renames,
                 initial_model_provenance,
                 agent_tool_specs: Some(resolved.tools),
                 external_tool_bindings: package.external_tool_bindings(),

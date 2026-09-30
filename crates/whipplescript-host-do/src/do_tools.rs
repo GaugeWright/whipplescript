@@ -168,6 +168,81 @@ pub struct DoToolExecutor<Sql: DoSql> {
 
 type RenameAdmission = dyn Fn(&RootRename) -> Result<(), String>;
 
+/// Where this placement records each presented-root rename it admits for the
+/// host to ratify (DR-0148), inside the instance's workspace and outside every
+/// selected root, so the agent never sees it. The host reads and drops these
+/// records when it takes the workspace back.
+pub const ROOT_RENAME_RECORDS: &str = ".whipplescript/root-renames";
+
+/// The rename admission for a host that ratifies renames after the command
+/// (DR-0148). This placement cannot ask its host mid-command, so it admits a
+/// rename only of a writable presented root to a name no other presented root
+/// holds, ignoring case, and records it at [`ROOT_RENAME_RECORDS`]. The host
+/// may still refuse it; the root then keeps its old name from the next turn.
+pub fn root_rename_recorder<Sql: DoSql + 'static>(
+    sql: Rc<Sql>,
+    instance_id: &str,
+    resources: &[ResourceRef],
+) -> impl Fn(&RootRename) -> Result<(), String> + 'static {
+    let prefix = format!("{instance_id}/{ROOT_RENAME_RECORDS}/");
+    let resources = resources
+        .iter()
+        .filter(|resource| resource.kind == "file_store")
+        .cloned()
+        .collect::<Vec<_>>();
+    move |rename: &RootRename| {
+        let resource = resources
+            .iter()
+            .find(|resource| {
+                resource.handle == rename.handle
+                    && resource
+                        .selector
+                        .as_deref()
+                        .map(normalize_workspace_path)
+                        .transpose()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        == rename.selector
+            })
+            .ok_or_else(|| format!("`{}` is not a presented file-store root", rename.from))?;
+        if resource.writable == Some(false) {
+            return Err(format!("`{}` is read-only", rename.from));
+        }
+        let taken = resources.iter().any(|other| {
+            !std::ptr::eq(other, resource)
+                && other
+                    .presented_as
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase() == rename.to.to_lowercase())
+        });
+        if taken {
+            return Err(format!("another folder is already named `{}`", rename.to));
+        }
+        let rows = sql
+            .query(
+                "SELECT COUNT(*) FROM files WHERE substr(key, 1, length(?1)) = ?1",
+                &[SqlValue::Text(prefix.clone())],
+            )
+            .map_err(|error| format!("cannot record the rename: {error}"))?;
+        let recorded = match rows.first().and_then(|row| row.first()) {
+            Some(SqlValue::Int(count)) => *count,
+            _ => 0,
+        };
+        let record = serde_json::to_string(rename).map_err(|error| error.to_string())?;
+        sql.execute(
+            "INSERT INTO files (key, content) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET content = excluded.content",
+            &[
+                SqlValue::Text(format!("{prefix}{:06}.json", recorded + 1)),
+                SqlValue::Text(record),
+            ],
+        )
+        .map_err(|error| format!("cannot record the rename: {error}"))?;
+        Ok(())
+    }
+}
+
 /// The keys a listing or search covers (see `DoToolExecutor::searched`).
 struct Searched {
     /// Each admitted key with the path the model sees.
@@ -1979,6 +2054,108 @@ mod tests {
         );
         assert_eq!(ok(&exec, "read", json!({ "path": "backend/b.txt" })), "b");
         refused(&exec, "read", json!({ "path": "api/b.txt" }));
+    }
+
+    #[test]
+    fn a_recorded_rename_is_admitted_for_the_host_to_ratify() {
+        let sql = Rc::new(store().sql);
+        let seed = DoToolExecutor::for_instance(Rc::clone(&sql), "inst");
+        for (path, content) in [("targets/t-a/a.txt", "a"), ("targets/t-b/b.txt", "b")] {
+            assert_eq!(
+                seed.execute(&call("write", json!({ "path": path, "content": content })))
+                    .status,
+                ToolStatus::Ok
+            );
+        }
+        let store_ref =
+            |handle: &str, selector: &str, presented: &str, writable: bool| ResourceRef {
+                handle: handle.to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some(selector.to_owned()),
+                writable: Some(writable),
+                presented_as: Some(presented.to_owned()),
+            };
+        let resources = [
+            store_ref("target:a", "targets/t-a", "api", true),
+            store_ref("target:b", "targets/t-b", "Web", false),
+        ];
+        let executor = || {
+            DoToolExecutor::for_instance(Rc::clone(&sql), "inst")
+                .with_resources(&resources)
+                .expect("scoped")
+                .with_root_rename_admission(root_rename_recorder(
+                    Rc::clone(&sql),
+                    "inst",
+                    &resources,
+                ))
+        };
+        let bash = |exec: &DoToolExecutor<_>, command: &str| {
+            exec.execute(&call("bash", json!({ "command": command })))
+        };
+
+        let refused = bash(&executor(), "mv Web site");
+        assert_eq!(refused.status, ToolStatus::Error, "{}", refused.content);
+        assert!(refused.content.contains("read-only"), "{}", refused.content);
+        let taken = bash(&executor(), "mv api WEB");
+        assert_eq!(taken.status, ToolStatus::Error, "{}", taken.content);
+        assert!(taken.content.contains("already named"), "{}", taken.content);
+
+        let exec = executor();
+        let admitted = bash(&exec, "mv api backend && ls");
+        assert_eq!(admitted.status, ToolStatus::Ok, "{}", admitted.content);
+        assert_eq!(admitted.content, "Web\nbackend\n");
+        let record = exec
+            .file_content(&format!("{ROOT_RENAME_RECORDS}/000001.json"))
+            .unwrap()
+            .expect("the rename is recorded for the host");
+        assert_eq!(
+            serde_json::from_str::<RootRename>(&record).unwrap(),
+            RootRename {
+                handle: "target:a".into(),
+                selector: "targets/t-a".into(),
+                from: "api".into(),
+                to: "backend".into(),
+            }
+        );
+        // The record is outside every selected root: the agent never sees it.
+        let listing = exec.execute(&call("ls", json!({})));
+        assert_eq!(listing.content, "Web/\nbackend/");
+        let second = bash(&exec, "mv backend api");
+        assert_eq!(second.status, ToolStatus::Ok, "{}", second.content);
+        assert!(exec
+            .file_content(&format!("{ROOT_RENAME_RECORDS}/000002.json"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn an_external_tool_reaches_the_placement_through_the_shared_handle() {
+        struct Answering(crate::do_store::test_support::RusqliteDoSql);
+        impl DoSql for Answering {
+            fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+                self.0.execute(sql, params)
+            }
+            fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+                self.0.query(sql, params)
+            }
+            fn external_tool(
+                &self,
+                name: &str,
+                call_id: &str,
+                _arguments: &str,
+            ) -> Result<String, String> {
+                Ok(format!("{name} answered {call_id}"))
+            }
+        }
+        let exec = DoToolExecutor::new(Rc::new(Answering(store().sql)))
+            .with_external_tools(&[("ask_choices".to_owned(), "question".to_owned())]);
+        let outcome = exec.execute(&ToolCall {
+            id: "call-1".into(),
+            name: "ask_choices".into(),
+            arguments: json!({}),
+        });
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+        assert_eq!(outcome.content, "ask_choices answered call-1");
     }
 
     #[test]
