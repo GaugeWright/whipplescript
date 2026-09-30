@@ -306,6 +306,7 @@ fn setup(case: &str, actor: &str) -> Fixture {
                     kind: "resolution_memory".into(),
                     writable: Some(true),
                     selector: Some(serde_json::to_string(&scope).expect("scope selector")),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: scope.version_ref(),

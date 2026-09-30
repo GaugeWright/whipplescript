@@ -246,6 +246,7 @@ fn run_scoped<S, B, C>(
                         kind: "file_store".into(),
                         selector: Some(target_selector(&binding, true)),
                         writable: Some(true),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: binding.base_cut_id.clone(),
@@ -261,6 +262,7 @@ fn run_scoped<S, B, C>(
                         kind: "resolution_memory".into(),
                         selector: Some(serde_json::to_string(&scope).expect("scope selector")),
                         writable: Some(false),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: scope.version_ref(),

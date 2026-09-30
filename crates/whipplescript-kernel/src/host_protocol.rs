@@ -77,6 +77,12 @@ pub struct ResourceRef {
     /// placement. `None` preserves the resolver's legacy access posture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable: Option<bool>,
+    /// The workspace-relative path at which the model sees a selected
+    /// file-store root (DR-0148). Every file tool and the virtual shell work in
+    /// presented paths and map them to the selector; records keep the
+    /// selector. `None` shows the root at its selector, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented_as: Option<String>,
 }
 
 /// A credential-free provider binding. Secret material is resolved ephemerally
@@ -327,6 +333,23 @@ impl StartTurnCommand {
                     "resource write attenuation requires kind file_store",
                 ));
             }
+            if let Some(presented) = &resource.presented_as {
+                if resource.kind != "file_store" {
+                    return Err(ProtocolError::Invalid(
+                        "a presented path requires kind file_store",
+                    ));
+                }
+                crate::file_view::normalize_presented_path(presented)
+                    .map_err(|_| ProtocolError::Invalid("resource presented path is not valid"))?;
+            }
+        }
+        if self
+            .resources
+            .iter()
+            .any(|resource| resource.presented_as.is_some())
+        {
+            crate::file_view::FileView::from_resources(&self.resources)
+                .map_err(|_| ProtocolError::Invalid("file-store presented paths overlap"))?;
         }
         Ok(())
     }
@@ -510,6 +533,7 @@ mod tests {
                 kind: "file_store".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),
@@ -546,6 +570,7 @@ mod tests {
             kind: "command".to_owned(),
             selector: None,
             writable: Some(false),
+            presented_as: None,
         });
         assert!(matches!(
             invalid.validate(),

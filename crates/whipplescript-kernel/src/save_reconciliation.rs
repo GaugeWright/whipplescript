@@ -427,6 +427,7 @@ mod ceiling_tests {
                 kind: "file_store".into(),
                 selector: Some(r#"["target", "branch", "note.txt"]"#.into()),
                 writable: Some(true),
+                presented_as: None,
             },
             basis: ActionBasis::Version {
                 version_ref: "base".into(),

@@ -38,6 +38,24 @@ remain beneath at least one selected root, and a mutation must also resolve to a
 writable reference. An unselected or read-only mutation is refused before any
 workspace change; unselected files are not made available to the virtual shell.
 
+A file-store reference may also set `ResourceRef::presented_as`, the
+workspace-relative path at which the model sees its selected root (DR-0148).
+Every file tool and the virtual shell then work in presented paths, and the
+host maps them to the selector; tool results, listings, search hits and error
+text never show that selector, while read sets, write witnesses and provenance
+keep it. A presented path may not overlap another visible root, and a
+presented root's selector may not lie inside an unpresented one. The workspace
+root, and any directory above a root, is listed from the roots beneath it. The
+`file_view` module in `whipplescript-kernel` is the one implementation both
+placements use.
+
+A shell `mv` of a presented root moves no files. It is reported as a
+`file_view::RootRename`, which the embedding host admits or refuses through
+`NativeWorkspaceResolver::with_root_rename_admission` (or
+`DoToolExecutor::with_root_rename_admission`); without one, every rename is
+refused. An admitted rename is presented for the rest of the turn, and the
+host's next turn reference is expected to carry the new name.
+
 The `host_runtime::GovernedHostRuntime` type is the native facade that persists:
 
 | Item | Meaning |

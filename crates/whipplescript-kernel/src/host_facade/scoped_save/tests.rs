@@ -299,6 +299,7 @@ fn setup(
                         kind: "file_store".into(),
                         selector: Some("fixture-target".into()),
                         writable: Some(true),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: "base".into(),
@@ -316,6 +317,7 @@ fn setup(
                             serde_json::to_string(&scope).expect("serialize scope selector"),
                         ),
                         writable: Some(false),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: scope.version_ref(),

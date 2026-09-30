@@ -1649,7 +1649,12 @@ fn parse_workspace_resources(json: &str) -> Result<Option<Vec<ResourceRef>>, Str
         if resource.writable.is_some() && resource.kind != "file_store" {
             return Err("workspace resource write attenuation requires kind file_store".to_owned());
         }
+        if resource.presented_as.is_some() && resource.kind != "file_store" {
+            return Err("a workspace resource presented path requires kind file_store".to_owned());
+        }
     }
+    whipplescript_kernel::file_view::FileView::from_resources(&resources)
+        .map_err(|error| format!("invalid workspace_resources: {error}"))?;
     Ok(Some(resources))
 }
 

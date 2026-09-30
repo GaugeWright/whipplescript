@@ -22,6 +22,10 @@ pub(super) struct Resource {
     selector: Option<String>,
     #[serde(default)]
     writable: Option<bool>,
+    /// A presented path is a turn file-tool concept (DR-0148). The action
+    /// contract never carries one, so it stays an unknown field here.
+    #[serde(skip)]
+    presented_as: Option<String>,
 }
 
 #[derive(Deserialize)]

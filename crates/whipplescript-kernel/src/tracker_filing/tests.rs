@@ -160,6 +160,7 @@ fn fixture_for_source(
                 kind: "tracker".into(),
                 selector: Some("tutorials".into()),
                 writable: Some(true),
+                presented_as: None,
             },
             basis: ActionBasis::Version {
                 version_ref: "tracker-incarnation:one".into(),

@@ -19,6 +19,17 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- A file-store `ResourceRef` may present its selected root to the model at
+  another path, `presented_as` (DR-0148). The native and Durable Object hosts
+  map every file tool and the virtual shell through one `file_view` module,
+  keep selectors in every record, and report a shell `mv` of a presented root
+  as a rename the embedding host admits through `with_root_rename_admission`.
+  This breaks construction of `ResourceRef`, `ShellRequest` and `ShellOutput`:
+  a dependent that builds one adds `presented_as: None`, `presented_roots:
+  Vec::new()` or reads `renames`. The next release is therefore 0.9.0.
+- The native host no longer refuses a `bash` command because an unchanged file
+  it left behind is read-only; only changed, added and removed paths are
+  checked for write access.
 - The native host verifies the exact registered skill catalogue before asking
   an embedding resolver for its system-prompt source labels. Missing or changed
   skill bodies keep that model request's provenance incomplete.

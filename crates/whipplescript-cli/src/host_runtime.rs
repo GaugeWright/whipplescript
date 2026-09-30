@@ -5,7 +5,7 @@
 //! provide only opaque-reference resolvers. Secrets and resource bodies are
 //! resolved after admission and never enter the host command or receipt.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -20,6 +20,9 @@ use whipplescript_kernel::construct_coverage::{
     embedded_std_registry_for_program, CheckedConstructBasis,
 };
 use whipplescript_kernel::context_assembly::SkillCatalogueEntry;
+use whipplescript_kernel::file_view::{
+    is_within, normalize_stored_path, FileView, RootRename, ViewResolution,
+};
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, MediaInput, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
@@ -456,6 +459,12 @@ pub struct NativeWorkspaceResolver {
     /// is a reserved hook for a future native-OS command tool (see
     /// spec/native-command-tool-tracker.md).
     witness: std::sync::Mutex<WitnessState>,
+    /// Renames of presented roots admitted this turn (DR-0148). Each applies
+    /// to later calls while their references still present the old name.
+    root_renames: std::sync::Mutex<Vec<RootRename>>,
+    /// The embedding host's admission of a presented-root rename. Without
+    /// one, every rename is refused.
+    rename_admission: Option<Box<RenameAdmission>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,11 +487,23 @@ struct WitnessState {
     taint: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct AdmittedFileScope {
-    root: PathBuf,
-    writable: bool,
+/// What a model path names in the native workspace.
+enum Target {
+    Stored {
+        absolute: PathBuf,
+        stored: String,
+    },
+    /// A directory that exists only in the view (DR-0148).
+    Synthetic,
 }
+
+/// What a walk covered.
+enum Walked {
+    Stored { stored: String, single_file: bool },
+    Synthetic,
+}
+
+type RenameAdmission = dyn Fn(&RootRename) -> Result<(), String> + Send + Sync;
 
 impl NativeWorkspaceResolver {
     pub fn take_model_read_witness(&self, call_id: &str) -> Option<ModelReadWitness> {
@@ -557,7 +578,20 @@ impl NativeWorkspaceResolver {
             read_only: Vec::new(),
             max_output_bytes: 50_000,
             witness: std::sync::Mutex::new(WitnessState::default()),
+            root_renames: std::sync::Mutex::new(Vec::new()),
+            rename_admission: None,
         })
+    }
+
+    /// Admit or refuse each rename of a presented root that a `bash` command
+    /// makes (DR-0148). The host records an admitted rename as its own fact;
+    /// a refusal refuses the whole command before any file changes.
+    pub fn with_root_rename_admission(
+        mut self,
+        admit: impl Fn(&RootRename) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.rename_admission = Some(Box::new(admit));
+        self
     }
 
     pub fn read_only(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
@@ -569,81 +603,141 @@ impl NativeWorkspaceResolver {
     }
 
     fn resolve(&self, path: &str, write: bool) -> Result<PathBuf, String> {
-        let relative = normalize_relative(Path::new(path))?;
+        self.resolve_stored(path, path, write)
+    }
+
+    /// Resolve a stored workspace path to its file, naming `display` — the
+    /// path as the model gave it — in every error.
+    fn resolve_stored(&self, stored: &str, display: &str, write: bool) -> Result<PathBuf, String> {
+        let relative = normalize_relative(Path::new(stored))
+            .map_err(|_| format!("workspace path `{display}` escapes its capability"))?;
         if write
             && self
                 .read_only
                 .iter()
                 .any(|protected| relative.starts_with(protected))
         {
-            return Err(format!("workspace path `{path}` is read-only"));
+            return Err(format!("workspace path `{display}` is read-only"));
         }
         let mut resolved = self.root.clone();
         for component in relative.components() {
             let Component::Normal(segment) = component else {
-                return Err(format!("workspace path `{path}` escapes its capability"));
+                return Err(format!("workspace path `{display}` escapes its capability"));
             };
             resolved.push(segment);
             if let Ok(metadata) = fs::symlink_metadata(&resolved) {
                 if metadata.file_type().is_symlink() {
-                    return Err(format!("workspace path `{path}` traverses a symlink"));
+                    return Err(format!("workspace path `{display}` traverses a symlink"));
                 }
             }
         }
         Ok(resolved)
     }
 
-    fn admitted_file_scopes(
-        &self,
-        resources: &[ResourceRef],
-    ) -> Result<Vec<AdmittedFileScope>, String> {
-        let file_stores = resources
+    /// The model-visible namespace of this call: the admitted file stores,
+    /// with every rename this resolver has admitted this turn (DR-0148).
+    fn admitted_view(&self, resources: &[ResourceRef]) -> Result<FileView, String> {
+        if !resources
             .iter()
-            .filter(|resource| resource.kind == "file_store")
-            .collect::<Vec<_>>();
-        if file_stores.is_empty() {
+            .any(|resource| resource.kind == "file_store")
+        {
             return Err("turn has no admitted file-store capability".to_owned());
         }
-        let mut scopes = file_stores
-            .into_iter()
-            .map(|resource| {
-                let root = resource
-                    .selector
-                    .as_deref()
-                    .map(|selector| normalize_relative(Path::new(selector)))
-                    .transpose()?
-                    .unwrap_or_default();
-                Ok(AdmittedFileScope {
-                    root,
-                    writable: resource.writable.unwrap_or(true),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        scopes.sort();
-        scopes.dedup();
-        Ok(scopes)
+        let mut view = FileView::from_resources(resources)?;
+        view.apply_renames(
+            &self
+                .root_renames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )?;
+        Ok(view)
+    }
+
+    fn resolve_model(&self, path: &str, write: bool, view: &FileView) -> Result<Target, String> {
+        match view.resolve(path)? {
+            ViewResolution::Stored { stored, writable } => {
+                if write && !writable {
+                    return Err(format!("workspace path `{path}` is read-only"));
+                }
+                let absolute = self.resolve_stored(&stored, path, write)?;
+                Ok(Target::Stored { absolute, stored })
+            }
+            ViewResolution::Synthetic if !write => Ok(Target::Synthetic),
+            ViewResolution::Synthetic => Err(format!(
+                "workspace path `{path}` is outside the admitted file-store selectors"
+            )),
+        }
     }
 
     fn resolve_admitted(
         &self,
         path: &str,
         write: bool,
-        scopes: &[AdmittedFileScope],
-    ) -> Result<PathBuf, String> {
-        let relative = normalize_relative(Path::new(path))?;
-        let matching = scopes
-            .iter()
-            .filter(|scope| relative.starts_with(&scope.root))
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            return Err(format!(
-                "workspace path `{path}` is outside the admitted file-store selectors"
-            ));
+        view: &FileView,
+    ) -> Result<(PathBuf, String), String> {
+        match self.resolve_model(path, write, view)? {
+            Target::Stored { absolute, stored } => Ok((absolute, stored)),
+            Target::Synthetic => Err(format!("workspace path `{path}` is a directory")),
         }
-        if write && !matching.iter().any(|scope| scope.writable) {
-            return Err(format!("workspace path `{path}` is read-only"));
+    }
+
+    /// The path a record keeps for a model path: its selector once any root
+    /// is presented, and the path as given otherwise, as before DR-0148.
+    fn record_path(view: &FileView, model: &str, stored: &str) -> String {
+        if view.presents() {
+            stored.to_owned()
+        } else {
+            model.to_owned()
         }
-        self.resolve(path, write)
+    }
+
+    /// Walk every file beneath a model path, handing `visit` each file's
+    /// stored path, the path the model sees, its absolute path, and whether
+    /// its name is valid UTF-8. A directory that exists only in the view
+    /// walks each root beneath it. Returns what the path named.
+    fn walk_model(
+        &self,
+        path: &str,
+        view: &FileView,
+        visit: &mut dyn FnMut(&str, &str, &Path, bool) -> bool,
+    ) -> Result<Walked, String> {
+        let mut continue_with = |stored: &str, absolute: &Path, valid: bool| {
+            let presented = view.presented(stored).unwrap_or_else(|| stored.to_owned());
+            visit(stored, &presented, absolute, valid)
+        };
+        match self.resolve_model(path, false, view)? {
+            Target::Stored { absolute, stored } => {
+                let single_file =
+                    fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_file());
+                walk_workspace(&self.root, &absolute, &mut continue_with)?;
+                Ok(Walked::Stored {
+                    stored,
+                    single_file,
+                })
+            }
+            Target::Synthetic => {
+                let directory = normalize_stored_path(path)?;
+                let mut stopped = false;
+                for root in view
+                    .roots()
+                    .iter()
+                    .filter(|root| is_within(root.visible(), &directory))
+                {
+                    let absolute = self.resolve_stored(&root.stored, path, false)?;
+                    if !absolute.exists() {
+                        continue;
+                    }
+                    walk_workspace(&self.root, &absolute, &mut |stored, absolute, valid| {
+                        stopped = !continue_with(stored, absolute, valid);
+                        !stopped
+                    })?;
+                    if stopped {
+                        break;
+                    }
+                }
+                Ok(Walked::Synthetic)
+            }
+        }
     }
 
     fn cap(&self, text: String) -> String {
@@ -660,15 +754,11 @@ impl NativeWorkspaceResolver {
         )
     }
 
-    fn read(
-        &self,
-        call_id: &str,
-        arguments: &Value,
-        scopes: &[AdmittedFileScope],
-    ) -> Result<String, String> {
+    fn read(&self, call_id: &str, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
-        let resolved = self.resolve_admitted(path, false, scopes)?;
-        self.witness_read(path);
+        let (resolved, stored) = self.resolve_admitted(path, false, view)?;
+        let recorded = Self::record_path(view, path, &stored);
+        self.witness_read(&recorded);
         let text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot read workspace path `{path}`: {error}"))?;
         let offset = arguments
@@ -694,17 +784,17 @@ impl NativeWorkspaceResolver {
             .insert(
                 call_id.to_owned(),
                 ModelReadWitness {
-                    path: path.to_owned(),
+                    path: recorded,
                     content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
                 },
             );
         Ok(self.cap(lines))
     }
 
-    fn write(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn write(&self, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
         let content = string_argument(arguments, "content")?;
-        let resolved = self.resolve_admitted(path, true, scopes)?;
+        let (resolved, stored) = self.resolve_admitted(path, true, view)?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
@@ -713,13 +803,17 @@ impl NativeWorkspaceResolver {
         let existed = resolved.exists();
         fs::write(&resolved, content)
             .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
-        self.witness_write(path, existed, content.as_bytes());
+        self.witness_write(
+            &Self::record_path(view, path, &stored),
+            existed,
+            content.as_bytes(),
+        );
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
-    fn edit(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn edit(&self, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
-        let resolved = self.resolve_admitted(path, true, scopes)?;
+        let (resolved, stored) = self.resolve_admitted(path, true, view)?;
         let mut text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
         let edits = arguments
@@ -739,19 +833,41 @@ impl NativeWorkspaceResolver {
         }
         fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
-        self.witness_write(path, true, text.as_bytes());
+        self.witness_write(
+            &Self::record_path(view, path, &stored),
+            true,
+            text.as_bytes(),
+        );
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
-    fn list(
-        &self,
-        call_id: &str,
-        arguments: &Value,
-        scopes: &[AdmittedFileScope],
-    ) -> Result<String, String> {
+    fn list(&self, call_id: &str, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let resolved = self.resolve_admitted(path, false, scopes)?;
-        self.witness_read(path);
+        let (resolved, stored) = match self.resolve_model(path, false, view)? {
+            Target::Stored { absolute, stored } => (absolute, stored),
+            Target::Synthetic => {
+                // A directory that exists only in the view lists the roots
+                // beneath it. Its listing names no stored file, so it carries
+                // no exact witness and keeps the coarse source.
+                self.witness_read(&normalize_stored_path(path)?);
+                let names = view
+                    .children(path)
+                    .into_iter()
+                    .map(|entry| match entry.root {
+                        Some(stored)
+                            if !self
+                                .resolve_stored(&stored, path, false)
+                                .is_ok_and(|absolute| absolute.is_dir()) =>
+                        {
+                            entry.name
+                        }
+                        _ => format!("{}/", entry.name),
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(self.cap(names.join("\n")));
+            }
+        };
+        self.witness_read(&Self::record_path(view, path, &stored));
         let mut names = Vec::new();
         let mut files = Vec::new();
         let mut directories = Vec::new();
@@ -820,7 +936,7 @@ impl NativeWorkspaceResolver {
                 .insert(
                     call_id.to_owned(),
                     ModelScanWitness {
-                        root: path.to_owned(),
+                        root: Self::record_path(view, path, &stored),
                         files,
                         directories,
                     },
@@ -829,28 +945,20 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(names.join("\n")))
     }
 
-    fn find(
-        &self,
-        call_id: &str,
-        arguments: &Value,
-        scopes: &[AdmittedFileScope],
-    ) -> Result<String, String> {
+    fn find(&self, call_id: &str, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let resolved = self.resolve_admitted(path, false, scopes)?;
-        self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         let mut matches = Vec::new();
-        let single_file = fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_file());
         // A negative name match still depends on every traversed file. Keep a
         // bounded exact witness for the whole search, including nonmatches;
         // an unreadable or larger scan remains coarse for model projection.
         let mut scan_files = Vec::new();
         let mut scan_complete = true;
         let mut scan_bytes = 0u64;
-        walk_workspace(
-            &self.root,
-            &resolved,
-            &mut |relative, absolute, valid_path| {
+        let walked = self.walk_model(
+            path,
+            view,
+            &mut |stored, presented, absolute, valid_path| {
                 if !valid_path {
                     scan_complete = false;
                 }
@@ -868,7 +976,7 @@ impl NativeWorkspaceResolver {
                         Ok(bytes) if bytes.len() as u64 <= max_file => {
                             scan_bytes += bytes.len() as u64;
                             scan_files.push(ModelReadWitness {
-                                path: relative.to_owned(),
+                                path: stored.to_owned(),
                                 content_hash: whipplescript_store::stable_hash_bytes_hex(&bytes),
                             });
                         }
@@ -878,8 +986,8 @@ impl NativeWorkspaceResolver {
                 } else {
                     scan_complete = false;
                 }
-                if wildcard_matches(pattern, relative) {
-                    matches.push(relative.to_owned());
+                if wildcard_matches(pattern, presented) {
+                    matches.push(presented.to_owned());
                 }
                 if matches.len() >= 5_000 {
                     scan_complete = false;
@@ -889,39 +997,41 @@ impl NativeWorkspaceResolver {
                 }
             },
         )?;
-        if scan_complete && !scan_files.is_empty() {
-            if single_file {
-                self.model_read_witnesses
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(call_id.to_owned(), scan_files.remove(0));
-            } else {
-                self.model_scan_witnesses
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(
-                        call_id.to_owned(),
-                        ModelScanWitness {
-                            root: path.to_owned(),
-                            files: scan_files,
-                            directories: Vec::new(),
-                        },
-                    );
+        match walked {
+            Walked::Stored {
+                stored,
+                single_file,
+            } => {
+                self.witness_read(&Self::record_path(view, path, &stored));
+                if scan_complete && !scan_files.is_empty() {
+                    if single_file {
+                        self.model_read_witnesses
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(call_id.to_owned(), scan_files.remove(0));
+                    } else {
+                        self.model_scan_witnesses
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(
+                                call_id.to_owned(),
+                                ModelScanWitness {
+                                    root: Self::record_path(view, path, &stored),
+                                    files: scan_files,
+                                    directories: Vec::new(),
+                                },
+                            );
+                    }
+                }
             }
+            Walked::Synthetic => self.witness_read(&normalize_stored_path(path)?),
         }
         matches.sort();
         Ok(self.cap(matches.join("\n")))
     }
 
-    fn grep(
-        &self,
-        call_id: &str,
-        arguments: &Value,
-        scopes: &[AdmittedFileScope],
-    ) -> Result<String, String> {
+    fn grep(&self, call_id: &str, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let resolved = self.resolve_admitted(path, false, scopes)?;
-        self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         // `ignoreCase`, `context` and `limit` are all declared by the schema
         // this tool advertises, and this implementation read NONE of them: a
@@ -948,14 +1058,21 @@ impl NativeWorkspaceResolver {
         let mut matches_found = 0usize;
         // A directory search also reveals negative matches. Its witness must
         // include every file searched, not just paths that produced matches.
-        let single_file = fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_file());
         let mut exact_witness = None;
         let mut scan_files = Vec::new();
         let mut scan_complete = true;
-        walk_workspace(
-            &self.root,
-            &resolved,
-            &mut |relative, absolute, valid_path| {
+        let target = self.resolve_model(path, false, view)?;
+        let (single_file, resolved) = match &target {
+            Target::Stored { absolute, .. } => (
+                fs::symlink_metadata(absolute).is_ok_and(|metadata| metadata.is_file()),
+                Some(absolute.clone()),
+            ),
+            Target::Synthetic => (false, None),
+        };
+        let walked = self.walk_model(
+            path,
+            view,
+            &mut |stored, presented, absolute, valid_path| {
                 if !valid_path {
                     scan_complete = false;
                 }
@@ -971,7 +1088,7 @@ impl NativeWorkspaceResolver {
                     // projected as a bounded current-access proof.
                     if scan_files.len() < 128 {
                         scan_files.push(ModelReadWitness {
-                            path: relative.to_owned(),
+                            path: stored.to_owned(),
                             content_hash: whipplescript_store::stable_hash_bytes_hex(
                                 text.as_bytes(),
                             ),
@@ -980,14 +1097,14 @@ impl NativeWorkspaceResolver {
                         scan_complete = false;
                     }
                 }
-                if single_file && absolute == resolved {
+                if single_file && resolved.as_deref() == Some(absolute) {
                     exact_witness = Some(ModelReadWitness {
-                        path: relative.to_owned(),
+                        path: stored.to_owned(),
                         content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
                     });
                 }
                 crate::workspace_grep::grep_file_into(
-                    relative,
+                    presented,
                     &text,
                     &matcher,
                     context,
@@ -998,28 +1115,34 @@ impl NativeWorkspaceResolver {
                 true
             },
         )?;
-        if let Some(witness) = exact_witness {
-            self.model_read_witnesses
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(call_id.to_owned(), witness);
-        } else if !single_file && scan_complete && !scan_files.is_empty() {
-            self.model_scan_witnesses
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(
-                    call_id.to_owned(),
-                    ModelScanWitness {
-                        root: path.to_owned(),
-                        files: scan_files,
-                        directories: Vec::new(),
-                    },
-                );
+        match walked {
+            Walked::Stored { stored, .. } => {
+                self.witness_read(&Self::record_path(view, path, &stored));
+                if let Some(witness) = exact_witness {
+                    self.model_read_witnesses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(call_id.to_owned(), witness);
+                } else if !single_file && scan_complete && !scan_files.is_empty() {
+                    self.model_scan_witnesses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(
+                            call_id.to_owned(),
+                            ModelScanWitness {
+                                root: Self::record_path(view, path, &stored),
+                                files: scan_files,
+                                directories: Vec::new(),
+                            },
+                        );
+                }
+            }
+            Walked::Synthetic => self.witness_read(&normalize_stored_path(path)?),
         }
         Ok(self.cap(matches.join("\n")))
     }
 
-    fn bash(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn bash(&self, arguments: &Value, view: &FileView) -> Result<String, String> {
         let command = string_argument(arguments, "command")?.trim();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
@@ -1034,35 +1157,45 @@ impl NativeWorkspaceResolver {
             return Err("command timeout must be between 1 and 30 seconds".to_owned());
         }
 
+        // The shell sees every admitted file at the path the model sees; the
+        // snapshot is keyed by that path.
         let mut before = BTreeMap::new();
-        let mut admitted_files = BTreeMap::new();
         let mut load_error = None;
-        let mut roots = scopes
+        let mut roots = view
+            .roots()
             .iter()
-            .map(|scope| {
-                if scope.root.as_os_str().is_empty() {
+            .map(|root| {
+                if root.stored.is_empty() {
                     Ok(self.root.clone())
                 } else {
-                    self.resolve(&scope.root.to_string_lossy(), false)
+                    self.resolve(&root.stored, false)
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
         roots.sort();
         roots.dedup();
         for root in roots {
+            if !root.exists() {
+                continue;
+            }
             walk_workspace(&self.root, &root, &mut |relative, absolute, _valid_path| {
-                if admitted_files.len() >= 5_000 {
+                if before.len() >= 5_000 {
                     load_error = Some("bash workspace contains more than 5000 files".to_owned());
                     return false;
                 }
+                let stored = relative.replace('\\', "/");
+                let Some(presented) = view.presented(&stored) else {
+                    return true;
+                };
                 match fs::read(absolute) {
                     Ok(content) => {
-                        admitted_files.insert(relative.replace('\\', "/"), content);
+                        before.insert(presented, (stored, content));
                         true
                     }
                     Err(error) => {
                         load_error = Some(format!(
-                            "cannot load bash workspace file `{relative}`: {error}"
+                            "cannot load bash workspace file `{}`: {error}",
+                            view.presented(&stored).unwrap_or(stored)
                         ));
                         false
                     }
@@ -1075,23 +1208,16 @@ impl NativeWorkspaceResolver {
         if let Some(error) = load_error {
             return Err(error);
         }
-        let files = admitted_files
+        let files = before
             .iter()
-            .map(|(relative, content)| {
-                let path = Path::new(relative);
-                let writable = scopes
-                    .iter()
-                    .any(|scope| scope.writable && path.starts_with(&scope.root))
+            .map(|(presented, (stored, content))| ShellFile {
+                path: presented.clone(),
+                content: content.clone(),
+                writable: view.writable_stored(stored)
                     && !self
                         .read_only
                         .iter()
-                        .any(|protected| path.starts_with(protected));
-                before.insert(relative.clone(), content.clone());
-                ShellFile {
-                    path: relative.clone(),
-                    content: content.clone(),
-                    writable,
-                }
+                        .any(|protected| Path::new(stored).starts_with(protected)),
             })
             .collect();
 
@@ -1099,43 +1225,102 @@ impl NativeWorkspaceResolver {
             command: command.to_owned(),
             timeout: requested,
             files,
+            presented_roots: view.presented_roots(),
         })?;
+        // Reads are recorded under the names the command started with, so
+        // they resolve through the view the command was given; a record keeps
+        // the selector of a presented root.
+        if view.presents() {
+            for read in &mut output.reads {
+                if let Ok(ViewResolution::Stored { stored, .. }) = view.resolve(&read.path) {
+                    read.path = stored;
+                }
+            }
+        }
         self.workspace_reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .append(&mut output.reads);
-        // Validate every result path and mutation before changing the real
-        // workspace. This preserves the same capability and read-only ceilings
-        // as the first-class file tools.
+
+        // Validate the complete result before changing the real workspace:
+        // each rename of a presented root, then every changed, added or
+        // removed path, under the same capability and read-only ceilings as
+        // the first-class file tools. Unchanged files are not writes.
+        let mut after_view = view.clone();
+        let mut renames = Vec::with_capacity(output.renames.len());
+        for rename in &output.renames {
+            let admitted = after_view.rename(&rename.from, &rename.to)?;
+            after_view.apply_renames(std::slice::from_ref(&admitted))?;
+            renames.push(admitted);
+        }
+        let before_stored = before
+            .values()
+            .map(|(stored, content)| (stored.clone(), content))
+            .collect::<BTreeMap<_, _>>();
+        let mut after = BTreeMap::new();
         for (path, content) in &output.files {
-            let resolved = self.resolve_admitted(path, true, scopes)?;
-            if let Some(parent) = resolved.parent() {
-                reject_symlinks_between(&self.root, parent, path)?;
+            let stored = match after_view.resolve(path) {
+                Ok(ViewResolution::Stored { stored, .. }) => stored,
+                Ok(ViewResolution::Synthetic) | Err(_) => {
+                    return Err(format!(
+                        "workspace path `{path}` is outside the admitted file-store selectors"
+                    ))
+                }
+            };
+            if before_stored.get(&stored).copied() != Some(content) {
+                let (resolved, _) = self.resolve_admitted(path, true, &after_view)?;
+                if let Some(parent) = resolved.parent() {
+                    reject_symlinks_between(&self.root, parent, path)?;
+                }
             }
-            let _ = content;
+            after.insert(stored, (path, content));
         }
-        let after_paths = output.files.keys().cloned().collect::<BTreeSet<_>>();
-        for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
-            let resolved = self.resolve_admitted(removed, true, scopes)?;
+        let removed = before
+            .iter()
+            .filter(|(_, (stored, _))| !after.contains_key(stored))
+            .map(|(presented, (stored, _))| (presented.clone(), stored.clone()))
+            .collect::<Vec<_>>();
+        for (presented, _) in &removed {
+            self.resolve_admitted(presented, true, view)?;
+        }
+        for rename in &renames {
+            match &self.rename_admission {
+                Some(admit) => admit(rename)?,
+                None => {
+                    return Err(format!(
+                        "renaming `{}` is not supported by this workspace host",
+                        rename.from
+                    ))
+                }
+            }
+        }
+        self.root_renames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(renames);
+
+        let record = |presented: &str, stored: &str| Self::record_path(view, presented, stored);
+        for (presented, stored) in &removed {
+            let resolved = self.resolve_stored(stored, presented, true)?;
             fs::remove_file(&resolved).map_err(|error| {
-                format!("cannot delete bash workspace path `{removed}`: {error}")
+                format!("cannot delete bash workspace path `{presented}`: {error}")
             })?;
-            self.witness_delete(removed);
+            self.witness_delete(&record(presented, stored));
         }
-        for (path, content) in &output.files {
-            if before.get(path) == Some(content) {
+        for (stored, (path, content)) in &after {
+            if before_stored.get(stored).copied() == Some(*content) {
                 continue;
             }
-            let resolved = self.resolve_admitted(path, true, scopes)?;
+            let resolved = self.resolve_stored(stored, path, true)?;
             if let Some(parent) = resolved.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
                 reject_symlinks_between(&self.root, parent, path)?;
             }
-            let existed = before.contains_key(path);
+            let existed = before_stored.contains_key(stored);
             fs::write(&resolved, content)
                 .map_err(|error| format!("cannot write bash workspace path `{path}`: {error}"))?;
-            self.witness_write(path, existed, content);
+            self.witness_write(&record(path, stored), existed, content);
         }
 
         let mut combined = output.stdout;
@@ -1219,15 +1404,15 @@ impl ResourceResolver for NativeWorkspaceResolver {
         // Reusing an ID cannot inherit a prior read, even if this call fails.
         self.take_model_read_witness(&call.id);
         self.take_model_scan_witness(&call.id);
-        let scopes = self.admitted_file_scopes(admitted_resources)?;
-        let scopes = scopes.as_slice();
+        let view = self.admitted_view(admitted_resources)?;
+        let view = &view;
         match call.name.as_str() {
-            "read" => self.read(&call.id, &call.arguments, scopes),
-            "write" => self.write(&call.arguments, scopes),
-            "edit" => self.edit(&call.arguments, scopes),
-            "ls" => self.list(&call.id, &call.arguments, scopes),
-            "find" => self.find(&call.id, &call.arguments, scopes),
-            "grep" => self.grep(&call.id, &call.arguments, scopes),
+            "read" => self.read(&call.id, &call.arguments, view),
+            "write" => self.write(&call.arguments, view),
+            "edit" => self.edit(&call.arguments, view),
+            "ls" => self.list(&call.id, &call.arguments, view),
+            "find" => self.find(&call.id, &call.arguments, view),
+            "grep" => self.grep(&call.id, &call.arguments, view),
             "bash" => {
                 if !admitted_resources
                     .iter()
@@ -1235,7 +1420,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
                 {
                     return Err("turn has no admitted command capability".to_owned());
                 }
-                self.bash(&call.arguments, scopes)
+                self.bash(&call.arguments, view)
             }
             _ => Err("tool has no native workspace implementation".to_owned()),
         }
@@ -4214,7 +4399,10 @@ mod refusal_pin_tests {
         let root = scratch("nonzero-exit");
         let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
         let error = resolver
-            .bash(&serde_json::json!({ "command": "echo out; exit 3" }), &[])
+            .bash(
+                &serde_json::json!({ "command": "echo out; exit 3" }),
+                &FileView::default(),
+            )
             .expect_err("a nonzero exit is an error");
         assert!(
             error.contains("command exited with status 3"),
@@ -5000,6 +5188,7 @@ workflow UnsafeHostChat {
                 kind: "file_store".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "model".to_owned(),
@@ -5290,6 +5479,7 @@ workflow UnsafeHostChat {
                         kind: "file_store".to_owned(),
                         selector: None,
                         writable: None,
+                        presented_as: None,
                     }],
                 },
                 CertifiedOutputFieldFlow {
@@ -5299,6 +5489,7 @@ workflow UnsafeHostChat {
                         kind: "file_store".to_owned(),
                         selector: None,
                         writable: None,
+                        presented_as: None,
                     }],
                 },
             ]
@@ -5710,6 +5901,7 @@ workflow UnsafeHostChat {
             kind: "file_store".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         }];
         for (name, arguments) in [
             ("ls", json!({ "path": "." })),
@@ -5752,6 +5944,7 @@ workflow UnsafeHostChat {
             kind: "file_store".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         }];
 
         let read = resolver
@@ -6120,24 +6313,28 @@ workflow UnsafeHostChat {
                 kind: "file_store".to_owned(),
                 selector: Some("targets/t-a".to_owned()),
                 writable: Some(true),
+                presented_as: None,
             },
             ResourceRef {
                 handle: "target-b".to_owned(),
                 kind: "file_store".to_owned(),
                 selector: Some("targets/t-b".to_owned()),
                 writable: Some(true),
+                presented_as: None,
             },
             ResourceRef {
                 handle: "target-manifest".to_owned(),
                 kind: "file_store".to_owned(),
                 selector: Some(".runtime/targets.json".to_owned()),
                 writable: Some(false),
+                presented_as: None,
             },
             ResourceRef {
                 handle: "command".to_owned(),
                 kind: "command".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             },
         ];
         let call = |name: &str, arguments: Value| ToolCall {
@@ -6196,6 +6393,182 @@ workflow UnsafeHostChat {
     /// thousand — each silently, because a tool that ignores an argument has no
     /// way to say so.
     #[test]
+    fn presented_roots_are_what_the_model_sees_and_renames_need_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-presented-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("targets/t-a/src")).expect("target a");
+        fs::create_dir_all(root.join("targets/t-b")).expect("target b");
+        fs::create_dir_all(root.join(".runtime")).expect("runtime");
+        fs::write(root.join("targets/t-a/src/main.rs"), "fn main() {}\n").expect("a");
+        fs::write(root.join("targets/t-b/readme.md"), "fn in prose\n").expect("b");
+        fs::write(root.join(".runtime/targets.json"), "{}").expect("manifest");
+        let store =
+            |handle: &str, selector: &str, presented: Option<&str>, writable: bool| ResourceRef {
+                handle: handle.to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some(selector.to_owned()),
+                writable: Some(writable),
+                presented_as: presented.map(str::to_owned),
+            };
+        let resources = [
+            store("target:a", "targets/t-a", Some("api"), true),
+            store("target:b", "targets/t-b", Some("web"), false),
+            store("manifest", ".runtime/targets.json", None, false),
+            ResourceRef {
+                handle: "command".to_owned(),
+                kind: "command".to_owned(),
+                selector: None,
+                writable: None,
+                presented_as: None,
+            },
+        ];
+        let call = |name: &str, arguments: Value| ToolCall {
+            id: format!("{name}-presented-test"),
+            name: name.to_owned(),
+            arguments,
+        };
+        let run = |resolver: &NativeWorkspaceResolver, name: &str, arguments: Value| {
+            resolver.execute_tool(&resources, &call(name, arguments))
+        };
+
+        let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
+        assert_eq!(
+            run(&resolver, "ls", json!({})).expect("the root is listed"),
+            ".runtime/\napi/\nweb/"
+        );
+        assert_eq!(
+            run(&resolver, "ls", json!({ "path": "api" })).unwrap(),
+            "src/"
+        );
+        assert_eq!(
+            run(&resolver, "read", json!({ "path": "api/src/main.rs" })).unwrap(),
+            "1: fn main() {}"
+        );
+        // Records keep the selector.
+        assert_eq!(
+            resolver
+                .take_model_read_witness("read-presented-test")
+                .expect("exact read")
+                .path,
+            "targets/t-a/src/main.rs"
+        );
+        let hidden = run(
+            &resolver,
+            "read",
+            json!({ "path": "targets/t-a/src/main.rs" }),
+        )
+        .unwrap_err();
+        assert!(hidden.contains("outside the admitted"), "{hidden}");
+        assert_eq!(
+            run(&resolver, "find", json!({ "pattern": "*.rs" })).unwrap(),
+            "api/src/main.rs"
+        );
+        assert_eq!(
+            run(&resolver, "grep", json!({ "pattern": "fn" })).unwrap(),
+            "api/src/main.rs:1:fn main() {}\nweb/readme.md:1:fn in prose"
+        );
+        run(
+            &resolver,
+            "write",
+            json!({ "path": "api/new.txt", "content": "n" }),
+        )
+        .expect("a writable root");
+        assert_eq!(
+            fs::read_to_string(root.join("targets/t-a/new.txt")).unwrap(),
+            "n"
+        );
+        assert!(run(
+            &resolver,
+            "write",
+            json!({ "path": "web/x", "content": "x" })
+        )
+        .is_err());
+        let TurnWitness::Witnessed { writes, .. } = resolver.take_turn_witness() else {
+            panic!("witnessed turn");
+        };
+        assert_eq!(writes[0].path, "targets/t-a/new.txt");
+
+        // A command that changes nothing read-only runs beside read-only files.
+        assert_eq!(
+            run(
+                &resolver,
+                "bash",
+                json!({ "command": "cat api/src/main.rs; ls" })
+            )
+            .unwrap(),
+            "fn main() {}\napi\nweb\n"
+        );
+        assert!(run(
+            &resolver,
+            "bash",
+            json!({ "command": "echo x > .runtime/targets.json" })
+        )
+        .is_err());
+        let refused = run(&resolver, "bash", json!({ "command": "mv api backend" })).unwrap_err();
+        assert!(refused.contains("not supported"), "{refused}");
+        assert!(
+            root.join("targets/t-a/src/main.rs").exists(),
+            "nothing moved"
+        );
+
+        let admitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&admitted);
+        let resolver = NativeWorkspaceResolver::new(&root)
+            .expect("resolver")
+            .with_root_rename_admission(move |rename| {
+                seen.lock().unwrap().push(rename.clone());
+                Ok(())
+            });
+        run(
+            &resolver,
+            "bash",
+            json!({ "command": "mv api backend && echo b > backend/b.txt" }),
+        )
+        .expect("an admitted rename");
+        assert_eq!(
+            admitted.lock().unwrap().as_slice(),
+            &[RootRename {
+                handle: "target:a".into(),
+                selector: "targets/t-a".into(),
+                from: "api".into(),
+                to: "backend".into(),
+            }]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("targets/t-a/b.txt")).unwrap(),
+            "b\n"
+        );
+        assert!(
+            root.join("targets/t-a/src/main.rs").exists(),
+            "storage did not move"
+        );
+        // The rest of the turn sees the new name.
+        run(&resolver, "read", json!({ "path": "backend/b.txt" })).expect("renamed");
+        assert!(run(&resolver, "read", json!({ "path": "api/b.txt" })).is_err());
+        let refusing = NativeWorkspaceResolver::new(&root)
+            .expect("resolver")
+            .with_root_rename_admission(|_| Err("names are frozen".to_owned()));
+        let refused = run(
+            &refusing,
+            "bash",
+            json!({ "command": "mv api backend && echo c > backend/c.txt" }),
+        )
+        .unwrap_err();
+        assert!(refused.contains("names are frozen"), "{refused}");
+        assert!(
+            !root.join("targets/t-a/c.txt").exists(),
+            "a refused result writes nothing"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn native_grep_honours_ignore_case_context_and_limit() {
         let root = std::env::temp_dir().join(format!(
             "whip-native-grep-{}-{}",
@@ -6213,6 +6586,7 @@ workflow UnsafeHostChat {
             kind: "file_store".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         }];
         let grep = |arguments: Value| {
             resolver
@@ -6275,6 +6649,7 @@ workflow UnsafeHostChat {
             kind: "file_store".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         }];
         let admitted = [
             project_only[0].clone(),
@@ -6283,6 +6658,7 @@ workflow UnsafeHostChat {
                 kind: "command".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             },
         ];
         let call = |command: &str| ToolCall {
@@ -6641,6 +7017,7 @@ workflow HostChat {
             kind: "command".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         });
         let turn4 = runtime
             .run_turn_with_driver(

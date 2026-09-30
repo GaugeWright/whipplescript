@@ -416,6 +416,7 @@ pub(crate) mod tests {
                         kind: "file_store".into(),
                         selector: Some("document.md".into()),
                         writable: Some(true),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: "cut:1".into(),

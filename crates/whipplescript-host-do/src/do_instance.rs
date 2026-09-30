@@ -816,6 +816,11 @@ fn discover_workspace_skills<Sql: DoSql>(
             &[crate::do_store::SqlValue::Text(prefix)],
         )
         .map_err(StoreError::Conflict)?;
+    // A skill's location is read back by the model, so it names the path the
+    // model sees (DR-0148).
+    let view = resources.and_then(|resources| {
+        whipplescript_kernel::file_view::FileView::from_resources(resources).ok()
+    });
     let mut skills = Vec::new();
     for row in rows {
         let path = crate::do_store::as_text(&row[0]);
@@ -833,11 +838,18 @@ fn discover_workspace_skills<Sql: DoSql>(
         if frontmatter.name != directory_name {
             continue;
         }
+        let location = match &view {
+            Some(view) => match view.presented(&path) {
+                Some(location) => location,
+                None => continue,
+            },
+            None => path,
+        };
         skills.push(DiscoveredSkill {
             entry: SkillCatalogueEntry {
                 name: frontmatter.name,
                 description: frontmatter.description,
-                location: path,
+                location,
             },
             body_digest: whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
         });
@@ -3021,6 +3033,7 @@ mod tests {
             kind: "file_store".to_owned(),
             selector: Some(".agents/skills".to_owned()),
             writable: Some(false),
+            presented_as: None,
         }];
         let skills = discover_workspace_skills(&store.sql, "instance", Some(&resources)).unwrap();
         assert_eq!(skills.len(), 1);
@@ -7740,6 +7753,7 @@ complete result { count count } }
             kind: "file_store".to_owned(),
             selector: Some(".agents/skills/theo".to_owned()),
             writable: Some(false),
+            presented_as: None,
         }];
         let driver = DoInstanceDriver {
             now_unix_ms: 0,

@@ -46,6 +46,19 @@ pub struct ShellRequest {
     pub command: String,
     pub files: Vec<ShellFile>,
     pub timeout: Duration,
+    /// Workspace-relative paths of presented file-store roots (DR-0148). Each
+    /// exists as a directory even when empty; the shell cannot create or
+    /// remove one, and a `mv` of one is reported as a rename, not a move.
+    pub presented_roots: Vec<String>,
+}
+
+/// A presented root the command renamed, in the order it renamed them. Paths
+/// are workspace-relative presented paths; the host's resolver admits or
+/// refuses each as part of validating the result.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShellRootRename {
+    pub from: String,
+    pub to: String,
 }
 
 /// One file the interpreter READ while running the command.
@@ -77,7 +90,13 @@ pub struct ShellOutput {
     /// ordered deterministically. A file read twice with the same contents is
     /// one entry; read, rewritten, and read again is two, which is the honest
     /// answer about what the command actually saw.
+    ///
+    /// A read inside a presented root the command renamed is recorded under
+    /// the name the root had when the command started, so a host maps every
+    /// read through the view it supplied.
     pub reads: Vec<ShellRead>,
+    /// Presented roots the command renamed (DR-0148), in order.
+    pub renames: Vec<ShellRootRename>,
 }
 
 /// WhippleScript-owned adapter around the pinned Bashkit dependency.
@@ -145,8 +164,15 @@ impl WhipShell {
                 if file.writable { 0o644 } else { 0o444 },
             );
         }
+        let mut presented_roots = Vec::with_capacity(request.presented_roots.len());
+        for root in &request.presented_roots {
+            let root = crate::file_view::normalize_presented_path(root)?;
+            let absolute = Path::new(WORKSPACE).join(&root);
+            fs.add_dir(&absolute, 0o755);
+            presented_roots.push(absolute);
+        }
 
-        let recorder = Arc::new(RecordingFs::new(fs));
+        let recorder = Arc::new(RecordingFs::new(fs, presented_roots));
 
         let limits = ExecutionLimits::new()
             .timeout(request.timeout)
@@ -179,25 +205,26 @@ impl WhipShell {
             // the whole workspace as read by the command.
             let reads = recorder.take_reads();
             let files = collect_workspace(&bash_fs).await?;
-            Ok::<_, String>((result, files, reads))
+            Ok::<_, String>((result, files, reads, recorder.take_renames()))
         };
         // Native Bashkit arms Tokio's wall-clock timeout. The Cloudflare build
         // intentionally uses Bashkit's WASM path, which relies on structural
         // command/loop/fuel limits and does not require a timer reactor.
         #[cfg(not(target_family = "wasm"))]
-        let (result, files, reads) = tokio::runtime::Builder::new_current_thread()
+        let (result, files, reads, renames) = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .map_err(|error| format!("cannot start virtual bash runtime: {error}"))?
             .block_on(execution)?;
         #[cfg(target_family = "wasm")]
-        let (result, files, reads) = futures::executor::block_on(execution)?;
+        let (result, files, reads, renames) = futures::executor::block_on(execution)?;
         Ok(ShellOutput {
             stdout: result.stdout.text_lossy().into_owned(),
             stderr: result.stderr.text_lossy().into_owned(),
             exit_code: result.exit_code,
             files,
             reads,
+            renames,
         })
     }
 }
@@ -219,17 +246,110 @@ struct RecordingFs {
     /// reads one file in a loop records one entry and two runs of the same
     /// command record byte-identical sets.
     reads: Mutex<BTreeSet<ShellRead>>,
+    /// Each presented root as `(path when the command started, current path)`,
+    /// both absolute (DR-0148).
+    roots: Mutex<Vec<(PathBuf, PathBuf)>>,
+    renames: Mutex<Vec<ShellRootRename>>,
 }
 
 impl RecordingFs {
-    fn new(inner: Arc<InMemoryFs>) -> Self {
+    fn new(inner: Arc<InMemoryFs>, presented_roots: Vec<PathBuf>) -> Self {
         Self {
             inner,
             reads: Mutex::new(BTreeSet::new()),
+            roots: Mutex::new(
+                presented_roots
+                    .into_iter()
+                    .map(|root| (root.clone(), root))
+                    .collect(),
+            ),
+            renames: Mutex::new(Vec::new()),
         }
     }
 
+    fn current_roots(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether `path` is a presented root or a directory above one.
+    fn holds_a_root(&self, path: &Path) -> bool {
+        self.current_roots()
+            .iter()
+            .any(|(_, current)| current.starts_with(path))
+    }
+
+    fn take_renames(&self) -> Vec<ShellRootRename> {
+        std::mem::take(
+            &mut *self
+                .renames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// Rename the presented root at `from`, which `mv` reached as one
+    /// `rename()`. Only the root's name changes; the host decides whether the
+    /// rename is admitted when it validates the result.
+    async fn rename_root(&self, from: &Path, to: &Path) -> bashkit::Result<()> {
+        let relative = to
+            .strip_prefix(WORKSPACE)
+            .ok()
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if crate::file_view::normalize_presented_path(&relative).is_err() {
+            return Err(invalid_root_rename());
+        }
+        let roots = self.current_roots();
+        if roots.iter().any(|(_, current)| {
+            current != from && (current.starts_with(to) || to.starts_with(current))
+        }) {
+            return Err(busy());
+        }
+        if self.inner.exists(to).await? {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
+            );
+        }
+        self.inner.rename(from, to).await?;
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(root) = roots.iter_mut().find(|(_, current)| current == from) {
+            root.1 = to.to_path_buf();
+        }
+        drop(roots);
+        let workspace_relative = |path: &Path| {
+            path.strip_prefix(WORKSPACE)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        self.renames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(ShellRootRename {
+                from: workspace_relative(from),
+                to: relative,
+            });
+        Ok(())
+    }
+
     fn record(&self, path: &Path, content: &[u8]) {
+        // A read inside a renamed root is recorded under the root's original
+        // name: that is the name the host's view resolves.
+        let original = self
+            .current_roots()
+            .into_iter()
+            .find_map(|(original, current)| {
+                path.strip_prefix(&current)
+                    .ok()
+                    .map(|rest| original.join(rest))
+            });
+        let path = original.as_deref().unwrap_or(path);
         let path = path
             .strip_prefix(WORKSPACE)
             .unwrap_or(path)
@@ -319,8 +439,25 @@ impl FileSystem for RecordingFs {
         self.inner.mkdir(path, recursive).await
     }
 
+    /// A presented root, or a directory above one, is never removed. A
+    /// recursive removal takes everything beneath it and then reports the root
+    /// busy, as removing a mount point does.
     async fn remove(&self, path: &Path, recursive: bool) -> bashkit::Result<()> {
-        self.inner.remove(path, recursive).await
+        if !self.holds_a_root(path) {
+            return self.inner.remove(path, recursive).await;
+        }
+        if recursive {
+            for entry in self.inner.read_dir(path).await? {
+                let child = path.join(&entry.name);
+                match self.remove(&child, true).await {
+                    Ok(()) => {}
+                    Err(bashkit::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::ResourceBusy => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(busy())
     }
 
     async fn stat(&self, path: &Path) -> bashkit::Result<Metadata> {
@@ -336,6 +473,16 @@ impl FileSystem for RecordingFs {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> bashkit::Result<()> {
+        let roots = self.current_roots();
+        if roots.iter().any(|(_, current)| current == from) {
+            return self.rename_root(from, to).await;
+        }
+        if roots
+            .iter()
+            .any(|(_, current)| current.starts_with(from) || current.starts_with(to))
+        {
+            return Err(busy());
+        }
         self.inner.rename(from, to).await
     }
 
@@ -358,6 +505,18 @@ impl FileSystem for RecordingFs {
     async fn set_modified_time(&self, path: &Path, time: SystemTime) -> bashkit::Result<()> {
         self.inner.set_modified_time(path, time).await
     }
+}
+
+fn busy() -> bashkit::Error {
+    std::io::Error::new(std::io::ErrorKind::ResourceBusy, "Device or resource busy").into()
+}
+
+fn invalid_root_rename() -> bashkit::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "a presented root can only be renamed within the workspace",
+    )
+    .into()
 }
 
 fn validated_relative_path(path: &str) -> Result<PathBuf, String> {
@@ -438,6 +597,7 @@ mod tests {
                     writable: true,
                 }],
                 timeout: Duration::from_secs(5),
+                presented_roots: Vec::new(),
             })
             .expect("virtual bash");
         assert_eq!(output.exit_code, 0);
@@ -451,6 +611,7 @@ mod tests {
                 command: "definitely-not-a-bashkit-command".to_owned(),
                 files: vec![],
                 timeout: Duration::from_secs(5),
+                presented_roots: Vec::new(),
             })
             .expect("honest shell result");
         assert_ne!(output.exit_code, 0);
@@ -471,6 +632,7 @@ mod tests {
                 command: command.to_owned(),
                 files,
                 timeout: Duration::from_secs(5),
+                presented_roots: Vec::new(),
             })
             .expect("virtual bash")
     }
@@ -568,6 +730,98 @@ mod tests {
         assert_eq!(output.reads.len(), 1, "got: {:?}", output.reads);
     }
 
+    fn run_presented(command: &str, files: Vec<ShellFile>, roots: &[&str]) -> ShellOutput {
+        WhipShell::default()
+            .execute(ShellRequest {
+                command: command.to_owned(),
+                files,
+                timeout: Duration::from_secs(5),
+                presented_roots: roots.iter().map(|root| (*root).to_owned()).collect(),
+            })
+            .expect("virtual bash")
+    }
+
+    #[test]
+    fn a_presented_root_exists_even_when_it_is_empty() {
+        let output = run_presented(
+            "ls",
+            vec![file("api/main.rs", "fn main() {}\n")],
+            &["api", "web"],
+        );
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "api\nweb\n");
+    }
+
+    #[test]
+    fn moving_a_presented_root_is_a_rename_later_commands_see() {
+        let output = run_presented(
+            "mv api backend && cat backend/main.rs && ls",
+            vec![file("api/main.rs", "body\n")],
+            &["api"],
+        );
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "body\nbackend\n");
+        assert_eq!(
+            output.renames,
+            vec![ShellRootRename {
+                from: "api".into(),
+                to: "backend".into(),
+            }]
+        );
+        assert_eq!(
+            output.files.get("backend/main.rs"),
+            Some(&b"body\n".to_vec())
+        );
+        // The read happened under the new name and is recorded under the
+        // original one, which is the name the host's view resolves.
+        let reads = output
+            .reads
+            .iter()
+            .map(|read| read.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(reads, vec!["api/main.rs"]);
+    }
+
+    #[test]
+    fn a_presented_root_cannot_be_moved_into_another_or_onto_a_file() {
+        let output = run_presented(
+            "mv api web; echo $?",
+            vec![file("api/a", "a\n"), file("web/b", "b\n")],
+            &["api", "web"],
+        );
+        assert_eq!(output.stdout, "1\n", "moving into another root is refused");
+        assert!(output.renames.is_empty());
+        let output = run_presented(
+            "mv notes.txt api; echo $?",
+            vec![file("notes.txt", "n\n"), file("api/a", "a\n")],
+            &["api"],
+        );
+        assert_eq!(output.stdout, "0\n", "a file moves into a root as usual");
+        assert_eq!(output.files.get("api/notes.txt"), Some(&b"n\n".to_vec()));
+    }
+
+    #[test]
+    fn removing_a_presented_root_empties_it_and_reports_it_busy() {
+        // `rm -r`, because Bashkit's `-f` discards every removal error.
+        let output = run_presented(
+            "rm -r api; echo $?; ls",
+            vec![file("api/a", "a\n"), file("api/deep/b", "b\n")],
+            &["api"],
+        );
+        assert!(output.stdout.starts_with("1\n"), "{}", output.stdout);
+        assert!(
+            output.stdout.ends_with("api\n"),
+            "the root remains: {}",
+            output.stdout
+        );
+        assert!(
+            output.files.is_empty(),
+            "its contents are gone: {:?}",
+            output.files
+        );
+        assert!(output.renames.is_empty());
+    }
+
     #[test]
     fn fixes_the_shell_clock_for_replay() {
         let output = WhipShell::default()
@@ -575,6 +829,7 @@ mod tests {
                 command: "date +%s".to_owned(),
                 files: vec![],
                 timeout: Duration::from_secs(5),
+                presented_roots: Vec::new(),
             })
             .expect("virtual bash");
         assert_eq!(output.stdout, "0\n");

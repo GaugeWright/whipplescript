@@ -517,6 +517,7 @@ where
                         kind: "resolution_memory".into(),
                         selector: Some(serde_json::to_string(&scope).expect("scope")),
                         writable: Some(true),
+                        presented_as: None,
                     },
                     basis: ActionBasis::Version {
                         version_ref: scope.version_ref(),

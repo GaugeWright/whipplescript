@@ -276,6 +276,7 @@ fn run<S, B, C>(
                     kind: "file_store".into(),
                     selector: Some(target_selector(&binding, enveloped)),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: "base".into(),

@@ -190,6 +190,7 @@ fn prepare_source_with_custody<
                 kind: "tracker".into(),
                 selector: Some("tutorials".into()),
                 writable: Some(true),
+                presented_as: None,
             },
             basis: ActionBasis::Version {
                 version_ref: "tracker-incarnation:1".into(),

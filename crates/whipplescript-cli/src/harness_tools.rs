@@ -2225,6 +2225,7 @@ impl FileToolExecutor {
             command: command.to_owned(),
             files,
             timeout,
+            presented_roots: Vec::new(),
         })?;
         self.workspace_reads
             .lock()

@@ -258,6 +258,7 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
                     kind: "file_store".into(),
                     selector: Some("target".into()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Absent,
                 label_ref: "private".into(),

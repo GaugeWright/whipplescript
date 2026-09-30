@@ -26,6 +26,7 @@ pub mod exec_reconciliation;
 pub mod exec_resolution;
 pub mod file_lease;
 mod file_settlement;
+pub mod file_view;
 pub mod gov;
 pub mod harness;
 pub mod harness_loop;

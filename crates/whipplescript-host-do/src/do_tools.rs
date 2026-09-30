@@ -31,6 +31,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use whipplescript_kernel::effect_handlers::glob_match;
+use whipplescript_kernel::file_view::{
+    is_within, normalize_stored_path, FileView, RootRename, ViewResolution,
+};
 use whipplescript_kernel::harness_loop::{
     ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
@@ -146,7 +149,15 @@ pub struct DoToolExecutor<Sql: DoSql> {
     model_scan_witnesses: std::sync::Mutex<BTreeMap<String, DoScanWitness>>,
     sql: Rc<Sql>,
     key_prefix: String,
-    file_scopes: Option<Vec<DoFileScope>>,
+    /// The admitted file stores as the model sees them (DR-0148). `None` keeps
+    /// the legacy whole-workspace scope of an authored turn.
+    file_view: Option<FileView>,
+    /// Renames of presented roots admitted this turn, applied to every later
+    /// call while its references still present the old name.
+    root_renames: std::sync::Mutex<Vec<RootRename>>,
+    /// The embedding host's admission of a presented-root rename. Without one,
+    /// a rename is refused.
+    rename_admission: Option<Box<RenameAdmission>>,
     external_tools: BTreeMap<String, String>,
     workspace_source: Option<String>,
     /// The running turn's result contract, installed by the host before the
@@ -155,10 +166,24 @@ pub struct DoToolExecutor<Sql: DoSql> {
     result_contract: std::sync::Mutex<Option<ResultContract>>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DoFileScope {
-    root: String,
-    writable: bool,
+type RenameAdmission = dyn Fn(&RootRename) -> Result<(), String>;
+
+/// The keys a listing or search covers (see `DoToolExecutor::searched`).
+struct Searched {
+    /// Each admitted key with the path the model sees.
+    keys: Vec<(String, String)>,
+    /// The stored root and key prefix an exact witness is attested against.
+    witness: Option<(String, String)>,
+    /// The entries of a directory that exists only in the view.
+    entries: Option<Vec<String>>,
+}
+
+/// What a model path names in the flat key space.
+enum DoTarget {
+    /// A stored key or directory prefix inside an admitted root.
+    Stored(String),
+    /// A directory that exists only in the view, as its normalized model path.
+    Synthetic(String),
 }
 
 struct DoScanWitness {
@@ -174,7 +199,9 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             model_scan_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: String::new(),
-            file_scopes: None,
+            file_view: None,
+            root_renames: std::sync::Mutex::new(Vec::new()),
+            rename_admission: None,
             external_tools: BTreeMap::new(),
             workspace_source: None,
             result_contract: std::sync::Mutex::new(None),
@@ -188,7 +215,9 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             model_scan_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: format!("{instance_id}/"),
-            file_scopes: None,
+            file_view: None,
+            root_renames: std::sync::Mutex::new(Vec::new()),
+            rename_admission: None,
             external_tools: BTreeMap::new(),
             workspace_source: None,
             result_contract: std::sync::Mutex::new(None),
@@ -206,21 +235,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// current host turn. A missing selector keeps the legacy whole-workspace
     /// scope; `writable: false` attenuates every mutating tool, including bash.
     pub fn with_resources(mut self, resources: &[ResourceRef]) -> Result<Self, String> {
-        let mut scopes = resources
-            .iter()
-            .filter(|resource| resource.kind == "file_store")
-            .map(|resource| {
-                Ok(DoFileScope {
-                    root: match resource.selector.as_deref() {
-                        Some(selector) => normalize_workspace_path(selector)?,
-                        None => String::new(),
-                    },
-                    writable: resource.writable.unwrap_or(true),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        scopes.sort();
-        scopes.dedup();
+        let view = FileView::from_resources(resources)?;
         let external_handles = resources
             .iter()
             .filter(|resource| resource.kind == "external_tool")
@@ -228,8 +243,47 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .collect::<BTreeSet<_>>();
         self.external_tools
             .retain(|_, capability| external_handles.contains(capability.as_str()));
-        self.file_scopes = Some(scopes);
+        self.file_view = Some(view);
         Ok(self)
+    }
+
+    /// Admit or refuse each rename of a presented root that a `bash` command
+    /// makes (DR-0148). A refusal refuses the whole command before any row
+    /// changes. Without an admission, every rename is refused.
+    pub fn with_root_rename_admission(
+        mut self,
+        admit: impl Fn(&RootRename) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.rename_admission = Some(Box::new(admit));
+        self
+    }
+
+    /// This call's view: the admitted stores with this turn's admitted renames.
+    fn view(&self) -> Result<Option<FileView>, String> {
+        let Some(view) = &self.file_view else {
+            return Ok(None);
+        };
+        let mut view = view.clone();
+        view.apply_renames(
+            &self
+                .root_renames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )?;
+        Ok(Some(view))
+    }
+
+    /// The path an error names: the model's path, normalized.
+    fn shown(path: &str) -> String {
+        normalize_workspace_path(path).unwrap_or_else(|_| path.to_owned())
+    }
+
+    /// Where a stored key appears to the model.
+    fn presented(view: Option<&FileView>, key: &str) -> Option<String> {
+        match view {
+            Some(view) => view.presented(key),
+            None => Some(key.to_owned()),
+        }
     }
 
     pub fn with_external_tools(mut self, bindings: &[(String, String)]) -> Self {
@@ -237,28 +291,50 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         self
     }
 
-    fn path_access(&self, path: &str, write: bool) -> Result<String, String> {
-        let normalized = normalize_workspace_path(path)?;
-        let Some(scopes) = &self.file_scopes else {
-            return Ok(normalized);
+    /// Resolve a model path in `view`, or as itself in the legacy scope.
+    fn target_in(view: Option<&FileView>, path: &str, write: bool) -> Result<DoTarget, String> {
+        let Some(view) = view else {
+            return Ok(DoTarget::Stored(normalize_workspace_path(path)?));
         };
-        let matching = scopes
-            .iter()
-            .filter(|scope| path_is_within(&normalized, &scope.root))
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            return Err(format!(
+        match view.resolve(path)? {
+            ViewResolution::Stored { stored, writable } => {
+                if write && !writable {
+                    return Err(format!("workspace path `{path}` is read-only"));
+                }
+                Ok(DoTarget::Stored(stored))
+            }
+            ViewResolution::Synthetic if !write => {
+                Ok(DoTarget::Synthetic(normalize_stored_path(path)?))
+            }
+            ViewResolution::Synthetic => Err(format!(
                 "workspace path `{path}` is outside the admitted file-store selectors"
-            ));
+            )),
         }
-        if write && !matching.iter().any(|scope| scope.writable) {
-            return Err(format!("workspace path `{path}` is read-only"));
-        }
-        Ok(normalized)
     }
 
-    fn path_writable(&self, path: &str) -> bool {
-        self.path_access(path, true).is_ok()
+    fn access_in(view: Option<&FileView>, path: &str, write: bool) -> Result<String, String> {
+        match Self::target_in(view, path, write)? {
+            DoTarget::Stored(stored) => Ok(stored),
+            DoTarget::Synthetic(_) => Err(format!("workspace path `{path}` is a directory")),
+        }
+    }
+
+    /// The stored key for a model path, refusing a directory that exists only
+    /// in the view.
+    fn path_access(&self, path: &str, write: bool) -> Result<String, String> {
+        Self::access_in(self.view()?.as_ref(), path, write)
+    }
+
+    fn stored_admitted(&self, key: &str) -> bool {
+        self.file_view
+            .as_ref()
+            .is_none_or(|view| view.admits_stored(key))
+    }
+
+    fn path_writable(&self, key: &str) -> bool {
+        self.file_view
+            .as_ref()
+            .is_none_or(|view| view.writable_stored(key))
     }
 
     fn storage_key(&self, path: &str) -> String {
@@ -356,7 +432,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Ok(rows
             .iter()
             .map(|row| as_text(&row[0]))
-            .filter(|key| self.path_access(key, false).is_ok())
+            .filter(|key| self.stored_admitted(key))
             .collect())
     }
 
@@ -397,7 +473,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Ok(rows
             .iter()
             .map(|row| (as_text(&row[0]), as_text(&row[1])))
-            .filter(|(key, _)| self.path_access(key, false).is_ok())
+            .filter(|(key, _)| self.stored_admitted(key))
             .collect())
     }
 
@@ -408,56 +484,104 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .and_then(Value::as_u64)
             .unwrap_or(30)
             .clamp(1, 30);
+        let view = self.view()?;
         let workspace = self.all_files(None)?;
+        // The shell sees each admitted file at the path the model sees.
         let mut before = BTreeMap::new();
         let mut files = Vec::with_capacity(workspace.len());
         for (key, content) in workspace {
+            let Some(presented) = Self::presented(view.as_ref(), &key) else {
+                continue;
+            };
             let writable = self.path_writable(&key);
-            before.insert(key.clone(), content.clone().into_bytes());
             files.push(ShellFile {
-                path: key,
-                content: content.into_bytes(),
+                path: presented,
+                content: content.clone().into_bytes(),
                 writable,
             });
+            before.insert(key, content.into_bytes());
         }
 
         let mut output = WhipShell::default().execute(ShellRequest {
             command: command.to_owned(),
             files,
             timeout: Duration::from_secs(timeout),
+            presented_roots: view
+                .as_ref()
+                .map(FileView::presented_roots)
+                .unwrap_or_default(),
         })?;
+        // Reads carry the names the command started with; a record keeps the
+        // selector of a presented root.
+        if let Some(view) = view.as_ref().filter(|view| view.presents()) {
+            for read in &mut output.reads {
+                if let Ok(ViewResolution::Stored { stored, .. }) = view.resolve(&read.path) {
+                    read.path = stored;
+                }
+            }
+        }
         self.workspace_reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .append(&mut output.reads);
 
-        // Validate the complete result before importing any delta. The v1 DO
-        // file plane is UTF-8 text; a binary result fails honestly instead of
-        // corrupting the flat SQLite representation.
+        // Validate the complete result before importing any delta: each
+        // rename of a presented root, then every changed, added or removed
+        // key. The v1 DO file plane is UTF-8 text; a binary result fails
+        // honestly instead of corrupting the flat SQLite representation.
+        let mut after_view = view.clone();
+        let mut renames = Vec::with_capacity(output.renames.len());
+        for rename in &output.renames {
+            let Some(renamed) = after_view.as_mut() else {
+                return Err(format!(
+                    "`{}` is not a presented file-store root",
+                    rename.from
+                ));
+            };
+            let admitted = renamed.rename(&rename.from, &rename.to)?;
+            renamed.apply_renames(std::slice::from_ref(&admitted))?;
+            renames.push(admitted);
+        }
         let mut after = BTreeMap::new();
         for (path, bytes) in output.files {
             let content = String::from_utf8(bytes)
                 .map_err(|_| format!("bash produced binary workspace file `{path}`"))?;
-            after.insert(path, content);
+            let key = Self::access_in(after_view.as_ref(), &path, false).map_err(|_| {
+                format!("workspace path `{path}` is outside the admitted file-store selectors")
+            })?;
+            if before.get(&key).map(Vec::as_slice) != Some(content.as_bytes()) {
+                Self::access_in(after_view.as_ref(), &path, true)?;
+            }
+            after.insert(key, content);
         }
-        let remaining = after.keys().cloned().collect::<BTreeSet<_>>();
-        for (path, content) in &after {
-            if before.get(path).map(Vec::as_slice) != Some(content.as_bytes()) {
-                self.path_access(path, true)?;
+        for removed in before.keys().filter(|key| !after.contains_key(*key)) {
+            let shown = Self::presented(view.as_ref(), removed).unwrap_or_else(|| removed.clone());
+            Self::access_in(view.as_ref(), &shown, true)?;
+        }
+        for rename in &renames {
+            match &self.rename_admission {
+                Some(admit) => admit(rename)?,
+                None => {
+                    return Err(format!(
+                        "renaming `{}` is not supported by this workspace host",
+                        rename.from
+                    ))
+                }
             }
         }
-        for removed in before.keys().filter(|path| !remaining.contains(*path)) {
-            self.path_access(removed, true)?;
-        }
+        self.root_renames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(renames);
         // The complete delta is now known to be admitted. Only now may any
         // SQLite row change, so one invalid shell output cannot leave a partial
         // multi-root mutation behind.
-        for (path, content) in &after {
-            if before.get(path).map(Vec::as_slice) != Some(content.as_bytes()) {
-                self.store_file(path, content)?;
+        for (key, content) in &after {
+            if before.get(key).map(Vec::as_slice) != Some(content.as_bytes()) {
+                self.store_file(key, content)?;
             }
         }
-        for removed in before.keys().filter(|path| !remaining.contains(*path)) {
+        for removed in before.keys().filter(|key| !after.contains_key(*key)) {
             let storage_key = self.storage_key(removed);
             self.sql
                 .execute(
@@ -480,9 +604,11 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     fn read(&self, call_id: &str, args: &Value) -> Result<String, String> {
-        let path = self.path_access(str_arg(args, "path")?, false)?;
+        let requested = str_arg(args, "path")?;
+        let key = self.path_access(requested, false)?;
+        let path = Self::shown(requested);
         let content = self
-            .file_content(&path)?
+            .file_content(&key)?
             .ok_or_else(|| format!("no such file: {path}"))?;
         // Binary guard (pi-conformance): a NUL byte in the head means this is not
         // text — refuse with a clean error rather than emit garbage.
@@ -499,7 +625,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .insert(
                 call_id.to_owned(),
                 (
-                    path,
+                    key,
                     whipplescript_store::stable_hash_bytes_hex(content.as_bytes()),
                 ),
             );
@@ -507,20 +633,24 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
-        let path = self.path_access(str_arg(args, "path")?, true)?;
+        let requested = str_arg(args, "path")?;
+        let key = self.path_access(requested, true)?;
+        let path = Self::shown(requested);
         let content = str_arg(args, "content")?;
-        self.store_file(&path, content)?;
+        self.store_file(&key, content)?;
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
     fn edit(&self, args: &Value) -> Result<String, String> {
-        let path = self.path_access(str_arg(args, "path")?, true)?;
+        let requested = str_arg(args, "path")?;
+        let key = self.path_access(requested, true)?;
+        let path = Self::shown(requested);
         let edits_value = edits_argument(args)?;
         let edits = edits_value
             .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
         let mut content = self
-            .file_content(&path)?
+            .file_content(&key)?
             .ok_or_else(|| format!("no such file: {path}"))?;
         // A UTF-8 BOM is invisible in the model's view: strip it before matching
         // so an edit anchored at the file start applies, restore it on write.
@@ -576,37 +706,94 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         } else {
             content
         };
-        self.store_file(&path, &output)?;
+        self.store_file(&key, &output)?;
         Ok(format!("applied {applied} edit(s) to {path}"))
+    }
+
+    /// The admitted keys a listing or search covers, each with the path the
+    /// model sees, and — when the path is inside one admitted root — the
+    /// stored root and key prefix its exact witness is attested against. A
+    /// directory that exists only in the view has no single stored root, so
+    /// its results keep the coarse source.
+    fn searched(&self, requested: &str) -> Result<Searched, String> {
+        let view = self.view()?;
+        let keys = self.all_keys()?;
+        match Self::target_in(view.as_ref(), requested, false)? {
+            DoTarget::Stored(admitted) => {
+                let prefix = directory_prefix(&admitted);
+                let keys = keys
+                    .into_iter()
+                    .filter(|key| key.starts_with(&prefix))
+                    .filter_map(|key| {
+                        Self::presented(view.as_ref(), &key).map(|presented| (key, presented))
+                    })
+                    .collect();
+                Ok(Searched {
+                    keys,
+                    witness: Some((admitted, prefix)),
+                    entries: None,
+                })
+            }
+            DoTarget::Synthetic(directory) => {
+                let view = view.expect("only a view has synthetic directories");
+                let entries = view
+                    .children(&directory)
+                    .into_iter()
+                    .map(|entry| match entry.root {
+                        Some(stored) if keys.contains(&stored) => entry.name,
+                        _ => format!("{}/", entry.name),
+                    })
+                    .collect();
+                let keys = keys
+                    .into_iter()
+                    .filter_map(|key| {
+                        view.presented(&key)
+                            .filter(|presented| is_within(presented, &directory))
+                            .map(|presented| (key, presented))
+                    })
+                    .collect();
+                Ok(Searched {
+                    keys,
+                    witness: None,
+                    entries: Some(entries),
+                })
+            }
+        }
     }
 
     /// List `files` keys under a prefix (flat-key `ls`): keys starting with the
     /// given path, or all keys when none is given. Sorted, capped.
     fn ls(&self, call_id: &str, args: &Value) -> Result<String, String> {
-        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(&admitted);
+        let searched = self.searched(optional_str_arg(args, "path").unwrap_or("."))?;
         let limit = usize_arg(args, "limit").unwrap_or(500);
-        let mut entries = BTreeSet::new();
-        let searched: Vec<String> = self
-            .all_keys()?
-            .into_iter()
-            .filter(|key| key.starts_with(&prefix))
-            .collect();
-        for key in &searched {
-            let relative = key.strip_prefix(&prefix).expect("filtered prefix");
-            if relative.is_empty() {
-                continue;
-            }
-            match relative.split_once('/') {
-                Some((directory, _)) => {
-                    entries.insert(format!("{directory}/"));
+        let entries = match (&searched.entries, &searched.witness) {
+            (Some(entries), _) => entries.iter().cloned().collect::<BTreeSet<_>>(),
+            (None, Some((admitted, prefix))) => {
+                let mut entries = BTreeSet::new();
+                for (key, _) in &searched.keys {
+                    let relative = key.strip_prefix(prefix.as_str()).expect("filtered prefix");
+                    if relative.is_empty() {
+                        continue;
+                    }
+                    match relative.split_once('/') {
+                        Some((directory, _)) => {
+                            entries.insert(format!("{directory}/"));
+                        }
+                        None => {
+                            entries.insert(relative.to_owned());
+                        }
+                    }
                 }
-                None => {
-                    entries.insert(relative.to_owned());
-                }
+                let keys = searched
+                    .keys
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                self.attest_key_listing(call_id, admitted, prefix, &keys);
+                entries
             }
-        }
-        self.attest_key_listing(call_id, &admitted, &prefix, &searched);
+            (None, None) => BTreeSet::new(),
+        };
         Ok(entries
             .into_iter()
             .take(limit)
@@ -615,25 +802,28 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     /// Find `files` keys matching a glob pattern (flat-key `find`): the classic
-    /// `*`-wildcard match over the key, optionally prefix-filtered by `path`.
+    /// `*`-wildcard match over the path the model sees, optionally narrowed by
+    /// `path`.
     fn find(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(&admitted);
+        let searched = self.searched(optional_str_arg(args, "path").unwrap_or("."))?;
         let limit = usize_arg(args, "limit").unwrap_or(1000);
-        let searched: Vec<String> = self
-            .all_keys()?
-            .into_iter()
-            .filter(|key| key.starts_with(&prefix))
-            .collect();
         let mut hits: Vec<String> = searched
+            .keys
             .iter()
-            .filter(|key| glob_match(pattern, key))
-            .cloned()
+            .filter(|(_, presented)| glob_match(pattern, presented))
+            .map(|(_, presented)| presented.clone())
             .collect();
         hits.truncate(limit);
         // The filename result also depends on the files that did not match.
-        self.attest_key_listing(call_id, &admitted, &prefix, &searched);
+        if let Some((admitted, prefix)) = &searched.witness {
+            let keys = searched
+                .keys
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            self.attest_key_listing(call_id, admitted, prefix, &keys);
+        }
         if hits.is_empty() {
             Ok("No files found".to_string())
         } else {
@@ -693,8 +883,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// pasted code fragment remains searchable.
     fn grep(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(&admitted);
+        let searched = self.searched(optional_str_arg(args, "path").unwrap_or("."))?;
         let ignore_case = args
             .get("ignoreCase")
             .and_then(Value::as_bool)
@@ -707,22 +896,19 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         // cheap. The bodies then come back in a single round-trip, because in
         // the live isolate a per-file read is a separate bridge crossing that
         // JSON-marshals params and rows each time.
-        let keys: BTreeSet<String> = self
-            .all_keys()?
-            .into_iter()
-            .filter(|key| key.starts_with(&prefix))
-            .collect();
+        let keys: BTreeMap<String, String> = searched.keys.iter().cloned().collect();
+        let under = searched.witness.as_ref().map(|(_, prefix)| prefix.as_str());
         let mut hits: Vec<String> = Vec::new();
         let mut matches_found = 0usize;
         let mut searched_files = Vec::new();
         let mut scan_complete = true;
-        for (key, content) in self.all_files(Some(&prefix))? {
+        for (key, content) in self.all_files(under)? {
             if matches_found >= limit {
                 break;
             }
-            if !keys.contains(&key) {
+            let Some(presented) = keys.get(&key) else {
                 continue;
-            }
+            };
             if searched_files.len() < 128 {
                 searched_files.push((
                     key.clone(),
@@ -751,23 +937,25 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             for index in emit {
                 let line = cap_grep_line(lines[index]);
                 if matched[index] {
-                    hits.push(format!("{key}:{}:{line}", index + 1));
+                    hits.push(format!("{presented}:{}:{line}", index + 1));
                 } else {
-                    hits.push(format!("{key}-{}-{line}", index + 1));
+                    hits.push(format!("{presented}-{}-{line}", index + 1));
                 }
             }
         }
-        if scan_complete && !searched_files.is_empty() {
-            self.model_scan_witnesses
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(
-                    call_id.to_owned(),
-                    DoScanWitness {
-                        root: admitted,
-                        files: searched_files,
-                    },
-                );
+        if let Some((admitted, _)) = searched.witness {
+            if scan_complete && !searched_files.is_empty() {
+                self.model_scan_witnesses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        call_id.to_owned(),
+                        DoScanWitness {
+                            root: admitted,
+                            files: searched_files,
+                        },
+                    );
+            }
         }
         if hits.is_empty() {
             Ok("No matches".to_string())
@@ -1097,14 +1285,6 @@ fn normalize_workspace_path(path: &str) -> Result<String, String> {
         }
     }
     Ok(components.join("/"))
-}
-
-fn path_is_within(path: &str, root: &str) -> bool {
-    root.is_empty()
-        || path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Convert an optional directory argument into an unambiguous flat-key prefix.
@@ -1664,6 +1844,7 @@ mod tests {
             kind: "file_store".to_owned(),
             selector: selector.map(str::to_owned),
             writable: Some(writable),
+            presented_as: None,
         };
         let exec = executor()
             .with_resources(&[
@@ -1688,6 +1869,116 @@ mod tests {
                 "{path} is run-owned",
             );
         }
+    }
+
+    #[test]
+    fn presented_roots_are_what_the_model_sees_and_renames_need_admission() {
+        let sql = Rc::new(store().sql);
+        let seed = DoToolExecutor::new(Rc::clone(&sql));
+        for (path, content) in [
+            ("targets/t-a/src/main.rs", "fn main() {}\n"),
+            ("targets/t-b/readme.md", "fn in prose\n"),
+            (".runtime/targets.json", "{}"),
+        ] {
+            assert_eq!(
+                seed.execute(&call("write", json!({ "path": path, "content": content })))
+                    .status,
+                ToolStatus::Ok
+            );
+        }
+        let store =
+            |handle: &str, selector: &str, presented: Option<&str>, writable: bool| ResourceRef {
+                handle: handle.to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some(selector.to_owned()),
+                writable: Some(writable),
+                presented_as: presented.map(str::to_owned),
+            };
+        let resources = [
+            store("target:a", "targets/t-a", Some("api"), true),
+            store("target:b", "targets/t-b", Some("web"), false),
+            store("manifest", ".runtime/targets.json", None, false),
+        ];
+        let scoped = || {
+            DoToolExecutor::new(Rc::clone(&sql))
+                .with_resources(&resources)
+                .expect("scoped executor")
+        };
+        let ok = |exec: &DoToolExecutor<_>, name: &str, arguments: Value| {
+            let outcome = exec.execute(&call(name, arguments));
+            assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+            outcome.content
+        };
+        let refused = |exec: &DoToolExecutor<_>, name: &str, arguments: Value| {
+            let outcome = exec.execute(&call(name, arguments));
+            assert_eq!(outcome.status, ToolStatus::Error, "{}", outcome.content);
+            outcome.content
+        };
+
+        let exec = scoped();
+        assert_eq!(ok(&exec, "ls", json!({})), ".runtime/\napi/\nweb/");
+        assert_eq!(ok(&exec, "ls", json!({ "path": "api" })), "src/");
+        assert_eq!(
+            ok(&exec, "read", json!({ "path": "api/src/main.rs" })),
+            "fn main() {}"
+        );
+        let hidden = refused(&exec, "read", json!({ "path": "targets/t-a/src/main.rs" }));
+        assert!(hidden.contains("outside the admitted"), "{hidden}");
+        assert_eq!(
+            ok(&exec, "find", json!({ "pattern": "*.rs" })),
+            "api/src/main.rs"
+        );
+        assert_eq!(
+            ok(&exec, "grep", json!({ "pattern": "fn" })),
+            "api/src/main.rs:1:fn main() {}\nweb/readme.md:1:fn in prose"
+        );
+        ok(
+            &exec,
+            "write",
+            json!({ "path": "api/new.txt", "content": "n" }),
+        );
+        assert_eq!(
+            seed.file_content("targets/t-a/new.txt").unwrap().as_deref(),
+            Some("n")
+        );
+        refused(&exec, "write", json!({ "path": "web/x", "content": "x" }));
+        assert_eq!(
+            ok(
+                &exec,
+                "bash",
+                json!({ "command": "cat api/src/main.rs; ls" })
+            ),
+            "fn main() {}\napi\nweb\n"
+        );
+        let unsupported = refused(&exec, "bash", json!({ "command": "mv api backend" }));
+        assert!(unsupported.contains("not supported"), "{unsupported}");
+
+        let admitted = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = Rc::clone(&admitted);
+        let exec = scoped().with_root_rename_admission(move |rename| {
+            seen.borrow_mut().push(rename.clone());
+            Ok(())
+        });
+        ok(
+            &exec,
+            "bash",
+            json!({ "command": "mv api backend && echo b > backend/b.txt" }),
+        );
+        assert_eq!(
+            admitted.borrow().as_slice(),
+            &[RootRename {
+                handle: "target:a".into(),
+                selector: "targets/t-a".into(),
+                from: "api".into(),
+                to: "backend".into(),
+            }]
+        );
+        assert_eq!(
+            seed.file_content("targets/t-a/b.txt").unwrap().as_deref(),
+            Some("b\n")
+        );
+        assert_eq!(ok(&exec, "read", json!({ "path": "backend/b.txt" })), "b");
+        refused(&exec, "read", json!({ "path": "api/b.txt" }));
     }
 
     #[test]
@@ -2298,18 +2589,21 @@ mod tests {
                     kind: "file_store".to_owned(),
                     selector: Some("targets/t-a".to_owned()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 ResourceRef {
                     handle: "target_b".to_owned(),
                     kind: "file_store".to_owned(),
                     selector: Some("targets/t-b".to_owned()),
                     writable: Some(false),
+                    presented_as: None,
                 },
                 ResourceRef {
                     handle: "target_manifest".to_owned(),
                     kind: "file_store".to_owned(),
                     selector: Some(".runtime/targets.json".to_owned()),
                     writable: Some(false),
+                    presented_as: None,
                 },
             ])
             .expect("scoped executor");
@@ -2442,6 +2736,7 @@ mod tests {
             kind: "external_tool".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         };
         let admitted = executor()
             .with_external_tools(&bindings)
