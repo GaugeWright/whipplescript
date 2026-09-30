@@ -345,6 +345,13 @@ impl FlowingAdmissions for BranchStore {
                 "retained flowing attempt lost its witness".into(),
             ));
         };
+        if witness.source_cut_id != pin.source_cut_id
+            || witness.candidate_cut_id != pin.candidate_cut_id
+        {
+            return Err(StoreError::Conflict(
+                "retained flowing attempt differs from its witness".into(),
+            ));
+        }
         if let Some(unit_id) = missing_unit_holder(&tx, &witness)? {
             return Ok(O::UnitHolderMissing { unit_id });
         }
@@ -575,6 +582,18 @@ impl FlowingAdmissions for BranchStore {
         }
         if let Some(refusal) = certificate.admission_refusal() {
             return Ok(Refused(refusal));
+        }
+        let Some(pin) = read_attempt_pin(&tx, &request.op_id)? else {
+            return Ok(Refused(R::AttemptPinMissing));
+        };
+        if pin.witness_digest != request.candidate_witness_digest
+            || pin.source_cut_id != request.source_cut_id
+            || pin.candidate_cut_id != request.candidate_cut_id
+        {
+            return Ok(Refused(R::AttemptPinMismatch));
+        }
+        if pin.released_at.is_some() {
+            return Ok(Refused(R::AttemptPinReleased));
         }
 
         let receipt = FlowingAdmissionReceipt {
@@ -916,6 +935,15 @@ mod tests {
         request.candidate_witness_digest = witness_for(&request).digest().unwrap();
         request.certificate_handle = certificate_for(&request).handle().unwrap();
         request
+    }
+
+    fn pin_attempt(store: &mut BranchStore, request: &FlowingAdmissionRequest) {
+        assert!(matches!(
+            store
+                .retain_flowing_attempt(&request.op_id, &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
     }
 
     #[test]
@@ -1385,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_attempt_cannot_release_a_lost_witness() {
+    fn cancelled_attempt_cannot_release_a_lost_or_changed_witness() {
         let mut store = fixture();
         let witness = request("unit-a", "fixture").candidate_witness_digest;
         store
@@ -1404,6 +1432,26 @@ mod tests {
         assert!(matches!(
             store.release_cancelled_flowing_attempt("attempt-a", "t5"),
             Err(StoreError::Conflict(message)) if message.contains("lost its witness")
+        ));
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        store
+            .record_candidate_witness(&witness_for(&request("unit-a", "fixture")))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET source_cut_id = 'other' WHERE op_id = 'attempt-a'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.release_cancelled_flowing_attempt("attempt-a", "t6"),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its witness")
         ));
         assert!(store
             .flowing_attempt_pin("attempt-a")
@@ -1437,6 +1485,49 @@ mod tests {
             .released_at
             .is_none());
         assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn native_cas_requires_the_live_pin_for_its_exact_attempt_and_witness() {
+        let mut store = fixture();
+        let request = request("unit-a", "fixture");
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinMissing)
+        );
+        pin_attempt(&mut store, &request);
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET witness_digest = 'different' WHERE op_id = ?1",
+                [&request.op_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinMismatch)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET witness_digest = ?2, released_at = 't4' WHERE op_id = ?1",
+                [&request.op_id, &request.candidate_witness_digest],
+            )
+            .unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinReleased)
+        );
+        assert!(store
+            .flowing_admission_receipt(&request.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
     }
 
     #[test]
@@ -1564,6 +1655,7 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+        pin_attempt(&mut store, &request("unit-a", "admission-b"));
         assert!(matches!(
             store
                 .admit_flowing_prefix(&request("unit-a", "admission-b"))
@@ -1576,6 +1668,7 @@ mod tests {
     fn cancellation_after_cas_reports_the_landed_receipt() {
         let mut store = fixture();
         let admission = request("unit-a", "admission-a");
+        pin_attempt(&mut store, &admission);
         let admitted = store.admit_flowing_prefix(&admission).unwrap();
         let FlowingAdmissionOutcome::Admitted(receipt) = admitted else {
             panic!("admission should land")
@@ -1624,6 +1717,7 @@ mod tests {
             .connection
             .execute_batch("DROP TRIGGER reject_cancel")
             .unwrap();
+        pin_attempt(&mut store, &request("unit-a", "admission-a"));
         assert!(matches!(
             store
                 .admit_flowing_prefix(&request("unit-a", "admission-a"))
@@ -1656,6 +1750,7 @@ mod tests {
             .is_err());
 
         let mut admitted_store = fixture();
+        pin_attempt(&mut admitted_store, &request("unit-a", "admission-b"));
         admitted_store
             .admit_flowing_prefix(&request("unit-a", "admission-b"))
             .unwrap();
@@ -1681,6 +1776,7 @@ mod tests {
     fn trunk_cas_and_unit_accounting_share_one_ref_entry() {
         let mut store = fixture();
         let first = request("unit-a", "admission-a");
+        pin_attempt(&mut store, &first);
         let FlowingAdmissionOutcome::Admitted(receipt) =
             store.admit_flowing_prefix(&first).unwrap()
         else {
@@ -1731,6 +1827,7 @@ mod tests {
             "metadata-only admission still needs the exact gate"
         );
         record_gate_certificate(&store, &no_op);
+        pin_attempt(&mut store, &no_op);
         store
             .record_cut(CutRecord {
                 cut_id: "spurious-cut",
@@ -1799,6 +1896,7 @@ mod tests {
         request.expected_eligibility_epoch = 2;
         request.certificate_handle = certificate_for(&request).handle().unwrap();
         record_gate_certificate(&store, &request);
+        pin_attempt(&mut store, &request);
         store
             .connection
             .execute_batch(

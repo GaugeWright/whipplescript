@@ -331,6 +331,13 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
                     "retained flowing attempt lost its witness".into(),
                 ));
             };
+            if witness.source_cut_id != pin.source_cut_id
+                || witness.candidate_cut_id != pin.candidate_cut_id
+            {
+                return Err(StoreError::Conflict(
+                    "retained flowing attempt differs from its witness".into(),
+                ));
+            }
             if let Some(unit_id) = self.missing_attempt_unit_holder(&witness)? {
                 return Ok(O::UnitHolderMissing { unit_id });
             }
@@ -556,6 +563,18 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
             }
             if let Some(refusal) = certificate.admission_refusal() {
                 return Ok(Refused(refusal));
+            }
+            let Some(pin) = read_attempt_pin(&self.sql, &request.op_id)? else {
+                return Ok(Refused(R::AttemptPinMissing));
+            };
+            if pin.witness_digest != request.candidate_witness_digest
+                || pin.source_cut_id != request.source_cut_id
+                || pin.candidate_cut_id != request.candidate_cut_id
+            {
+                return Ok(Refused(R::AttemptPinMismatch));
+            }
+            if pin.released_at.is_some() {
+                return Ok(Refused(R::AttemptPinReleased));
             }
 
             let receipt = FlowingAdmissionReceipt {
@@ -878,6 +897,15 @@ mod tests {
         request
     }
 
+    fn pin_attempt(store: &mut DoBranches<Sql>, request: &FlowingAdmissionRequest) {
+        assert!(matches!(
+            store
+                .retain_flowing_attempt(&request.op_id, &request.candidate_witness_digest, "t3")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+    }
+
     #[test]
     fn hosted_ref_requires_the_recorded_complete_candidate_witness() {
         let (_, mut store) = fixture();
@@ -1124,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_cancelled_attempt_cannot_release_a_lost_witness() {
+    fn hosted_cancelled_attempt_cannot_release_a_lost_or_changed_witness() {
         let (sql, mut store) = fixture();
         let witness = request("unit-a", "fixture").candidate_witness_digest;
         store
@@ -1141,6 +1169,24 @@ mod tests {
         assert!(matches!(
             store.release_cancelled_flowing_attempt("attempt-a", "t5"),
             Err(StoreError::Conflict(message)) if message.contains("lost its witness")
+        ));
+        assert!(store
+            .flowing_attempt_pin("attempt-a")
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+        store
+            .record_candidate_witness(&witness_for(&request("unit-a", "fixture")))
+            .unwrap();
+        sql.execute(
+            "UPDATE flowing_attempt_pins SET source_cut_id = 'other' WHERE op_id = 'attempt-a'",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.release_cancelled_flowing_attempt("attempt-a", "t6"),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its witness")
         ));
         assert!(store
             .flowing_attempt_pin("attempt-a")
@@ -1174,6 +1220,45 @@ mod tests {
             .released_at
             .is_none());
         assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
+    }
+
+    #[test]
+    fn hosted_cas_requires_the_live_pin_for_its_exact_attempt_and_witness() {
+        let (sql, mut store) = fixture();
+        let request = request("unit-a", "fixture");
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinMissing)
+        );
+        pin_attempt(&mut store, &request);
+        sql.execute(
+            "UPDATE flowing_attempt_pins SET witness_digest = 'different' WHERE op_id = ?1",
+            &[text(&request.op_id)],
+        )
+        .unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinMismatch)
+        );
+        sql.execute(
+            "UPDATE flowing_attempt_pins SET witness_digest = ?2, released_at = 't4' WHERE op_id = ?1",
+            &[text(&request.op_id), text(&request.candidate_witness_digest)],
+        )
+        .unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::AttemptPinReleased)
+        );
+        assert!(store
+            .flowing_admission_receipt(&request.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
     }
 
     #[test]
@@ -1291,6 +1376,7 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+        pin_attempt(&mut store, &request("unit-a", "admission-b"));
         assert!(matches!(
             store
                 .admit_flowing_prefix(&request("unit-a", "admission-b"))
@@ -1302,6 +1388,7 @@ mod tests {
     #[test]
     fn hosted_cancellation_after_cas_reports_admission_without_reversing_it() {
         let (_, mut store) = fixture();
+        pin_attempt(&mut store, &request("unit-a", "admission-a"));
         let FlowingAdmissionOutcome::Admitted(receipt) = store
             .admit_flowing_prefix(&request("unit-a", "admission-a"))
             .unwrap()
@@ -1337,6 +1424,7 @@ mod tests {
             .unwrap()
             .is_none());
         sql.execute("DROP TRIGGER reject_cancel", &[]).unwrap();
+        pin_attempt(&mut store, &request("unit-a", "admission-a"));
         assert!(matches!(
             store
                 .admit_flowing_prefix(&request("unit-a", "admission-a"))
@@ -1367,6 +1455,7 @@ mod tests {
             .is_err());
 
         let (sql, mut store) = fixture();
+        pin_attempt(&mut store, &request("unit-a", "admission-b"));
         store
             .admit_flowing_prefix(&request("unit-a", "admission-b"))
             .unwrap();
@@ -1418,6 +1507,7 @@ mod tests {
         first.expected_eligibility_epoch = 2;
         first.certificate_handle = certificate_for(&first).handle().unwrap();
         record_gate_certificate(&store.sql, &first);
+        pin_attempt(&mut store, &first);
         let FlowingAdmissionOutcome::Admitted(receipt) =
             store.admit_flowing_prefix(&first).unwrap()
         else {
@@ -1459,6 +1549,7 @@ mod tests {
             "metadata-only admission still needs the exact gate"
         );
         record_gate_certificate(&store.sql, &no_op);
+        pin_attempt(&mut store, &no_op);
         assert!(matches!(
             store.admit_flowing_prefix(&no_op).unwrap(),
             FlowingAdmissionOutcome::Admitted(_)
@@ -1476,6 +1567,7 @@ mod tests {
     #[test]
     fn hosted_failed_unit_write_rolls_back_trunk_and_receipt() {
         let (sql, mut store) = fixture();
+        pin_attempt(&mut store, &request("unit-a", "admission-a"));
         sql.execute(
             "CREATE TRIGGER reject_admitted_unit BEFORE INSERT ON flowing_admitted_units \
              BEGIN SELECT RAISE(ABORT, 'injected refusal'); END",
