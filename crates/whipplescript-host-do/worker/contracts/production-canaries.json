@@ -210,6 +210,32 @@
       ]
     },
     {
+      "id": "private-command-retirement",
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#private-command-retirement",
+      "executionBoundary": "managed-private-home",
+      "contracts": [
+        "runtime.private-home.retire"
+      ],
+      "requiredInfrastructure": [
+        "Dedicated synthetic private Home and tenant with a signer admitted by the deployed private Worker",
+        "Production R2 bucket with command-scoped objects and one disposable nonsecret command per UTC day",
+        "Synthetic terminal-only signed execution grant with a distinct retirement authorization bit"
+      ],
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_PRIVATE_ORIGIN",
+        "GW_SYNTHETIC_WHIP_PRIVATE_HOME",
+        "GW_SYNTHETIC_WHIP_PRIVATE_TENANT",
+        "GW_SYNTHETIC_WHIP_PRIVATE_PROJECT",
+        "GW_SYNTHETIC_WHIP_PRIVATE_GOVERNANCE_SIGNER",
+        "GW_SYNTHETIC_WHIP_PRIVATE_SIGNER_JWK"
+      ],
+      "cleanup": "Use only nonsecret daily synthetic bytes, retire the day's command in the same journey, and assert collection and the permanent fence. Later passes that day retry the same receipt without placing bytes. The runtime retains one small tombstone per UTC day; the synthetic R2 copy must be absent after each fresh pass.",
+      "surfaces": [
+        "whip-runtime"
+      ]
+    },
+    {
       "id": "norm-evidence",
       "state": "runner-needed",
       "runner": null,

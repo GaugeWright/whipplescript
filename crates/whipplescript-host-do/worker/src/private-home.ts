@@ -3,7 +3,9 @@ import { declaredLength } from "./object-store";
 import {
   decodeGrant,
   durableWorkflowObjectName,
+  privateObjectStorageKey,
   p256JwkToGovernanceHex,
+  parsePrivateRetirementReceipt,
   sha256Hex,
   validateDurableWorkflowGrant,
   verifyP256GrantSignature,
@@ -21,6 +23,32 @@ const EMPTY_SHA256 =
 
 function jsonError(error: string, status: number): Response {
   return Response.json({ error }, { status });
+}
+
+async function boundedRetirementBody(request: Request): Promise<ArrayBuffer | Response> {
+  const declared = request.headers.get("content-length");
+  if (declared && Number(declared) > 4096) return jsonError("private retirement receipt is too large", 413);
+  const reader = request.body?.getReader();
+  if (!reader) return new ArrayBuffer(0);
+  const parts: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.byteLength;
+    if (length > 4096) {
+      await reader.cancel();
+      return jsonError("private retirement receipt is too large", 413);
+    }
+    parts.push(value);
+  }
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result.buffer;
 }
 
 function packageBindingError(
@@ -169,6 +197,30 @@ async function admittedGrant(
 /** `/host/objects/:id` — the Home's byte route, addressed by content id. */
 const OBJECT_INNER_PATH = /^\/host\/objects\/([0-9a-f]{32})$/;
 
+function privateForwardHeaders(
+  request: Request,
+  env: PrivateHomeEnv,
+  grant: DurableWorkflowGrant,
+  governanceKeyHex: string,
+): Headers {
+  const headers = new Headers(request.headers);
+  headers.delete("x-gaugewright-execution-grant");
+  headers.delete("x-gaugewright-execution-signature");
+  headers.set("x-gaugewright-private-governance-signer", grant.governance_signer);
+  headers.set("x-gaugewright-private-governance-key", governanceKeyHex);
+  headers.set("x-gaugewright-private-callback", grant.callback_ref);
+  headers.set(
+    "x-gaugewright-private-execution-grant",
+    request.headers.get("x-gaugewright-execution-grant") ?? "",
+  );
+  headers.set(
+    "x-gaugewright-private-execution-signature",
+    request.headers.get("x-gaugewright-execution-signature") ?? "",
+  );
+  headers.set("authorization", `Bearer ${env.WHIP_CONTROL_TOKEN}`);
+  return headers;
+}
+
 /**
  * Place or serve one object's bytes on a private Home, mediated by a grant.
  *
@@ -202,7 +254,7 @@ async function homeObjectRoute(
   }
   const envelope = await verifyGrantEnvelope(request, env, route);
   if (envelope instanceof Response) return envelope;
-  const { grant } = envelope;
+  const { grant, governanceKeyHex } = envelope;
 
   // The grant names one content id, and the path must address that one.
   if (grant.request_body_sha256.slice(0, 32) !== id) {
@@ -211,10 +263,43 @@ async function homeObjectRoute(
       403,
     );
   }
+  const storageKey = await privateObjectStorageKey(grant, id);
+  const instance = env.WORKFLOW_INSTANCE.get(
+    env.WORKFLOW_INSTANCE.idFromName(durableWorkflowObjectName(grant)),
+  );
+  // Ask the command object before streaming or serving bytes. This pins its
+  // governance root on the first byte operation and leaves a retirement fence
+  // one place to refuse every later read and write.
+  const bindingHeaders = privateForwardHeaders(request, env, grant, governanceKeyHex);
+  bindingHeaders.delete("content-length");
+  const bound = await instance.fetch(new Request(`https://instance/__private/object-binding/${id}`, {
+    method: "GET",
+    headers: bindingHeaders,
+  }));
+  if (bound.status !== 404 && !bound.ok) {
+    return jsonError(
+      "private object command is unavailable",
+      bound.status === 403 || bound.status === 409 || bound.status === 410 ? bound.status : 502,
+    );
+  }
 
   if (request.method === "GET") {
-    const object = await bucket.get(id);
+    // The command's durable handle says which physical key is in force. A
+    // blind fallback to the old global key would let a retired scoped copy
+    // resolve through another command's equal content after deletion.
+    if (bound.status === 404) return jsonError("private object handle unavailable", 404);
+    const binding = await bound.json() as { byte_len?: number; storage_key?: string };
+    if (
+      !Number.isSafeInteger(binding.byte_len) ||
+      (binding.storage_key !== id && !/^s-[0-9a-f]{32}$/.test(binding.storage_key ?? ""))
+    ) {
+      return jsonError("private object binding is invalid", 502);
+    }
+    const object = await bucket.get(binding.storage_key!);
     if (!object) return jsonError("no such object", 404);
+    if (object.size !== binding.byte_len) {
+      return jsonError("private object length differs from its durable handle", 409);
+    }
     return new Response(object.body, {
       status: 200,
       headers: {
@@ -233,11 +318,31 @@ async function homeObjectRoute(
     return jsonError("content-length is required to stream an object", 411);
   }
 
+  // Record a non-live write intent before R2 sees any bytes. A failed checksum
+  // or a crash between the bucket put and handle registration must still leave
+  // the command with the physical key its later retirement has to collect.
+  const intentHeaders = privateForwardHeaders(request, env, grant, governanceKeyHex);
+  intentHeaders.delete("content-length");
+  const intent = await instance.fetch(new Request(`https://instance/__private/object-intent/${id}`, {
+    method: "POST",
+    headers: intentHeaders,
+  }));
+  if (!intent.ok) {
+    return jsonError(
+      "private object write intent could not be recorded",
+      intent.status === 403 || intent.status === 409 || intent.status === 410 ? intent.status : 502,
+    );
+  }
+  const recordedIntent = await intent.json() as { storage_key?: string };
+  if (recordedIntent.storage_key !== storageKey) {
+    return jsonError("private object write intent names another key", 502);
+  }
+
   const measured = new FixedLengthStream(declared);
   const pumped = request.body.pipeTo(measured.writable);
   let stored: R2Object;
   try {
-    stored = await bucket.put(id, measured.readable, {
+    stored = await bucket.put(storageKey, measured.readable, {
       sha256: grant.request_body_sha256,
     });
     await pumped;
@@ -260,17 +365,14 @@ async function homeObjectRoute(
   // contains the delimiter, and two distinct grants must never address one
   // instance. The internal hop carries the control token the same way the
   // ordinary forward below does.
-  const instance = env.WORKFLOW_INSTANCE.get(
-    env.WORKFLOW_INSTANCE.idFromName(durableWorkflowObjectName(grant)),
-  );
+  const registrationHeaders = privateForwardHeaders(request, env, grant, governanceKeyHex);
+  registrationHeaders.delete("content-length");
+  registrationHeaders.set("content-type", "application/json");
   const registered = await instance.fetch(
     new Request("https://instance/host/objects/register", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${env.WHIP_CONTROL_TOKEN}`,
-      },
-      body: JSON.stringify({ id, byte_len: stored.size }),
+      headers: registrationHeaders,
+      body: JSON.stringify({ id, byte_len: stored.size, storage_key: storageKey }),
     }),
   );
   if (!registered.ok) {
@@ -281,7 +383,105 @@ async function homeObjectRoute(
       502,
     );
   }
+  const binding = await registered.json() as { storage_key?: string };
+  if (binding.storage_key !== storageKey) {
+    // An older command may already have bound this id to its legacy global
+    // key. Do not silently claim our new copy is in force, and do not leave an
+    // unreachable extra object behind.
+    try {
+      await bucket.delete(storageKey);
+    } catch {
+      return jsonError("private object copy could not be collected", 502);
+    }
+    if (binding.storage_key !== id || !(await bucket.head(id))) {
+      return jsonError("private object handle is bound to another storage key", 409);
+    }
+  }
   return Response.json({ id, byte_len: stored.size }, { status: 201 });
+}
+
+async function homeRetirementRoute(
+  request: Request,
+  env: PrivateHomeEnv,
+  route: NonNullable<ReturnType<typeof routeIdentity>>,
+  body: ArrayBuffer,
+  grant: DurableWorkflowGrant,
+  governanceKeyHex: string,
+): Promise<Response> {
+  let receipt: unknown;
+  try {
+    receipt = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return jsonError("private retirement receipt is invalid JSON", 400);
+  }
+  const terminal = parsePrivateRetirementReceipt(receipt);
+  if (!terminal || terminal.attempt_id !== grant.attempt_id || terminal.epoch !== grant.epoch) {
+    return jsonError("private retirement receipt does not name this attempt", 409);
+  }
+  const instance = env.WORKFLOW_INSTANCE.get(
+    env.WORKFLOW_INSTANCE.idFromName(durableWorkflowObjectName(grant)),
+  );
+  const forwardHeaders = privateForwardHeaders(request, env, grant, governanceKeyHex);
+  const start = await instance.fetch(new Request(`https://instance${route.innerPath}`, {
+    method: "POST",
+    headers: forwardHeaders,
+    body,
+  }));
+  if (!start.ok) return start;
+
+  const internalHeaders = privateForwardHeaders(request, env, grant, governanceKeyHex);
+  internalHeaders.delete("content-length");
+  const bucket = env.WHIP_OBJECTS;
+  for (let collected = 0; collected < 1000; ) {
+    const debt = await instance.fetch(new Request("https://instance/__private/retirement/debt", {
+      method: "GET", headers: internalHeaders,
+    }));
+    if (!debt.ok) return jsonError("private retirement debt is unavailable", 502);
+    const page = await debt.json() as {
+      pending?: { id: string; storage_key: string }[];
+      scoped_pending?: number;
+      legacy_pending?: number;
+    };
+    if (!Array.isArray(page.pending) || !Number.isSafeInteger(page.scoped_pending) ||
+        !Number.isSafeInteger(page.legacy_pending)) {
+      return jsonError("private retirement debt is invalid", 502);
+    }
+    if (page.scoped_pending === 0) {
+      return Response.json({
+        phase: page.legacy_pending === 0 ? "collected" : "legacy-key-debt",
+        legacy_pending: page.legacy_pending,
+      }, {
+        status: page.legacy_pending === 0 ? 200 : 202,
+        headers: { "cache-control": "no-store" },
+      });
+    }
+    if (!bucket) return jsonError("private retirement byte tier is unavailable", 503);
+    const scoped = page.pending.filter(({ id, storage_key }) =>
+      /^[0-9a-f]{32}$/.test(id) && /^s-[0-9a-f]{32}$/.test(storage_key));
+    if (scoped.length === 0) {
+      return jsonError("private retirement has an uncollectible scoped key", 502);
+    }
+    for (const { id, storage_key: storageKey } of scoped) {
+      try {
+        await bucket.delete(storageKey);
+      } catch {
+        return jsonError("private retirement byte collection is pending retry", 503);
+      }
+      const ackHeaders = new Headers(internalHeaders);
+      ackHeaders.set("content-type", "application/json");
+      const ack = await instance.fetch(new Request("https://instance/__private/retirement/ack", {
+        method: "POST",
+        headers: ackHeaders,
+        body: JSON.stringify({ id, storage_key: storageKey }),
+      }));
+      if (!ack.ok) return jsonError("private retirement byte acknowledgement is pending retry", 503);
+      collected += 1;
+      if (collected >= 1000) break;
+    }
+  }
+  return Response.json({ phase: "collection-pending" }, {
+    status: 202, headers: { "cache-control": "no-store" },
+  });
 }
 
 export default {
@@ -309,35 +509,26 @@ export default {
     const object = route.innerPath.match(OBJECT_INNER_PATH);
     if (object) return homeObjectRoute(request, env, route, object[1]);
 
-    const body = request.method === "POST" ? await request.arrayBuffer() : new ArrayBuffer(0);
+    if (route.innerPath === "/host/private/retire") {
+      const envelope = await verifyGrantEnvelope(request, env, route);
+      if (envelope instanceof Response) return envelope;
+    }
+    const retirementBody = route.innerPath === "/host/private/retire"
+      ? await boundedRetirementBody(request)
+      : undefined;
+    if (retirementBody instanceof Response) return retirementBody;
+    const body = retirementBody ?? (request.method === "POST" ? await request.arrayBuffer() : new ArrayBuffer(0));
     const admission = await admittedGrant(request, env, route, body);
     if (admission instanceof Response) return admission;
     const { grant, governanceKeyHex } = admission;
+    if (route.innerPath === "/host/private/retire") {
+      return homeRetirementRoute(request, env, route, body, grant, governanceKeyHex);
+    }
 
     const inner = new URL(request.url);
     inner.pathname = route.innerPath;
     inner.search = url.search;
-    const headers = new Headers(request.headers);
-    headers.delete("x-gaugewright-execution-grant");
-    headers.delete("x-gaugewright-execution-signature");
-    headers.set(
-      "x-gaugewright-private-governance-signer",
-      grant.governance_signer,
-    );
-    headers.set("x-gaugewright-private-governance-key", governanceKeyHex);
-    headers.set(
-      "x-gaugewright-private-callback",
-      grant.callback_ref,
-    );
-    headers.set(
-      "x-gaugewright-private-execution-grant",
-      request.headers.get("x-gaugewright-execution-grant") ?? "",
-    );
-    headers.set(
-      "x-gaugewright-private-execution-signature",
-      request.headers.get("x-gaugewright-execution-signature") ?? "",
-    );
-    headers.set("authorization", `Bearer ${env.WHIP_CONTROL_TOKEN}`);
+    const headers = privateForwardHeaders(request, env, grant, governanceKeyHex);
     const forwarded = new Request(inner, {
       method: request.method,
       headers,

@@ -290,10 +290,20 @@ export default {
       );
     }
     if (url.pathname.startsWith("/v1/homes/")) {
+      const objectBucket = request.headers.get("x-test-private-r2-delete-fail") === "1" && env.WHIP_OBJECTS
+        ? new Proxy(env.WHIP_OBJECTS, {
+            get(target, property) {
+              if (property === "delete") return async () => { throw new Error("injected private R2 deletion failure"); };
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          })
+        : env.WHIP_OBJECTS;
       return privateHome.fetch(
         request,
         {
           ...env,
+          WHIP_OBJECTS: objectBucket,
           HOME_ADMISSION_KEYS: JSON.stringify({
             [TEST_HOME_KEY_ID]: exportedTestHomePublicKey,
           }),

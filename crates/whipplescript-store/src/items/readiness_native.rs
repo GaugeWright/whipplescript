@@ -30,6 +30,10 @@ use crate::{StoreError, StoreResult};
 pub(super) struct NativeReadiness<'c>(pub(super) &'c Connection);
 
 impl ReadinessSource for NativeReadiness<'_> {
+    fn issue_kind(&self, issue: &str) -> StoreResult<Option<String>> {
+        super::initiatives::native_kind(self.0, issue).map(|kind| kind.map(str::to_owned))
+    }
+
     fn durable_status(&self, issue: &str) -> StoreResult<Option<String>> {
         Ok(self
             .0

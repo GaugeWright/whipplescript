@@ -117,6 +117,8 @@ pub enum TransportError {
     Timeout,
     /// Any other transport-level failure (connect/TLS/decode), redacted message.
     Transport(String),
+    /// The host exhausted its bounded transport attempts; settle without retry.
+    RetryBudgetExhausted(String),
 }
 
 /// A unit of external I/O the host must perform.

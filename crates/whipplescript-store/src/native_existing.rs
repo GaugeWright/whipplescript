@@ -53,6 +53,50 @@ mod tests {
 
     const KINDS: [&str; 4] = ["runtime", "coordination", "work-item", "content"];
 
+    #[test]
+    fn read_only_work_item_capture_never_creates_repairs_or_writes() {
+        let fixture = Fixture::new();
+        let path = fixture.path("work-item");
+        assert!(WorkItemStore::open_read_only(&path).is_err());
+        assert!(!path.exists());
+        drop(Connection::open(&path).unwrap());
+        assert!(WorkItemStore::open_read_only(&path).is_err());
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        initialize("work-item", &path);
+        let mut reader = WorkItemStore::open_read_only(&path).unwrap();
+        assert!(reader.export_events().unwrap().is_empty());
+        assert!(reader
+            .file_item(
+                "checks",
+                "forbidden",
+                "",
+                &[],
+                &serde_json::json!({}),
+                None,
+                None
+            )
+            .is_err());
+        assert!(reader.export_events().unwrap().is_empty());
+        drop(reader);
+        let db = Connection::open(&path).unwrap();
+        db.execute("UPDATE schema_migrations SET name='foreign'", [])
+            .unwrap();
+        assert!(WorkItemStore::open_read_only(&path).is_err());
+        db.execute(
+            "UPDATE schema_migrations SET name='work-item', version=version+1",
+            [],
+        )
+        .unwrap();
+        assert!(WorkItemStore::open_read_only(&path).is_err());
+    }
+
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Self {

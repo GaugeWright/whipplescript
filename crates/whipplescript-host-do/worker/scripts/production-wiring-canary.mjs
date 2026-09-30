@@ -784,6 +784,124 @@ export async function runPrivateHome(environment = process.env, fetchImpl = fetc
   return { instance: opened.instance_ref, command };
 }
 
+// One disposable command per UTC day proves the destructive route against the
+// deployed private worker. Later passes that day retry the exact same terminal
+// receipt and verify the fence; the next day places and collects fresh bytes.
+export async function runPrivateRetirement(
+  environment = process.env,
+  fetchImpl = fetch,
+  now = new Date(),
+) {
+  const origin = exactOrigin(environment, "GW_SYNTHETIC_WHIP_PRIVATE_ORIGIN");
+  const home = boundedId(environment, "GW_SYNTHETIC_WHIP_PRIVATE_HOME", "synthetic-wiring");
+  const tenant = boundedId(environment, "GW_SYNTHETIC_WHIP_PRIVATE_TENANT", "synthetic-wiring");
+  const project = boundedId(environment, "GW_SYNTHETIC_WHIP_PRIVATE_PROJECT", "synthetic-wiring");
+  const day = now.toISOString().slice(0, 10).replaceAll("-", "");
+  const command = `production-retirement-canary-${day}`;
+  const epoch = 1;
+  const signerName = required(environment, "GW_SYNTHETIC_WHIP_PRIVATE_GOVERNANCE_SIGNER");
+  const privateJwk = JSON.parse(required(environment, "GW_SYNTHETIC_WHIP_PRIVATE_SIGNER_JWK"));
+  assert.equal(typeof privateJwk.d, "string", "private Home signer JWK has no private key");
+  const keyId = environment.GW_SYNTHETIC_WHIP_PRIVATE_KEY_ID?.trim()
+    || p256PublicHex(privateJwk);
+  const signerKey = await crypto.subtle.importKey(
+    "jwk", privateJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"],
+  );
+  const outer =
+    `/v1/homes/${encodeURIComponent(home)}`
+    + `/tenants/${encodeURIComponent(tenant)}`
+    + `/projects/${encodeURIComponent(project)}`
+    + `/commands/${encodeURIComponent(command)}`
+    + `/attempts/${epoch}`;
+  const bytes = `private-retirement-canary:${day}`;
+  const digest = await sha256Hex(bytes);
+  const id = digest.slice(0, 32);
+  const objectPath = `/host/objects/${id}`;
+  const retirementPath = "/host/private/retire";
+  const receipt = JSON.stringify({
+    version: 1,
+    attempt_id: `attempt:${command}:${epoch}`,
+    epoch,
+    terminal_phase: "completed",
+    terminal_receipt_sha256: await sha256Hex(`terminal:${command}`),
+  });
+  const signedHeaders = async (innerPath, method, bodyDigest, retirementAuthorized = false) => {
+    const issuedAt = Math.floor(now.getTime() / 1000);
+    const grant = {
+      version: 1,
+      key_id: keyId,
+      governance_signer: signerName,
+      home_id: home,
+      tenant_id: tenant,
+      project_id: project,
+      work_target_basis: "whipple:cut:production-retirement-canary-v1",
+      command_id: command,
+      attempt_id: `attempt:${command}:${epoch}`,
+      payload_digest: `sha256:${"1".repeat(64)}`,
+      epoch,
+      profile: "durable_workflow",
+      package_ref: "package:production-retirement-canary@1",
+      capabilities: [],
+      credential_class: "private-home",
+      max_spend_nanos_usd: 0,
+      retention_seconds: 3600,
+      callback_ref: "https://synthetic.invalid/internal/model-egress",
+      request_method: method,
+      request_path: innerPath,
+      request_body_sha256: bodyDigest,
+      ...(retirementAuthorized ? { retirement_authorized: true } : {}),
+      issued_at: issuedAt,
+      expires_at: issuedAt + 300,
+    };
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" }, signerKey, encoder.encode(canonicalJson(grant)),
+    );
+    return {
+      "x-gaugewright-execution-grant": Buffer.from(JSON.stringify(grant)).toString("base64url"),
+      "x-gaugewright-execution-signature": Buffer.from(signature).toString("base64"),
+    };
+  };
+  const objectGet = async () => fetchImpl(`${origin}${outer}${objectPath}`, {
+    method: "GET",
+    headers: await signedHeaders(objectPath, "GET", digest),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const initial = await objectGet();
+  assert([404, 410].includes(initial.status),
+    `retirement canary command began with unexpected HTTP ${initial.status}`);
+  if (initial.status === 404) {
+    const placed = await fetchImpl(`${origin}${outer}${objectPath}`, {
+      method: "POST",
+      headers: {
+        ...(await signedHeaders(objectPath, "POST", digest)),
+        "content-type": "application/octet-stream",
+        "content-length": String(Buffer.byteLength(bytes)),
+      },
+      body: bytes,
+      signal: AbortSignal.timeout(30_000),
+    });
+    assertStatus(placed, [201], "private retirement canary byte placement");
+    const read = await objectGet();
+    assertStatus(read, [200], "private retirement canary live read");
+    assert.equal(await read.text(), bytes);
+  }
+  const retired = await fetchImpl(`${origin}${outer}${retirementPath}`, {
+    method: "POST",
+    headers: {
+      ...(await signedHeaders(retirementPath, "POST", await sha256Hex(receipt), true)),
+      "content-type": "application/json",
+    },
+    body: receipt,
+    signal: AbortSignal.timeout(30_000),
+  });
+  assertStatus(retired, [200], "private retirement canary collection");
+  const result = await responseJson(retired, "Private Home retirement");
+  assert.equal(result?.phase, "collected", "private retirement left byte debt");
+  const fenced = await objectGet();
+  assert.equal(fenced.status, 410, "retired command still serves a private object");
+  return { command, phase: result.phase, first_run: initial.status === 404 };
+}
+
 // The norm-ledger suite: the six `/host/norm/*` doors of one dedicated
 // synthetic ledger placement, over the same managed origin and control token
 // as `managed-host-lifecycle`.
@@ -1207,6 +1325,7 @@ export const runners = {
   "managed-host-lifecycle": runManagedHost,
   "live-model-context": runLiveModelContext,
   "private-home-forwarding": runPrivateHome,
+  "private-command-retirement": runPrivateRetirement,
   "norm-ledger": runNormLedger,
 };
 

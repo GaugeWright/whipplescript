@@ -593,3 +593,30 @@ A tracker moves work between participants that share a workspace. Chapter 16
 opens the workspace itself. The chapter gives channels and messages that go
 out, and signals and ingress sources that come in. These are the connections
 of a workflow to systems that are not whip.
+
+## Group related work into initiatives
+
+An initiative names a set of related tasks and describes its outcome and
+completion criteria. It uses the same issue identity, history, comments,
+evidence and assignment, with immutable kind `initiative`.
+
+```sh
+whip issue new --tracker company --kind initiative --title "Release the tracker"
+whip issue link WS-2 belongs-to WS-1
+whip issue list --kind initiative
+whip issue show WS-1
+```
+
+These example IDs assume the initiative was filed as WS-1 and a task as WS-2.
+A task may belong to several initiatives, including ones in another repository
+tracker. Membership is a set: adding the same membership again does nothing.
+It is independent of `parent-of` decomposition, task assignment, dependencies
+and execution claims. Initiatives cannot belong to other initiatives, become
+ready or be claimed; their assignment names the outcome owner.
+
+Inspection derives current member states and blockers. Finish an initiative
+explicitly after verifying the outcome. With unfinished members, supply a
+summary explaining what remains and its disposition. Closing a group never
+closes its tasks, and later task or membership changes do not silently reopen
+it. The existing `link`, `unlink`, `show` and `finish` commands manage this
+without another work store.

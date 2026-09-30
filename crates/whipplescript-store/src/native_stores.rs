@@ -232,6 +232,22 @@ impl RuntimeStore for NativeStores {
             .reattest_instance_program_with_import_witness(instance_id, version, witness)
     }
 
+    fn reattest_instance_program_with_import_witness_at_id(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &crate::program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<crate::program_imports::ProgramImportAdmissionRecord> {
+        self.runtime
+            .reattest_instance_program_with_import_witness_at_id(
+                instance_id,
+                version,
+                witness,
+                operation_id,
+            )
+    }
+
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.runtime.get_program_version(version_id)
     }

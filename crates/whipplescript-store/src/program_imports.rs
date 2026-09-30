@@ -490,6 +490,180 @@ mod tests {
     }
 
     #[test]
+    fn home_reattestation_recovers_exact_instance_transition() {
+        const HOME_OPERATION: &str = "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = store
+            .create_program_version_with_import_witness(version("home-reattest"), &witness(LOCK))
+            .unwrap();
+        let first = store
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let other = store
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let changed = NewProgramVersion {
+            ir_hash: NEXT_LOCK,
+            ..version("home-reattest")
+        };
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version("home-reattest"),
+                &witness(LOCK),
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("no exact target operation")
+        ));
+        let admitted = store
+            .reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                changed,
+                &witness(LOCK),
+                HOME_OPERATION,
+            )
+            .unwrap();
+        assert_eq!(admitted.operation_id, HOME_OPERATION);
+        let after = store.program_import_operation_roster().unwrap();
+        assert_eq!(
+            store
+                .reattest_instance_program_with_import_witness_at_id(
+                    &first.instance_id,
+                    changed,
+                    &witness(LOCK),
+                    HOME_OPERATION,
+                )
+                .unwrap(),
+            admitted
+        );
+        assert_eq!(store.program_import_operation_roster().unwrap(), after);
+        let mut wrong_source = witness(LOCK);
+        wrong_source.program_source_digest = NEXT_LOCK.into();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                changed,
+                &wrong_source,
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("program source differs")
+        ));
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                changed,
+                &witness(NEXT_LOCK),
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("different evidence")
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE events SET correlation_id = NULL WHERE correlation_id = ?1",
+                [HOME_OPERATION],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                changed,
+                &witness(LOCK),
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("instance transition")
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE events SET correlation_id = ?1 WHERE instance_id = ?2 \
+                 AND event_type = 'instance.program.reattested'",
+                rusqlite::params![HOME_OPERATION, &first.instance_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &other.instance_id,
+                changed,
+                &witness(LOCK),
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("another transition")
+        ));
+        assert_eq!(
+            store
+                .get_instance(&other.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            original.version_id
+        );
+        assert_eq!(store.program_import_operation_roster().unwrap(), after);
+
+        // A prior unjournaled transition with the same from/to pair cannot
+        // be retroactively relabeled as this Home operation on replay.
+        let mut prior = SqliteStore::open_in_memory().unwrap();
+        let original = prior
+            .create_program_version_with_import_witness(version("prior-transition"), &witness(LOCK))
+            .unwrap();
+        let instance = prior
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let next = NewProgramVersion {
+            ir_hash: NEXT_LOCK,
+            ..version("prior-transition")
+        };
+        prior
+            .reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                next,
+                &witness(LOCK),
+            )
+            .unwrap();
+        prior
+            .reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                version("prior-transition"),
+                &witness(LOCK),
+            )
+            .unwrap();
+        let prior_roster = prior.program_import_operation_roster().unwrap();
+        assert!(matches!(
+            prior.reattest_instance_program_with_import_witness_at_id(
+                &instance.instance_id,
+                next,
+                &witness(LOCK),
+                HOME_OPERATION,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("prior instance transition")
+        ));
+        assert_eq!(
+            prior.program_import_operation_roster().unwrap(),
+            prior_roster
+        );
+        assert_eq!(
+            prior
+                .get_instance(&instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            original.version_id
+        );
+    }
+
+    #[test]
     fn home_chosen_operation_identity_commits_once_with_exact_witness() {
         const OPERATION_ID: &str = "imp_11111111111111111111111111111111";
         let mut store = SqliteStore::open_in_memory().unwrap();

@@ -927,11 +927,14 @@ fn map_transport_response(
     wire: ModelWire,
     response: Result<HttpResponse, CoerceTransportError>,
 ) -> Result<ModelReply, HarnessModelError> {
-    match response {
-        Ok(response) => parse_response(wire, response.status, &response.body),
-        Err(CoerceTransportError::Timeout) => Err(HarnessModelError::Timeout),
-        Err(CoerceTransportError::Transport(message)) => Err(HarnessModelError::Transport(message)),
-    }
+    let response = response.map_err(|error| match error {
+        CoerceTransportError::Timeout => HarnessModelError::Timeout,
+        CoerceTransportError::Transport(message) => HarnessModelError::Transport(message),
+        CoerceTransportError::RetryBudgetExhausted(message) => {
+            HarnessModelError::RetryBudgetExhausted(message)
+        }
+    })?;
+    parse_response(wire, response.status, &response.body)
 }
 
 // -- request construction -------------------------------------------------
@@ -3646,6 +3649,27 @@ mod tests {
         );
         // sanity: a request was actually built and sent
         assert!(transport.seen.borrow().is_some());
+    }
+
+    #[test]
+    fn transport_mapping_preserves_timeout_failure_and_exhaustion() {
+        for (transport, expected) in [
+            (CoerceTransportError::Timeout, HarnessModelError::Timeout),
+            (
+                CoerceTransportError::Transport("lost reply".into()),
+                HarnessModelError::Transport("lost reply".into()),
+            ),
+            (
+                CoerceTransportError::RetryBudgetExhausted("lost reply".into()),
+                HarnessModelError::RetryBudgetExhausted("lost reply".into()),
+            ),
+        ] {
+            let actual = map_transport_response(ModelWire::AnthropicMessages, Err(transport));
+            assert!(
+                matches!(actual, Err(ref error) if format!("{error:?}") == format!("{expected:?}")),
+                "{actual:?}"
+            );
+        }
     }
 
     #[test]

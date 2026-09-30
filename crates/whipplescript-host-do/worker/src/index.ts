@@ -1,3 +1,4 @@
+import { transportFailureObservation } from "./transport-failure";
 import { ExecutorController } from "./executor-controller";
 import { ExecutorControllerRoutes } from "./executor-controller-routes";
 import { performExecutorHandoff } from "./executor-handoff";
@@ -68,6 +69,53 @@ import {
 } from "./provider-realization";
 import { agentWorkspaceResources } from "./agent-workspace-resources";
 import { LiveModelContext, type ModelRequestProvenance } from "./live-model-context";
+import {
+  canonicalJson,
+  decodeGrant,
+  parsePrivateRetirementReceipt,
+  privateObjectStorageKey,
+  sha256Hex,
+  validateDurableWorkflowGrant,
+  verifyPinnedP256GrantSignature,
+  type DurableWorkflowGrant,
+  type PrivateRetirementReceipt,
+} from "./private-home-protocol";
+
+interface PrivateRetirementState {
+  home_id: string;
+  tenant_id: string;
+  project_id: string;
+  command_id: string;
+  attempt_id: string;
+  epoch: number;
+  receipt_sha256: string;
+  terminal_phase: PrivateRetirementReceipt["terminal_phase"];
+  sql_purged: number;
+  kv_purged: number;
+}
+
+function privateAttemptBasis(grant: DurableWorkflowGrant): string {
+  return canonicalJson({
+    version: grant.version,
+    key_id: grant.key_id,
+    governance_signer: grant.governance_signer,
+    home_id: grant.home_id,
+    tenant_id: grant.tenant_id,
+    project_id: grant.project_id,
+    work_target_basis: grant.work_target_basis,
+    command_id: grant.command_id,
+    attempt_id: grant.attempt_id,
+    payload_digest: grant.payload_digest,
+    epoch: grant.epoch,
+    profile: grant.profile,
+    package_ref: grant.package_ref,
+    capabilities: grant.capabilities,
+    credential_class: grant.credential_class,
+    max_spend_nanos_usd: grant.max_spend_nanos_usd,
+    retention_seconds: grant.retention_seconds,
+    callback_ref: grant.callback_ref,
+  });
+}
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -187,6 +235,10 @@ const hostFunctions = bindings as unknown as {
     id: string,
     byteLen: number,
     storageKey?: string,
+  ) => string;
+  host_external_object_binding: (
+    bridge: unknown,
+    id: string,
   ) => string;
   host_explain_action: (
     bridge: unknown,
@@ -1557,12 +1609,48 @@ export class WorkflowInstance implements DurableObject {
     if (authError) {
       return authError;
     }
+    const url = new URL(request.url);
+    const retirement = this.privateRetirementState();
+    if (retirement instanceof Response) return retirement;
+    if (retirement) {
+      if (request.method === "POST" && url.pathname === "/host/private/retire") {
+        return this.privateRetire(request, retirement);
+      }
+      if (request.method === "GET" && url.pathname === "/__private/retirement/debt") {
+        return this.privateRetirementDebt(request, retirement);
+      }
+      if (request.method === "POST" && url.pathname === "/__private/retirement/ack") {
+        return this.privateRetirementAck(request, retirement);
+      }
+      return Response.json({ error: "private command has been retired" }, { status: 410 });
+    }
     const privateRootError = this.pinPrivateGovernanceRoot(request);
     if (privateRootError) {
       return privateRootError;
     }
-    const url = new URL(request.url);
     if (request.method === "GET") {
+      const privateObjectIntent = url.pathname.match(/^\/__private\/object-intent\/([0-9a-f]{32})$/);
+      if (privateObjectIntent) {
+        return this.privateObjectIntent(request, privateObjectIntent[1], false);
+      }
+      const privateObjectBinding = url.pathname.match(/^\/__private\/object-binding\/([0-9a-f]{32})$/);
+      if (privateObjectBinding) {
+        if (!request.headers.get("x-gaugewright-private-governance-signer")) {
+          return Response.json({ error: "private Home governance is required" }, { status: 403 });
+        }
+        let binding: { id: string; byte_len: number; storage_key: string } | null;
+        try {
+          binding = JSON.parse(hostFunctions.host_external_object_binding(
+            makeBridge(this.ctx.storage), privateObjectBinding[1],
+          )) as typeof binding;
+        } catch (error) {
+          return Response.json({ error: `private object binding failed: ${String(error)}` }, { status: 500 });
+        }
+        if (!binding) {
+          return Response.json({ error: "private object handle unavailable" }, { status: 404 });
+        }
+        return Response.json(binding);
+      }
       if (url.pathname === "/public/session/state") {
         return this.publicSessionState();
       }
@@ -1616,6 +1704,13 @@ export class WorkflowInstance implements DurableObject {
     }
     if (request.method !== "POST") {
       return Response.json({ error: "method not allowed" }, { status: 405 });
+    }
+    if (url.pathname === "/host/private/retire") {
+      return this.privateRetire(request);
+    }
+    const privateObjectIntent = url.pathname.match(/^\/__private\/object-intent\/([0-9a-f]{32})$/);
+    if (privateObjectIntent) {
+      return this.privateObjectIntent(request, privateObjectIntent[1], true);
     }
     const externalAnswer = url.pathname.match(/^\/public\/session\/external-calls\/([^/]+)\/answer$/);
     if (externalAnswer) {
@@ -1741,9 +1836,8 @@ export class WorkflowInstance implements DurableObject {
       if (!Number.isInteger(byteLen) || byteLen < 0) {
         return Response.json({ error: "byte_len must be a non-negative whole number" }, { status: 400 });
       }
-      // Absent for a push, whose writer keyed on the id because it held the
-      // digest; present for an ingest, which learned the digest only after it
-      // had to name a key.
+      // Absent for a shared push keyed on its digest-derived id; present for
+      // ingest or a private Home copy under its command-scoped opaque key.
       const storageKey = typeof parsed?.storage_key === "string" ? parsed.storage_key : undefined;
       let inForce: string;
       try {
@@ -2755,6 +2849,10 @@ export class WorkflowInstance implements DurableObject {
     socket: WebSocket,
     message: string | ArrayBuffer,
   ): Promise<void> {
+    if (this.privateRetirementState()) {
+      socket.close(1008, "private command retired");
+      return;
+    }
     let operationId: unknown;
     try {
       const parsed = JSON.parse(
@@ -4206,6 +4304,282 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  private async privateObjectIntent(request: Request, id: string, record: boolean): Promise<Response> {
+    const signer = request.headers.get("x-gaugewright-private-governance-signer");
+    const grant = decodeGrant(request.headers.get("x-gaugewright-private-execution-grant") ?? "");
+    if (
+      !signer || !grant || grant.governance_signer !== signer ||
+      grant.request_path !== `/host/objects/${id}` ||
+      typeof grant.request_body_sha256 !== "string" ||
+      grant.request_body_sha256.slice(0, 32) !== id ||
+      (record && grant.request_method !== "POST")
+    ) {
+      return Response.json({ error: "private object intent needs its signed command grant" }, { status: 403 });
+    }
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS private_object_write_intents (
+         id TEXT PRIMARY KEY,
+         storage_key TEXT NOT NULL
+       )`,
+    );
+    if (record) {
+      const storageKey = await privateObjectStorageKey(grant, id);
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO private_object_write_intents (id, storage_key)
+         VALUES (?1, ?2)`,
+        id, storageKey,
+      );
+    }
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT storage_key FROM private_object_write_intents WHERE id = ?1`, id,
+    ).toArray() as { storage_key: string }[];
+    if (rows.length === 0) {
+      return Response.json({ error: "private object write intent unavailable" }, { status: 404 });
+    }
+    if (rows[0].storage_key !== await privateObjectStorageKey(grant, id)) {
+      return Response.json({ error: "private object write intent changed" }, { status: 409 });
+    }
+    return Response.json({ id, storage_key: rows[0].storage_key }, {
+      status: record ? 201 : 200,
+      headers: { "cache-control": "no-store" },
+    });
+  }
+
+  private privateRetirementState(): PrivateRetirementState | Response | undefined {
+    const table = this.ctx.storage.sql.exec(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'private_retirement'`,
+    ).toArray();
+    if (table.length === 0) return undefined;
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT home_id, tenant_id, project_id, command_id, attempt_id,
+              epoch, receipt_sha256, terminal_phase, sql_purged, kv_purged
+         FROM private_retirement WHERE singleton = 1`,
+    ).toArray() as unknown as PrivateRetirementState[];
+    return rows.length === 1
+      ? rows[0]
+      : Response.json({ error: "private retirement marker is unreadable" }, { status: 500 });
+  }
+
+  private async privateRetirementGrant(request: Request, state?: PrivateRetirementState): Promise<DurableWorkflowGrant | Response> {
+    const signer = request.headers.get("x-gaugewright-private-governance-signer");
+    const key = request.headers.get("x-gaugewright-private-governance-key")?.toLowerCase();
+    const grant = decodeGrant(request.headers.get("x-gaugewright-private-execution-grant") ?? "");
+    if (
+      !signer || !key || !grant ||
+      validateDurableWorkflowGrant(grant, Math.floor(Date.now() / 1000)) !== undefined ||
+      grant.governance_signer !== signer ||
+      grant.retirement_authorized !== true ||
+      grant.request_method !== "POST" ||
+      grant.request_path !== "/host/private/retire"
+    ) {
+      return Response.json({ error: "signed private retirement grant is required" }, { status: 403 });
+    }
+    const roots = this.ctx.storage.sql.exec(
+      `SELECT signer, key FROM private_governance_root WHERE singleton = 1`,
+    ).toArray() as { signer: string; key: string }[];
+    if (roots.length !== 1 || roots[0].signer !== signer || roots[0].key !== key) {
+      return Response.json({ error: "private retirement governance root changed" }, { status: 403 });
+    }
+    if (!(await verifyPinnedP256GrantSignature(
+      grant,
+      request.headers.get("x-gaugewright-private-execution-signature") ?? "",
+      roots[0].key,
+    ))) {
+      return Response.json({ error: "private retirement signature is invalid" }, { status: 403 });
+    }
+    if (state && (
+      state.home_id !== grant.home_id ||
+      state.tenant_id !== grant.tenant_id ||
+      state.project_id !== grant.project_id ||
+      state.command_id !== grant.command_id ||
+      state.attempt_id !== grant.attempt_id ||
+      state.epoch !== grant.epoch
+    )) {
+      return Response.json({ error: "private retirement command changed" }, { status: 409 });
+    }
+    return grant;
+  }
+
+  private async privateRetire(request: Request, previous?: PrivateRetirementState): Promise<Response> {
+    const grant = await this.privateRetirementGrant(request, previous);
+    if (grant instanceof Response) return grant;
+    const early = requestBodyTooLarge(request);
+    if (early) return early;
+    const body = await request.arrayBuffer();
+    if (body.byteLength > 4096) {
+      return Response.json({ error: "private retirement receipt is too large" }, { status: 413 });
+    }
+    const digest = await sha256Hex(body);
+    if (digest !== grant.request_body_sha256) {
+      return Response.json({ error: "private retirement receipt differs from its grant" }, { status: 403 });
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(body));
+    } catch {
+      return Response.json({ error: "private retirement receipt is invalid JSON" }, { status: 400 });
+    }
+    const receipt = parsePrivateRetirementReceipt(parsed);
+    if (!receipt || receipt.attempt_id !== grant.attempt_id || receipt.epoch !== grant.epoch) {
+      return Response.json({ error: "private retirement receipt does not name this attempt" }, { status: 409 });
+    }
+    if (previous && (
+      previous.receipt_sha256 !== receipt.terminal_receipt_sha256 ||
+      previous.terminal_phase !== receipt.terminal_phase
+    )) {
+      return Response.json({ error: "private retirement receipt changed on retry" }, { status: 409 });
+    }
+    if (!previous) this.beginPrivateRetirement(grant, receipt);
+    await this.purgePrivateRetirementPayload();
+    return Response.json({ fenced: true, receipt: receipt.terminal_receipt_sha256 }, {
+      headers: { "cache-control": "no-store" },
+    });
+  }
+
+  private beginPrivateRetirement(grant: DurableWorkflowGrant, receipt: PrivateRetirementReceipt): void {
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql;
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS private_retirement (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           home_id TEXT NOT NULL, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL,
+           command_id TEXT NOT NULL, attempt_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+           receipt_sha256 TEXT NOT NULL, terminal_phase TEXT NOT NULL,
+           sql_purged INTEGER NOT NULL DEFAULT 0, kv_purged INTEGER NOT NULL DEFAULT 0
+         )`,
+      );
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS private_retirement_debt (
+           id TEXT NOT NULL, storage_key TEXT NOT NULL, collected INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY (id, storage_key)
+         )`,
+      );
+      const exists = (name: string) => sql.exec(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1`, name,
+      ).toArray().length === 1;
+      const keysExist = exists("content_external_keys");
+      if (exists("content_external_blobs")) {
+        sql.exec(keysExist
+          ? `INSERT OR IGNORE INTO private_retirement_debt (id, storage_key)
+             SELECT blobs.id, COALESCE(keys.storage_key, blobs.id)
+               FROM content_external_blobs AS blobs
+               LEFT JOIN content_external_keys AS keys ON keys.id = blobs.id`
+          : `INSERT OR IGNORE INTO private_retirement_debt (id, storage_key)
+             SELECT id, id FROM content_external_blobs`);
+      }
+      if (exists("content_external_pending_delete")) {
+        sql.exec(keysExist
+          ? `INSERT OR IGNORE INTO private_retirement_debt (id, storage_key)
+             SELECT pending.id, COALESCE(keys.storage_key, pending.id)
+               FROM content_external_pending_delete AS pending
+               LEFT JOIN content_external_keys AS keys ON keys.id = pending.id`
+          : `INSERT OR IGNORE INTO private_retirement_debt (id, storage_key)
+             SELECT id, id FROM content_external_pending_delete`);
+      }
+      if (exists("private_object_write_intents")) {
+        sql.exec(
+          `INSERT OR IGNORE INTO private_retirement_debt (id, storage_key)
+           SELECT id, storage_key FROM private_object_write_intents`,
+        );
+      }
+      sql.exec(
+        `INSERT INTO private_retirement
+           (singleton, home_id, tenant_id, project_id, command_id, attempt_id,
+            epoch, receipt_sha256, terminal_phase)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+        grant.home_id, grant.tenant_id, grant.project_id, grant.command_id,
+        grant.attempt_id, grant.epoch, receipt.terminal_receipt_sha256, receipt.terminal_phase,
+      );
+    });
+  }
+
+  private async purgePrivateRetirementPayload(): Promise<void> {
+    const state = this.privateRetirementState();
+    if (!state || state instanceof Response) throw new Error("private retirement marker is unavailable");
+    if (!state.sql_purged) {
+      this.ctx.storage.transactionSync(() => {
+        const sql = this.ctx.storage.sql;
+        sql.exec("PRAGMA defer_foreign_keys = ON");
+        const retained = new Set([
+          "private_governance_root", "private_retirement", "private_retirement_debt",
+        ]);
+        const tables = sql.exec(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             AND name NOT LIKE '__cf_%'`,
+        ).toArray() as { name: string }[];
+        for (const { name } of tables) {
+          if (!retained.has(name)) sql.exec(`DELETE FROM "${name.replaceAll('"', '""')}"`);
+        }
+        sql.exec("UPDATE private_retirement SET sql_purged = 1 WHERE singleton = 1");
+      });
+    }
+    if (!state.kv_purged) {
+      for (;;) {
+        const keys = [...(await this.ctx.storage.list({ limit: 100 })).keys()];
+        if (keys.length === 0) break;
+        await this.ctx.storage.delete(keys);
+      }
+      await this.ctx.storage.deleteAlarm();
+      this.ctx.storage.sql.exec("UPDATE private_retirement SET kv_purged = 1 WHERE singleton = 1");
+    }
+    this.liveModelContext.clearAll();
+    for (const controllers of this.turnStreams.values()) {
+      for (const controller of controllers) {
+        try { controller.close(); } catch { /* A terminal stream may already be closed. */ }
+      }
+    }
+    this.turnStreams.clear();
+    this.publicTurns.clear();
+    this.publicTraceStarts.clear();
+    this.publicFirstWebSocketDeltas.clear();
+    for (const socket of this.ctx.getWebSockets()) {
+      socket.close(1008, "private command retired");
+    }
+  }
+
+  private async privateRetirementDebt(request: Request, state: PrivateRetirementState): Promise<Response> {
+    const grant = await this.privateRetirementGrant(request, state);
+    if (grant instanceof Response) return grant;
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT id, storage_key FROM private_retirement_debt
+         WHERE collected = 0
+         ORDER BY CASE WHEN storage_key = id THEN 1 ELSE 0 END, storage_key, id
+         LIMIT 100`,
+    ).toArray() as { id: string; storage_key: string }[];
+    const counts = this.ctx.storage.sql.exec(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN storage_key = id THEN 1 ELSE 0 END) AS legacy
+         FROM private_retirement_debt WHERE collected = 0`,
+    ).toArray() as { total: number; legacy: number | null }[];
+    return Response.json({
+      pending: rows,
+      scoped_pending: counts[0].total - (counts[0].legacy ?? 0),
+      legacy_pending: counts[0].legacy ?? 0,
+    }, { headers: { "cache-control": "no-store" } });
+  }
+
+  private async privateRetirementAck(request: Request, state: PrivateRetirementState): Promise<Response> {
+    const grant = await this.privateRetirementGrant(request, state);
+    if (grant instanceof Response) return grant;
+    const parsed = await request.json<{ id?: string; storage_key?: string }>().catch(() => null);
+    if (!parsed || !/^[0-9a-f]{32}$/.test(parsed.id ?? "") ||
+        !/^s-[0-9a-f]{32}$/.test(parsed.storage_key ?? "")) {
+      return Response.json({ error: "private retirement acknowledgement is invalid" }, { status: 400 });
+    }
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT collected FROM private_retirement_debt
+         WHERE id = ?1 AND storage_key = ?2`, parsed.id, parsed.storage_key,
+    ).toArray();
+    if (rows.length !== 1) {
+      return Response.json({ error: "private retirement debt does not name this key" }, { status: 404 });
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE private_retirement_debt SET collected = 1
+         WHERE id = ?1 AND storage_key = ?2`, parsed.id, parsed.storage_key,
+    );
+    return Response.json({ acknowledged: true }, { headers: { "cache-control": "no-store" } });
+  }
+
   private pinPrivateGovernanceRoot(request: Request): Response | undefined {
     const signer = request.headers
       .get("x-gaugewright-private-governance-signer")
@@ -4297,14 +4671,53 @@ export class WorkflowInstance implements DurableObject {
     );
     const execution = this.ctx.storage.sql
       .exec(
-        `SELECT callback FROM private_execution_context WHERE singleton = 1`,
+        `SELECT callback, execution_grant FROM private_execution_context WHERE singleton = 1`,
       )
-      .toArray() as { callback: string }[];
+      .toArray() as { callback: string; execution_grant: string }[];
     if (execution.length === 1 && execution[0].callback !== callbackUrl.toString()) {
       return Response.json(
         { error: "private Home callback changed for this command" },
         { status: 403 },
       );
+    }
+    const incoming = decodeGrant(executionGrant);
+    if (!incoming || !Number.isSafeInteger(incoming.epoch) || incoming.epoch < 1) {
+      return Response.json(
+        { error: "private Home attempt identity is invalid" },
+        { status: 403 },
+      );
+    }
+    if (execution.length === 1) {
+      const previous = decodeGrant(execution[0].execution_grant);
+      if (!previous || !Number.isSafeInteger(previous.epoch) || previous.epoch < 1) {
+        return Response.json(
+          { error: "pinned private Home attempt is unreadable" },
+          { status: 500 },
+        );
+      }
+      if (
+        incoming.home_id !== previous.home_id ||
+        incoming.tenant_id !== previous.tenant_id ||
+        incoming.project_id !== previous.project_id ||
+        incoming.command_id !== previous.command_id
+      ) {
+        return Response.json(
+          { error: "private Home command identity changed" },
+          { status: 403 },
+        );
+      }
+      if (incoming.epoch < previous.epoch) {
+        return Response.json(
+          { error: "private Home attempt epoch has been superseded" },
+          { status: 409 },
+        );
+      }
+      if (incoming.epoch === previous.epoch && privateAttemptBasis(incoming) !== privateAttemptBasis(previous)) {
+        return Response.json(
+          { error: "private Home attempt policy changed within its epoch" },
+          { status: 409 },
+        );
+      }
     }
     this.ctx.storage.sql.exec(
       `INSERT INTO private_execution_context
@@ -5253,6 +5666,10 @@ export class WorkflowInstance implements DurableObject {
   // timers/deadlines scheduled this; re-enter and drive — the due-time pass
   // fires the timers, the rule pass sees the facts, and the run continues.
   async alarm(): Promise<void> {
+    if (this.privateRetirementState()) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
     try {
       await this.reconcileExecutorLifetimes();
       await this.sessionRetentionAlarm();
@@ -5661,10 +6078,9 @@ export class WorkflowInstance implements DurableObject {
             console.log(`model broker transport failed: ${message}`);
             transportFailures += 1;
             onActivity?.("retrying");
-            if (transportFailures >= 3) {
-              throw new Error(`model broker failed repeatedly: ${message}`);
-            }
-            responseJson = JSON.stringify({ error: message });
+            // Even the last failed call must reach the kernel: it owns the
+            // cancellation/terminal evidence that makes this effect quiescent.
+            responseJson = transportFailureObservation(transportFailures, message);
           }
         } else if (providerBinding?.execution === "managed") {
           try {
@@ -5707,10 +6123,9 @@ export class WorkflowInstance implements DurableObject {
             console.log(`managed gateway transport failed: ${message}`);
             transportFailures += 1;
             onActivity?.("retrying");
-            if (transportFailures >= 3) {
-              throw new Error(`managed gateway failed repeatedly: ${message}`);
-            }
-            responseJson = JSON.stringify({ error: message });
+            // Even the last failed call must reach the kernel: it owns the
+            // cancellation/terminal evidence that makes this effect quiescent.
+            responseJson = transportFailureObservation(transportFailures, message);
           }
         } else if (providerBinding?.execution === "direct") {
           try {
@@ -5749,10 +6164,9 @@ export class WorkflowInstance implements DurableObject {
             console.log(`direct provider transport failed: ${message}`);
             transportFailures += 1;
             onActivity?.("retrying");
-            if (transportFailures >= 3) {
-              throw new Error(`direct provider failed repeatedly: ${message}`);
-            }
-            responseJson = JSON.stringify({ error: message });
+            // Even the last failed call must reach the kernel: it owns the
+            // cancellation/terminal evidence that makes this effect quiescent.
+            responseJson = transportFailureObservation(transportFailures, message);
           }
         } else {
           responseJson = await performFetch(outcome.request, this.env);

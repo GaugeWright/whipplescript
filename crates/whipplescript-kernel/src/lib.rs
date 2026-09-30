@@ -77,7 +77,6 @@ pub mod rule_pass;
 pub mod sansio;
 pub mod save_reconciliation;
 pub mod source_action;
-#[cfg(feature = "native")]
 pub mod source_admission;
 pub mod source_merge;
 pub mod source_process;
@@ -1633,6 +1632,41 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             basis,
             Some(construct_basis),
         )
+    }
+
+    /// Move a retained instance under the exact operation its Home registered.
+    /// The target store recovers the same transition after a completion crash.
+    pub fn reattest_instance_program_with_imports_and_constructs_at_id(
+        &mut self,
+        instance_id: &str,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
+        self.store
+            .reattest_instance_program_with_import_witness_at_id(
+                instance_id,
+                NewProgramVersion {
+                    program_name: input.program_name,
+                    source_hash: input.source_hash,
+                    ir_hash: input.ir_hash,
+                    ir_snapshot: None,
+                    compiler_version: input.compiler_version,
+                    declared_capabilities_json: "[]",
+                    declared_profiles_json: "[]",
+                    declared_skills_json: "[]",
+                    declared_schemas_json: "[]",
+                    analysis_summary_json: "{}",
+                    generated_artifacts_json: "[]",
+                    artifact_root: None,
+                },
+                &witness,
+                operation_id,
+            )
     }
 
     fn reattest_instance_program_with_imports_basis(

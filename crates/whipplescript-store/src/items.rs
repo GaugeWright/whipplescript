@@ -57,6 +57,7 @@ mod closure;
 mod control;
 #[cfg(feature = "native")]
 mod control_ops;
+pub mod initiatives;
 
 /// The active-lease predicate, shared by every readiness/overlay query: a lease
 /// is active while it has not been released and has not expired. A NULL
@@ -129,6 +130,7 @@ const STORE_PRODUCED_STATUSES: &[&str] = &[
 /// dependency kind gates (DR-0126); `parent-of` places an issue under the
 /// parent its position is ranked within; the rest are graph metadata.
 pub const RELATION_KINDS: &[&str] = &[
+    "belongs-to",
     "blocks",
     "parent-of",
     "related",
@@ -323,6 +325,17 @@ pub struct WorkItemStore {
 
 #[cfg(feature = "native")]
 impl WorkItemStore {
+    /// Observe a current existing ledger without creating or repairing schema,
+    /// changing journal mode, or granting a writable connection. Missing,
+    /// foreign, old and newer schemas refuse rather than being initialized.
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        crate::native_existing::validate(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
+        Self::from_existing_connection(connection, None)
+    }
+
     /// Open only a current existing work-item store. Checks its owning stamp and
     /// SQLite integrity, establishes WAL, and never creates or repairs schema.
     /// Missing schema required by an operation remains an error when used.
@@ -869,6 +882,7 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(FinishOutcome::NotOpen);
         }
+        initiatives::native_validate_closure(&tx, item_id, summary)?;
         let payload = json!({"status": "closed", "summary": summary});
         tx_append_event(
             &tx,
@@ -1129,6 +1143,17 @@ impl WorkItemStore {
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
         let to_cid = content_id_of(&tx, to)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        initiatives::validate_relation(
+            kind,
+            initiatives::native_kind(&tx, from)?,
+            initiatives::native_kind(&tx, to)?,
+        )?;
+        if kind == "belongs-to" && tx.query_row(
+            "SELECT 1 FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = 'belongs-to'",
+            params![from, to], |_| Ok(()),
+        ).optional()?.is_some() {
+            return Ok(());
+        }
         let payload = json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         tx_append_event(
             &tx,
@@ -1902,6 +1927,7 @@ impl WorkItemStore {
                 &alias_of,
             )?;
         }
+        initiatives::native_validate_projection(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -2476,6 +2502,7 @@ fn tx_file_item(
     effect_id: Option<&str>,
     filing_fingerprint: Option<&str>,
 ) -> StoreResult<(String, String)> {
+    initiatives::issue_kind(metadata)?;
     let now = tx_now(tx)?;
     let next: i64 = tx.query_row(
             "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
@@ -3060,6 +3087,14 @@ fn tx_apply_field_set(
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
+    if field == "kind" || field == "metadata.kind" {
+        return Err(StoreError::Conflict(
+            "issue kind is immutable; set it when filing".into(),
+        ));
+    }
+    if field == "status" && value == "closed" {
+        initiatives::native_validate_closure(tx, item_id, None)?;
+    }
     let payload = json!({"field": field, "value": value});
     tx_append_event(
         tx,
@@ -3424,6 +3459,7 @@ fn fold_event(
     let str_of = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
     match kind {
         "issue.created" => {
+            initiatives::issue_kind(payload.get("metadata").unwrap_or(&Value::Null))?;
             let labels_json = payload
                 .get("labels")
                 .map_or_else(|| "[]".to_owned(), std::string::ToString::to_string);

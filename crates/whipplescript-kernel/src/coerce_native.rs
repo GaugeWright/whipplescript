@@ -1113,14 +1113,15 @@ impl StepMachine for CoerceStepMachine<'_> {
                     usage_json: r#"{"input_tokens":0,"output_tokens":0}"#.to_owned(),
                 })
             }
-            Some(IoResult::Http(Err(CoerceTransportError::Transport(message)))) => {
-                Outcome::Settle(failed_result_classified(
-                    format!("transport error: {message}"),
-                    None,
-                    "network",
-                    None,
-                ))
-            }
+            Some(IoResult::Http(Err(
+                CoerceTransportError::Transport(message)
+                | CoerceTransportError::RetryBudgetExhausted(message),
+            ))) => Outcome::Settle(failed_result_classified(
+                format!("transport error: {message}"),
+                None,
+                "network",
+                None,
+            )),
         }
     }
 }

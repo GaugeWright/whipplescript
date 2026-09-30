@@ -23,6 +23,7 @@
 #[cfg(feature = "native")]
 pub mod flowing_gate;
 mod flowing_selection;
+pub mod flowing_subject;
 pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;

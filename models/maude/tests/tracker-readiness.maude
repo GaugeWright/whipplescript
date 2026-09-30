@@ -144,4 +144,15 @@ search [1] in TRACKER-READINESS-CLOCK :
   { issue(1, open) wait(1, 1, at(70), 90) now(50) }
   =>* { ready(1) issue(1, open) wait(1, 1, at(70), 90) now(T:Nat) } .
 
-quit .
+
+--- DR-0153 coverage: multiple memberships do not gate task readiness.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) initiative(2) initiative(3) belongsTo(1, 2) belongsTo(1, 3) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- DR-0153 bite: an open initiative is never ready.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) initiative(2) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+quit

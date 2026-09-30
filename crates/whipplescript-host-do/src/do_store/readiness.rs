@@ -17,6 +17,10 @@ use super::*;
 pub(super) struct DoReadiness<'a, S: DoSql>(pub(super) &'a S);
 
 impl<S: DoSql> ReadinessSource for DoReadiness<'_, S> {
+    fn issue_kind(&self, issue: &str) -> StoreResult<Option<String>> {
+        issue_kind(self.0, issue).map(|kind| kind.map(str::to_owned))
+    }
+
     fn durable_status(&self, issue: &str) -> StoreResult<Option<String>> {
         let rows = self
             .0
@@ -342,11 +346,46 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     }
 }
 
+// DR-0153: kind is immutable creation metadata, fetched with this backend's SQL.
+pub(super) fn issue_kind(sql: &impl DoSql, id: &str) -> StoreResult<Option<&'static str>> {
+    let rows = sql
+        .query(
+            "SELECT metadata_json FROM tracker_issues WHERE issue_id = ?1",
+            &[text(id)],
+        )
+        .map_err(sql_err)?;
+    rows.first()
+        .map(|row| {
+            whipplescript_store::items::initiatives::issue_kind(&serde_json::from_str::<
+                serde_json::Value,
+            >(&as_text(&row[0]))?)
+        })
+        .transpose()
+}
+
+pub(super) fn validate_closure(
+    sql: &impl DoSql,
+    id: &str,
+    summary: Option<&str>,
+) -> StoreResult<()> {
+    if issue_kind(sql, id)? != Some("initiative") {
+        return Ok(());
+    }
+    let rows = sql.query("SELECT count(*) FROM tracker_relations r JOIN tracker_issues i ON i.issue_id = r.from_issue WHERE r.to_issue = ?1 AND r.kind = 'belongs-to' AND i.status != 'closed'", &[text(id)]).map_err(sql_err)?;
+    let unfinished = rows.first().map_or(0, |row| as_i64(&row[0]));
+    whipplescript_store::items::initiatives::validate_closure(
+        "initiative",
+        unfinished as usize,
+        summary,
+    )
+}
+
 /// Parity with the native store (DR-0126): the same events, imported, give the
 /// same ready set, the same refusals and the same order on the hosted store.
 #[cfg(test)]
 mod tests {
     use super::super::test_support::store;
+    use super::super::DoSql;
     use serde_json::json;
     use whipplescript_store::items::readiness::WaitCondition;
     use whipplescript_store::items::{ClaimOutcome, WorkItemStore, WorkItems};
@@ -362,6 +401,170 @@ mod tests {
 
     fn ids(items: Vec<whipplescript_store::items::WorkItem>) -> Vec<String> {
         items.into_iter().map(|item| item.id).collect()
+    }
+
+    #[test]
+    fn initiative_hosted_import_refuses_invalid_membership_without_exposing_it() {
+        let mut native = WorkItemStore::open_in_memory().expect("store");
+        native
+            .file_item("q", "A", "", &[], &json!({"kind":"initiative"}), None, None)
+            .expect("group");
+        native
+            .file_item("q", "task", "", &[], &json!({}), None, None)
+            .expect("task");
+        let mut events = native.export_events().expect("export");
+        let from = events[0].event_id.clone();
+        let to = events[1].event_id.clone();
+        let payload_json =
+            json!({"from":from, "to":to, "kind":"belongs-to", "dep_kind":null}).to_string();
+        let parents = vec![to.clone()];
+        let created_at = "2030-01-01 00:00:00".to_owned();
+        let event_id = whipplescript_store::items::event_content_id(
+            "relation.added",
+            Some(&to),
+            &payload_json,
+            None,
+            &parents,
+            &created_at,
+        );
+        events.push(whipplescript_store::items::TrackerEvent {
+            event_id,
+            parents,
+            issue_id: Some(to),
+            kind: "relation.added".into(),
+            payload_json,
+            actor: None,
+            created_at,
+        });
+        let mut hosted = store();
+        let error = hosted
+            .import_events(&events)
+            .expect_err("invalid membership");
+        assert!(format!("{error:?}")
+            .contains("belongs-to requires a task source and an initiative target"));
+        assert!(hosted
+            .sql
+            .query(
+                "SELECT 1 FROM tracker_relations WHERE kind = 'belongs-to'",
+                &[]
+            )
+            .expect("relations")
+            .is_empty());
+    }
+
+    #[test]
+    fn initiatives_have_the_same_non_execution_and_closure_on_both_hosts() {
+        let mut native = WorkItemStore::open_in_memory().unwrap();
+        let a = native
+            .file_item(
+                "company",
+                "initiative A",
+                "outcome",
+                &[],
+                &json!({"kind":"initiative"}),
+                None,
+                None,
+            )
+            .unwrap();
+        let b = native
+            .file_item(
+                "company",
+                "initiative B",
+                "outcome",
+                &[],
+                &json!({"kind":"initiative"}),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = native
+            .file_item("product", "shared task", "", &[], &json!({}), None, None)
+            .unwrap();
+        native
+            .add_relation(&task.id, &a.id, "belongs-to", None)
+            .unwrap();
+        native
+            .add_relation(&task.id, &b.id, "belongs-to", None)
+            .unwrap();
+        let mut hosted = store();
+        hosted
+            .import_events(&native.export_events().unwrap())
+            .unwrap();
+        assert!(WorkItems::ready_items_at(&hosted, "company", AT)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ids(WorkItems::ready_items_at(&hosted, "product", AT).unwrap()),
+            vec![task.id.clone()]
+        );
+        assert!(
+            matches!(WorkItems::claim_item_at(&mut hosted, &a.id, "agent", None, AT).unwrap(), ClaimOutcome::NotReady { reasons } if reasons.contains(&whipplescript_store::items::readiness::Unready::Initiative))
+        );
+        assert!(WorkItems::finish_item(&mut hosted, &a.id, None, None).is_err());
+        assert!(hosted.set_field(&a.id, "status", "closed").is_err());
+        let kind_error = hosted
+            .set_field(&a.id, "kind", "task")
+            .expect_err("immutable kind");
+        assert!(format!("{kind_error:?}").contains("issue kind is immutable"));
+        assert!(hosted
+            .add_relation(&a.id, &b.id, "belongs-to", None)
+            .is_err());
+        assert!(hosted
+            .add_relation(&task.id, &task.id, "belongs-to", None)
+            .is_err());
+        assert!(hosted
+            .add_relation(&a.id, &task.id, "blocks", None)
+            .is_err());
+        assert!(hosted
+            .add_relation(&task.id, &a.id, "blocks", None)
+            .is_err());
+        let n = hosted.export_events().unwrap().len();
+        hosted
+            .add_relation(&task.id, &a.id, "belongs-to", None)
+            .unwrap();
+        assert_eq!(hosted.export_events().unwrap().len(), n);
+        WorkItems::finish_item(
+            &mut hosted,
+            &a.id,
+            Some("Outcome verified; shared task remains in B"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            WorkItems::get_item(&hosted, &task.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+        WorkItems::finish_item(&mut hosted, &task.id, None, None).unwrap();
+        assert_eq!(
+            WorkItems::get_item(&hosted, &b.id).unwrap().unwrap().status,
+            "open"
+        );
+        hosted.rebuild_tracker_projection().unwrap();
+        assert_eq!(
+            WorkItems::get_item(&hosted, &a.id).unwrap().unwrap().status,
+            "closed"
+        );
+        assert_eq!(
+            WorkItems::get_item(&hosted, &a.id)
+                .unwrap()
+                .unwrap()
+                .metadata["kind"],
+            "initiative"
+        );
+        let mut recovered = WorkItemStore::open_in_memory().unwrap();
+        recovered
+            .import_events(&hosted.export_events().unwrap())
+            .unwrap();
+        let group = recovered
+            .list_items(None, None)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.title == "initiative A")
+            .unwrap();
+        assert_eq!(recovered.initiative_members(&group.id).unwrap().len(), 1);
     }
 
     #[test]

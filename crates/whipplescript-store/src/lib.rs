@@ -2321,7 +2321,7 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
-            .run(|| self.reattest_instance_program_retained(instance_id, version, None))
+            .run(|| self.reattest_instance_program_retained(instance_id, version, None, None))
             .map(|(record, _, _)| record)
     }
 
@@ -2331,9 +2331,9 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
-        let (record, digest, operation_id) = self
-            .retained_publication()
-            .run(|| self.reattest_instance_program_retained(instance_id, version, Some(witness)))?;
+        let (record, digest, operation_id) = self.retained_publication().run(|| {
+            self.reattest_instance_program_retained(instance_id, version, Some(witness), None)
+        })?;
         Ok(program_imports::ProgramImportAdmissionRecord {
             program_id: record.program_id,
             version_id: record.version_id,
@@ -2342,11 +2342,39 @@ impl SqliteStore {
         })
     }
 
+    /// Re-attest under a Home-registered operation identity. An exact retry
+    /// recovers the transition on this instance after a Home completion crash;
+    /// the same ID cannot be applied to another instance or transition.
+    pub fn reattest_instance_program_with_import_witness_at_id(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        program_imports::validate_operation_id(operation_id)?;
+        let (record, digest, admitted_id) = self.retained_publication().run(|| {
+            self.reattest_instance_program_retained(
+                instance_id,
+                version,
+                Some(witness),
+                Some(operation_id),
+            )
+        })?;
+        Ok(program_imports::ProgramImportAdmissionRecord {
+            program_id: record.program_id,
+            version_id: record.version_id,
+            witness_digest: digest.expect("checked Home re-attestation retained its witness"),
+            operation_id: admitted_id.expect("checked Home re-attestation retained its operation"),
+        })
+    }
+
     fn reattest_instance_program_retained(
         &mut self,
         instance_id: &str,
         version: NewProgramVersion<'_>,
         witness: Option<&program_imports::ProgramImportWitness>,
+        requested_operation_id: Option<&str>,
     ) -> StoreResult<(ProgramVersionRecord, Option<String>, Option<String>)> {
         let tx = self
             .connection
@@ -2385,7 +2413,71 @@ impl SqliteStore {
                 "re-attestation requires the same authored program".to_owned(),
             ));
         }
+        let requested_witness = if let Some(operation_id) = requested_operation_id {
+            let witness = witness.expect("a Home operation identity requires a checked witness");
+            if !program_imports::matches_source_id(witness, version.source_hash) {
+                return Err(StoreError::Conflict(
+                    "import witness program source differs from the version".into(),
+                ));
+            }
+            let (digest, json) = program_imports::encode(witness)?;
+            let prior: Option<(String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT version_id, witness_digest, kind FROM program_import_operations \
+                     WHERE operation_id = ?1",
+                    [operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            Some((operation_id, digest, json, prior))
+        } else {
+            None
+        };
         if recorded_ir == version.ir_hash {
+            if let Some((operation_id, digest, json, prior)) = requested_witness {
+                let Some((prior_version, prior_digest, prior_kind)) = prior else {
+                    return Err(StoreError::Conflict(
+                        "Home re-attestation has no exact target operation".into(),
+                    ));
+                };
+                if prior_version != from_version_id
+                    || prior_digest.as_deref() != Some(&digest)
+                    || prior_kind != "checked"
+                {
+                    return Err(StoreError::Conflict(
+                        "Home re-attestation operation has different evidence".into(),
+                    ));
+                }
+                let retained_json: String = tx.query_row(
+                    "SELECT witness_json FROM program_import_admissions \
+                     WHERE version_id = ?1 AND witness_digest = ?2",
+                    params![&from_version_id, &digest],
+                    |row| row.get(0),
+                )?;
+                let transition: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM events WHERE instance_id = ?1 \
+                         AND event_type = 'instance.program.reattested' \
+                         AND correlation_id = ?2 LIMIT 1",
+                        params![instance_id, operation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if retained_json != json || transition.is_none() {
+                    return Err(StoreError::Conflict(
+                        "Home re-attestation retry differs from its instance transition".into(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok((
+                    ProgramVersionRecord {
+                        program_id,
+                        version_id: from_version_id,
+                    },
+                    Some(digest),
+                    Some(operation_id.to_owned()),
+                ));
+            }
             if witness.is_some() {
                 return Err(StoreError::Conflict(
                     "checked re-attestation requires changed compiler IR".into(),
@@ -2398,6 +2490,14 @@ impl SqliteStore {
                 },
                 None,
                 None,
+            ));
+        }
+        if requested_witness
+            .as_ref()
+            .is_some_and(|(_, _, _, prior)| prior.is_some())
+        {
+            return Err(StoreError::Conflict(
+                "Home re-attestation operation already belongs to another transition".into(),
             ));
         }
         tx.execute(
@@ -2488,7 +2588,13 @@ impl SqliteStore {
         // instance back to its recorded version) is the same durable
         // statement, so the append returns the existing event rather than
         // tripping the UNIQUE index -- as the DO twin already does.
-        append_event_idempotent_on(
+        let operation_id: String = match requested_operation_id {
+            Some(operation_id) => operation_id.to_owned(),
+            None => tx.query_row("SELECT 'imp_' || lower(hex(randomblob(16)))", [], |row| {
+                row.get(0)
+            })?,
+        };
+        let event = append_event_idempotent_on(
             &tx,
             NewEvent {
                 instance_id,
@@ -2496,18 +2602,26 @@ impl SqliteStore {
                 payload_json: &payload,
                 source: "kernel",
                 causation_id: None,
-                correlation_id: None,
+                correlation_id: requested_operation_id,
                 idempotency_key: Some(&idempotency),
             },
         )?;
+        if requested_operation_id.is_some() {
+            let retained_correlation: Option<String> = tx.query_row(
+                "SELECT correlation_id FROM events WHERE event_id = ?1",
+                [&event.event_id],
+                |row| row.get(0),
+            )?;
+            if retained_correlation.as_deref() != Some(&operation_id) {
+                return Err(StoreError::Conflict(
+                    "Home re-attestation conflicts with a prior instance transition".into(),
+                ));
+            }
+        }
         tx.execute(
             "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
             params![&to_version_id, instance_id],
         )?;
-        let operation_id: String =
-            tx.query_row("SELECT 'imp_' || lower(hex(randomblob(16)))", [], |row| {
-                row.get(0)
-            })?;
         tx.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
@@ -8743,6 +8857,13 @@ pub trait RuntimeStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
+    fn reattest_instance_program_with_import_witness_at_id(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>>;
     fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord>;
     fn create_instance_with_authority(
@@ -9239,6 +9360,20 @@ impl RuntimeStore for SqliteStore {
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
         self.reattest_instance_program_with_import_witness(instance_id, version, witness)
+    }
+    fn reattest_instance_program_with_import_witness_at_id(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        self.reattest_instance_program_with_import_witness_at_id(
+            instance_id,
+            version,
+            witness,
+            operation_id,
+        )
     }
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.get_program_version(version_id)

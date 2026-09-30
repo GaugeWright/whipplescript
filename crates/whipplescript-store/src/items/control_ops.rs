@@ -43,7 +43,9 @@ pub(super) fn claim_item(
     }) {
         return Ok(ClaimOutcome::NotOpen { status });
     }
-    if !reasons.is_empty() && override_reason.is_none() {
+    if reasons.contains(&super::readiness::Unready::Initiative)
+        || (!reasons.is_empty() && override_reason.is_none())
+    {
         return Ok(ClaimOutcome::NotReady { reasons });
     }
     // No active lease: grant. The lease's identity IS its `claim.acquired`

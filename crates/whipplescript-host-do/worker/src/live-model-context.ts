@@ -102,4 +102,8 @@ export class LiveModelContext {
   clear(turn: string): void {
     this.turns.delete(turn);
   }
+
+  clearAll(): void {
+    this.turns.clear();
+  }
 }

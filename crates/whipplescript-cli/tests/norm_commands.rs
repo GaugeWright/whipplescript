@@ -2126,3 +2126,6 @@ mod door_rows;
 mod evidence_rows;
 #[path = "norm_commands/impact.rs"]
 mod impact;
+
+#[path = "norm_commands/review.rs"]
+mod review;

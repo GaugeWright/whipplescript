@@ -37,7 +37,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 target=x86_64-pc-windows-msvc
-host="$(rustc -vV | sed -n 's/^host: //p')"
+toolchain="$(rustc -vV)"
+host="$(printf '%s\n' "$toolchain" | sed -n 's/^host: //p')"
 
 # What the build reads: the same set BUCK declares for the `windows-compile`
 # target, whose Linux siblings the read sandbox holds to it (GaugeWright
@@ -57,18 +58,46 @@ if [ "$host" = "$target" ]; then
     # never looked up, because git's record of it is not what cargo would read.
     record="target/windows-compile-passed"
     key=""
-    if git rev-parse --verify -q HEAD >/dev/null && [ -z "$(git status --porcelain -- "${inputs[@]}")" ]; then
-        key="$( { rustc -vV; git ls-tree -r HEAD -- "${inputs[@]}"; } | git hash-object --stdin)"
+    input_key=""
+    toolchain_key="$(printf '%s\n' "$toolchain" | git hash-object --stdin)"
+    reason=no-head
+    # Only hashes, closed categories, and elapsed seconds enter measurement.
+    # The input hash names git's tracked tree; dirty work is never served.
+    measure() {
+        printf 'CI_WINDOWS_COMPILE: {"version":1,"decision":"%s","reason":"%s","outcome":"%s","key":"%s","inputTreeKey":"%s","toolchainKey":"%s","cargoSeconds":%s}\n' \
+            "$1" "$reason" "$2" "$key" "$input_key" "$toolchain_key" "$3"
+    }
+    if git rev-parse --verify -q HEAD >/dev/null; then
+        input_key="$(git ls-tree -r HEAD -- "${inputs[@]}" | git hash-object --stdin)"
+        reason=dirty-inputs
+    fi
+    if [ -n "$input_key" ] && [ -z "$(git status --porcelain -- "${inputs[@]}")" ]; then
+        key="$( { printf '%s\n' "$toolchain"; git ls-tree -r HEAD -- "${inputs[@]}"; } | git hash-object --stdin)"
+        reason=no-pass-record
+        if [ -f "$record" ]; then reason=key-miss; fi
         if [ -f "$record" ] && grep -q "^$key " "$record"; then
             echo "served: these exact inputs compiled under the dist profile on this host at $(grep "^$key " "$record" | tail -1 | cut -d' ' -f2-)"
+            reason=matching-pass
+            measure served passed null
             exit 0
         fi
     fi
-    cargo build --workspace --profile dist --locked
+    started=$SECONDS
+    if cargo build --workspace --profile dist --locked; then
+        status=0
+    else
+        status=$?
+    fi
+    elapsed=$((SECONDS - started))
+    if [ "$status" -ne 0 ]; then
+        measure build failed "$elapsed"
+        exit "$status"
+    fi
     if [ -n "$key" ]; then
         mkdir -p target
         echo "$key $(git rev-parse --short=12 HEAD) $(date -u +%Y-%m-%dT%H:%MZ)" >> "$record"
     fi
+    measure build passed "$elapsed"
     exit 0
 fi
 

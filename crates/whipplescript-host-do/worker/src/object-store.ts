@@ -53,9 +53,8 @@
  *  deliberately left unbound: the route authenticates with the host control
  *  token rather than the session token, so binding a bucket there would widen
  *  what a public surface can reach for no use it has. The private Home configs
- *  run `private-home.ts`, which serves no object route at all and buffers its
- *  bodies inside grant admission; giving that surface a streaming byte route is
- *  its own change, not a binding. */
+ *  run `private-home.ts`, whose signed byte route uses this same binding with
+ *  command-scoped physical keys. */
 export interface ObjectPlaneEnv {
     WHIP_OBJECTS?: R2Bucket;
     /** Hosts this deployment will ingest bytes from, comma-separated.
@@ -89,9 +88,9 @@ const CONTENT_ID_PATTERN = /^[0-9a-f]{32}$/;
  * bucket's namespace, and a second key form is a second door into it. The `s-`
  * prefix cannot collide with an id, which is hex throughout.
  *
- * Only this route mints them. A PUT still demands a content id, because a
- * writer that holds the digest has no reason not to key on it — and every
- * reason to, since that is what makes its claim checkable.
+ * This route mints random staged keys for ingest. The private Home mints a
+ * deterministic key of the same narrow shape for each command and content id.
+ * Both retain the digest-derived content id as the logical handle.
  */
 const STAGED_KEY_PATTERN = /^s-[0-9a-f]{32}$/;
 

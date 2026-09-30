@@ -559,6 +559,11 @@ mod tests {
                 blobs.register_external(bad, 1).is_err(),
                 "{bad:?} must be refused"
             );
+            let error = blobs.external_binding(bad).expect_err("invalid binding id");
+            assert!(
+                format!("{error:?}").contains("not a content id"),
+                "the private binding reader must refuse {bad:?} as an invalid id"
+            );
         }
         assert!(blobs.register_external(&"a1".repeat(16), 1).is_ok());
     }
@@ -588,6 +593,11 @@ mod tests {
             staged,
             "and every later reader resolves the id to it"
         );
+        assert_eq!(
+            blobs.external_binding(id).expect("read binding"),
+            Some((4096, staged.to_owned())),
+            "the private byte reader gets the recorded key and length"
+        );
 
         assert!(matches!(
             blobs.erase(id, "2026-09-15T00:00:00Z").expect("erase"),
@@ -600,6 +610,11 @@ mod tests {
                 storage_key: staged.to_owned(),
             }],
             "the plane deletes by key, so the key has to survive the index row"
+        );
+        assert_eq!(
+            blobs.external_binding(id).expect("read erased binding"),
+            None,
+            "a pending physical deletion is no longer a readable binding"
         );
 
         blobs.external_delete_collected(id).expect("collected");

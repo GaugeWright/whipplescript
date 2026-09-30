@@ -67,6 +67,7 @@ pub mod norm_runtime;
 mod rule_commit_recovery_tests;
 #[cfg(test)]
 mod run_reattach_tests;
+pub mod source_planning;
 
 #[cfg(test)]
 mod governed_host_tests {

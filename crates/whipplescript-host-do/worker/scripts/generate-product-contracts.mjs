@@ -27,6 +27,14 @@ const hostOperations = [
   // that it exists (DR-0113). Important rather than critical — it asserts a fact
   // about content already placed and verified, and cannot itself move any.
   ["runtime.host.objects.register", "POST", "/host/objects/register", "http-json", "mutation", "important"],
+  // Only the signed private-Home Worker calls this DO-internal binding read.
+  // It is inventoried so a new inner recognizer cannot hide from the contract.
+  ["runtime.private-home.object.binding", "GET", "/__private/object-binding/:object", "internal-callback", "none", "internal"],
+  ["runtime.private-home.object.intent.record", "POST", "/__private/object-intent/:object", "internal-callback", "mutation", "internal"],
+  ["runtime.private-home.object.intent.read", "GET", "/__private/object-intent/:object", "internal-callback", "none", "internal"],
+  ["runtime.private-home.retirement.debt", "GET", "/__private/retirement/debt", "internal-callback", "none", "internal"],
+  ["runtime.private-home.retirement.ack", "POST", "/__private/retirement/ack", "internal-callback", "mutation", "internal"],
+  ["runtime.private-home.retirement.start", "POST", "/host/private/retire", "internal-callback", "mutation", "internal"],
   // The Home's mediated byte route (DR-0112). Declared at the OUTER shape,
   // like the private-home forwards beside it, because that is the URL the Home
   // actually routes on — the bytes never reach an instance to have an inner
@@ -34,6 +42,7 @@ const hostOperations = [
   // content, and a grant admits it.
   ["runtime.private-home.object.place", "POST", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "mutation", "critical"],
   ["runtime.private-home.object.read", "GET", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "none", "important"],
+  ["runtime.private-home.retire", "POST", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/private/retire", "http-json", "mutation", "critical"],
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],
@@ -106,10 +115,23 @@ function samplePath(path) {
     .replace(":instance", "instance-canary")
     .replace(":turn", "turn-canary")
     .replace(":call", "call-canary")
+    .replace(":object", "0123456789abcdef0123456789abcdef")
     .replace(":operation", "policy");
 }
 
 function evidenceFor(id) {
+  if (id === "runtime.private-home.retire" || id.startsWith("runtime.private-home.retirement.")) {
+    const retirement = "src/private-home-objects.integration.test.ts#private-command-retirement";
+    return { contract: [retirement], authority: [retirement], journey: [retirement], deployed: [], property: [retirement] };
+  }
+  if (id === "runtime.private-home.object.binding") {
+    const binding = "src/private-home-objects.integration.test.ts#command-bound-byte-keys";
+    return { contract: [binding], authority: [binding], journey: [binding], deployed: [], property: [binding] };
+  }
+  if (id.startsWith("runtime.private-home.object.intent.")) {
+    const intent = "src/private-home-objects.integration.test.ts#write-intent-survives-refusal";
+    return { contract: [intent], authority: [intent], journey: [intent], deployed: [], property: [intent] };
+  }
   if (id === "runtime.public.external-call.answer") {
     const answer = "src/session.integration.test.ts#external-tool-answer-persistence";
     return { contract: [answer], authority: [answer], journey: [answer], deployed: [], property: [answer] };
@@ -200,6 +222,7 @@ function operation(row) {
   const [id, method, path, transport, sideEffect, risk] = row;
   const publicSession = id.startsWith("runtime.public.");
   const privateHome = id.startsWith("runtime.private-home.");
+  const privateBinding = id === "runtime.private-home.object.binding" || id.startsWith("runtime.private-home.object.intent.") || id.startsWith("runtime.private-home.retirement.");
   const placement = id.startsWith("runtime.placement.");
   return {
     id,
@@ -212,19 +235,25 @@ function operation(row) {
     method,
     path,
     samplePath: samplePath(path),
-    producer: privateHome
+    producer: privateBinding
+      ? "whipplescript-private-home-durable-object"
+      : privateHome
       ? "whipplescript-private-home-worker"
       : publicSession
         ? "whipplescript-session-durable-object"
         : "whipplescript-host-worker",
-    consumer: publicSession
+    consumer: privateBinding
+      ? "WhippleScript signed private-Home Worker"
+      : publicSession
       ? "GaugeWright edge Deployment object"
       : privateHome
         ? "GaugeDesk Home durable workflow client"
         : placement
           ? "GaugeDesk managed workflow client"
           : "WhippleScript host protocol client",
-    authentication: privateHome
+    authentication: privateBinding
+      ? "internal-control-token-and-pinned-private-governance"
+      : privateHome
       ? "signed-home-execution-grant-and-internal-control-token"
       : "runtime-control-bearer",
     scope: publicSession

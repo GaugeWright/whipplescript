@@ -20,8 +20,34 @@ export interface DurableWorkflowGrant {
   request_method: string;
   request_path: string;
   request_body_sha256: string;
+  /** Only a Home terminal-command signer may set this for /host/private/retire. */
+  retirement_authorized?: true;
   issued_at: number;
   expires_at: number;
+}
+
+export interface PrivateRetirementReceipt {
+  version: 1;
+  attempt_id: string;
+  epoch: number;
+  terminal_phase: "completed" | "failed" | "canceled";
+  terminal_receipt_sha256: string;
+}
+
+export function parsePrivateRetirementReceipt(value: unknown): PrivateRetirementReceipt | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const receipt = value as Partial<PrivateRetirementReceipt>;
+  if (
+    receipt.version !== 1 ||
+    typeof receipt.attempt_id !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/.test(receipt.attempt_id) ||
+    !Number.isSafeInteger(receipt.epoch) ||
+    (receipt.epoch ?? 0) < 1 ||
+    !["completed", "failed", "canceled"].includes(receipt.terminal_phase ?? "") ||
+    typeof receipt.terminal_receipt_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(receipt.terminal_receipt_sha256)
+  ) return undefined;
+  return receipt as PrivateRetirementReceipt;
 }
 
 export function durableWorkflowObjectName(
@@ -37,6 +63,22 @@ export function durableWorkflowObjectName(
     grant.project_id,
     grant.command_id,
   ]);
+}
+
+/**
+ * Physical byte key for one private command's content id. The content id stays
+ * the digest-derived logical handle; the private Home owns a separate copy so
+ * collecting its bytes cannot delete an equal object held by another command.
+ * The `s-` shape is the host's existing narrow opaque-key namespace.
+ */
+export async function privateObjectStorageKey(
+  grant: Pick<DurableWorkflowGrant, "home_id" | "tenant_id" | "project_id" | "command_id">,
+  contentId: string,
+): Promise<string> {
+  const basis = new TextEncoder().encode(
+    JSON.stringify([durableWorkflowObjectName(grant), contentId]),
+  );
+  return `s-${(await sha256Hex(basis)).slice(0, 32)}`;
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/;
@@ -118,6 +160,27 @@ export async function verifyP256GrantSignature(
   }
 }
 
+/** Verify against the SEC1 point pinned inside one private command object. */
+export async function verifyPinnedP256GrantSignature(
+  grant: DurableWorkflowGrant,
+  signatureBase64: string,
+  sec1Hex: string,
+): Promise<boolean> {
+  if (!/^04[0-9a-f]{128}$/.test(sec1Hex)) return false;
+  try {
+    const point = Uint8Array.from(sec1Hex.match(/../g)!, (part) => Number.parseInt(part, 16));
+    const key = await crypto.subtle.importKey(
+      "raw", point, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"],
+    );
+    return crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" }, key, decodeBase64(signatureBase64),
+      new TextEncoder().encode(canonicalJson(grant)),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function validateDurableWorkflowGrant(
   grant: DurableWorkflowGrant,
   nowSeconds: number,
@@ -182,6 +245,13 @@ export function validateDurableWorkflowGrant(
     !SHA256.test(grant.request_body_sha256)
   ) {
     return "invalid bound request";
+  }
+  if (grant.request_path === "/host/private/retire") {
+    if (grant.request_method !== "POST" || grant.retirement_authorized !== true) {
+      return "private retirement needs terminal Home authorization";
+    }
+  } else if (grant.retirement_authorized !== undefined) {
+    return "private retirement authorization is bound to its own route";
   }
   if (
     !Number.isSafeInteger(grant.issued_at) ||

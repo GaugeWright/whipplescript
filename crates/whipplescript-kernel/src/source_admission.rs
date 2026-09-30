@@ -10,22 +10,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use whipplescript_core::norm_evidence::EvidenceVersion;
 use whipplescript_core::norm_selection::EvidenceSelection;
+use whipplescript_store::branches::flowing_admission::FlowingAdmissions;
 use whipplescript_store::branches::flowing_admission::FlowingCandidateWitness;
+use whipplescript_store::branches::flowing_fence::FlowingFence;
 use whipplescript_store::branches::flowing_fence::FlowingFenceState;
+use whipplescript_store::branches::Branches;
+use whipplescript_store::content::ContentBlobs;
 use whipplescript_store::norm_artifact::ArtifactLimits;
 use whipplescript_store::norm_history::{CapturedNormHistory, NormHistoryLimits};
 use whipplescript_store::norm_reference_inventory::{
     inventory_at, observed_acts_at, observed_edges_at, NormReferenceMeaning,
 };
 use whipplescript_store::norm_resources::RequirementResources;
+#[cfg(feature = "native")]
 use whipplescript_store::vcs::NativeWorkspaceVcs;
+use whipplescript_store::vcs::WorkspaceVcs;
 use whipplescript_store::RuntimeStore;
 
 use crate::norm_admission::{AdmissionHost, AdmissionLedger};
 use crate::norm_impact::{ImpactBasis, ImpactWork};
 use crate::norm_planning::{ImpactQuery, Planned};
 use crate::source_process::{
-    DependencyIdentity, ProcessCaptureAuthority, ProcessImpact, ReferenceScope,
+    DependencyIdentity, NormValidationBinding, ProcessCaptureAuthority, ProcessImpact,
+    ReferenceScope,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +68,27 @@ pub struct ReferenceClassObservation {
     pub version: String,
     pub field: String,
     pub meaning: Option<NormReferenceMeaning>,
+}
+
+/// An owning full-scope check required by dependency impact. Finding its
+/// installed method does not establish that it ran or that its result passed.
+#[derive(Clone, Debug, Serialize)]
+pub struct DependencyValidationWork {
+    pub consumer: DependencyIdentity,
+    pub owner: String,
+    pub method: EvidenceVersion,
+    pub structural_cut: String,
+    pub binding: Option<NormValidationBinding>,
+}
+
+/// References the independently derived local obligation rather than accepting
+/// a second serialized evidence judgment from the owning route. All selected
+/// observations and adequacy diagnostics remain in that obligation's support.
+#[derive(Clone, Debug, Serialize)]
+pub struct DependencyValidationJudgment {
+    pub obligation: Option<String>,
+    pub work: ImpactWork,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,6 +131,8 @@ pub struct SourceAdmissionJudgment {
     pub obligations: BTreeMap<String, SourceObligation>,
     pub references: LocalReferenceObservation,
     pub dependencies: Option<ProcessImpact>,
+    pub dependency_work: BTreeMap<String, DependencyValidationWork>,
+    pub dependency_judgments: BTreeMap<String, DependencyValidationJudgment>,
     pub blockers: BTreeSet<LocatedBlocker>,
 }
 
@@ -131,10 +161,18 @@ fn identity(value: &impl Serialize) -> Result<String, String> {
     // by their owning derivation. Operational queue order is never an input.
     let canonical = serde_json::to_value(value).map_err(|error| format!("{error:?}"))?;
     let bytes = serde_json::to_vec(&canonical).map_err(|error| format!("{error:?}"))?;
-    Ok(format!(
-        "sha256:{}",
-        whipplescript_store::stable_hash_bytes_hex(&bytes)
-    ))
+    Ok(format!("sha256:{}", crate::exec_http::sha256_hex(&bytes)))
+}
+
+fn process_identity() -> Result<EvidenceVersion, String> {
+    Ok(EvidenceVersion {
+        name: "whipplescript.source-admission.full-norm".into(),
+        version: "1".into(),
+        digest: identity(&(
+            crate::exec_http::sha256_hex(include_bytes!("source_admission.rs")),
+            crate::exec_http::sha256_hex(include_bytes!("source_process.rs")),
+        ))?,
+    })
 }
 
 fn obligations(
@@ -178,6 +216,66 @@ fn obligations(
     Ok(result)
 }
 
+fn validation_judgment(
+    work: &DependencyValidationWork,
+    ledger: &str,
+    obligations: &BTreeMap<String, SourceObligation>,
+) -> DependencyValidationJudgment {
+    let gap = |reason: &str| DependencyValidationJudgment {
+        obligation: None,
+        work: ImpactWork::ObservationGap,
+        reason: Some(reason.into()),
+    };
+    let Some(binding) = &work.binding else {
+        return gap("owning validation is required; no independently verified execution evidence or admitted norm correspondence was captured");
+    };
+    if binding.ledger != ledger
+        || binding.record.trim().is_empty()
+        || [
+            &binding.contract.name,
+            &binding.contract.version,
+            &binding.contract.digest,
+        ]
+        .iter()
+        .any(|part| part.trim().is_empty())
+    {
+        return gap("owning validation correspondence has no exact local ledger or contract");
+    }
+    let matches: Vec<_> = obligations
+        .iter()
+        .filter(|(_, obligation)| {
+            obligation.record == binding.record
+                && obligation.requirement.as_ref() == Some(&binding.requirement)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return gap("owning validation correspondence has no unique exact candidate obligation");
+    }
+    let (id, obligation) = matches[0];
+    let method_matches = match &obligation.work {
+        ImpactWork::Supported => obligation.support.as_ref().is_some_and(|selection| {
+            selection.positive.iter().any(|event| {
+                selection
+                    .judgments
+                    .get(event)
+                    .is_some_and(|judgment| judgment.subject.method == work.method)
+            })
+        }),
+        ImpactWork::Check { method } => method == &work.method,
+        _ => true,
+    };
+    DependencyValidationJudgment {
+        obligation: Some(id.clone()),
+        work: if method_matches {
+            obligation.work.clone()
+        } else {
+            ImpactWork::ObservationGap
+        },
+        reason: (!method_matches)
+            .then(|| "selected norm method does not establish this exact owning validation".into()),
+    }
+}
+
 /// Derive the candidate's full local norm obligations. No requirement is
 /// filtered by a partial reverse-dependency query. The Home's authoritative
 /// population/cut is still owed and remains an explicit blocking scope.
@@ -185,6 +283,7 @@ fn obligations(
 /// The caller selects only a retained witness and attempt; policy, methods,
 /// artifacts and evidence come from the embedding's owning readers. This
 /// function creates no issue, claim, execution, certificate or publication.
+#[cfg(feature = "native")]
 pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
     vcs: &NativeWorkspaceVcs,
     ledger: &L,
@@ -192,12 +291,13 @@ pub fn plan_native<L: AdmissionLedger, S: RuntimeStore>(
     witness_digest: &str,
     attempt_id: &str,
 ) -> Result<SourceAdmissionPlan, String> {
-    derive_native(vcs, ledger, host, witness_digest, attempt_id, None)
+    plan(vcs, ledger, host, witness_digest, attempt_id)
 }
 
 /// Compose the product Home's authoritative dependency capture. The installed
 /// Home reader must bind its norm and reference bases; an injected graph or a
 /// complete-looking extraction list cannot replace that authority.
+#[cfg(feature = "native")]
 pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
     vcs: &NativeWorkspaceVcs,
     ledger: &L,
@@ -206,7 +306,7 @@ pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
     attempt_id: &str,
     authority: &dyn ProcessCaptureAuthority,
 ) -> Result<SourceAdmissionPlan, String> {
-    derive_native(
+    derive(
         vcs,
         ledger,
         host,
@@ -216,16 +316,62 @@ pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
     )
 }
 
-fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
-    vcs: &NativeWorkspaceVcs,
+/// The same domain process over any owning VCS implementation. Hosted
+/// readers do not substitute serialized manifests or replayed subjects.
+pub fn plan<
+    B: Branches + FlowingAdmissions + FlowingFence,
+    C: ContentBlobs,
+    L: AdmissionLedger,
+    S: RuntimeStore,
+>(
+    vcs: &WorkspaceVcs<B, C>,
+    ledger: &L,
+    host: AdmissionHost<'_, S>,
+    witness_digest: &str,
+    attempt_id: &str,
+) -> Result<SourceAdmissionPlan, String> {
+    derive(vcs, ledger, host, witness_digest, attempt_id, None)
+}
+
+pub fn plan_with_authority<
+    B: Branches + FlowingAdmissions + FlowingFence,
+    C: ContentBlobs,
+    L: AdmissionLedger,
+    S: RuntimeStore,
+>(
+    vcs: &WorkspaceVcs<B, C>,
+    ledger: &L,
+    host: AdmissionHost<'_, S>,
+    witness_digest: &str,
+    attempt_id: &str,
+    authority: &dyn ProcessCaptureAuthority,
+) -> Result<SourceAdmissionPlan, String> {
+    derive(
+        vcs,
+        ledger,
+        host,
+        witness_digest,
+        attempt_id,
+        Some(authority),
+    )
+}
+
+fn derive<
+    B: Branches + FlowingAdmissions + FlowingFence,
+    C: ContentBlobs,
+    L: AdmissionLedger,
+    S: RuntimeStore,
+>(
+    vcs: &WorkspaceVcs<B, C>,
     ledger: &L,
     host: AdmissionHost<'_, S>,
     witness_digest: &str,
     attempt_id: &str,
     authority: Option<&dyn ProcessCaptureAuthority>,
 ) -> Result<SourceAdmissionPlan, String> {
+    let process = process_identity()?;
     let captured = vcs
-        .capture_native_gate_subject(witness_digest, attempt_id)
+        .capture_gate_subject(witness_digest, attempt_id)
         .map_err(|error| format!("{error:?}"))?;
     if !ledger
         .bootstrapped()
@@ -308,8 +454,15 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
         historical_population_unknown: inventory.historical_population_unknown,
     };
     let mut blockers = BTreeSet::new();
+    let mut process_installation = None;
     let dependencies = match authority {
         None => {
+            blockers.insert(LocatedBlocker {
+                scope: "home/process-installation".into(),
+                reason:
+                    "no independently admitted process policy or installed derivation was captured"
+                        .into(),
+            });
             blockers.insert(LocatedBlocker {
                 scope: "home/reference-population".into(),
                 reason: "no authoritative Home operation population, sealed cut or enforced scope boundary was captured".into(),
@@ -325,6 +478,14 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
                 None
             }
             Ok(impact) => {
+                let installed = authority.verify_process_basis(&impact.basis, &process);
+                if let Err(reason) = &installed {
+                    blockers.insert(LocatedBlocker {
+                        scope: "home/process-installation".into(),
+                        reason: reason.clone(),
+                    });
+                }
+                process_installation = Some(installed);
                 if impact.basis.native_base_cut != witness.expected_trunk_cut_id
                     || impact.basis.native_candidate_cut != witness.candidate_cut_id
                 {
@@ -412,16 +573,48 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
             reason: serde_json::to_string(conflict).map_err(|error| format!("{error:?}"))?,
         });
     }
+    let mut dependency_work = BTreeMap::new();
+    let mut dependency_judgments = BTreeMap::new();
+    let mut validation_bindings = Vec::new();
+    let obligations = obligations(witness_digest, &planned)?;
+    if let (Some(impact), Some(authority)) = (&dependencies, authority) {
+        for (consumer, validations) in &impact.validations {
+            for validation in validations {
+                let binding = authority.validation_requirement(&impact.basis, consumer, validation);
+                let work = DependencyValidationWork {
+                    consumer: consumer.clone(),
+                    owner: validation.owner.clone(),
+                    method: validation.method.clone(),
+                    structural_cut: validation.candidate_cut.clone(),
+                    binding: binding.as_ref().ok().cloned().flatten(),
+                };
+                let mut selected = validation_judgment(&work, &references.ledger, &obligations);
+                if let Err(reason) = &binding {
+                    selected.reason = Some(reason.clone());
+                }
+                let id = identity(&(
+                    "source-dependency-validation-v1",
+                    witness_digest,
+                    &impact.basis,
+                    &work,
+                ))?;
+                if selected.work != ImpactWork::Supported {
+                    blockers.insert(LocatedBlocker {
+                        scope: format!("dependency-validation/{id}"),
+                        reason: selected.reason.clone().unwrap_or_else(|| {
+                            format!("owning validation remains {:?}", selected.work)
+                        }),
+                    });
+                }
+                validation_bindings.push((consumer.clone(), validation.clone(), binding));
+                dependency_judgments.insert(id.clone(), selected);
+                dependency_work.insert(id, work);
+            }
+        }
+    }
     let judgment = SourceAdmissionJudgment {
         protocol: "whipplescript.source-admission/v1",
-        process: EvidenceVersion {
-            name: "whipplescript.source-admission.full-norm".into(),
-            version: "1".into(),
-            digest: format!(
-                "sha256:{}",
-                whipplescript_store::stable_hash_bytes_hex(include_bytes!("source_admission.rs"))
-            ),
-        },
+        process,
         subject: SourceAdmissionSubject {
             witness_digest: witness_digest.into(),
             witness: witness.clone(),
@@ -429,14 +622,16 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
         },
         interpretation: host.configuration.identity().clone(),
         norm: planned.to_json(),
-        obligations: obligations(witness_digest, &planned)?,
+        obligations,
         references,
         dependencies,
+        dependency_work,
+        dependency_judgments,
         blockers,
     };
     // Detect change during derivation. This is not the final publication fence.
     let current = vcs
-        .capture_native_gate_subject(witness_digest, attempt_id)
+        .capture_gate_subject(witness_digest, attempt_id)
         .map_err(|error| format!("{error:?}"))?;
     let (current_view, current_events) = ledger
         .capture(host.verifier)
@@ -452,6 +647,18 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
         return Err("source-admission premises changed during derivation".into());
     }
     if let (Some(authority), Some(impact)) = (authority, &judgment.dependencies) {
+        for (consumer, validation, captured) in validation_bindings {
+            if authority.validation_requirement(&impact.basis, &consumer, &validation) != captured {
+                return Err(
+                    "Home owning validation correspondence changed during derivation".into(),
+                );
+            }
+        }
+        if Some(authority.verify_process_basis(&impact.basis, &judgment.process))
+            != process_installation
+        {
+            return Err("Home process installation changed during derivation".into());
+        }
         if authority.basis(witness_digest)? != impact.basis {
             return Err("Home source-admission basis changed during derivation".into());
         }
@@ -462,6 +669,6 @@ fn derive_native<L: AdmissionLedger, S: RuntimeStore>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 #[path = "source_admission_tests.rs"]
 mod tests;

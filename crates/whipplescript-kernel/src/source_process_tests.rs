@@ -99,6 +99,9 @@ impl Authority {
     }
 }
 impl ProcessCaptureAuthority for Authority {
+    fn verify_process_basis(&self, _: &ProcessBasis, _: &EvidenceVersion) -> Result<(), String> {
+        Err("this graph fixture supplies no process installation authority".into())
+    }
     fn verify_norm_basis(
         &self,
         _: &ProcessBasis,
@@ -157,6 +160,7 @@ impl ProcessCaptureAuthority for Authority {
 #[test]
 fn impact_keeps_deleted_edges_and_transitive_consumers_from_both_cuts() {
     let mut authority = Authority::new();
+    authority.fallback = true;
     authority
         .observations
         .get_mut(&(CutSide::After, scope()))
@@ -174,6 +178,27 @@ fn impact_keeps_deleted_edges_and_transitive_consumers_from_both_cuts() {
     let wire = serde_json::to_value(&impact).unwrap();
     assert!(wire["basis"]["after"]["scopes"].is_array());
     assert!(wire["coverage"].is_array());
+}
+
+#[test]
+fn closed_graph_routes_required_validation_and_missing_owner_stays_blocked() {
+    let mut authority = Authority::new();
+    let missing = capture_impact(&authority, "candidate").unwrap();
+    assert!(missing.blockers.iter().any(|gap| gap
+        .reason
+        .contains("has no installed exact-candidate owning validator")));
+    assert!(missing.affected.contains(&dep("b")));
+    authority.fallback = true;
+    let routed = capture_impact(&authority, "candidate").unwrap();
+    assert!(routed.blockers.is_empty());
+    assert_eq!(routed.validations.len(), 2);
+    authority.missing_owner = Some(dep("b"));
+    let missing = capture_impact(&authority, "candidate").unwrap();
+    assert!(missing
+        .blockers
+        .iter()
+        .any(|gap| gap.reason.contains("home/b")));
+    assert_eq!(missing.validations.len(), 1);
 }
 
 #[test]
@@ -223,6 +248,7 @@ fn unknown_coverage_can_widen_only_to_every_installed_exact_owner_validation() {
 #[test]
 fn an_enforced_envelope_widens_but_a_declared_incomplete_envelope_is_unknown() {
     let mut authority = Authority::new();
+    authority.fallback = true;
     authority.boundary = VerifiedScopeBoundary::Bounded {
         contract: version("installed-ceiling"),
         consumers: BTreeSet::from([dep("a"), dep("b")]),
@@ -231,6 +257,7 @@ fn an_enforced_envelope_widens_but_a_declared_incomplete_envelope_is_unknown() {
     let impact = capture_impact(&authority, "candidate").unwrap();
     assert!(impact.blockers.is_empty());
     assert!(impact.affected.contains(&dep("b")));
+    authority.fallback = false;
     authority.boundary = VerifiedScopeBoundary::Bounded {
         contract: version("installed-ceiling"),
         consumers: BTreeSet::from([dep("a")]),

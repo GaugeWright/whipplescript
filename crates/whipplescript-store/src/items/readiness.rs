@@ -155,6 +155,7 @@ pub struct WaitVerdict {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Unready {
     NotFound,
+    Initiative,
     NotOpen {
         status: String,
     },
@@ -184,6 +185,7 @@ impl Unready {
     pub fn describe(&self) -> String {
         match self {
             Self::NotFound => "not found".to_owned(),
+            Self::Initiative => "initiative is a grouping record, not executable work".to_owned(),
             Self::NotOpen { status } => format!("status is {status}"),
             Self::Claimed { holder, expires_at } => match expires_at {
                 Some(at) => format!("claimed by {holder} until {at}"),
@@ -227,6 +229,8 @@ pub struct Blocker {
 /// The facts readiness reads, fetched by a backend. Every lease question is
 /// asked at the caller's instant `at`; nothing here reads a clock.
 pub trait ReadinessSource {
+    /// Immutable issue kind, fetched through the backend's payload protection.
+    fn issue_kind(&self, issue: &str) -> StoreResult<Option<String>>;
     /// Durable status (no lease overlay), or `None` if the issue is absent.
     fn durable_status(&self, issue: &str) -> StoreResult<Option<String>>;
     /// The issue's queue.
@@ -444,6 +448,9 @@ pub fn unready_reasons(
         return Ok(vec![Unready::NotFound]);
     };
     let mut reasons = Vec::new();
+    if source.issue_kind(issue)?.as_deref() == Some("initiative") {
+        reasons.push(Unready::Initiative);
+    }
     if status != "open" {
         reasons.push(Unready::NotOpen { status });
     }

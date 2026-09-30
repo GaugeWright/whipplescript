@@ -7607,6 +7607,207 @@ complete result { count count } }
         );
     }
 
+    #[test]
+    fn exhausted_transport_settles_durable_effect_and_allows_checkpoint() {
+        exhausted_transport_checkpoint_case(false);
+    }
+
+    #[test]
+    fn exhausted_transport_preserves_pending_cancellation_and_allows_checkpoint() {
+        exhausted_transport_checkpoint_case(true);
+    }
+
+    fn exhausted_transport_checkpoint_case(cancel: bool) {
+        use whipplescript_kernel::harness_loop::{HarnessModelError, ModelReply};
+        struct TransportModel;
+        impl HttpModelClient for TransportModel {
+            fn build_request(
+                &self,
+                messages: &[ChatMessage],
+                tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+            ) -> whipplescript_kernel::sansio::HttpRequest {
+                FinalReplyModel.build_request(messages, tools)
+            }
+            fn parse_response(
+                &self,
+                response: Result<HttpResponse, TransportError>,
+            ) -> Result<ModelReply, HarnessModelError> {
+                match response {
+                    Err(TransportError::Transport(message)) => {
+                        Err(HarnessModelError::Transport(message))
+                    }
+                    Err(TransportError::RetryBudgetExhausted(message)) => {
+                        Err(HarnessModelError::RetryBudgetExhausted(message))
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+        }
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                r#"{"package_version_ref":"one"}"#,
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let sql = kernel.store().sql.clone();
+        let model = TransportModel;
+        let driver = DoInstanceDriver {
+            now_unix_ms: 0,
+            norm_gate: None,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            media: &Default::default(),
+            agent_model: Some(&model),
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            initial_model_provenance: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are the package persona.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        let running = sql
+            .query(
+                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                &[crate::do_store::SqlValue::Text(instance_id.clone())],
+            )
+            .unwrap();
+        assert_eq!(running[0][0], crate::do_store::SqlValue::Int(1));
+        for _ in 0..2 {
+            assert!(matches!(
+                machine.step(Some(IoResult::Http(Err(TransportError::Transport(
+                    "lost reply".into()
+                ))))),
+                Outcome::NeedsIo(_)
+            ));
+        }
+        // Reproduce the old escape path: throwing here strands a running
+        // effect, so the consistent-cut refusal must remain in force.
+        let mut observer = DoSqliteStore::new(sql.clone());
+        let refusal = observer
+            .capture_checkpoint(whipplescript_store::CheckpointCapture {
+                instance_id: &instance_id,
+                cut_id: "before-final-observation",
+                transcript_ref: None,
+                idempotency_key: None,
+            })
+            .expect_err("withholding the final observation strands a running effect");
+        assert!(format!("{refusal:?}").contains("checkpoint requires a quiescent instance"));
+        if cancel {
+            let effect = sql
+                .query(
+                    "SELECT effect_id FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                    &[crate::do_store::SqlValue::Text(instance_id.clone())],
+                )
+                .unwrap();
+            let crate::do_store::SqlValue::Text(effect_id) = &effect[0][0] else {
+                panic!("running effect identity missing");
+            };
+            observer
+                .request_effect_cancellation(whipplescript_store::EffectCancellationRequest {
+                    instance_id: &instance_id,
+                    effect_id,
+                    revision_id: None,
+                    reason: Some("synthetic cancellation"),
+                    requested_by: "test",
+                    causation_event_id: None,
+                    idempotency_key: Some("cancel-before-exhaustion"),
+                })
+                .expect("cancellation requested");
+        }
+        // The shell previously threw here and never delivered this observation.
+        let outcome = machine.step(Some(IoResult::Http(Err(
+            TransportError::RetryBudgetExhausted("lost reply".into()),
+        ))));
+        assert!(
+            if cancel {
+                matches!(outcome, Outcome::Settle(InstanceOutcome::Parked))
+            } else {
+                matches!(outcome, Outcome::Settle(InstanceOutcome::Terminal))
+            },
+            "{outcome:?}"
+        );
+        let mut driver = machine.into_driver();
+        let running = sql
+            .query(
+                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                &[crate::do_store::SqlValue::Text(instance_id.clone())],
+            )
+            .unwrap();
+        assert_eq!(running[0][0], crate::do_store::SqlValue::Int(0));
+        let terminal = sql.query("SELECT COUNT(*) FROM events WHERE instance_id = ?1 AND event_type = 'effect.terminal'", &[crate::do_store::SqlValue::Text(instance_id.clone())]).unwrap();
+        assert_eq!(terminal[0][0], crate::do_store::SqlValue::Int(1));
+        let statuses = sql
+            .query(
+                "SELECT status FROM effects WHERE instance_id = ?1",
+                &[crate::do_store::SqlValue::Text(instance_id.clone())],
+            )
+            .unwrap();
+        assert_eq!(
+            statuses[0][0],
+            crate::do_store::SqlValue::Text(if cancel { "cancelled" } else { "failed" }.to_owned(),)
+        );
+        driver
+            .kernel
+            .store_mut()
+            .capture_checkpoint(whipplescript_store::CheckpointCapture {
+                instance_id: &instance_id,
+                cut_id: "after-exhaustion",
+                transcript_ref: None,
+                idempotency_key: None,
+            })
+            .expect("settled effect is checkpointable");
+    }
+
     /// Store-backed project instructions (context-assembly Phase 3 item 4):
     /// docs registered in the DO store ride into the agent turn's system prompt
     /// with pi's exact wrapper, and each doc records a `context.bundle`

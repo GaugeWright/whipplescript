@@ -187,7 +187,9 @@ test("every ready local suite in the inventory starts a journey the runner has",
   });
   assert.deepEqual(spawned, [
     "managed-host-lifecycle", "private-home-forwarding", "live-model-context", "norm-ledger",
+    "private-command-retirement",
   ]);
+  assert(result.executed.includes("private-command-retirement"));
   assert(result.executed.includes("norm-ledger"));
   assert(result.executed.includes("placement-forwarding"));
 });

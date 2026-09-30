@@ -29,6 +29,18 @@ The blocking workerd gate runs the public Session composition and a separate
 authenticated host composition covering every declared inner route, generated
 placement identifiers, full host lifecycle, and signed private-Home grants.
 
+On the private Home byte route, a content id remains the logical handle but
+new uploads are stored under a command-scoped opaque R2 key. The command's
+durable binding selects the exact key for reads, including legacy commands
+whose bytes are still under a global content-id key. Equal bytes in two new
+commands therefore have independent physical copies, a prerequisite for
+retiring one shadow placement without deleting another's data. The signed
+retirement and byte collection lifecycle is tracked separately in WS-220.
+Before streaming a private upload, the command object also records a non-live
+write intent for that key. A failed checksum or interrupted registration can
+leave no live content handle; the intent keeps its possible physical copy
+discoverable for later retirement without claiming its bytes were placed.
+
 `contracts/production-canaries.json` maps every critical deployed-evidence gap
 exactly once. The public Session lifecycle uses the immutable GaugeWright Cloud
 Panels runner. `scripts/production-wiring-canary.mjs` supplies the managed-host,

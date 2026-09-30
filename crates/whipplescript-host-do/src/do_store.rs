@@ -5306,6 +5306,7 @@ fn do_reattest_instance_program<Sql: DoSql>(
     instance_id: &str,
     version: NewProgramVersion<'_>,
     witness: Option<&whipplescript_store::program_imports::ProgramImportWitness>,
+    requested_operation_id: Option<&str>,
 ) -> StoreResult<(ProgramVersionRecord, Option<String>, Option<String>)> {
     use whipplescript_store::program_imports;
 
@@ -5332,7 +5333,69 @@ fn do_reattest_instance_program<Sql: DoSql>(
             "re-attestation requires the same authored program".to_owned(),
         ));
     }
+    let requested_witness = if let Some(operation_id) = requested_operation_id {
+        let witness = witness.expect("a Home operation identity requires a checked witness");
+        if !program_imports::matches_source_id(witness, version.source_hash) {
+            return Err(StoreError::Conflict(
+                "import witness program source differs from the version".into(),
+            ));
+        }
+        let (digest, json) = program_imports::encode(witness)?;
+        let prior = sql
+            .query(
+                "SELECT version_id, IFNULL(witness_digest, ''), kind \
+                 FROM program_import_operations WHERE operation_id = ?1",
+                &[text(operation_id)],
+            )
+            .map_err(sql_err)?;
+        Some((operation_id, digest, json, prior))
+    } else {
+        None
+    };
     if recorded_ir == version.ir_hash {
+        if let Some((operation_id, digest, json, prior)) = requested_witness {
+            let Some(prior) = prior.first() else {
+                return Err(StoreError::Conflict(
+                    "Home re-attestation has no exact target operation".into(),
+                ));
+            };
+            if as_text(&prior[0]) != from_version_id
+                || as_text(&prior[1]) != digest
+                || as_text(&prior[2]) != "checked"
+            {
+                return Err(StoreError::Conflict(
+                    "Home re-attestation operation has different evidence".into(),
+                ));
+            }
+            let retained = sql
+                .query(
+                    "SELECT witness_json FROM program_import_admissions \
+                     WHERE version_id = ?1 AND witness_digest = ?2",
+                    &[text(&from_version_id), text(&digest)],
+                )
+                .map_err(sql_err)?;
+            let transition = sql
+                .query(
+                    "SELECT 1 FROM events WHERE instance_id = ?1 \
+                     AND event_type = 'instance.program.reattested' \
+                     AND correlation_id = ?2 LIMIT 1",
+                    &[text(instance_id), text(operation_id)],
+                )
+                .map_err(sql_err)?;
+            if retained.first().map(|row| as_text(&row[0])) != Some(json) || transition.is_empty() {
+                return Err(StoreError::Conflict(
+                    "Home re-attestation retry differs from its instance transition".into(),
+                ));
+            }
+            return Ok((
+                ProgramVersionRecord {
+                    program_id,
+                    version_id: from_version_id,
+                },
+                Some(digest),
+                Some(operation_id.to_owned()),
+            ));
+        }
         if witness.is_some() {
             return Err(StoreError::Conflict(
                 "checked re-attestation requires changed compiler IR".into(),
@@ -5347,6 +5410,14 @@ fn do_reattest_instance_program<Sql: DoSql>(
             None,
         ));
     }
+    if requested_witness
+        .as_ref()
+        .is_some_and(|(_, _, _, prior)| !prior.is_empty())
+    {
+        return Err(StoreError::Conflict(
+            "Home re-attestation operation already belongs to another transition".into(),
+        ));
+    }
     let encoded = witness
         .map(|witness| {
             if !program_imports::matches_source_id(witness, version.source_hash) {
@@ -5357,8 +5428,11 @@ fn do_reattest_instance_program<Sql: DoSql>(
             program_imports::encode(witness)
         })
         .transpose()?;
+    let new_operation_id = match requested_operation_id {
+        Some(operation_id) => operation_id.to_owned(),
+        None => do_new_import_operation_id(sql)?,
+    };
     let mut record = None;
-    let mut operation_id = None;
     sql.atomic(&mut || {
         let to_version_id = do_insert_program_version(sql, &program_id, version)?;
         if let Some((digest, json)) = &encoded {
@@ -5379,7 +5453,7 @@ fn do_reattest_instance_program<Sql: DoSql>(
         })
         .to_string();
         let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
-        do_append_event_idempotent(
+        let event = do_append_event_idempotent(
             sql,
             NewEvent {
                 instance_id,
@@ -5387,16 +5461,28 @@ fn do_reattest_instance_program<Sql: DoSql>(
                 payload_json: &payload,
                 source: "kernel",
                 causation_id: None,
-                correlation_id: None,
+                correlation_id: requested_operation_id,
                 idempotency_key: Some(&idempotency),
             },
         )?;
+        if requested_operation_id.is_some() {
+            let retained = sql
+                .query(
+                    "SELECT correlation_id FROM events WHERE event_id = ?1",
+                    &[text(&event.event_id)],
+                )
+                .map_err(sql_err)?;
+            if retained.first().map(|row| as_text(&row[0])) != Some(new_operation_id.clone()) {
+                return Err(StoreError::Conflict(
+                    "Home re-attestation conflicts with a prior instance transition".into(),
+                ));
+            }
+        }
         sql.execute(
             "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
             &[text(&to_version_id), text(instance_id)],
         )
         .map_err(sql_err)?;
-        let new_operation_id = do_new_import_operation_id(sql)?;
         sql.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
@@ -5419,13 +5505,12 @@ fn do_reattest_instance_program<Sql: DoSql>(
             program_id: program_id.clone(),
             version_id: to_version_id,
         });
-        operation_id = Some(new_operation_id);
         Ok(())
     })?;
     Ok((
         record.expect("the successful atomic body sets its re-attestation record"),
         encoded.map(|(digest, _)| digest),
-        operation_id,
+        Some(new_operation_id),
     ))
 }
 
@@ -5681,7 +5766,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        do_reattest_instance_program(&self.sql, instance_id, version, None)
+        do_reattest_instance_program(&self.sql, instance_id, version, None, None)
             .map(|(record, _, _)| record)
     }
 
@@ -5692,13 +5777,39 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         witness: &whipplescript_store::program_imports::ProgramImportWitness,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
         let (record, digest, operation_id) =
-            do_reattest_instance_program(&self.sql, instance_id, version, Some(witness))?;
+            do_reattest_instance_program(&self.sql, instance_id, version, Some(witness), None)?;
         Ok(
             whipplescript_store::program_imports::ProgramImportAdmissionRecord {
                 program_id: record.program_id,
                 version_id: record.version_id,
                 witness_digest: digest.expect("the supplied re-attestation witness was stored"),
                 operation_id: operation_id.expect("checked re-attestation wrote an operation"),
+            },
+        )
+    }
+
+    fn reattest_instance_program_with_import_witness_at_id(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+        witness: &whipplescript_store::program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        let (record, digest, admitted_id) = do_reattest_instance_program(
+            &self.sql,
+            instance_id,
+            version,
+            Some(witness),
+            Some(operation_id),
+        )?;
+        Ok(
+            whipplescript_store::program_imports::ProgramImportAdmissionRecord {
+                program_id: record.program_id,
+                version_id: record.version_id,
+                witness_digest: digest.expect("checked Home re-attestation retained its witness"),
+                operation_id: admitted_id
+                    .expect("checked Home re-attestation retained its operation"),
             },
         )
     }
@@ -9309,6 +9420,7 @@ fn do_file_item_on(
     effect_id: Option<&str>,
     filing_fingerprint: Option<&str>,
 ) -> StoreResult<(String, String)> {
+    whipplescript_store::items::initiatives::issue_kind(metadata)?;
     let now = do_now(sql)?;
     // The caller owns the transaction spanning counter, event and projection.
     let bumped = sql
@@ -9856,6 +9968,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         if status.as_deref() != Some("open") {
             return Ok(FinishOutcome::NotOpen);
         }
+        readiness::validate_closure(&self.sql, item_id, summary)?;
         let payload = serde_json::json!({"status": "closed", "summary": summary});
         do_tracker_append(
             &self.sql,
@@ -9924,6 +10037,15 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
         let to_cid = do_content_id(&self.sql, to)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        whipplescript_store::items::initiatives::validate_relation(
+            kind,
+            readiness::issue_kind(&self.sql, from)?,
+            readiness::issue_kind(&self.sql, to)?,
+        )?;
+        if kind == "belongs-to" && !self.sql.query(
+            "SELECT 1 FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = 'belongs-to'",
+            &[text(from), text(to)],
+        ).map_err(sql_err)?.is_empty() { return Ok(()); }
         let payload =
             serde_json::json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         do_tracker_append(
@@ -9952,6 +10074,14 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let Some(content_id) = do_content_id(&self.sql, item_id)? else {
             return Ok(false);
         };
+        if field == "kind" || field == "metadata.kind" {
+            return Err(StoreError::Conflict(
+                "issue kind is immutable; set it when filing".into(),
+            ));
+        }
+        if field == "status" && value == "closed" {
+            readiness::validate_closure(&self.sql, item_id, None)?;
+        }
         let payload = serde_json::json!({"field": field, "value": value});
         do_tracker_append_raw(
             &self.sql,
@@ -10539,7 +10669,20 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 &alias_of,
             )?;
         }
-        Ok(())
+        let edges = self.sql.query("SELECT from_issue, to_issue, kind FROM tracker_relations WHERE kind IN ('belongs-to', 'blocks')", &[]).map_err(sql_err)?;
+        let mut invalid = None;
+        for row in edges {
+            let (from, to, kind) = (as_text(&row[0]), as_text(&row[1]), as_text(&row[2]));
+            if let Err(error) = whipplescript_store::items::initiatives::validate_relation(
+                &kind,
+                readiness::issue_kind(&self.sql, &from)?,
+                readiness::issue_kind(&self.sql, &to)?,
+            ) {
+                self.sql.execute("DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3", &[text(&from), text(&to), text(&kind)]).map_err(sql_err)?;
+                invalid.get_or_insert(error);
+            }
+        }
+        invalid.map_or(Ok(()), Err)
     }
 
     /// An issue's comments in chronological order.
@@ -10623,6 +10766,9 @@ fn do_fold_tracker_event(
                 let labels_json = payload
                     .get("labels")
                     .map_or_else(|| "[]".to_owned(), std::string::ToString::to_string);
+                whipplescript_store::items::initiatives::issue_kind(
+                    payload.get("metadata").unwrap_or(&serde_json::Value::Null),
+                )?;
                 let metadata_json = payload
                     .get("metadata")
                     .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
@@ -15431,6 +15577,198 @@ pub(crate) mod tests {
                 )
                 .is_err(),
             "an exact hosted retry must inspect retained witness bytes"
+        );
+    }
+
+    #[test]
+    fn hosted_home_reattestation_recovers_exact_instance_transition() {
+        const OPERATION_ID: &str = "imp_33333333333333333333333333333333";
+        const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEXT_IR: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let version = |ir_hash| NewProgramVersion {
+            program_name: "home-reattest",
+            source_hash: &SOURCE[..32],
+            ir_hash,
+            compiler_version: "test-compiler",
+            ir_snapshot: None,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        let witness = whipplescript_store::program_imports::ProgramImportWitness {
+            program_source_digest: SOURCE.into(),
+            version_source_digest: None,
+            lock_digest: SOURCE.into(),
+            compiler_artifact_digest: SOURCE.into(),
+            examined: vec![],
+            edges: vec![],
+            edge_digest: whipplescript_store::items::sha256_hex("[]"),
+            constructs: None,
+            declarations: None,
+        };
+        let mut store = store();
+        let original = store
+            .create_program_version_with_import_witness(version(SOURCE), &witness)
+            .unwrap();
+        let first = store
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let other = store
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version(SOURCE),
+                &witness,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("no exact target operation")
+        ));
+        let admitted = store
+            .reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version(NEXT_IR),
+                &witness,
+                OPERATION_ID,
+            )
+            .unwrap();
+        assert_eq!(admitted.operation_id, OPERATION_ID);
+        let after = store.program_import_operation_roster().unwrap();
+        assert_eq!(
+            store
+                .reattest_instance_program_with_import_witness_at_id(
+                    &first.instance_id,
+                    version(NEXT_IR),
+                    &witness,
+                    OPERATION_ID,
+                )
+                .unwrap(),
+            admitted
+        );
+        let mut changed_witness = witness.clone();
+        changed_witness.lock_digest = NEXT_IR.into();
+        let mut wrong_source = witness.clone();
+        wrong_source.program_source_digest = NEXT_IR.into();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version(NEXT_IR),
+                &wrong_source,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("program source differs")
+        ));
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version(NEXT_IR),
+                &changed_witness,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("different evidence")
+        ));
+        store
+            .sql
+            .execute(
+                "UPDATE events SET correlation_id = NULL WHERE correlation_id = ?1",
+                &[text(OPERATION_ID)],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &first.instance_id,
+                version(NEXT_IR),
+                &witness,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("instance transition")
+        ));
+        store
+            .sql
+            .execute(
+                "UPDATE events SET correlation_id = ?1 WHERE instance_id = ?2 \
+                 AND event_type = 'instance.program.reattested'",
+                &[text(OPERATION_ID), text(&first.instance_id)],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reattest_instance_program_with_import_witness_at_id(
+                &other.instance_id,
+                version(NEXT_IR),
+                &witness,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("another transition")
+        ));
+        assert_eq!(
+            store
+                .get_instance(&other.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            original.version_id
+        );
+        assert_eq!(store.program_import_operation_roster().unwrap(), after);
+
+        let mut prior = super::test_support::store();
+        let original = prior
+            .create_program_version_with_import_witness(version(SOURCE), &witness)
+            .unwrap();
+        let instance = prior
+            .create_instance(NewInstance {
+                program_id: &original.program_id,
+                version_id: &original.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        prior
+            .reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                version(NEXT_IR),
+                &witness,
+            )
+            .unwrap();
+        prior
+            .reattest_instance_program_with_import_witness(
+                &instance.instance_id,
+                version(SOURCE),
+                &witness,
+            )
+            .unwrap();
+        let prior_roster = prior.program_import_operation_roster().unwrap();
+        assert!(matches!(
+            prior.reattest_instance_program_with_import_witness_at_id(
+                &instance.instance_id,
+                version(NEXT_IR),
+                &witness,
+                OPERATION_ID,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("prior instance transition")
+        ));
+        assert_eq!(
+            prior.program_import_operation_roster().unwrap(),
+            prior_roster
+        );
+        assert_eq!(
+            prior
+                .get_instance(&instance.instance_id)
+                .unwrap()
+                .unwrap()
+                .version_id,
+            original.version_id
         );
     }
 

@@ -1804,7 +1804,7 @@ mod tests {
     fn expect_gate_refusal<T: std::fmt::Debug>(result: StoreResult<T>, reason: &str) {
         match result {
             Err(StoreError::Conflict(message)) => {
-                assert_eq!(message, format!("native candidate gate refuses: {reason}"));
+                assert_eq!(message, format!("candidate gate refuses: {reason}"));
             }
             other => panic!("expected native gate refusal `{reason}`, got {other:?}"),
         }

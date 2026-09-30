@@ -67,6 +67,10 @@ mod TRACKER-READINESS is
   op labeled : Nat Label -> Fact [ctor] .
   --- ready(id): the derived readiness fact.
   op ready : Nat -> Fact [ctor] .
+  --- DR-0153: a grouping record is never executable.
+  op initiative : Nat -> Fact [ctor] .
+  op belongsTo : Nat Nat -> Fact [ctor] .
+  op isInitiative : Nat Cfg -> Bool .
   --- dueReview(id): a wait on id is past its review instant and unmet.
   op dueReview : Nat -> Fact [ctor] .
 
@@ -81,6 +85,10 @@ mod TRACKER-READINESS is
   var Cd : Cond .
   var L : Label .
   vars C Full : Cfg .
+
+  eq isInitiative(Id, initiative(Id) C) = true .
+  eq isInitiative(Id, C) = false [owise] .
+
 
   --- The historical two-argument dependency is a hard one.
   eq blocks(B, Id) = blocks(B, Id, hard) .
@@ -176,7 +184,8 @@ mod TRACKER-READINESS is
   --- Derive ready(Id): open, no active gating blocker, no active lease, not in
   --- conflict, every wait holds, not yet ready.
   crl [ready] : { issue(Id, open) now(T) C } => { ready(Id) issue(Id, open) now(T) C }
-    if blockedByActive(Id, C, issue(Id, open) now(T) C) = false
+    if isInitiative(Id, C) = false
+    /\ blockedByActive(Id, C, issue(Id, open) now(T) C) = false
     /\ hasActiveLeaseOn(Id, T, C) = false
     /\ isConflicted(Id, C) = false
     /\ waitsHold(Id, T, C, issue(Id, open) now(T) C) = true

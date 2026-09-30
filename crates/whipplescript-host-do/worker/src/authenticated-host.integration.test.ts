@@ -1706,11 +1706,9 @@ describe("real WorkflowInstance hibernation", () => {
     // about this suite trips it, and every operation below is then exercised
     // for real.
     //
-    // It counts what the FILTER yields, not the declared surface: of the 43
-    // declared operations, six are `/v1/...` routes outside it. Writing the
-    // declared total here counts those six and fails; this number is counted
-    // from `runtime-route-surface.json` through the same filter.
-    expect(operations.length).toBe(39);
+    // It counts what the FILTER yields, not the declared surface: outer
+    // `/v1/...` and DO-internal `/__private/...` routes are outside it.
+    expect(operations.length).toBe(40);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {

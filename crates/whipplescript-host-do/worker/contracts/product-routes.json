@@ -547,6 +547,222 @@
       }
     },
     {
+      "id": "runtime.private-home.object.binding",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "GET",
+      "path": "/__private/object-binding/:object",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.object.binding/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.object.binding/response",
+      "sideEffect": "none",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#command-bound-byte-keys"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#command-bound-byte-keys"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#command-bound-byte-keys"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#command-bound-byte-keys"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.object.intent.record",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "POST",
+      "path": "/__private/object-intent/:object",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.object.intent.record/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.object.intent.record/response",
+      "sideEffect": "mutation",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.object.intent.read",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "GET",
+      "path": "/__private/object-intent/:object",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.object.intent.read/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.object.intent.read/response",
+      "sideEffect": "none",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#write-intent-survives-refusal"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.retirement.debt",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "GET",
+      "path": "/__private/retirement/debt",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.debt/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.debt/response",
+      "sideEffect": "none",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.retirement.ack",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "POST",
+      "path": "/__private/retirement/ack",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.ack/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.ack/response",
+      "sideEffect": "mutation",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.retirement.start",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "POST",
+      "path": "/host/private/retire",
+      "producer": "whipplescript-private-home-durable-object",
+      "consumer": "WhippleScript signed private-Home Worker",
+      "authentication": "internal-control-token-and-pinned-private-governance",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.start/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.retirement.start/response",
+      "sideEffect": "mutation",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ]
+      }
+    },
+    {
       "id": "runtime.private-home.object.place",
       "jurisdiction": "private-home-command",
       "transport": "http-stream",
@@ -621,6 +837,42 @@
         "property": [
           "src/private-home-protocol.test.ts#grant-field-mutations",
           "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.retire",
+      "jurisdiction": "private-home-command",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/private/retire",
+      "producer": "whipplescript-private-home-worker",
+      "consumer": "GaugeDesk Home durable workflow client",
+      "authentication": "signed-home-execution-grant-and-internal-control-token",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.retire/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.retire/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "authority": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "journey": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-objects.integration.test.ts#private-command-retirement"
         ]
       }
     },

@@ -128,6 +128,23 @@ pub use impact::{
 mod promotion;
 pub use promotion::execute_installed_hosted_norm_promotion;
 
+/// Domain query embeddings share installed norm inputs without adding their
+/// coordinates or process vocabulary to the generic norm command protocol.
+pub(crate) fn with_query_host<Sql: crate::do_store::DoSql + Clone, T>(
+    sql: &Sql,
+    trust: &str,
+    deployment: &str,
+    time_basis: &str,
+    evaluate: impl FnOnce(
+        whipplescript_kernel::norm_admission::AdmissionHost<'_, crate::do_store::DoSqliteStore<Sql>>,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut deployment = impact::Deployment::parse(deployment)?;
+    deployment.time_basis = time_basis.into();
+    deployment.now = None;
+    promotion::with_admission_host(sql, trust, &deployment, evaluate)
+}
+
 /// The deployment's norm planning configuration for the object's in-language
 /// doors onto the mainline (norm-plane §5): the trust document and the
 /// installed planning premises `/host/norm/promotions` receives, without a

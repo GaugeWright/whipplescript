@@ -194,6 +194,8 @@ pub enum HarnessModelError {
     Provider(String),
     /// Any other transport-level failure (connect/TLS/decode), redacted message.
     Transport(String),
+    /// The host has no remaining transport attempts for this turn.
+    RetryBudgetExhausted(String),
 }
 
 /// The single model side effect: one model call given the conversation so far and
@@ -1307,6 +1309,27 @@ where
         });
     }
 
+    fn settle_transport_exhaustion(&mut self, message: String) -> Outcome<BrokeredTurnOutcome> {
+        let cancelled = self.cancel_check.is_some_and(|probe| probe());
+        Outcome::Settle(BrokeredTurnOutcome {
+            status: if cancelled {
+                TurnStatus::Cancelled
+            } else {
+                TurnStatus::Failed
+            },
+            summary: if cancelled {
+                "turn cancelled by request".to_owned()
+            } else {
+                model_error_summary(&HarnessModelError::RetryBudgetExhausted(message))
+            },
+            steps: self.step + usize::from(!cancelled),
+            observations: std::mem::take(&mut self.observations),
+            usage: std::mem::take(&mut self.usage),
+            last_input_tokens: self.last_input_tokens,
+            structured_result_json: None,
+        })
+    }
+
     /// Prepare the main agent model call for the current step (observe + build).
     fn main_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
         // Cooperative cancel (pi-conformance §3): every model round funnels
@@ -1509,6 +1532,12 @@ where
             }
         };
 
+        // Host exhaustion covers every provider round, including compaction.
+        // Falling back from a failed summary must not spend a fourth call.
+        if let Err(TransportError::RetryBudgetExhausted(message)) = &response {
+            return self.settle_transport_exhaustion(message.clone());
+        }
+
         // A summarization round (Phase 4 Layer B): fold the summary into a fresh
         // stable prefix (apply-once), disarm, and issue the deferred main call. The
         // summarizer round is infrastructure — it does not advance `step`, and its
@@ -1589,6 +1618,9 @@ where
                         (self.checkpoint)(&self.messages);
                         return self.main_call();
                     }
+                }
+                if let HarnessModelError::RetryBudgetExhausted(message) = &error {
+                    return self.settle_transport_exhaustion(message.clone());
                 }
                 // Bounded auto-retry on transient provider errors
                 // (pi-conformance §2): re-issue the same main call. The
@@ -2473,7 +2505,7 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// EXCLUDED — that is compaction's job (the Lb-5 fallback above).
 fn is_retryable_provider_error(error: &HarnessModelError) -> bool {
     match error {
-        HarnessModelError::Timeout => false,
+        HarnessModelError::Timeout | HarnessModelError::RetryBudgetExhausted(_) => false,
         HarnessModelError::Transport(_) => true,
         HarnessModelError::Provider(message) => {
             if is_context_overflow(error) {
@@ -2748,6 +2780,9 @@ fn model_error_summary(error: &HarnessModelError) -> String {
         HarnessModelError::Timeout => "model call timed out".to_string(),
         HarnessModelError::Provider(message) => format!("provider error: {message}"),
         HarnessModelError::Transport(message) => format!("transport error: {message}"),
+        HarnessModelError::RetryBudgetExhausted(message) => {
+            format!("transport retry budget exhausted: {message}")
+        }
     }
 }
 
@@ -3279,6 +3314,59 @@ mod tests {
             ),
             "final message is the assistant answer: {rebuilt:?}"
         );
+    }
+
+    #[test]
+    fn exhausted_summary_transport_does_not_issue_a_fallback_model_call() {
+        let model = ScriptedHttpClient::new(vec![]);
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "unused".into(),
+        });
+        let turn = input(5);
+        let mut checkpoint = no_checkpoint();
+        let mut machine =
+            BrokeredTurnMachine::new(&model, &executor, &turn, &mut checkpoint, &NoopCompactor);
+        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        machine.awaiting = Awaiting::Summary;
+        machine.pending_compaction = Some(SummarizationRequest {
+            request_messages: machine.messages.clone(),
+            anchors: vec![],
+            keep_tail: vec![],
+        });
+        let Outcome::Settle(outcome) = machine.step(Some(IoResult::Http(Err(
+            TransportError::RetryBudgetExhausted("summary transport lost".into()),
+        )))) else {
+            panic!("exhaustion must not request a fourth call");
+        };
+        assert!(matches!(outcome.status, TurnStatus::Failed));
+        assert_eq!(
+            outcome.summary,
+            "transport retry budget exhausted: summary transport lost"
+        );
+    }
+
+    #[test]
+    fn brokered_turn_settles_exhausted_host_transport_without_retry() {
+        let http = ScriptedHttpClient::new(vec![Err(HarnessModelError::RetryBudgetExhausted(
+            "lost reply".into(),
+        ))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "unused".into(),
+        });
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut |_msgs: &[ChatMessage]| {},
+            &DummyHost,
+            &NoopCompactor,
+            None,
+            None,
+        );
+        assert!(matches!(out.status, TurnStatus::Failed), "{out:?}");
+        assert_eq!(out.summary, "transport retry budget exhausted: lost reply");
     }
 
     /// Cooperative cancel (pi-conformance §3): a cancellation request arriving

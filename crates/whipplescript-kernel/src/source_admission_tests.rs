@@ -20,6 +20,9 @@ use whipplescript_store::vcs::{
 };
 use whipplescript_store::SqliteStore;
 
+#[path = "source_validation_tests.rs"]
+mod validation;
+
 struct NativeFixture {
     root: std::path::PathBuf,
     vcs: NativeWorkspaceVcs,
@@ -37,23 +40,41 @@ impl NativeFixture {
         Self::with_path("main.py")
     }
     fn with_path(path: &str) -> Self {
+        Self::with_change(path, false)
+    }
+    fn with_change(path: &str, deleted: bool) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "whip-source-plan-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("fixture clock follows Unix epoch")
                 .as_nanos(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir(&root).unwrap();
-        let mut vcs =
-            NativeWorkspaceVcs::open(root.join("branches.db"), root.join("content.db")).unwrap();
-        vcs.init("t0").unwrap();
+        std::fs::create_dir(&root).expect("create native source fixture directory");
+        let mut vcs = NativeWorkspaceVcs::open(root.join("branches.db"), root.join("content.db"))
+            .expect("open fixture native stores");
+        vcs.init("t0").expect("initialize fixture mainline");
+        if deleted {
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                path,
+                Some("def allow(value): return False\n"),
+                "base",
+                "t0",
+            )
+            .expect("write deleted subject base");
+        }
         vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
-            .unwrap();
-        let mut branches = BranchStore::open(root.join("branches.db")).unwrap();
+            .expect("create fixture twig");
+        let mut branches =
+            BranchStore::open(root.join("branches.db")).expect("open fixture branch store");
+        let base = branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("read fixture mainline")
+            .expect("fixture mainline exists");
         branches
             .open_flowing_source(&OpenFlowingSource {
                 source_branch_id: "twig".into(),
@@ -62,16 +83,23 @@ impl NativeFixture {
                 owner: "coordinator".into(),
                 opened_at: "t1".into(),
             })
-            .unwrap();
+            .expect("open fixture source incarnation");
         vcs.write(
             "twig",
             path,
-            Some("def allow(value):\n    return False\n"),
+            if deleted {
+                None
+            } else {
+                Some("def allow(value):\n    return False\n")
+            },
             "source",
             "t2",
         )
-        .unwrap();
-        let cut = branches.get_cut("source").unwrap().unwrap();
+        .expect("write fixture source cut");
+        let cut = branches
+            .get_cut("source")
+            .expect("read fixture source cut")
+            .expect("fixture source cut exists");
         branches
             .pin_private_cut(PinPrivateCut {
                 pin_id: "pin",
@@ -81,35 +109,39 @@ impl NativeFixture {
                 principal: "author",
                 retained_at: "t3",
             })
-            .unwrap();
+            .expect("pin fixture private cut");
         branches
             .declare_contribution(DeclareContribution {
                 unit_id: "unit",
                 pin_id: "pin",
                 principal: "author",
                 intent: "change",
-                read_basis_digest: &native_read_basis_digest(None, None),
+                read_basis_digest: &native_read_basis_digest(
+                    base.head_cut_id.as_deref(),
+                    base.head_manifest_hash.as_deref(),
+                ),
                 dependency_basis_digest: &native_dependency_basis_digest(&[]),
                 scope_digest: "scope",
                 declared_at: "t3",
             })
-            .unwrap();
+            .expect("declare fixture contribution");
         let FlowingSelectionOutcome::Selected(selection) = vcs
             .select_private_changes(
                 "pin",
-                &whipplescript_store::selection::parse(&format!("path({path})")).unwrap(),
+                &whipplescript_store::selection::parse(&format!("path({path})"))
+                    .expect("parse fixture path selection"),
             )
-            .unwrap()
+            .expect("select fixture private changes")
         else {
             panic!("valid source selection")
         };
         vcs.bind_private_selection("unit", &selection, "t3")
-            .unwrap();
+            .expect("bind fixture selection");
         let mut fixture = Self {
             root,
             vcs,
             branches,
-            reviews: ReviewStore::open(":memory:").unwrap(),
+            reviews: ReviewStore::open(":memory:").expect("open fixture review store"),
             witness: String::new(),
         };
         fixture.witness = fixture.review("review", "candidate", "attempt");
@@ -118,7 +150,7 @@ impl NativeFixture {
     fn review(&mut self, review: &str, candidate: &str, attempt: &str) -> String {
         self.reviews
             .create_native_contribution(review, "author", "change", MAINLINE_BRANCH_ID, &[])
-            .unwrap();
+            .expect("create fixture review contribution");
         self.reviews
             .upload_native_revision(
                 &self.branches,
@@ -131,7 +163,12 @@ impl NativeFixture {
                     unit_ids: &["unit"],
                 },
             )
-            .unwrap();
+            .expect("upload fixture review revision");
+        let base = self
+            .vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("read candidate mainline")
+            .expect("candidate mainline exists");
         let NativeCandidateOutcome::Prepared(prepared) = self
             .reviews
             .prepare_native_candidate(
@@ -139,20 +176,20 @@ impl NativeFixture {
                 NativeCandidateRequest {
                     contribution_id: review,
                     sequence: 1,
-                    expected_trunk_cut_id: None,
+                    expected_trunk_cut_id: base.head_cut_id.as_deref(),
                     candidate_cut_id: candidate,
                     actor: "coordinator",
                     recorded_at: "t4",
                 },
             )
-            .unwrap()
+            .expect("prepare fixture candidate")
         else {
             panic!("valid candidate")
         };
         assert!(matches!(
             self.vcs
                 .retain_review_attempt(attempt, &prepared.candidate_witness_digest, "t4")
-                .unwrap(),
+                .expect("retain fixture review attempt"),
             RetainFlowingAttemptOutcome::Retained(_)
         ));
         prepared.candidate_witness_digest
@@ -160,12 +197,15 @@ impl NativeFixture {
 }
 
 fn configuration(store: &WorkItemStore, record: &str) -> PlanningConfiguration {
-    let vocabulary = store.norm_view(&Boundary).unwrap().records[record]
+    let vocabulary = store
+        .norm_view(&Boundary)
+        .expect("read fixture norm vocabulary")
+        .records[record]
         .vocabulary
         .clone();
     PlanningConfiguration::parse(&serde_json::json!({
         "capability": "observer", "roles": [{"vocabulary": vocabulary, "interpretation": "context"}]
-    }).to_string()).unwrap()
+    }).to_string()).expect("parse fixture planning configuration")
 }
 fn policy() -> ProtectedPythonPolicy {
     let mut runtime = f::method().runtime;
@@ -174,7 +214,11 @@ fn policy() -> ProtectedPythonPolicy {
         artifact_sha256: "a".repeat(64),
     };
     runtime.executable = "/usr/local/bin/whip".into();
-    ProtectedPythonPolicy::new(&serde_json::to_string(&runtime).unwrap(), "t9").unwrap()
+    ProtectedPythonPolicy::new(
+        &serde_json::to_string(&runtime).expect("serialize fixture runtime"),
+        "t9",
+    )
+    .expect("construct protected fixture policy")
 }
 
 #[test]
@@ -195,6 +239,11 @@ fn native_derivation_is_read_only_and_does_not_promote_local_coverage() {
     };
     let before = store.export_events().unwrap();
     let first = plan_native(&native.vcs, &store, host, &native.witness, "attempt").unwrap();
+    assert!(first
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/process-installation"));
     native
         .vcs
         .write("twig", "later.txt", Some("tail"), "tail", "t5")
@@ -233,6 +282,58 @@ fn native_derivation_is_read_only_and_does_not_promote_local_coverage() {
     let third = plan_native(&native.vcs, &store, host, &native.witness, "attempt").unwrap();
     assert_eq!(third.identity(), first.identity());
     assert!(third.judgment().norm["method_gaps"].get(&record).is_some());
+}
+
+#[test]
+fn deleting_the_subject_at_a_native_candidate_keeps_the_prior_duty() {
+    let native = NativeFixture::with_change("main.py", true);
+    let runtime = SqliteStore::open_in_memory().unwrap();
+    let (store, record) = f::fixture(Some(f::template()), true);
+    let configuration = configuration(&store, &record);
+    let policy = policy();
+    let verify = |_: &PythonRuntime| Ok(());
+    let plan = plan_native(
+        &native.vcs,
+        &store,
+        AdmissionHost {
+            now: None,
+            verifier: &Boundary,
+            configuration: &configuration,
+            runtime: &runtime,
+            policy: &policy,
+            verify_runtime: &verify,
+        },
+        &native.witness,
+        "attempt",
+    )
+    .unwrap();
+    assert_eq!(
+        plan.judgment()
+            .subject
+            .witness
+            .expected_trunk_cut_id
+            .as_deref(),
+        Some("base")
+    );
+    let obligations: Vec<_> = plan
+        .judgment()
+        .obligations
+        .values()
+        .filter(|obligation| obligation.record == record)
+        .collect();
+    assert!(!obligations.is_empty());
+    assert!(obligations
+        .iter()
+        .any(|obligation| obligation.bases.contains(&ImpactBasis::Before)));
+    assert!(obligations.iter().any(|obligation| obligation
+        .applicability
+        .values()
+        .any(|binding| !binding.subject_present)));
+    assert!(plan
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "norm/admission"));
 }
 
 #[test]
@@ -473,8 +574,26 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
         reads: std::cell::Cell<usize>,
         change_on: usize,
         norm_binding: bool,
+        installed_process: Option<EvidenceVersion>,
+        process_reads: std::cell::Cell<usize>,
+        uninstall_on: usize,
+        validation: Option<OwnerValidation>,
     }
     impl ProcessCaptureAuthority for EmptyHome {
+        fn verify_process_basis(
+            &self,
+            _: &ProcessBasis,
+            process: &EvidenceVersion,
+        ) -> Result<(), String> {
+            self.process_reads.set(self.process_reads.get() + 1);
+            if self.process_reads.get() < self.uninstall_on
+                && self.installed_process.as_ref() == Some(process)
+            {
+                Ok(())
+            } else {
+                Err("derivation implementation has no exact admitted process installation".into())
+            }
+        }
         fn basis(&self, _: &str) -> Result<ProcessBasis, String> {
             self.reads.set(self.reads.get() + 1);
             let mut basis = self.basis.clone();
@@ -519,7 +638,7 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
             _: &ReferenceScope,
             _: &DependencyIdentity,
         ) -> Result<Option<OwnerValidation>, String> {
-            Ok(None)
+            Ok(self.validation.clone())
         }
     }
     let native = NativeFixture::new();
@@ -562,6 +681,10 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
         reads: std::cell::Cell::new(0),
         change_on: usize::MAX,
         norm_binding: true,
+        installed_process: None,
+        process_reads: std::cell::Cell::new(0),
+        uninstall_on: usize::MAX,
+        validation: None,
     };
     let plan = plan_native_with_authority(
         &native.vcs,
@@ -577,6 +700,57 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
         .reason
         .contains("omits a locally required reference scope")));
     assert!(plan.judgment().dependencies.is_some());
+    assert!(plan
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/process-installation"));
+    authority.installed_process = Some(plan.judgment().process.clone());
+    let installed = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert!(!installed
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/process-installation"));
+    // A different implementation cannot inherit the same admitted methodology.
+    authority.installed_process.as_mut().unwrap().digest = "another-implementation".into();
+    let substituted = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert!(substituted
+        .judgment()
+        .blockers
+        .iter()
+        .any(|gap| gap.scope == "home/process-installation"));
+    assert_ne!(installed.identity(), substituted.identity());
+    authority.installed_process = Some(plan.judgment().process.clone());
+    authority.process_reads.set(0);
+    authority.uninstall_on = 2;
+    assert!(plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap_err()
+    .contains("Home process installation changed during derivation"));
+    authority.uninstall_on = usize::MAX;
     assert!(plan.to_json()["judgment"]["dependencies"]["coverage"].is_array());
     authority.basis.native_candidate_cut = "another-candidate".into();
     let wrong_native = plan_native_with_authority(
@@ -610,6 +784,48 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
         .iter()
         .any(|gap| gap.scope == "home/norm-basis"));
     authority.norm_binding = true;
+    let consumer = DependencyIdentity {
+        authority: "fixture-home".into(),
+        identity: "program".into(),
+    };
+    let scope = ReferenceScope {
+        class: version("fixture-imports"),
+        consumer_scope: "programs".into(),
+    };
+    authority
+        .basis
+        .after
+        .scopes
+        .insert(scope, BTreeSet::from([consumer.clone()]));
+    authority
+        .basis
+        .after
+        .resolutions
+        .insert(consumer, "p1".into());
+    authority.validation = Some(OwnerValidation {
+        owner: "program-owner".into(),
+        candidate_cut: "after".into(),
+        method: version("program-check"),
+    });
+    let work_only = plan_native_with_authority(
+        &native.vcs,
+        &store,
+        host,
+        &native.witness,
+        "attempt",
+        &authority,
+    )
+    .unwrap();
+    assert_eq!(work_only.judgment().dependency_work.len(), 1);
+    assert!(work_only.judgment().blockers.iter().any(|gap| gap
+        .scope
+        .starts_with("dependency-validation/")
+        && gap
+            .reason
+            .contains("no independently verified execution evidence")));
+    authority.basis.after.scopes.clear();
+    authority.basis.after.resolutions.clear();
+    authority.validation = None;
     authority.reads.set(0);
     // Dependency capture's two reads agree. Only the final joined source/norm
     // recheck sees a relevant policy movement; no changed plan may escape.

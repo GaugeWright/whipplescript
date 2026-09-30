@@ -167,6 +167,7 @@ mod norm_publication_tests;
 mod norm_wasi;
 mod otel;
 mod project_context;
+mod review_commands;
 mod skills_loader;
 mod turn_server;
 mod web_tools;
@@ -1097,6 +1098,7 @@ const ALSO_LISTED_IN: &[(&str, &str)] = &[("evidence", "improve")];
 /// Entries are grouped: each group's commands are contiguous, and `whip help`
 /// prints the groups in the order they first appear here.
 const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "review", group: "source review", usage: review_commands::USAGE, run: review_commands::command },
     CommandSpec { name: "norm", group: "norm plane", usage: norm_commands::USAGE, run: norm_commands::command },
     CommandSpec { name: "build", group: "build engine", usage: build_commands::USAGE, run: build_commands::command },
     CommandSpec {
@@ -34032,8 +34034,8 @@ fn artifacts(options: &CliOptions) -> ExitCode {
 }
 
 const ISSUE_USAGE: &str = "usage: whip issue <\
-new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
-list [--tracker TR] [--status S]|\
+new --tracker TR --title T [--kind task|initiative] [--body B] [--label L]... [--actor A]|\
+list [--tracker TR] [--status S] [--kind task|initiative]|\
 show <id>|\
 ready <tracker> [--limit N]|\
 claim <id> [--actor A] [--ttl D] [--override REASON]|why <id>|\
@@ -34784,6 +34786,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             let mut queue = None;
             let mut title = None;
             let mut item_body = String::new();
+            let mut kind = "task".to_owned();
             let mut labels = Vec::new();
             let mut actor = None;
             let mut iter = args.iter().skip(1);
@@ -34792,6 +34795,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                     "--tracker" => queue = iter.next().cloned(),
                     "--title" => title = iter.next().cloned(),
                     "--body" => item_body = iter.next().cloned().unwrap_or_default(),
+                    "--kind" => kind = iter.next().cloned().unwrap_or_default(),
                     "--actor" => actor = iter.next().cloned(),
                     "--label" => {
                         if let Some(label) = iter.next() {
@@ -34826,7 +34830,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 title,
                 &item_body,
                 &labels,
-                &json!({}),
+                &json!({"kind": kind}),
                 filed_by.as_deref(),
                 None,
             ) {
@@ -34844,11 +34848,13 @@ fn issue(options: &CliOptions) -> ExitCode {
         "list" => {
             let mut queue = None;
             let mut status = None;
+            let mut kind = None;
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--tracker" => queue = iter.next().cloned(),
                     "--status" => status = iter.next().cloned(),
+                    "--kind" => kind = Some(iter.next().cloned().unwrap_or_default()),
                     other if other.starts_with('-') => {
                         let problem = subcommand_refusal::unexpected(other);
                         return subcommand_refusal::refuse(usage, "list", &problem);
@@ -34862,10 +34868,29 @@ fn issue(options: &CliOptions) -> ExitCode {
                     }
                 }
             }
+            if kind
+                .as_deref()
+                .is_some_and(|k| !matches!(k, "task" | "initiative"))
+            {
+                return subcommand_refusal::refuse(
+                    usage,
+                    "list",
+                    "kind must be task or initiative",
+                );
+            }
             let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
                 Ok(items) => items,
                 Err(error) => return report_store_error("failed to list issues", error),
             };
+            let listed = listed
+                .into_iter()
+                .filter(|item| {
+                    kind.as_deref().is_none_or(|kind| {
+                        whipplescript_store::items::initiatives::issue_kind(&item.metadata).ok()
+                            == Some(kind)
+                    })
+                })
+                .collect::<Vec<_>>();
             if options.json {
                 return emit_json(Value::Array(
                     listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
@@ -34876,9 +34901,11 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             for item in listed {
                 println!(
-                    "{} [{}] tracker={} {}{}",
+                    "{} [{}] kind={} tracker={} {}{}",
                     item.id,
                     item.status,
+                    whipplescript_store::items::initiatives::issue_kind(&item.metadata)
+                        .unwrap_or("unknown"),
                     item.queue,
                     item.title,
                     item.claimed_by
@@ -34901,6 +34928,19 @@ fn issue(options: &CliOptions) -> ExitCode {
                     };
                     if options.json {
                         let mut value = work_item_to_json(&item);
+                        if whipplescript_store::items::initiatives::issue_kind(&item.metadata).ok()
+                            == Some("initiative")
+                        {
+                            match initiative_progress_json(&store, id) {
+                                Ok(progress) => value["progress"] = progress,
+                                Err(error) => {
+                                    return report_store_error(
+                                        "failed to inspect initiative",
+                                        error,
+                                    )
+                                }
+                            }
+                        }
                         if let (Some(map), Some(view)) = (value.as_object_mut(), &conflicts) {
                             map.insert("conflicted".to_owned(), json!(view.conflicted()));
                             map.insert("heads".to_owned(), json!(view.heads));
@@ -34946,7 +34986,39 @@ fn issue(options: &CliOptions) -> ExitCode {
                         emit_json(value)
                     } else {
                         println!("{} [{}] tracker={}", item.id, item.status, item.queue);
+                        println!(
+                            "kind: {}",
+                            whipplescript_store::items::initiatives::issue_kind(&item.metadata)
+                                .unwrap_or("unknown")
+                        );
                         println!("title: {}", item.title);
+                        if whipplescript_store::items::initiatives::issue_kind(&item.metadata).ok()
+                            == Some("initiative")
+                        {
+                            match initiative_progress_json(&store, id) {
+                                Ok(progress) => {
+                                    println!("member states: {}", progress["states"]);
+                                    for member in
+                                        progress["members"].as_array().into_iter().flatten()
+                                    {
+                                        println!(
+                                            "member: {} [{}] tracker={} {}",
+                                            member["id"].as_str().unwrap_or_default(),
+                                            member["status"].as_str().unwrap_or_default(),
+                                            member["queue"].as_str().unwrap_or_default(),
+                                            member["title"].as_str().unwrap_or_default()
+                                        );
+                                        println!("  readiness: {}", member["readiness"]);
+                                    }
+                                }
+                                Err(error) => {
+                                    return report_store_error(
+                                        "failed to inspect initiative",
+                                        error,
+                                    )
+                                }
+                            }
+                        }
                         if !item.body.is_empty() {
                             println!("body: {}", item.body);
                         }
@@ -35771,10 +35843,29 @@ fn emit_import_report(
     }
 }
 
+/// DR-0153: progress is a current view, never another mutable tracker value.
+fn initiative_progress_json(
+    store: &whipplescript_store::items::WorkItemStore,
+    id: &str,
+) -> whipplescript_store::StoreResult<Value> {
+    let members = store.initiative_members(id)?;
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    let mut values = Vec::new();
+    for member in &members {
+        *states.entry(member.status.clone()).or_default() += 1;
+        let mut value = work_item_to_json(member);
+        value["readiness"] =
+            issue_readiness::readiness_json(store, &member.id).unwrap_or(Value::Null);
+        values.push(value);
+    }
+    Ok(json!({"total": members.len(), "states": states, "members": values}))
+}
+
 fn work_item_to_json(item: &whipplescript_store::items::WorkItem) -> Value {
     json!({
         "id": item.id,
         "queue": item.queue,
+        "kind": whipplescript_store::items::initiatives::issue_kind(&item.metadata).unwrap_or("unknown"),
         "title": item.title,
         "body": item.body,
         "status": item.status,

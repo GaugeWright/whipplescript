@@ -29,6 +29,10 @@ use whipplescript_kernel::harness_loop::{
     ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
+use whipplescript_kernel::host_facade::{
+    HostFacadeError, OpenInstanceHomeJournal, OpenInstanceOperationBasis,
+    OpenInstanceOperationEvidence,
+};
 use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use whipplescript_kernel::sansio::{
     HostDriver, HttpResponse, IoRequest, IoResult, ModelContentProvenance, TransportError,
@@ -2107,6 +2111,27 @@ impl GovernedHostRuntime {
         command: &OpenInstanceCommand,
         packages: &P,
     ) -> Result<OpenedInstance, HostRuntimeError> {
+        self.open_instance_inner(command, packages, None)
+    }
+
+    /// Open through the authenticated Home's durable operation journal. The
+    /// Home registers before a target write and completes the exact import
+    /// operation before an instance can be returned or used on replay.
+    pub fn open_instance_with_home_journal<P: PackageResolver + ?Sized>(
+        &mut self,
+        command: &OpenInstanceCommand,
+        packages: &P,
+        journal: &mut dyn OpenInstanceHomeJournal,
+    ) -> Result<OpenedInstance, HostRuntimeError> {
+        self.open_instance_inner(command, packages, Some(journal))
+    }
+
+    fn open_instance_inner<P: PackageResolver + ?Sized>(
+        &mut self,
+        command: &OpenInstanceCommand,
+        packages: &P,
+        mut journal: Option<&mut dyn OpenInstanceHomeJournal>,
+    ) -> Result<OpenedInstance, HostRuntimeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
         let package = packages
@@ -2117,7 +2142,14 @@ impl GovernedHostRuntime {
             .checked_import_source_digest()
             .map_err(HostRuntimeError::Resolver)?;
         self.check_package_ifc(&package)?;
-        if let Some(opened) = self.replayed_open_instance(command, &package, &source_digest)? {
+        if let Some((opened, version_id)) =
+            self.replayed_open_instance(command, &package, &source_digest, &mut journal)?
+        {
+            if let Some(journal) = journal.as_mut() {
+                journal
+                    .allow_retained_use(&command.request_id, &opened.instance_ref, &version_id)
+                    .map_err(home_journal_error)?;
+            }
             return Ok(opened);
         }
 
@@ -2128,30 +2160,75 @@ impl GovernedHostRuntime {
             crate::std_manifests::EMBEDDED_STD_MANIFESTS,
         )
         .map_err(HostRuntimeError::Resolver)?;
-        let admission = self
-            .kernel
-            .create_program_version_with_imports_and_constructs(
-                ProgramVersionInput {
+        let construct_basis = CheckedConstructBasis {
+            registry: &construct_registry,
+            sources: &[],
+        };
+        let operation_id = journal
+            .as_mut()
+            .map(|journal| {
+                journal.register(&OpenInstanceOperationBasis {
+                    kind: "open",
+                    instance_ref: None,
+                    from_version_id: None,
+                    request_id: &command.request_id,
+                    package_version_ref: &command.package_version_ref,
                     program_name: &package.agent,
-                    source_hash: &package.source_hash,
-                    ir_hash: &package.ir_hash,
-                    compiler_version: HOST_PROTOCOL,
-                    ir_snapshot: None,
-                },
-                &package.program,
-                &CheckedImportBasis {
-                    program_source_digest: &source_digest,
-                    version_source_digest: Some(&package.source_hash),
+                    source_digest: &source_digest,
+                    version_source_digest: &package.source_hash,
                     lock_digest: NO_LOCK_DIGEST,
+                    ir_hash: &package.ir_hash,
                     compiler_artifact_digest: &compiler_artifact_digest,
-                    packages: &[],
-                },
-                &CheckedConstructBasis {
-                    registry: &construct_registry,
-                    sources: &[],
-                },
-            )
-            .map_err(HostRuntimeError::Store)?;
+                    policy: &command.policy,
+                    construct_basis: Some(&construct_basis),
+                })
+            })
+            .transpose()
+            .map_err(home_journal_error)?;
+        let input = ProgramVersionInput {
+            program_name: &package.agent,
+            source_hash: &package.source_hash,
+            ir_hash: &package.ir_hash,
+            compiler_version: HOST_PROTOCOL,
+            ir_snapshot: None,
+        };
+        let import_basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: Some(&package.source_hash),
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: &compiler_artifact_digest,
+            packages: &[],
+        };
+        let admission = if let Some(operation_id) = operation_id.as_deref() {
+            self.kernel
+                .create_program_version_for_program_with_imports_and_constructs_at_id(
+                    input,
+                    &package.program,
+                    &import_basis,
+                    &construct_basis,
+                    operation_id,
+                )
+        } else {
+            self.kernel
+                .create_program_version_with_imports_and_constructs(
+                    input,
+                    &package.program,
+                    &import_basis,
+                    &construct_basis,
+                )
+        }
+        .map_err(HostRuntimeError::Store)?;
+        if let Some(journal) = journal.as_mut() {
+            journal
+                .complete_for_use(&OpenInstanceOperationEvidence {
+                    request_id: &command.request_id,
+                    operation_id: &admission.operation_id,
+                    instance_ref: None,
+                    version_id: &admission.version_id,
+                    witness_digest: &admission.witness_digest,
+                })
+                .map_err(home_journal_error)?;
+        }
         let version = whipplescript_store::ProgramVersionRecord {
             program_id: admission.program_id,
             version_id: admission.version_id,
@@ -2478,7 +2555,8 @@ impl GovernedHostRuntime {
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
         source_digest: &str,
-    ) -> Result<Option<OpenedInstance>, HostRuntimeError> {
+        journal: &mut Option<&mut dyn OpenInstanceHomeJournal>,
+    ) -> Result<Option<(OpenedInstance, String)>, HostRuntimeError> {
         for instance in self
             .kernel
             .store()
@@ -2554,7 +2632,16 @@ impl GovernedHostRuntime {
             // current compile is re-attested (an auditable event plus a
             // version re-point, spec/agent-harness.md "Program identity
             // across toolchains").
-            if version.ir_hash != package.ir_hash {
+            let current_version_id = if version.ir_hash != package.ir_hash {
+                if let Some(journal) = journal.as_mut() {
+                    journal
+                        .allow_retained_use(
+                            &command.request_id,
+                            &instance.instance_id,
+                            &version.version_id,
+                        )
+                        .map_err(home_journal_error)?;
+                }
                 let compiler_artifact_digest =
                     native_compiler_artifact_digest().map_err(HostRuntimeError::Resolver)?;
                 let construct_registry = embedded_std_registry_for_program(
@@ -2562,32 +2649,82 @@ impl GovernedHostRuntime {
                     crate::std_manifests::EMBEDDED_STD_MANIFESTS,
                 )
                 .map_err(HostRuntimeError::Resolver)?;
-                self.kernel
-                    .reattest_instance_program_with_imports_and_constructs(
-                        &instance.instance_id,
-                        ProgramVersionInput {
+                let construct_basis = CheckedConstructBasis {
+                    registry: &construct_registry,
+                    sources: &[],
+                };
+                let operation_id = journal
+                    .as_mut()
+                    .map(|journal| {
+                        journal.register(&OpenInstanceOperationBasis {
+                            kind: "reattest",
+                            instance_ref: Some(&instance.instance_id),
+                            from_version_id: Some(&version.version_id),
+                            request_id: &command.request_id,
+                            package_version_ref: &command.package_version_ref,
                             program_name: &package.agent,
-                            source_hash: &package.source_hash,
-                            ir_hash: &package.ir_hash,
-                            compiler_version: HOST_PROTOCOL,
-                            ir_snapshot: None,
-                        },
-                        &package.program,
-                        &CheckedImportBasis {
-                            program_source_digest: source_digest,
-                            version_source_digest: Some(&package.source_hash),
+                            source_digest,
+                            version_source_digest: &package.source_hash,
                             lock_digest: NO_LOCK_DIGEST,
+                            ir_hash: &package.ir_hash,
                             compiler_artifact_digest: &compiler_artifact_digest,
-                            packages: &[],
-                        },
-                        &CheckedConstructBasis {
-                            registry: &construct_registry,
-                            sources: &[],
-                        },
-                    )
-                    .map_err(HostRuntimeError::Store)?;
-            }
-            return Ok(Some(opened));
+                            policy: &command.policy,
+                            construct_basis: Some(&construct_basis),
+                        })
+                    })
+                    .transpose()
+                    .map_err(home_journal_error)?;
+                let input = ProgramVersionInput {
+                    program_name: &package.agent,
+                    source_hash: &package.source_hash,
+                    ir_hash: &package.ir_hash,
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                };
+                let import_basis = CheckedImportBasis {
+                    program_source_digest: source_digest,
+                    version_source_digest: Some(&package.source_hash),
+                    lock_digest: NO_LOCK_DIGEST,
+                    compiler_artifact_digest: &compiler_artifact_digest,
+                    packages: &[],
+                };
+                let admission = if let Some(operation_id) = operation_id.as_deref() {
+                    self.kernel
+                        .reattest_instance_program_with_imports_and_constructs_at_id(
+                            &instance.instance_id,
+                            input,
+                            &package.program,
+                            &import_basis,
+                            Some(&construct_basis),
+                            operation_id,
+                        )
+                } else {
+                    self.kernel
+                        .reattest_instance_program_with_imports_and_constructs(
+                            &instance.instance_id,
+                            input,
+                            &package.program,
+                            &import_basis,
+                            &construct_basis,
+                        )
+                }
+                .map_err(HostRuntimeError::Store)?;
+                if let Some(journal) = journal.as_mut() {
+                    journal
+                        .complete_for_use(&OpenInstanceOperationEvidence {
+                            request_id: &command.request_id,
+                            operation_id: &admission.operation_id,
+                            instance_ref: Some(&instance.instance_id),
+                            version_id: &admission.version_id,
+                            witness_digest: &admission.witness_digest,
+                        })
+                        .map_err(home_journal_error)?;
+                }
+                admission.version_id
+            } else {
+                version.version_id
+            };
+            return Ok(Some((opened, current_version_id)));
         }
         Ok(None)
     }
@@ -4123,9 +4260,14 @@ pub enum HostRuntimeError {
     Ifc(Vec<String>),
     UnknownInstance(String),
     Incomplete(String),
+    HomeJournal(String),
     Resolver(String),
     Store(StoreError),
     Json(serde_json::Error),
+}
+
+fn home_journal_error(error: HostFacadeError) -> HostRuntimeError {
+    HostRuntimeError::HomeJournal(error.to_string())
 }
 
 impl fmt::Display for HostRuntimeError {
@@ -4143,6 +4285,9 @@ impl fmt::Display for HostRuntimeError {
             ),
             Self::UnknownInstance(instance) => write!(formatter, "unknown instance: {instance}"),
             Self::Incomplete(command) => write!(formatter, "turn is not terminal: {command}"),
+            Self::HomeJournal(message) => {
+                write!(formatter, "Home reference journal refused: {message}")
+            }
             Self::Resolver(message) => write!(formatter, "host resolver refused: {message}"),
             Self::Store(error) => write!(formatter, "runtime store error: {error:?}"),
             Self::Json(error) => write!(formatter, "runtime JSON error: {error}"),
@@ -4452,6 +4597,98 @@ mod tests {
     use crate::host_protocol::{CredentialRef, TurnInput};
 
     struct Packages;
+
+    const HOME_OPEN_OPERATION: &str = "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HOME_REATTEST_OPERATION: &str = "imp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[derive(Default)]
+    struct TestHomeJournal {
+        fail_at: Option<&'static str>,
+        registered: Vec<String>,
+        completed: Vec<String>,
+        retained: Vec<String>,
+    }
+
+    impl OpenInstanceHomeJournal for TestHomeJournal {
+        fn register(
+            &mut self,
+            basis: &OpenInstanceOperationBasis<'_>,
+        ) -> Result<String, HostFacadeError> {
+            assert_eq!(basis.request_id, "home-chat-open");
+            assert!(!basis.source_digest.is_empty());
+            assert!(!basis.compiler_artifact_digest.is_empty());
+            assert!(basis.construct_basis.is_some());
+            self.registered.push(basis.kind.to_owned());
+            if self.fail_at == Some("register") {
+                return Err(HostFacadeError::Incomplete("Home register refused".into()));
+            }
+            Ok(match basis.kind {
+                "open" => {
+                    assert!(basis.instance_ref.is_none());
+                    assert!(basis.from_version_id.is_none());
+                    HOME_OPEN_OPERATION
+                }
+                "reattest" => {
+                    assert!(basis.instance_ref.is_some());
+                    assert!(basis.from_version_id.is_some());
+                    HOME_REATTEST_OPERATION
+                }
+                other => panic!("unexpected Home operation: {other}"),
+            }
+            .to_owned())
+        }
+
+        fn complete_for_use(
+            &mut self,
+            evidence: &OpenInstanceOperationEvidence<'_>,
+        ) -> Result<(), HostFacadeError> {
+            assert_eq!(evidence.request_id, "home-chat-open");
+            assert!(!evidence.version_id.is_empty());
+            assert!(!evidence.witness_digest.is_empty());
+            assert_eq!(
+                evidence.instance_ref.is_some(),
+                evidence.operation_id == HOME_REATTEST_OPERATION
+            );
+            if self.fail_at == Some("complete") {
+                return Err(HostFacadeError::Incomplete("Home complete refused".into()));
+            }
+            self.completed.push(evidence.operation_id.to_owned());
+            Ok(())
+        }
+
+        fn allow_retained_use(
+            &mut self,
+            request_id: &str,
+            instance_ref: &str,
+            version_id: &str,
+        ) -> Result<(), HostFacadeError> {
+            assert_eq!(request_id, "home-chat-open");
+            assert!(!instance_ref.is_empty());
+            assert!(!version_id.is_empty());
+            self.retained.push(instance_ref.to_owned());
+            if !self.completed.iter().any(|id| id == HOME_OPEN_OPERATION) {
+                return Err(HostFacadeError::Incomplete(
+                    "pending Home open has not been recovered".into(),
+                ));
+            }
+            if self.registered.iter().any(|kind| kind == "reattest")
+                && !self
+                    .completed
+                    .iter()
+                    .any(|id| id == HOME_REATTEST_OPERATION)
+            {
+                return Err(HostFacadeError::Incomplete(
+                    "pending Home re-attestation has not been recovered".into(),
+                ));
+            }
+            if self.fail_at == Some("retained") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home retained use refused".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
 
     impl PackageResolver for Packages {
         fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
@@ -7477,6 +7714,192 @@ workflow Method {
                 }),
             }))
         }
+    }
+
+    #[test]
+    fn cli_home_open_recovers_exact_target_operation_before_instance_use() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-chat-open".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let mut journal = TestHomeJournal {
+            fail_at: Some("register"),
+            ..TestHomeJournal::default()
+        };
+        assert!(runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .is_err());
+        assert!(runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+        journal.fail_at = Some("complete");
+        assert!(runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .is_err());
+        assert!(runtime.kernel.store().list_instances().unwrap().is_empty());
+        let operation = runtime
+            .kernel
+            .store()
+            .program_import_operation(HOME_OPEN_OPERATION)
+            .unwrap()
+            .expect("Home operation committed before completion");
+        assert!(operation.witness_digest.is_some());
+
+        journal.fail_at = None;
+        let opened = runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .expect("exact target retry completes and opens");
+        assert_eq!(journal.completed, [HOME_OPEN_OPERATION]);
+        assert_eq!(runtime.kernel.store().list_instances().unwrap().len(), 1);
+        let replayed = runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .expect("completed Home open can be reused");
+        assert_eq!(replayed.instance_ref, opened.instance_ref);
+        assert_eq!(journal.retained.len(), 1);
+        assert_eq!(
+            runtime
+                .kernel
+                .store()
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .len(),
+            1,
+        );
+        journal.fail_at = Some("retained");
+        assert!(runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .is_err());
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cli_home_replay_keeps_pending_reattest_unusable_until_recovery() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-chat-open".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let mut journal = TestHomeJournal::default();
+        let first = runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .expect("first Home open");
+        drop(runtime);
+        {
+            let connection = rusqlite::Connection::open(&path).expect("raw store");
+            connection
+                .execute(
+                    "UPDATE program_versions SET ir_hash = 'ir-of-an-older-toolchain'",
+                    [],
+                )
+                .expect("age recorded compiler IR");
+        }
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("reopen");
+        journal.fail_at = Some("complete");
+        let refused = runtime.open_instance_with_home_journal(&open, &Packages, &mut journal);
+        assert!(format!("{refused:?}").contains("Home complete refused"));
+        let operation = runtime
+            .kernel
+            .store()
+            .program_import_operation(HOME_REATTEST_OPERATION)
+            .unwrap()
+            .expect("exact re-attestation target operation");
+        let correlated: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = ?1 \
+                 AND event_type = 'instance.program.reattested' AND correlation_id = ?2",
+                rusqlite::params![&first.instance_ref, HOME_REATTEST_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(correlated, 1);
+        journal.fail_at = None;
+        let pending = runtime.open_instance_with_home_journal(&open, &Packages, &mut journal);
+        assert!(format!("{pending:?}").contains("pending Home re-attestation"));
+        journal
+            .complete_for_use(&OpenInstanceOperationEvidence {
+                request_id: &open.request_id,
+                operation_id: HOME_REATTEST_OPERATION,
+                instance_ref: Some(&first.instance_ref),
+                version_id: &operation.version_id,
+                witness_digest: operation.witness_digest.as_deref().unwrap(),
+            })
+            .expect("Home recovers exact target operation");
+        let replayed = runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .expect("recovered re-attestation can be reused");
+        assert_eq!(replayed.instance_ref, first.instance_ref);
+        assert_eq!(
+            runtime
+                .kernel
+                .store()
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .len(),
+            2,
+        );
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cli_home_replay_refuses_legacy_origin_before_reattest_write() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-chat-open".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        runtime
+            .open_instance(&open, &Packages)
+            .expect("legacy open");
+        drop(runtime);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE program_versions SET ir_hash = 'ir-of-an-older-toolchain'",
+                [],
+            )
+            .unwrap();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("reopen");
+        let before = runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .unwrap();
+        let mut journal = TestHomeJournal::default();
+        let refusal = runtime.open_instance_with_home_journal(&open, &Packages, &mut journal);
+        assert!(format!("{refusal:?}").contains("pending Home open"));
+        assert!(journal.registered.is_empty());
+        assert_eq!(
+            runtime
+                .kernel
+                .store()
+                .program_import_operation_roster()
+                .unwrap(),
+            before,
+        );
+        drop(runtime);
+        let _ = fs::remove_file(&path);
     }
 
     /// A runtime upgrade changes the compiled identity of the same authored

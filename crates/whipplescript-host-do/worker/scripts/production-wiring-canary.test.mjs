@@ -14,6 +14,7 @@ import {
   runNormEvidence,
   runNormLedger,
   runPrivateHome,
+  runPrivateRetirement,
 } from "./production-wiring-canary.mjs";
 
 function json(body, status = 200, headers = {}) {
@@ -301,6 +302,61 @@ test("Private Home canary denies missing and tampered grants before forwarding",
     calls.filter((call) => call.headers.has("x-gaugewright-execution-signature"))
       .every((call) => call.headers.get("x-gaugewright-execution-signature").length > 40),
   );
+});
+
+test("Private retirement canary collects fresh daily bytes and retries the exact fence", async () => {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+  );
+  const privateJwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
+  const environment = {
+    GW_SYNTHETIC_WHIP_PRIVATE_ORIGIN: "https://private-runtime.example.test",
+    GW_SYNTHETIC_WHIP_PRIVATE_HOME: "home-synthetic",
+    GW_SYNTHETIC_WHIP_PRIVATE_TENANT: "tenant-synthetic",
+    GW_SYNTHETIC_WHIP_PRIVATE_PROJECT: "project-synthetic",
+    GW_SYNTHETIC_WHIP_PRIVATE_GOVERNANCE_SIGNER: "home-authority-synthetic",
+    GW_SYNTHETIC_WHIP_PRIVATE_SIGNER_JWK: JSON.stringify(privateJwk),
+  };
+  const objects = new Map();
+  const retired = new Set();
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    const grant = JSON.parse(Buffer.from(
+      new Headers(init.headers).get("x-gaugewright-execution-grant"), "base64url",
+    ));
+    const command = grant.command_id;
+    calls.push({ path, method: init.method, grant });
+    assert(path.includes(`/commands/${command}/attempts/1`));
+    assert.equal(grant.request_method, init.method);
+    assert.equal(grant.request_path, path.slice(path.indexOf("/host/")));
+    if (path.endsWith("/host/private/retire")) {
+      assert.equal(grant.retirement_authorized, true);
+      assert.equal(grant.request_body_sha256, hex(init.body));
+      retired.add(command);
+      objects.delete(command);
+      return json({ phase: "collected", legacy_pending: 0 });
+    }
+    assert.equal(grant.retirement_authorized, undefined);
+    if (retired.has(command)) return json({ error: "retired" }, 410);
+    if (init.method === "GET") {
+      return objects.has(command)
+        ? new Response(objects.get(command))
+        : json({ error: "absent" }, 404);
+    }
+    assert.equal(new Headers(init.headers).get("content-length"), String(Buffer.byteLength(init.body)));
+    objects.set(command, init.body);
+    return json({ id: path.split("/").at(-1) }, 201);
+  };
+  const first = await runPrivateRetirement(environment, fetchImpl, new Date("2026-09-30T12:00:00Z"));
+  const repeated = await runPrivateRetirement(environment, fetchImpl, new Date("2026-09-30T13:00:00Z"));
+  const next = await runPrivateRetirement(environment, fetchImpl, new Date("2026-10-01T12:00:00Z"));
+  assert.equal(first.first_run, true);
+  assert.equal(repeated.first_run, false);
+  assert.equal(next.first_run, true);
+  assert.equal(objects.size, 0, "the canary left no R2 bytes in its simulated bucket");
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path.includes("/host/objects/")).length, 2);
+  assert.equal(retired.size, 2);
 });
 
 // --- norm-ledger ------------------------------------------------------------

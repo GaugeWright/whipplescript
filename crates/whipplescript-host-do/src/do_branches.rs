@@ -43,6 +43,11 @@ pub struct DoBranches<S: DoSql> {
 }
 
 impl<S: DoSql> DoBranches<S> {
+    /// Query an existing owning store without schema initialization. Required
+    /// tables remain required; an absent table fails when the reader uses it.
+    pub(crate) fn observe(sql: S) -> Self {
+        Self { sql }
+    }
     fn require_legacy_shape_move(&self, branch_id: &str) -> StoreResult<()> {
         if flowing_fence::read_state(&self.sql, branch_id)?.is_some() {
             return Err(
@@ -1472,16 +1477,16 @@ pub struct PendingExternalDelete {
     pub storage_key: String,
 }
 
-/// A staged key is `s-` followed by sixteen random bytes, hex.
+/// An opaque external key is `s-` followed by sixteen hex bytes.
 ///
 /// Ingested content cannot be keyed on its id. The digest is known only once
 /// the bytes have passed, and by then the `put` that consumed them has already
 /// had to name a key, so the plane mints one before the transfer and records
-/// it here afterwards. That is safe only while a staged key's shape is as
-/// narrow as an id's: a key a caller could choose freely would be an arbitrary
-/// name in the bucket's namespace, which is the thing keying on the hash
-/// refused in the first place. The `s-` prefix cannot collide with an id,
-/// which is hex throughout.
+/// it here afterwards. A private Home instead derives a stable command-scoped
+/// key from its signed command identity and the content id, so equal bytes on
+/// two commands can be collected separately. Both are minted by the trusted
+/// plane, and their narrow shape excludes arbitrary bucket names. The `s-`
+/// prefix cannot collide with an id, which is hex throughout.
 fn is_staged_key(key: &str) -> bool {
     key.len() == 34
         && key.starts_with("s-")
@@ -1521,6 +1526,13 @@ pub struct DoContentBlobs<S: DoSql> {
 }
 
 impl<S: DoSql> DoContentBlobs<S> {
+    pub(crate) fn observe(sql: S) -> Self {
+        Self {
+            sql,
+            external: None,
+            threshold_bytes: crate::DEFAULT_TIER_THRESHOLD_BYTES,
+        }
+    }
     pub fn new(sql: S) -> StoreResult<Self> {
         // Defensive for stores predating the base schema; matches the
         // do_store DDL (no created_at column on the DO).
@@ -1652,10 +1664,10 @@ impl<S: DoSql> DoContentBlobs<S> {
     /// The same, naming the key the bytes were actually stored under, and
     /// answering with the key this id means once the registration settles.
     ///
-    /// `None` is the push path: a writer that already holds the digest chooses
-    /// the id as its key, and the two are the same string. `Some` is the ingest
-    /// path, where the plane had to name a key before it could learn the digest
-    /// and so cannot have used the id.
+    /// `None` is the shared push path: a writer that already holds the digest
+    /// chooses the id as its key. `Some` is an opaque key minted by the plane:
+    /// ingest names it before learning the digest, while a private Home uses a
+    /// command-scoped key to make later collection independent.
     ///
     /// The answer matters because two ingests of identical bytes mint two keys
     /// and write two objects, and only one of them can be what the id means.
@@ -1723,6 +1735,19 @@ impl<S: DoSql> DoContentBlobs<S> {
             .first()
             .map(|row| as_text(&row[0]))
             .unwrap_or_else(|| id.to_owned()))
+    }
+
+    /// The live external handle and its actual byte key, if this object owns
+    /// one. A private Home must resolve this before serving bytes: a guessed
+    /// content-id key could belong to another command after this one erased
+    /// its scoped copy.
+    pub fn external_binding(&self, id: &str) -> StoreResult<Option<(u64, String)>> {
+        if !is_content_id(id) {
+            return Err(StoreError::Conflict(format!("`{id}` is not a content id")));
+        }
+        self.external_len(id)?
+            .map(|byte_len| self.external_storage_key(id).map(|key| (byte_len, key)))
+            .transpose()
     }
 
     /// Blobs whose bytes are erased by decision and still await collection from
@@ -2168,6 +2193,21 @@ pub(crate) fn compose_vcs<Sql: crate::do_store::DoSql + Clone>(
         whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
     ));
     Ok(vcs)
+}
+
+/// Read an already provisioned workspace without ensuring or backfilling
+/// schema. No empty-store creation can masquerade as an empty population.
+pub(crate) fn observe_vcs<Sql: crate::do_store::DoSql + Clone>(
+    sql: &Sql,
+) -> whipplescript_store::vcs::WorkspaceVcs<DoBranches<Sql>, DoContentBlobs<Sql>> {
+    let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(
+        DoBranches::observe(sql.clone()),
+        DoContentBlobs::observe(sql.clone()),
+    );
+    vcs.set_decl_canonicalizer(Box::new(
+        whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
+    ));
+    vcs
 }
 
 #[cfg(test)]

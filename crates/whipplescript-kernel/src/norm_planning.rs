@@ -185,7 +185,7 @@ impl PlanningConfiguration {
             version: "1".into(),
             digest: format!(
                 "sha256:{}",
-                whipplescript_store::stable_hash_bytes_hex(
+                crate::exec_http::sha256_hex(
                     &serde_json::to_vec(&configuration).map_err(|error| error.to_string())?
                 )
             ),

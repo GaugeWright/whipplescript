@@ -82,6 +82,22 @@ To print the usage line of a command, run `whip <command> --help` or
 | `WHIPPLESCRIPT_MISUSE_LOG` | The path of the misuse log. The value `off` stops the log. Refer to [The misuse log](#the-misuse-log). |
 | `WHIPPLESCRIPT_BRANCH_STORE`, `WHIPPLESCRIPT_WORKSTREAM_STORE`, `WHIPPLESCRIPT_VCS_CONTENT_STORE` / `WHIPPLESCRIPT_CONTENT_STORE`, `WHIPPLESCRIPT_MAX_BLOB_BYTES`, `WHIPPLESCRIPT_TEXT_MERGE_GAP` / `WHIPPLESCRIPT_TEXT_MERGE_MAX_BYTES` | The stores of the versioned workspace, and the settings for a merge. These variables are experimental and apply to the `branch` command and the `stream` command. |
 
+### Native source review planning
+
+`whip [--json] review plan <candidate-witness-digest> <attempt-id>` reads an
+existing retained native candidate and returns its immutable plan: exact
+subject and premises, obligations, selected evidence, required work and
+located blockers. It uses `WHIPPLESCRIPT_BRANCH_STORE`,
+`WHIPPLESCRIPT_VCS_CONTENT_STORE`, `WHIPPLESCRIPT_ITEMS_STORE` and
+`WHIPPLESCRIPT_STORE`, together with the host's existing norm trust, planning
+and native runtime configuration. The request supplies no policy or coverage
+assertion. Missing stores refuse; the query creates and repairs no database.
+
+A successful exit means the query returned a judgment. Read its `blockers`
+before treating it as actionable. The command runs no checks, files no tracker
+work and advances no ref. Home population authority is currently an explicit
+blocker; this surface does not certify admission or world freshness.
+
 ### The misuse log
 
 When whip refuses an invocation, whip adds one line to the misuse log. A
@@ -1221,8 +1237,8 @@ listener is deferred. Refer to the "Deferred with cause" section of
 ### Issue commands
 
 ```sh
-whip issue new --tracker <TR> --title <T> [--body <B>] [--label <L>] [--actor <A>]
-whip issue list [--tracker <TR>] [--status <S>]
+whip issue new --tracker <TR> --title <T> [--kind task|initiative] [--body <B>] [--label <L>] [--actor <A>]
+whip issue list [--tracker <TR>] [--status <S>] [--kind task|initiative]
 whip issue show <id>
 whip issue ready <tracker> [--limit <N>]
 whip issue claim <id> [--actor <A>]
@@ -1239,6 +1255,24 @@ The issue commands operate the builtin issue tracker. Refer to
 the workspace. The tracker stores the items in `.whipplescript/items.sqlite`.
 Override the path with the `WHIPPLESCRIPT_ITEMS_STORE` variable. The tracker
 gives sequential identifiers: `WS-1`, `WS-2`, and so on.
+
+An **initiative** is a named set of related tasks, filed with `--kind initiative`.
+The default kind is `task`; kind is immutable after filing. Link a task to one
+or several initiatives with `whip issue link <task> belongs-to <initiative>`;
+remove membership with `whip issue unlink <task> belongs-to <initiative>`.
+Membership can cross trackers. Initiatives cannot themselves be members.
+
+`whip issue show <initiative>` shows the current members, their state counts
+and readiness reasons; `--json` exposes them under `progress`. This is derived
+from current tasks. Initiatives are never ready or claimable, even with a claim
+override, and membership does not affect task readiness or ownership. Dependencies
+connect tasks. Assignment on an initiative names its outcome owner.
+
+Finish an initiative explicitly after verifying its outcome. If any members
+are not closed, `finish --summary` must explain their disposition. A status-only
+close cannot bypass that requirement. Group closure does not close members,
+and subsequent member changes do not silently reopen the initiative. An empty
+or all-closed set does not automatically close its initiative.
 
 The `--status` flag filters on the categories of status. The categories are
 `open`, `in_progress`, `closed`, `canceled`, and `archived`.

@@ -196,7 +196,7 @@ tracker-lease.maude	SSSSSNNNN
 tracker-merge.maude	SSSSSNNNS
 tracker-ordering.maude	SSSSSSNNNNSNS
 tracker-projection.maude	SSNNN
-tracker-readiness.maude	SSSNNNNSSNNNSNSNNSNSNNSNNNS
+tracker-readiness.maude	SSSNNNNSSNNNSNSNNSNSNNSNNNSSN
 tracker-wait-settlement.maude	SNSNSNSSNSNSS
 turn-access-grant.maude	SSNN
 turn-witness.maude	SNNSSS

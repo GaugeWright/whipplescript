@@ -120,6 +120,19 @@ pub struct OwnerValidation {
     pub candidate_cut: String,
     pub method: EvidenceVersion,
 }
+
+/// An admitted mapping from an owning full-scope validator to a norm duty.
+/// The contract must establish that this requirement/method exercises the
+/// complete named consumer at the candidate structural cut, including its
+/// source/resolution and world premises. A matching record name alone cannot
+/// establish that correspondence. It supplies no execution result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NormValidationBinding {
+    pub contract: EvidenceVersion,
+    pub ledger: String,
+    pub record: String,
+    pub requirement: EvidenceVersion,
+}
 impl Ord for OwnerValidation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (
@@ -152,6 +165,16 @@ impl PartialOrd for OwnerValidation {
 /// compare an observation's declaration with itself or check its signature.
 pub trait ProcessCaptureAuthority {
     fn basis(&self, candidate_witness_digest: &str) -> Result<ProcessBasis, String>;
+    /// Verify that this exact derivation implementation is installed under the
+    /// admitted process policy at this Home basis. A population seal, package
+    /// signature or successful norm judgment supplies no methodology grant.
+    /// The owning reader must establish standing and installation independently
+    /// of the implementation identity supplied for comparison.
+    fn verify_process_basis(
+        &self,
+        basis: &ProcessBasis,
+        process: &EvidenceVersion,
+    ) -> Result<(), String>;
     fn observe(
         &self,
         basis: &ProcessBasis,
@@ -175,7 +198,9 @@ pub trait ProcessCaptureAuthority {
         policy: &EvidenceVersion,
     ) -> Result<(), String>;
     /// An independently installed exact-candidate validator and owning route.
-    /// None prevents unknown graph coverage from using a full-scope fallback.
+    /// None blocks an affected consumer and prevents unknown graph coverage
+    /// from using a full-scope fallback. This is required work, not a passing
+    /// execution observation.
     fn owner_validation(
         &self,
         basis: &ProcessBasis,
@@ -183,6 +208,20 @@ pub trait ProcessCaptureAuthority {
         scope: &ReferenceScope,
         consumer: &DependencyIdentity,
     ) -> Result<Option<OwnerValidation>, String>;
+
+    /// Read the independently installed correspondence contract under the
+    /// admitted process policy. The norm reader independently authenticates
+    /// the exact requirement and selects its evidence at the candidate.
+    /// Returning None keeps the work owed; adapters need not pretend that an
+    /// external owning validator is represented in the local norm ledger.
+    fn validation_requirement(
+        &self,
+        _basis: &ProcessBasis,
+        _consumer: &DependencyIdentity,
+        _validation: &OwnerValidation,
+    ) -> Result<Option<NormValidationBinding>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -539,6 +578,41 @@ pub fn capture_impact_with_limits(
                 .insert(provider.clone());
             if result.affected.insert(consumer.clone()) {
                 pending.push(consumer.clone());
+            }
+        }
+    }
+    // Closed graph coverage identifies affected consumers; it does not check
+    // them. Bounded coverage routes every consumer in its enforced envelope.
+    // Unknown scopes already requested every required owning validator above.
+    for (side, cut) in [
+        (CutSide::Before, &basis.before),
+        (CutSide::After, &basis.after),
+    ] {
+        for (scope, population) in &cut.scopes {
+            let members = match &result.coverage[&side][scope].boundary {
+                VerifiedScopeBoundary::Closed { .. } => population,
+                VerifiedScopeBoundary::Bounded { consumers, .. } => consumers,
+                VerifiedScopeBoundary::Unknown { .. } => continue,
+            };
+            for consumer in result.affected.intersection(members) {
+                match authority.owner_validation(&basis, side, scope, consumer) {
+                    Ok(Some(validation))
+                        if !validation.owner.trim().is_empty()
+                            && validation.candidate_cut == basis.after.cut
+                            && complete_identity(&validation.method) =>
+                    {
+                        result
+                            .validations
+                            .entry(consumer.clone())
+                            .or_default()
+                            .insert(validation);
+                    }
+                    _ => {
+                        result.blockers.insert(CoverageGap {
+                        side, scope: scope.clone(), reason: format!("affected consumer {}/{} has no installed exact-candidate owning validator", consumer.authority, consumer.identity)
+                    });
+                    }
+                }
             }
         }
     }

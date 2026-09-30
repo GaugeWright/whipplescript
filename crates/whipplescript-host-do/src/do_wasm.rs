@@ -381,6 +381,24 @@ pub fn host_norm_promotion(
 
 /// Read-only planning with a deployment-owned probed image binding.
 #[wasm_bindgen]
+pub fn host_source_plan(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+    deployment: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    crate::source_planning::execute_installed_hosted_source_plan(
+        &sql,
+        trusted_configuration,
+        command,
+        deployment,
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Read-only norm impact with a deployment-owned probed image binding.
+#[wasm_bindgen]
 pub fn host_norm_impact(
     bridge: DoSqlBridge,
     trusted_configuration: &str,
@@ -812,11 +830,11 @@ pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<S
 /// it maintained across the transfer on the ingest path — so the id provably
 /// describes them and all that is left is the durable fact.
 ///
-/// `storage_key` is absent for a push, whose writer held the digest and keyed
-/// on the id, and present for an ingest, which could not. The answer is the key
-/// in force afterwards, which is the offered one unless this id was already
-/// registered; a plane that gets back a key it did not offer has written an
-/// object nothing will ever read and must collect it.
+/// `storage_key` is absent for a shared push keyed on its digest-derived id,
+/// and present for ingest or a command-scoped private Home copy. The answer is
+/// the key in force afterwards, which is the offered one unless this id was
+/// already registered; a plane that gets back a key it did not offer has
+/// written an object nothing will ever read and must collect it.
 #[wasm_bindgen]
 pub fn host_register_external_object(
     bridge: DoSqlBridge,
@@ -831,6 +849,20 @@ pub fn host_register_external_object(
     blobs
         .register_external_at(id, byte_len, storage_key.as_deref())
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+}
+
+/// Read the exact live external handle before a private Home serves its bytes.
+#[wasm_bindgen]
+pub fn host_external_object_binding(bridge: DoSqlBridge, id: &str) -> Result<String, JsValue> {
+    let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let binding = blobs
+        .external_binding(id)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    serde_json::to_string(&binding.map(|(byte_len, storage_key)| {
+        serde_json::json!({ "id": id, "byte_len": byte_len, "storage_key": storage_key })
+    }))
+    .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Blobs whose bytes are erased by decision and await collection from the
@@ -1319,7 +1351,11 @@ fn parse_incoming(
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| JsValue::from_str(&error.to_string()))?;
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        let transport = if error == "timeout" {
+        let transport = if value.get("transport_retry_budget_exhausted")
+            == Some(&serde_json::Value::Bool(true))
+        {
+            TransportError::RetryBudgetExhausted(error.to_owned())
+        } else if error == "timeout" {
             TransportError::Timeout
         } else {
             TransportError::Transport(error.to_owned())
