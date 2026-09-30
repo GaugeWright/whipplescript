@@ -621,3 +621,23 @@ norm-ledger composition, recovery from independent storage failures, or
 implementation cost. The founder selected the Home journal and epoch seal in
 [DR-0150](../../spec/decision-records/0150-home-operation-journal-and-sealed-epoch-cuts.md);
 the model does not discharge those remaining product and gate obligations.
+
+`home_store_cutover.py` probes a prerequisite for making that Home roster
+authoritative across older and newly created runtime stores:
+
+```sh
+python3 models/research/home_store_cutover.py
+```
+
+An old writer is excluded before the Home inventories existing stores as
+`legacy_unknown`. A new store or restored incarnation first gets a Home
+catalogue entry and pending operation; exact target evidence and Home
+completion precede use. Historical unknown use may continue in the model but
+cannot support a complete coverage claim. Its 325 safe states through eleven
+transitions and five weakened paths expose a late old writer, target write
+before registration, restore without a new incarnation fence, pending use,
+and a false complete claim. It treats the writer exclusion, exact target
+evidence, re-attestation, and item-to-operation use pin as atomic premises.
+GaugeDesk's in-process Workbench mutex and a filesystem directory scan do not
+establish those premises across processes or restores. The probe supplies a
+necessary cutover shape, not a product migration or Home-wide proof.
