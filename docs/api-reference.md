@@ -1665,7 +1665,7 @@ use the `whip answer --revoke` command.
 whip [--json] improve [<gauge>[>=<target>] ... [then ...] | <campaign>]
      [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%]
      [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]
-     [--redacted-view]
+     [--context-root <directory>] [--redacted-view]
 ```
 
 The command runs a campaign for an improvement. The gauges that you name express
@@ -1686,6 +1686,23 @@ A campaign that crosses its cap **parks**. The record then has a
 allowance for that invocation. The specification, the program, and the numbers
 of the candidates come from the record. If the program changed, the command
 refuses the operation because of the guard on the hash of the baseline.
+
+`--context-root` opts a dedicated text directory into the candidate. Every
+regular UTF-8 file below it may be replaced, added, or deleted, including
+`AGENTS.md`, `skills/<name>/SKILL.md`, and documents a Managed Agent reads
+through file tools. The tree is limited to 64 files, 64 KiB per file, and
+256 KiB total; links and non-regular entries refuse. Put the `.whip` program
+outside the tree. The proposer sees the complete admitted snapshot and records
+path-addressed `context_edits`; the evidence card reports computed resource
+changes and paths omitted from its edit account. Baseline and candidate runs
+use separate disposable workspaces. Mark-pinned scenarios use input replay on
+both arms and carry `context-input-replay`, since their frozen prefix may have
+read earlier context. Resume and `whip adopt` verify the entire program and
+context snapshot. Adoption changes only proposed paths and refuses a stale
+baseline. A configured global context directory or
+`WHIPPLESCRIPT_NO_CONTEXT_FILES` refuses the campaign because it would change
+which instructions the evaluated agent sees. With no `--context-root`, improve
+retains its source-only behavior.
 
 An inline target such as `extract_quality>=0.9` becomes a reach bound. The
 `then` keyword separates the lexicographic stages, and the stages have ratchet

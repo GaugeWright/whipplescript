@@ -36,6 +36,15 @@ pub fn discover_project_instructions(
     discover_project_instructions_inner(cwd, global_dir, std::env::var_os(DISABLE_ENV).is_some())
 }
 
+/// Improve's isolated context workspace is already the complete admitted
+/// snapshot. Do not walk its temporary ancestors and inject host instructions.
+pub fn discover_isolated_project_instructions(root: &Path) -> Vec<ProjectInstruction> {
+    if std::env::var_os(DISABLE_ENV).is_some() {
+        return Vec::new();
+    }
+    first_context_file(root).into_iter().collect()
+}
+
 fn discover_project_instructions_inner(
     cwd: &Path,
     global_dir: Option<&Path>,

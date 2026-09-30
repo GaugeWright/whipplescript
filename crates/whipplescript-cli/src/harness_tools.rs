@@ -5195,6 +5195,7 @@ pub fn run_owned_agent_turn(
     store_path: &Path,
     max_child_iterations: usize,
     work_unit_root: Option<&str>,
+    context_workspace: Option<&Path>,
     program_path: Option<&Path>,
     root: Option<&str>,
     package_lock_path: Option<&Path>,
@@ -5235,7 +5236,9 @@ pub fn run_owned_agent_turn(
         workflow_tool_specs.push(spec);
         workflow_tools.push(entry);
     }
-    let workspace = owned_workspace_root();
+    let workspace = context_workspace
+        .map(Path::to_path_buf)
+        .unwrap_or_else(owned_workspace_root);
     let turn_tool_access = turn_tool_access_from_input(input_json).map_err(StoreError::Conflict)?;
     enforce_turn_access_governance(&turn_tool_access).map_err(StoreError::Conflict)?;
     let registered_profile_policy = registered_profile_policy_from_store(store_path, profile)?;
@@ -5444,10 +5447,14 @@ pub fn run_owned_agent_turn(
     // optional env-configured global directory (context-assembly Phase 3).
     let global_context_dir =
         std::env::var_os("WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR").map(PathBuf::from);
-    let project_instructions = crate::project_context::discover_project_instructions(
-        &workspace,
-        global_context_dir.as_deref(),
-    );
+    let project_instructions = if context_workspace.is_some() {
+        crate::project_context::discover_isolated_project_instructions(&workspace)
+    } else {
+        crate::project_context::discover_project_instructions(
+            &workspace,
+            global_context_dir.as_deref(),
+        )
+    };
     // Assemble the system prompt from provenance-tagged bundles: persona,
     // guidelines, project context, available skills, date, and cwd. Tools remain
     // solely in the provider-native tool field. The host supplies date/cwd plus

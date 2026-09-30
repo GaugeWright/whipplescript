@@ -462,6 +462,7 @@ fn queued_invoke_child(
         agent_results: BTreeMap::new(),
         virtual_now: None,
         work_unit_root: None,
+        context_workspace: None,
         side_stores: None,
     };
 

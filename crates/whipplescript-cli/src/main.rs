@@ -151,6 +151,7 @@ mod subcommand_refusal;
 use whipplescript::instance_view;
 mod build_commands;
 mod build_scope;
+mod improve_context;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;
@@ -1437,7 +1438,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "improve",
         group: "improve",
-        usage: "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
+        usage: "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--context-root <directory>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  --context-root admits a bounded UTF-8 text tree as editable Managed context; --resume uses its recorded root\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
         run: improve::improve_command,
     },
     CommandSpec {
@@ -13248,6 +13249,7 @@ fn execute_scenario(
         agent_results: scenario_agent_results(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
         work_unit_root: None,
+        context_workspace: None,
         side_stores: None,
     };
     let run_kind = scenario_run_kind(&test.clauses);
@@ -20807,6 +20809,9 @@ struct WorkerOptions {
     /// root's lease (keyed on `root`, so a parent and its descendants never
     /// contend) and does not release it — only the root does.
     work_unit_root: Option<String>,
+    /// An isolated improve context snapshot for Managed agent turns.
+    /// Normal runs keep the ambient owned workspace.
+    context_workspace: Option<PathBuf>,
     /// Explicit coordination/items store overrides (the improve loop's
     /// per-evaluation containment). `None` resolves from env/workspace as
     /// always. Child workflow drives inherit the parent's overrides.
@@ -20945,6 +20950,7 @@ impl WorkerOptions {
             agent_results: std::collections::BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            context_workspace: None,
             side_stores: None,
         })
     }
@@ -22340,6 +22346,7 @@ fn run_agent_effect(
             store_path,
             options.max_child_iterations,
             options.work_unit_root.as_deref(),
+            options.context_workspace.as_deref(),
             options.program_path.as_deref(),
             options.root.as_deref(),
             options.package_lock_path.as_deref(),
@@ -27740,6 +27747,7 @@ fn run_workflow_invoke_effect(
             agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
             work_unit_root: options.work_unit_root.clone(),
+            context_workspace: options.context_workspace.clone(),
             side_stores: None,
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
@@ -28268,6 +28276,7 @@ struct SubworkflowProviderContext {
     agent_results: std::collections::BTreeMap<String, String>,
     virtual_now: Option<String>,
     side_stores: Option<SideStorePaths>,
+    context_workspace: Option<PathBuf>,
 }
 
 impl SubworkflowProviderContext {
@@ -28284,6 +28293,7 @@ impl SubworkflowProviderContext {
             agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
             side_stores: options.side_stores.clone(),
+            context_workspace: options.context_workspace.clone(),
         }
     }
 }
@@ -28341,6 +28351,7 @@ fn drive_subworkflow_tool(
             // workspace lease (DR-0025), so a nested owned turn re-enters the
             // lease the still-running parent holds rather than self-deadlocking.
             work_unit_root: Some(work_unit_root.to_owned()),
+            context_workspace: provider_ctx.context_workspace.clone(),
             side_stores: provider_ctx.side_stores.clone(),
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
@@ -28876,6 +28887,7 @@ fn run(options: &CliOptions) -> ExitCode {
                 agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                context_workspace: None,
                 side_stores: None,
             },
         ) {
@@ -29845,6 +29857,7 @@ fn acceptance_dev_report(
                 agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                context_workspace: None,
                 side_stores: None,
             },
         ) {

@@ -403,6 +403,162 @@ fn ambiguous_shortcut_finding_remains_reviewable_and_testable() {
 }
 
 #[test]
+fn external_context_only_candidate_is_evaluated_and_adopted_against_exact_baseline() {
+    let env = Env::new("external-context");
+    let context_root = env.dir.join("context");
+    fs::create_dir_all(&context_root).expect("context root");
+    let context_file = context_root.join("AGENTS.md");
+    fs::write(&context_file, "Use long answers.").expect("baseline context");
+    let skill_dir = context_root.join("skills/demo");
+    fs::create_dir_all(&skill_dir).expect("skill directory");
+    let skill_file = skill_dir.join("SKILL.md");
+    let baseline_skill =
+        "---\nname: demo\ndescription: Context skill marker baseline.\n---\n# demo\nRead project guidance.\n";
+    let candidate_skill =
+        "---\nname: demo\ndescription: Context skill marker candidate.\n---\n# demo\nRead project guidance.\n";
+    fs::write(&skill_file, baseline_skill).expect("baseline skill");
+    let judge = env.dir.join("always.py");
+    fs::write(&judge, "import json\nprint(json.dumps({'ok': True}))\n").expect("judge");
+    let program_path = env.dir.join("context.whip");
+    let source = format!(
+        r#"use std.files
+
+workflow Context
+input ticket Ticket
+
+class Ticket {{ id string title string }}
+class Done {{ ok bool }}
+
+gauge quality {{
+  judge via exec "python3 {}"
+  expect P(ok) at least 0.5
+}}
+
+file store context_docs {{
+  root "."
+  allow read ["**"]
+}}
+
+agent helper {{
+  provider owned
+  profile "repo-reader"
+  capacity 1
+}}
+
+rule begin
+  when Ticket as ticket
+  when helper is available
+=> {{
+  tell helper as turn
+    with access to context_docs {{
+      read ["**"]
+    }}
+  """markdown
+  Classify {{ ticket.title }}.
+  """
+  after turn succeeds {{ record Done {{ ok true }} }}
+}}
+"#,
+        judge.display()
+    );
+    fs::write(&program_path, &source).expect("program");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+
+    let proposal_path = env.dir.join("candidate.whip");
+    fs::write(&proposal_path, &source).expect("context-only proposal");
+    let edits = serde_json::json!([
+        {"path":"AGENTS.md","content":"Use short answers."},
+        {"path":"skills/demo/SKILL.md","content":candidate_skill}
+    ])
+    .to_string();
+    let account = serde_json::json!({"mechanism":"shorter project guidance",
+        "declarations":[],"resources":["AGENTS.md","skills/demo/SKILL.md"],"expected_gauges":["std.tokens"]})
+    .to_string();
+    let (base_url, requests) = mock_harness_context_endpoint();
+    let proposal_str = proposal_path.to_string_lossy().into_owned();
+    let root_str = context_root.to_string_lossy().into_owned();
+    let envs = [
+        ("WHIPPLESCRIPT_IMPROVE_PROPOSALS", proposal_str.as_str()),
+        ("WHIPPLESCRIPT_IMPROVE_CONTEXT_EDITS", edits.as_str()),
+        ("WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT", account.as_str()),
+        ("WHIPPLESCRIPT_HARNESS_PROVIDER", "openai-generic"),
+        ("WHIPPLESCRIPT_HARNESS_MODEL", "test-model"),
+        ("WHIPPLESCRIPT_HARNESS_BASE_URL", base_url.as_str()),
+        ("OPENAI_API_KEY", "test-key"),
+    ];
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "std.tokens",
+            "--program",
+            &program_str,
+            "--context-root",
+            &root_str,
+            "--proposer",
+            "fixture",
+            "--provider",
+            "owned",
+        ],
+        &envs,
+    );
+    assert_eq!(report["proposed"], true, "context-only gain: {report}");
+    let card = &report["cards"][0];
+    assert_eq!(card["edit"]["changed_resources"][0]["path"], "AGENTS.md");
+    assert_eq!(
+        card["edit"]["changed_resources"][1]["path"],
+        "skills/demo/SKILL.md"
+    );
+    assert!(card["edit"]["changed_declarations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fs::read_to_string(&context_file).unwrap(),
+        "Use long answers.",
+        "evaluation must not change the live context"
+    );
+    assert_eq!(fs::read_to_string(&skill_file).unwrap(), baseline_skill);
+    let seen = requests.lock().unwrap();
+    assert!(
+        seen.iter().any(|body| body.contains("Use long answers.")),
+        "baseline request lacked context"
+    );
+    assert!(
+        seen.iter().any(|body| body.contains("Use short answers.")),
+        "candidate request lacked context"
+    );
+    assert!(seen
+        .iter()
+        .any(|body| body.contains("Context skill marker baseline.")));
+    assert!(seen
+        .iter()
+        .any(|body| body.contains("Context skill marker candidate.")));
+    drop(seen);
+
+    let target = format!("{}:K-1", report["campaign"].as_str().unwrap());
+    fs::write(&context_file, "Human edit after campaign.").expect("human edit");
+    let refusal = env.run_expect_failure(&["adopt", &target, "--program", &program_str]);
+    assert!(
+        refusal.contains("program or admitted context changed"),
+        "{refusal}"
+    );
+    fs::write(&context_file, "Use long answers.").expect("restore baseline");
+    let adopted = env.run_json(
+        &["--json", "adopt", &target, "--program", &program_str],
+        &[],
+    );
+    assert_eq!(adopted["changed_resources"][0], "AGENTS.md");
+    assert_eq!(adopted["changed_resources"][1], "skills/demo/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&context_file).unwrap(),
+        "Use short answers."
+    );
+    assert_eq!(fs::read_to_string(&skill_file).unwrap(), candidate_skill);
+}
+
+#[test]
 fn improve_campaign_proposes_dominant_candidate_and_adopts() {
     let env = Env::new("dominant");
     write_judges(&env.dir);
@@ -1601,6 +1757,69 @@ fn mock_coerce_endpoint(
     verdict: &'static str,
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     mock_coerce_sequence_endpoint(vec![verdict.to_owned()])
+}
+
+fn mock_harness_context_endpoint() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind harness endpoint");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut raw = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let header_end = loop {
+                let Ok(n) = stream.read(&mut buffer) else {
+                    break 0;
+                };
+                if n == 0 {
+                    break 0;
+                }
+                raw.extend_from_slice(&buffer[..n]);
+                if let Some(pos) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            if header_end == 0 {
+                continue;
+            }
+            let header = String::from_utf8_lossy(&raw[..header_end]);
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + length {
+                let Ok(n) = stream.read(&mut buffer) else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buffer[..n]);
+            }
+            let body = String::from_utf8_lossy(&raw[header_end..]).into_owned();
+            let candidate = body.contains("Use short answers.");
+            collected.lock().expect("requests").push(body);
+            let prompt_tokens = if candidate { 5 } else { 80 };
+            let reply = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "finished"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1,
+                    "total_tokens": prompt_tokens + 1},
+            }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(), reply,
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (url, requests)
 }
 
 fn mock_coerce_sequence_endpoint(
