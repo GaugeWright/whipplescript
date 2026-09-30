@@ -1975,7 +1975,7 @@ impl SqliteStore {
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
             .run(|| self.create_program_version_retained(version, None))
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
 
     pub fn create_program_version_with_import_witness(
@@ -1983,13 +1983,14 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
-        let (record, digest) = self
+        let (record, digest, operation_id) = self
             .retained_publication()
             .run(|| self.create_program_version_retained(version, Some(witness)))?;
         Ok(program_imports::ProgramImportAdmissionRecord {
             program_id: record.program_id,
             version_id: record.version_id,
             witness_digest: digest.expect("the supplied witness was stored in the transaction"),
+            operation_id,
         })
     }
 
@@ -2062,7 +2063,7 @@ impl SqliteStore {
         &mut self,
         version: NewProgramVersion<'_>,
         witness: Option<&program_imports::ProgramImportWitness>,
-    ) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
+    ) -> StoreResult<(ProgramVersionRecord, Option<String>, String)> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2170,11 +2171,16 @@ impl SqliteStore {
         } else {
             None
         };
+        let operation_id: String =
+            tx.query_row("SELECT 'imp_' || lower(hex(randomblob(16)))", [], |row| {
+                row.get(0)
+            })?;
         tx.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
-             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+             VALUES (?1, ?2, ?3, ?4)",
             params![
+                &operation_id,
                 &version_id,
                 &witness_digest,
                 if witness_digest.is_some() {
@@ -2192,6 +2198,7 @@ impl SqliteStore {
                 version_id,
             },
             witness_digest,
+            operation_id,
         ))
     }
 
@@ -2212,7 +2219,7 @@ impl SqliteStore {
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
             .run(|| self.reattest_instance_program_retained(instance_id, version, None))
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
 
     pub fn reattest_instance_program_with_import_witness(
@@ -2221,13 +2228,14 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
-        let (record, digest) = self
+        let (record, digest, operation_id) = self
             .retained_publication()
             .run(|| self.reattest_instance_program_retained(instance_id, version, Some(witness)))?;
         Ok(program_imports::ProgramImportAdmissionRecord {
             program_id: record.program_id,
             version_id: record.version_id,
             witness_digest: digest.expect("the supplied re-attestation witness was stored"),
+            operation_id: operation_id.expect("checked re-attestation wrote an operation"),
         })
     }
 
@@ -2236,7 +2244,7 @@ impl SqliteStore {
         instance_id: &str,
         version: NewProgramVersion<'_>,
         witness: Option<&program_imports::ProgramImportWitness>,
-    ) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
+    ) -> StoreResult<(ProgramVersionRecord, Option<String>, Option<String>)> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2285,6 +2293,7 @@ impl SqliteStore {
                     program_id,
                     version_id: from_version_id,
                 },
+                None,
                 None,
             ));
         }
@@ -2392,11 +2401,16 @@ impl SqliteStore {
             "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
             params![&to_version_id, instance_id],
         )?;
+        let operation_id: String =
+            tx.query_row("SELECT 'imp_' || lower(hex(randomblob(16)))", [], |row| {
+                row.get(0)
+            })?;
         tx.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
-             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+             VALUES (?1, ?2, ?3, ?4)",
             params![
+                &operation_id,
                 &to_version_id,
                 &witness_digest,
                 if witness_digest.is_some() {
@@ -2413,6 +2427,7 @@ impl SqliteStore {
                 version_id: to_version_id,
             },
             witness_digest,
+            Some(operation_id),
         ))
     }
 

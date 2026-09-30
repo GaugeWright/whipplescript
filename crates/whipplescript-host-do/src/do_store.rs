@@ -5295,7 +5295,7 @@ fn do_reattest_instance_program<Sql: DoSql>(
     instance_id: &str,
     version: NewProgramVersion<'_>,
     witness: Option<&whipplescript_store::program_imports::ProgramImportWitness>,
-) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
+) -> StoreResult<(ProgramVersionRecord, Option<String>, Option<String>)> {
     use whipplescript_store::program_imports;
 
     let recorded_rows = sql
@@ -5333,6 +5333,7 @@ fn do_reattest_instance_program<Sql: DoSql>(
                 version_id: from_version_id,
             },
             None,
+            None,
         ));
     }
     let encoded = witness
@@ -5346,6 +5347,7 @@ fn do_reattest_instance_program<Sql: DoSql>(
         })
         .transpose()?;
     let mut record = None;
+    let mut operation_id = None;
     sql.atomic(&mut || {
         let to_version_id = do_insert_program_version(sql, &program_id, version)?;
         if let Some((digest, json)) = &encoded {
@@ -5383,11 +5385,13 @@ fn do_reattest_instance_program<Sql: DoSql>(
             &[text(&to_version_id), text(instance_id)],
         )
         .map_err(sql_err)?;
+        let new_operation_id = do_new_import_operation_id(sql)?;
         sql.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
-             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+             VALUES (?1, ?2, ?3, ?4)",
             &[
+                text(&new_operation_id),
                 text(&to_version_id),
                 encoded
                     .as_ref()
@@ -5404,11 +5408,23 @@ fn do_reattest_instance_program<Sql: DoSql>(
             program_id: program_id.clone(),
             version_id: to_version_id,
         });
+        operation_id = Some(new_operation_id);
         Ok(())
     })?;
     Ok((
         record.expect("the successful atomic body sets its re-attestation record"),
         encoded.map(|(digest, _)| digest),
+        operation_id,
+    ))
+}
+
+fn do_new_import_operation_id<Sql: DoSql>(sql: &Sql) -> StoreResult<String> {
+    let rows = sql
+        .query("SELECT 'imp_' || lower(hex(randomblob(16)))", &[])
+        .map_err(sql_err)?;
+    // A scalar SELECT returns one row whenever query succeeds.
+    Ok(as_text(
+        &rows.first().expect("scalar SELECT returns one row")[0],
     ))
 }
 
@@ -5485,12 +5501,13 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     &[text(&version_id), text(&digest), text(&json)],
                 )
                 .map_err(sql_err)?;
+            let operation_id = do_new_import_operation_id(&self.sql)?;
             self.sql
                 .execute(
                     "INSERT INTO program_import_operations \
                      (operation_id, version_id, witness_digest, kind) \
-                     VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, 'checked')",
-                    &[text(&version_id), text(&digest)],
+                     VALUES (?1, ?2, ?3, 'checked')",
+                    &[text(&operation_id), text(&version_id), text(&digest)],
                 )
                 .map_err(sql_err)?;
             record = Some(
@@ -5498,6 +5515,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     program_id,
                     version_id,
                     witness_digest: digest.clone(),
+                    operation_id,
                 },
             );
             Ok(())
@@ -5581,7 +5599,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         do_reattest_instance_program(&self.sql, instance_id, version, None)
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
 
     fn reattest_instance_program_with_import_witness(
@@ -5590,13 +5608,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         version: NewProgramVersion<'_>,
         witness: &whipplescript_store::program_imports::ProgramImportWitness,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        let (record, digest) =
+        let (record, digest, operation_id) =
             do_reattest_instance_program(&self.sql, instance_id, version, Some(witness))?;
         Ok(
             whipplescript_store::program_imports::ProgramImportAdmissionRecord {
                 program_id: record.program_id,
                 version_id: record.version_id,
                 witness_digest: digest.expect("the supplied re-attestation witness was stored"),
+                operation_id: operation_id.expect("checked re-attestation wrote an operation"),
             },
         )
     }
@@ -14937,6 +14956,8 @@ pub(crate) mod tests {
             .filter(|operation| operation.version_id == first.version_id)
             .collect();
         assert_eq!(operations.len(), 3);
+        assert_eq!(operations[0].operation_id, first.operation_id);
+        assert_eq!(operations[1].operation_id, second.operation_id);
         assert!(operations
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence));
@@ -15081,6 +15102,10 @@ pub(crate) mod tests {
             Some(witness(LOCK))
         );
         let checked_roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(
+            checked_roster.operations.last().unwrap().operation_id,
+            checked.operation_id
+        );
         assert_eq!(
             checked_roster.operations.last().unwrap().kind,
             whipplescript_store::program_imports::ProgramImportOperationKind::Checked

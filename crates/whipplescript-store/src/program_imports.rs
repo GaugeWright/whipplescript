@@ -118,6 +118,10 @@ pub struct ProgramImportAdmissionRecord {
     pub program_id: String,
     pub version_id: String,
     pub witness_digest: String,
+    /// The exact accepting operation committed with this witness. A reused
+    /// version may have many operations, so the version ID cannot stand in for
+    /// this identity at a Home journal boundary (DR-0150).
+    pub operation_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -688,7 +692,10 @@ mod tests {
         let repeated = store
             .create_program_version_with_import_witness(version("paint"), &first_witness)
             .unwrap();
-        assert_eq!(repeated, first);
+        assert_eq!(repeated.program_id, first.program_id);
+        assert_eq!(repeated.version_id, first.version_id);
+        assert_eq!(repeated.witness_digest, first.witness_digest);
+        assert_ne!(repeated.operation_id, first.operation_id);
         let unwitnessed = store.create_program_version(version("paint")).unwrap();
         assert_eq!(unwitnessed.version_id, first.version_id);
 
@@ -727,6 +734,9 @@ mod tests {
             .filter(|operation| operation.version_id == first.version_id)
             .collect();
         assert_eq!(operations.len(), 4);
+        assert_eq!(operations[0].operation_id, first.operation_id);
+        assert_eq!(operations[1].operation_id, repeated.operation_id);
+        assert_eq!(operations[3].operation_id, second.operation_id);
         assert!(operations
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence));
@@ -891,6 +901,7 @@ mod tests {
         );
         let roster = store.program_import_operation_roster().unwrap();
         assert_eq!(roster.operations.len(), 2);
+        assert_eq!(roster.operations[1].operation_id, checked.operation_id);
         assert_eq!(
             roster.operations[1].kind,
             ProgramImportOperationKind::Checked
