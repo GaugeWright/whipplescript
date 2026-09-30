@@ -1413,7 +1413,60 @@ mod tests {
     use crate::source_review_native::{NativeCandidateRequest, NativeUpload};
     use crate::vcs::flowing_gate::{
         NativeGateCommand, NativeGateExecution, NativeGateExecutor, NativeGatePlan,
+        NativeGatePlanAuthority, NativeGateRun,
     };
+    use crate::vcs::NativeWorkspaceVcs;
+
+    struct FixturePlanAuthority(NativeGatePlan);
+
+    impl NativeGatePlanAuthority for FixturePlanAuthority {
+        fn required_plan(
+            &mut self,
+            _vcs: &NativeWorkspaceVcs,
+            _witness_digest: &str,
+            _attempt_op_id: &str,
+        ) -> StoreResult<NativeGatePlan> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct ChangingPlanAuthority {
+        initial: NativeGatePlan,
+        changed: NativeGatePlan,
+        captures: usize,
+    }
+
+    impl NativeGatePlanAuthority for ChangingPlanAuthority {
+        fn required_plan(
+            &mut self,
+            _vcs: &NativeWorkspaceVcs,
+            _witness_digest: &str,
+            _attempt_op_id: &str,
+        ) -> StoreResult<NativeGatePlan> {
+            self.captures += 1;
+            Ok(if self.captures == 1 {
+                self.initial.clone()
+            } else {
+                self.changed.clone()
+            })
+        }
+    }
+
+    fn run_fixture_gate(
+        vcs: &mut NativeWorkspaceVcs,
+        witness_digest: &str,
+        plan: &NativeGatePlan,
+        scratch: &std::path::Path,
+        executor: &mut impl NativeGateExecutor,
+    ) -> StoreResult<NativeGateRun> {
+        vcs.run_native_candidate_gate(
+            witness_digest,
+            &plan.attempt_op_id,
+            scratch,
+            &mut FixturePlanAuthority(plan.clone()),
+            executor,
+        )
+    }
 
     struct LocalProcessFixture;
 
@@ -1842,7 +1895,18 @@ mod tests {
         ));
         let mut executor = LocalProcessFixture;
         expect_gate_refusal(
-            vcs.run_native_candidate_gate("sha256:missing", &plan, &scratch, &mut executor),
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                "",
+                &scratch,
+                &mut FixturePlanAuthority(plan.clone()),
+                &mut executor,
+            ),
+            "candidate or attempt identity is incomplete",
+        );
+        assert!(!scratch.exists());
+        expect_gate_refusal(
+            run_fixture_gate(&mut vcs, "sha256:missing", &plan, &scratch, &mut executor),
             "candidate witness is missing",
         );
         assert!(!scratch.exists());
@@ -1851,7 +1915,8 @@ mod tests {
             ..plan.clone()
         };
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &empty,
                 &scratch,
@@ -1860,14 +1925,14 @@ mod tests {
             "plan is incomplete",
         );
         assert!(!scratch.exists());
-        let run = vcs
-            .run_native_candidate_gate(
-                &candidate.candidate_witness_digest,
-                &plan,
-                &scratch,
-                &mut executor,
-            )
-            .expect("record every result");
+        let run = run_fixture_gate(
+            &mut vcs,
+            &candidate.candidate_witness_digest,
+            &plan,
+            &scratch,
+            &mut executor,
+        )
+        .expect("record every result");
         assert_eq!(
             run.certificate.admission_refusal(),
             Some(crate::branches::flowing_admission::FlowingAdmissionRefusal::GateFailed)
@@ -1905,7 +1970,8 @@ mod tests {
             .expect("failed output retained");
         assert_eq!(second.exit_code, Some(7));
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -1919,16 +1985,55 @@ mod tests {
             checks: vec![plan.checks[0].clone()],
             ..plan
         };
-        let passed = vcs
-            .run_native_candidate_gate(
-                &candidate.candidate_witness_digest,
-                &passing,
-                &scratch,
-                &mut executor,
-            )
-            .expect("run passing check against exact cut");
+        let passed = run_fixture_gate(
+            &mut vcs,
+            &candidate.candidate_witness_digest,
+            &passing,
+            &scratch,
+            &mut executor,
+        )
+        .expect("run passing check against exact cut");
         assert_eq!(passed.certificate.admission_refusal(), None);
         assert_ne!(passed.handle, run.handle);
+        std::fs::remove_dir_all(&scratch).expect("remove test scratch");
+
+        let mut changed = passing.clone();
+        changed.policy_digest = "policy-v2".into();
+        let certificate_count_before: i64 = vcs
+            .branches
+            .test_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM flowing_gate_certificates",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained certificates");
+        let mut authority = ChangingPlanAuthority {
+            initial: passing.clone(),
+            changed,
+            captures: 0,
+        };
+        expect_gate_refusal(
+            vcs.run_native_candidate_gate(
+                &candidate.candidate_witness_digest,
+                &passing.attempt_op_id,
+                &scratch,
+                &mut authority,
+                &mut executor,
+            ),
+            "required plan changed during checks",
+        );
+        assert_eq!(authority.captures, 2);
+        let certificate_count_after: i64 = vcs
+            .branches
+            .test_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM flowing_gate_certificates",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained certificates");
+        assert_eq!(certificate_count_after, certificate_count_before);
         std::fs::remove_dir_all(&scratch).expect("remove test scratch");
 
         assert!(matches!(
@@ -1947,7 +2052,8 @@ mod tests {
             FlowingFenceOutcome::Applied(_)
         ));
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &passing,
                 &scratch,
@@ -2002,7 +2108,8 @@ mod tests {
             ..plan.clone()
         };
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &duplicate,
                 &scratch,
@@ -2015,7 +2122,8 @@ mod tests {
             ..plan.clone()
         };
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &missing_pin,
                 &scratch,
@@ -2043,7 +2151,8 @@ mod tests {
             ..plan.clone()
         };
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &foreign_pin,
                 &scratch,
@@ -2055,7 +2164,8 @@ mod tests {
         vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_fence AS SELECT * FROM flowing_source_fences WHERE source_branch_id = 'twig'; DELETE FROM flowing_source_fences WHERE source_branch_id = 'twig';")
             .unwrap();
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2069,7 +2179,8 @@ mod tests {
         vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_trunk AS SELECT * FROM branches WHERE branch_id = 'main'; DELETE FROM branches WHERE branch_id = 'main';")
             .unwrap();
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2092,7 +2203,8 @@ mod tests {
             )
             .unwrap();
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2111,7 +2223,8 @@ mod tests {
         vcs.branches.test_connection().execute_batch("CREATE TEMP TABLE saved_candidate AS SELECT * FROM cuts WHERE cut_id = 'candidate-a'; DELETE FROM cuts WHERE cut_id = 'candidate-a';")
             .unwrap();
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2133,7 +2246,8 @@ mod tests {
             )
             .unwrap();
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2158,7 +2272,8 @@ mod tests {
         vcs.branches = BranchStore::open(&db_path).expect("reopen branch fixture from disk");
         let mut moving = MoveTrunkDuringCheck(rusqlite::Connection::open(&db_path).unwrap());
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,
@@ -2190,7 +2305,8 @@ mod tests {
             crate::branches::flowing_admission::FlowingCancelOutcome::Cancelled(_)
         ));
         expect_gate_refusal(
-            vcs.run_native_candidate_gate(
+            run_fixture_gate(
+                &mut vcs,
                 &candidate.candidate_witness_digest,
                 &plan,
                 &scratch,

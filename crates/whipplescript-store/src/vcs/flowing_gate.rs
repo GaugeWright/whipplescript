@@ -1,7 +1,8 @@
-//! Store-only native-cut gate runner. The trusted caller supplies the current
-//! policy, coverage and ordered check plan; this module proves which retained
-//! cut each process saw and retains its exact output with the certificate.
-//! Hosted transport and plan authority are separate prerequisites.
+//! Store-only native-cut gate runner. A trusted planner derives the current
+//! policy, coverage and ordered checks from the exact retained candidate.
+//! This module recaptures that plan after execution and retains raw output
+//! with the certificate. Hosted transport and plan authority remain separate
+//! prerequisites.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -35,6 +36,19 @@ pub struct NativeGatePlan {
     pub rules_digest: String,
     pub graph_coverage_digest: String,
     pub checks: Vec<NativeGateCommand>,
+}
+
+/// Derive the required plan from the retained candidate and current policy,
+/// rules, graph coverage and world inputs. Return an error if any required
+/// scope is unknown. The runner invokes this twice, but the admission door
+/// must still recapture mutable premises under its ref exclusion.
+pub trait NativeGatePlanAuthority {
+    fn required_plan(
+        &mut self,
+        vcs: &NativeWorkspaceVcs,
+        witness_digest: &str,
+        attempt_op_id: &str,
+    ) -> StoreResult<NativeGatePlan>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,12 +85,17 @@ impl NativeWorkspaceVcs {
     pub fn run_native_candidate_gate(
         &mut self,
         witness_digest: &str,
-        plan: &NativeGatePlan,
+        attempt_op_id: &str,
         scratch: &Path,
+        authority: &mut impl NativeGatePlanAuthority,
         executor: &mut impl NativeGateExecutor,
     ) -> StoreResult<NativeGateRun> {
-        if witness_digest.trim().is_empty()
-            || plan.attempt_op_id.trim().is_empty()
+        if witness_digest.trim().is_empty() || attempt_op_id.trim().is_empty() {
+            return Err(invalid("candidate or attempt identity is incomplete"));
+        }
+        let plan = authority.required_plan(self, witness_digest, attempt_op_id)?;
+        if plan.attempt_op_id.trim().is_empty()
+            || plan.attempt_op_id != attempt_op_id
             || plan.coordinator.trim().is_empty()
             || plan.policy_digest.trim().is_empty()
             || plan.rules_digest.trim().is_empty()
@@ -192,9 +211,9 @@ impl NativeWorkspaceVcs {
             });
             evidence.push(result);
         }
-        // A worker can spend minutes in the checks. Keep stale evidence, but
-        // do not issue a certificate for a base or source fence that changed
-        // while it ran. The final ref transaction checks again under CAS.
+        // A worker can spend minutes in the checks. Do not issue a certificate
+        // for a changed base, source fence or required plan. The final ref
+        // transaction must check mutable premises again under CAS.
         let current_trunk = self.branches.get_branch(MAINLINE_BRANCH_ID)?;
         let current_fence = self.branches.flowing_source(&witness.source_branch_id)?;
         let current_pin = self.branches.flowing_attempt_pin(&plan.attempt_op_id)?;
@@ -208,6 +227,9 @@ impl NativeWorkspaceVcs {
                 .is_some()
         {
             return Err(invalid("trunk or source changed during checks"));
+        }
+        if authority.required_plan(self, witness_digest, attempt_op_id)? != plan {
+            return Err(invalid("required plan changed during checks"));
         }
         let certificate = FlowingGateCertificate {
             candidate_witness_digest: witness_digest.to_owned(),
