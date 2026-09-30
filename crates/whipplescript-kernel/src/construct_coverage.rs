@@ -6,6 +6,7 @@
 //! forms, or close a Home operation roster.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use whipplescript_core::{ConstructRegistration, ContractRegistry};
 use whipplescript_parser::{IrConstructUse, IrDeclarationConstruct, IrProgram};
@@ -63,6 +64,32 @@ pub fn registry_matches_declaration_inventory(
                     .any(|form| matches_declaration(form, declaration))
             })
         })
+}
+
+/// Resolve the vocabulary shipped by one host from its exact embedded
+/// manifest bytes. A declaration can select its standard provider without an
+/// explicit import; rule-effect constructs still need the owning `use` at
+/// capture. The caller binds `embedded` to the compiler artifact identity in
+/// the import basis it admits with this registry.
+pub fn embedded_std_registry_for_program(
+    program: &IrProgram,
+    embedded: &[(&str, &str)],
+) -> Result<ContractRegistry, String> {
+    let mut registry = program.contract_registry();
+    for (name, json) in embedded {
+        let path = PathBuf::from(format!("<embedded:{name}>"));
+        let manifest = crate::package_registry::package_manifest_from_json_with_embedded(
+            &path,
+            (*json).to_owned(),
+            embedded,
+        )?;
+        if program.uses.iter().any(|use_decl| use_decl.name == *name)
+            || registry_matches_declaration_inventory(program, &manifest.registry)
+        {
+            registry.merge(manifest.registry);
+        }
+    }
+    Ok(registry)
 }
 
 fn is_digest(value: &str) -> bool {

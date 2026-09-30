@@ -1234,6 +1234,35 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })
     }
 
+    fn capture_checked_program_witness(
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportWitness> {
+        let mut witness =
+            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        if let Some(construct_basis) = construct_basis {
+            witness.constructs = Some(
+                construct_coverage::capture(
+                    program,
+                    construct_basis.registry,
+                    &witness,
+                    construct_basis.sources,
+                )
+                .map_err(StoreError::Conflict)?,
+            );
+            witness.declarations = Some(
+                construct_coverage::capture_declarations(
+                    program,
+                    construct_basis.registry,
+                    &witness,
+                )
+                .map_err(StoreError::Conflict)?,
+            );
+        }
+        Ok(witness)
+    }
+
     /// Preserve the plain host version's recorded metadata while atomically
     /// retaining import evidence. The IR is examined for imports, but this
     /// path does not change the executable profile/capability projection that
@@ -1244,8 +1273,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        let witness =
-            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        self.create_program_version_with_imports_basis(input, program, basis, None)
+    }
+
+    /// Admit a plain host version with both import and exact construct edges.
+    /// The source, registry, and compiler artifact must be one checked basis.
+    pub fn create_program_version_with_imports_and_constructs(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_with_imports_basis(input, program, basis, Some(construct_basis))
+    }
+
+    fn create_program_version_with_imports_basis(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
         self.store.create_program_version_with_import_witness(
             NewProgramVersion {
                 program_name: input.program_name,
@@ -1439,27 +1489,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             generated_artifacts_json: "[]",
             artifact_root: None,
         };
-        let mut witness =
-            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
-        if let Some(construct_basis) = construct_basis {
-            witness.constructs = Some(
-                construct_coverage::capture(
-                    program,
-                    construct_basis.registry,
-                    &witness,
-                    construct_basis.sources,
-                )
-                .map_err(StoreError::Conflict)?,
-            );
-            witness.declarations = Some(
-                construct_coverage::capture_declarations(
-                    program,
-                    construct_basis.registry,
-                    &witness,
-                )
-                .map_err(StoreError::Conflict)?,
-            );
-        }
+        let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
         self.store
             .create_program_version_with_import_witness(version, &witness)
     }

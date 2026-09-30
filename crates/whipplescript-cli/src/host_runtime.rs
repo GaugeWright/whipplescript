@@ -16,6 +16,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::construct_coverage::{
+    embedded_std_registry_for_program, CheckedConstructBasis,
+};
 use whipplescript_kernel::context_assembly::SkillCatalogueEntry;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
@@ -1935,9 +1938,14 @@ impl GovernedHostRuntime {
 
         let compiler_artifact_digest =
             native_compiler_artifact_digest().map_err(HostRuntimeError::Resolver)?;
+        let construct_registry = embedded_std_registry_for_program(
+            &package.program,
+            crate::std_manifests::EMBEDDED_STD_MANIFESTS,
+        )
+        .map_err(HostRuntimeError::Resolver)?;
         let admission = self
             .kernel
-            .create_program_version_with_imports(
+            .create_program_version_with_imports_and_constructs(
                 ProgramVersionInput {
                     program_name: &package.agent,
                     source_hash: &package.source_hash,
@@ -1952,6 +1960,10 @@ impl GovernedHostRuntime {
                     lock_digest: NO_LOCK_DIGEST,
                     compiler_artifact_digest: &compiler_artifact_digest,
                     packages: &[],
+                },
+                &CheckedConstructBasis {
+                    registry: &construct_registry,
+                    sources: &[],
                 },
             )
             .map_err(HostRuntimeError::Store)?;
@@ -4364,6 +4376,23 @@ workflow HostChat {
         );
         assert_eq!(witness.lock_digest, NO_LOCK_DIGEST);
         assert!(witness.examined.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+        let declarations = witness.declarations.expect("checked declaration capture");
+        assert_eq!(
+            declarations
+                .edges
+                .iter()
+                .map(|edge| edge.registration_id.as_str())
+                .collect::<Vec<_>>(),
+            ["files.file_store"]
+        );
+        assert!(declarations
+            .edges
+            .iter()
+            .all(|edge| { edge.provider_source_digest == witness.compiler_artifact_digest }));
     }
 
     struct UnsafePackages;

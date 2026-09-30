@@ -21,7 +21,7 @@
 //! native one (DR-0074 §12) — its effects refuse at the admission gate.
 
 use whipplescript_core::ContractRegistry;
-use whipplescript_kernel::{construct_coverage, package_registry};
+use whipplescript_kernel::construct_coverage;
 use whipplescript_parser::IrProgram;
 use whipplescript_store::{RuntimeStore, StoreError};
 
@@ -94,24 +94,7 @@ pub const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
 /// Parsing the shipped bytes here binds this registry to the same wasm artifact
 /// whose digest the worker passes to checked admission.
 pub fn construct_registry_for_ir(program: &IrProgram) -> Result<ContractRegistry, String> {
-    let mut registry = program.contract_registry();
-    for (name, json) in EMBEDDED_STD_MANIFESTS {
-        let path = std::path::PathBuf::from(format!("<embedded:{name}>"));
-        let manifest = package_registry::package_manifest_from_json_with_embedded(
-            &path,
-            (*json).to_owned(),
-            EMBEDDED_STD_MANIFESTS,
-        )?;
-        if program.uses.iter().any(|use_decl| use_decl.name == *name)
-            || construct_coverage::registry_matches_declaration_inventory(
-                program,
-                &manifest.registry,
-            )
-        {
-            registry.merge(manifest.registry);
-        }
-    }
-    Ok(registry)
+    construct_coverage::embedded_std_registry_for_program(program, EMBEDDED_STD_MANIFESTS)
 }
 
 /// Seed the embedded std manifests into the DO store so the admission gate is
