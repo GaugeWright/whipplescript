@@ -27,6 +27,22 @@ test("v1 keeps narrower admitted scopes and refuses an absent scope", () => {
   assert.deepEqual(agentWorkspaceResources(v1, undefined), []);
 });
 
+test("v1 leaves a host's other subtrees as admitted, presentation included", () => {
+  const target = {
+    handle: "target:t-a",
+    kind: "file_store",
+    selector: "targets/t-a",
+    writable: true,
+    presented_as: "api",
+  };
+  const readOnly = { ...target, handle: "target:t-b", selector: "targets/t-b", writable: false };
+  assert.deepEqual(agentWorkspaceResources(v1, [target, readOnly]), [target, readOnly]);
+  // A subtree holding the definition is still narrowed.
+  assert.deepEqual(agentWorkspaceResources(v1, [{ ...root, selector: "agent/skills" }]), [
+    { ...root, selector: "agent/skills", writable: false },
+  ]);
+});
+
 test("older pinned packages retain their workspace authority", () => {
   assert.deepEqual(agentWorkspaceResources(v0, [root]), [root]);
   assert.equal(agentWorkspaceResources(v0, undefined), undefined);

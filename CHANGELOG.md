@@ -19,6 +19,15 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- An authenticated host opts in to recorded presented-root renames with
+  `"workspace_root_renames": "recorded"` on its turn request; the Durable
+  Object worker forwards it into the placement's agent configuration, which
+  the host cannot write itself. A public session cannot opt in.
+- A v1 Agent's hosted session no longer makes a host's work-target references
+  read-only. Only the root reference and references touching `agent/`,
+  `artifacts/` or `work/` are narrowed, as the harness specification
+  describes; any other subtree keeps the writability its host admitted.
+
 - A Durable Object host can now admit presented-root renames: a host that sets
   `"workspace_root_renames": "recorded"` has the placement admit a rename of a
   writable root to a free name and record it at

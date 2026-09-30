@@ -1208,6 +1208,9 @@ interface HostCommandRequest {
   image_bodies: unknown[];
   /** Ephemeral source labels from the authenticated owning host. */
   initial_model_provenance?: unknown;
+  /** `"recorded"` when the authenticated host ratifies presented-root renames
+   *  after the command (DR-0148); anything else refuses them. */
+  workspace_root_renames?: unknown;
 }
 
 interface PublicSessionBootstrap {
@@ -4675,6 +4678,7 @@ export class WorkflowInstance implements DurableObject {
       package: candidate as HostPackageDocuments,
       image_bodies: Array.isArray(parsed.image_bodies) ? parsed.image_bodies : [],
       initial_model_provenance: parsed.initial_model_provenance,
+      workspace_root_renames: parsed.workspace_root_renames,
     };
   }
 
@@ -4958,6 +4962,10 @@ export class WorkflowInstance implements DurableObject {
           // neither the command nor WhippleScript evidence stores them.
           initial_model_provenance: this.isPublicSession()
             ? undefined : request.initial_model_provenance,
+          // DR-0148: only an authenticated host can take back and ratify the
+          // renames this placement records; a public visitor never can.
+          workspace_root_renames: !this.isPublicSession()
+            && request.workspace_root_renames === "recorded" ? "recorded" : undefined,
         }),
         ...this.normGate(),
       );

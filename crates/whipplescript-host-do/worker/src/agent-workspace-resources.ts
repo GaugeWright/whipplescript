@@ -2,7 +2,9 @@
  *
  * The admitted root resource is still readable. Its write authority is
  * attenuated to the two run-owned directories; no new resource handle is
- * minted, and every writable selector stays inside its admitted root.
+ * minted, and every writable selector stays inside its admitted root. A
+ * reference to any other subtree — a host's work target, say — cannot hold
+ * the definition, so it keeps the writability its host admitted.
  */
 export function agentWorkspaceResources(
   manifest: string,
@@ -26,6 +28,11 @@ export function agentWorkspaceResources(
     const root = typeof selector === "string" && selector !== "."
       ? selector.replace(/^\.\//, "").replace(/\/$/, "")
       : "";
+    const overlaps = (dir: string) =>
+      root === "" || root === dir || root.startsWith(`${dir}/`) || dir.startsWith(`${root}/`);
+    if (!["agent", "artifacts", "work"].some(overlaps)) {
+      return [resource];
+    }
     const writable = ["artifacts", "work"].flatMap((allowed) => {
       if (root === "" || allowed.startsWith(`${root}/`) || root === allowed) {
         return [{ ...resource, selector: allowed, writable: true }];
