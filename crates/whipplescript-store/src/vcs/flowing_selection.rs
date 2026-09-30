@@ -181,7 +181,6 @@ pub enum NativeCandidateOutcome {
     StaleBase,
     SourceMismatch,
     IncompletePrefix,
-    OverlappingUnits { path: String },
     MissingContent { content_id: String },
     UnitAlreadyAdmitted { unit_id: String },
     UnprovenBasis { unit_id: String },
@@ -253,9 +252,9 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     }
 
     /// Prepare the complete selected direct-twig prefix at its original trunk
-    /// branch point. This intentionally refuses selective skips, overlapping
-    /// unit paths and a moved trunk: without a complete dependency graph or
-    /// composed per-unit outcomes, those cases have no closure proof yet.
+    /// branch point. This refuses selective skips and a moved trunk. When
+    /// units write the same path, their ordered source atoms must reproduce
+    /// the selected manifest before any per-unit outcome is recorded.
     #[cfg(feature = "native")]
     pub fn prepare_native_review_candidate(
         &mut self,
@@ -418,8 +417,6 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let mut owners = BTreeMap::new();
         let mut cut_owners = BTreeMap::new();
         let mut declarations = BTreeMap::new();
-        let mut paths = BTreeSet::new();
-        let mut outcomes = Vec::new();
         for unit in &revision.units {
             if self
                 .branches
@@ -458,7 +455,6 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             {
                 return Ok(R::IncompletePrefix);
             }
-            let mut unit_paths = BTreeSet::new();
             for atom in &basis.atoms {
                 let key = (atom.cut_id.clone(), atom.path.clone());
                 if expected.get(&key) != Some(atom)
@@ -472,32 +468,14 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 {
                     return Ok(R::IncompletePrefix);
                 }
-                unit_paths.insert(atom.path.clone());
             }
-            for path in &unit_paths {
-                if !paths.insert(path.clone()) {
-                    return Ok(R::OverlappingUnits { path: path.clone() });
-                }
-            }
-            let selected = match self.net_source_paths(&basis)? {
-                Ok(selected) => selected,
+            match self.net_source_paths(&basis)? {
+                Ok(_) => {}
                 Err(FlowingTargetEffectsOutcome::MissingContent { content_id }) => {
                     return Ok(R::MissingContent { content_id });
                 }
                 Err(_) => return Ok(R::IncompletePrefix),
-            };
-            let neutralized = selected.values().all(|(before, after)| before == after);
-            outcomes.push(FlowingSelectedUnit {
-                unit_id: unit.unit_id.clone(),
-                basis_digest: unit.basis_digest.clone(),
-                principal: unit.principal.clone(),
-                intent: unit.intent.clone(),
-                outcome: if neutralized {
-                    FlowingUnitOutcome::Neutralized
-                } else {
-                    FlowingUnitOutcome::Applied
-                },
-            });
+            }
             declarations.insert(unit.unit_id.clone(), declared);
         }
         if owners.len() != expected.len() {
@@ -565,6 +543,63 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         {
             return Ok(R::IncompletePrefix);
         }
+        // Reproduce the exact selected source manifest from the trunk base.
+        // This proves the before content each dependent actually saw, even
+        // when a predecessor's write is later undone by another unit. The
+        // last substantive owner of a surviving path effect is Applied;
+        // earlier overwritten owners are Neutralized. A unit with only
+        // no-op atoms is Equivalent.
+        let base_manifest = self.load_manifest(trunk.head_manifest_hash.as_deref())?;
+        let selected_manifest = self.load_manifest(Some(&selected_cut.manifest_hash))?;
+        let mut composed = base_manifest.clone();
+        let mut substantive_units = BTreeSet::new();
+        let mut last_substantive_owner = BTreeMap::new();
+        for atom in &atoms {
+            if composed.get(&atom.path).map(String::as_str) != atom.before.as_deref() {
+                return Ok(R::SourceMismatch);
+            }
+            let key = (atom.cut_id.clone(), atom.path.clone());
+            let Some(owner) = owners.get(&key) else {
+                return Ok(R::IncompletePrefix);
+            };
+            if atom.before != atom.after {
+                substantive_units.insert(owner.clone());
+                last_substantive_owner.insert(atom.path.clone(), owner.clone());
+            }
+            match &atom.after {
+                Some(after) => {
+                    composed.insert(atom.path.clone(), after.clone());
+                }
+                None => {
+                    composed.remove(&atom.path);
+                }
+            }
+        }
+        if composed != selected_manifest {
+            return Ok(R::SourceMismatch);
+        }
+        let applied_units: BTreeSet<String> = last_substantive_owner
+            .into_iter()
+            .filter(|(path, _)| base_manifest.get(path) != selected_manifest.get(path))
+            .map(|(_, owner)| owner)
+            .collect();
+        let outcomes: Vec<FlowingSelectedUnit> = revision
+            .units
+            .iter()
+            .map(|unit| FlowingSelectedUnit {
+                unit_id: unit.unit_id.clone(),
+                basis_digest: unit.basis_digest.clone(),
+                principal: unit.principal.clone(),
+                intent: unit.intent.clone(),
+                outcome: if applied_units.contains(&unit.unit_id) {
+                    FlowingUnitOutcome::Applied
+                } else if substantive_units.contains(&unit.unit_id) {
+                    FlowingUnitOutcome::Neutralized
+                } else {
+                    FlowingUnitOutcome::Equivalent
+                },
+            })
+            .collect();
         let Some(raw) = self.load_manifest_opt_raw(&selected_cut.manifest_hash)? else {
             return Ok(R::SourceMismatch);
         };
@@ -1424,6 +1459,13 @@ mod tests {
     fn reviewed_two_unit_twig_with_read(
         second_read_override: Option<&str>,
     ) -> (WorkspaceVcs<BranchStore, ContentStore>, ReviewStore) {
+        reviewed_two_unit_twig_variant(second_read_override, false)
+    }
+
+    fn reviewed_two_unit_twig_variant(
+        second_read_override: Option<&str>,
+        undo_first_write: bool,
+    ) -> (WorkspaceVcs<BranchStore, ContentStore>, ReviewStore) {
         let mut vcs = workspace();
         vcs.init("t0").expect("native candidate test");
         vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
@@ -1458,7 +1500,11 @@ mod tests {
                 .expect("native candidate test"),
             BindContributionBasisOutcome::Bound
         );
-        vcs.write("twig", "b.txt", Some("B"), "twig-b", "t4")
+        if undo_first_write {
+            vcs.write("twig", "a.txt", None, "twig-undo", "t4")
+                .expect("dependent undoes predecessor write");
+        }
+        vcs.write("twig", "b.txt", Some("B"), "twig-b", "t5")
             .expect("second source write");
         pin(&mut vcs, "twig-b", "pin-b");
         let prior = vec![("unit-a".into(), selection.digest().into())];
@@ -1470,17 +1516,22 @@ mod tests {
             &prior,
             second_read_override,
         );
+        let expression = if undo_first_write {
+            "change(twig-undo) | change(twig-b)"
+        } else {
+            "path(b.txt)"
+        };
         let FlowingSelectionOutcome::Selected(selection) = vcs
             .select_private_changes(
                 "pin-b",
-                &selection::parse("path(b.txt)").expect("native candidate test"),
+                &selection::parse(expression).expect("native candidate test"),
             )
             .expect("native candidate test")
         else {
             panic!("second selection")
         };
         assert_eq!(
-            vcs.bind_private_selection("unit-b", &selection, "t5")
+            vcs.bind_private_selection("unit-b", &selection, "t6")
                 .expect("native candidate test"),
             BindContributionBasisOutcome::Bound
         );
@@ -1958,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn native_candidate_refuses_overlapping_unit_paths() {
+    fn native_candidate_refuses_overlap_with_an_unproven_read_basis() {
         let (mut vcs, mut reviews) = reviewed_two_unit_twig();
         vcs.write("twig", "a.txt", Some("A2"), "twig-a2", "t6")
             .expect("native candidate test");
@@ -1998,8 +2049,8 @@ mod tests {
                     native_candidate_request("candidate-overlap", "t8")
                 )
                 .expect("native candidate test"),
-            NativeCandidateOutcome::OverlappingUnits {
-                path: "a.txt".into()
+            NativeCandidateOutcome::UnprovenBasis {
+                unit_id: "unit-a2".into()
             }
         );
         assert!(vcs
@@ -2007,6 +2058,130 @@ mod tests {
             .get_cut("candidate-overlap")
             .expect("native candidate test")
             .is_none());
+    }
+
+    #[test]
+    fn native_candidate_accounts_a_neutralized_predecessor_and_applied_dependent() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        vcs.write("twig", "a.txt", Some("A2"), "twig-a2", "t6")
+            .expect("later source write");
+        pin(&mut vcs, "twig-a2", "pin-a2");
+        let prior: Vec<(String, String)> = ["unit-a", "unit-b"]
+            .into_iter()
+            .map(|unit_id| {
+                let basis = vcs
+                    .branches
+                    .contribution_basis(unit_id)
+                    .expect("read contribution")
+                    .expect("bound contribution");
+                (unit_id.into(), basis.basis_digest)
+            })
+            .collect();
+        declare_native(&mut vcs, "unit-a2", "pin-a2", Some("twig-b"), &prior, None);
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-a2",
+                &selection::parse("change(twig-a2)").expect("select later write"),
+            )
+            .expect("derive later write")
+        else {
+            panic!("third selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a2", &selection, "t7")
+                .expect("bind later write"),
+            BindContributionBasisOutcome::Bound
+        );
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-a",
+                    upload_id: "upload-overlap",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-a2",
+                    unit_ids: &["unit-a", "unit-b", "unit-a2"],
+                },
+            )
+            .expect("upload exact prefix");
+        let prepared = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                native_candidate_request("candidate-overlap", "t8"),
+            )
+            .expect("prepare exact prefix");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("overlapping complete prefix must prepare: {prepared:?}")
+        };
+        assert_eq!(candidate.units.len(), 3);
+        assert_eq!(candidate.units[0].outcome, FlowingUnitOutcome::Neutralized);
+        assert_eq!(candidate.units[1].outcome, FlowingUnitOutcome::Applied);
+        assert_eq!(candidate.units[2].outcome, FlowingUnitOutcome::Applied);
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .expect("read witness")
+            .expect("persisted witness");
+        assert_eq!(witness.units, candidate.units);
+        let candidate_manifest = vcs
+            .cut_manifest("candidate-overlap")
+            .expect("read candidate")
+            .expect("recorded candidate");
+        assert_eq!(candidate_manifest.len(), 2);
+        assert_eq!(
+            candidate_manifest.get("a.txt"),
+            Some(&vcs.content.put_text("A2").expect("content id"))
+        );
+        assert_eq!(
+            candidate_manifest.get("b.txt"),
+            Some(&vcs.content.put_text("B").expect("content id"))
+        );
+    }
+
+    #[test]
+    fn native_candidate_replays_a_dependent_undo_before_accounting_both_units() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig_variant(None, true);
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-undo", "t7"))
+            .expect("prepare exact prefix");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("dependent undo must prepare: {prepared:?}")
+        };
+        assert_eq!(candidate.units.len(), 2);
+        assert_eq!(candidate.units[0].outcome, FlowingUnitOutcome::Neutralized);
+        assert_eq!(candidate.units[1].outcome, FlowingUnitOutcome::Applied);
+        let candidate_manifest = vcs
+            .cut_manifest("candidate-undo")
+            .expect("read candidate")
+            .expect("recorded candidate");
+        assert_eq!(candidate_manifest.len(), 1);
+        assert_eq!(
+            candidate_manifest.get("b.txt"),
+            Some(&vcs.content.put_text("B").expect("content id"))
+        );
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .expect("read witness")
+            .expect("persisted witness");
+        assert_eq!(witness.units, candidate.units);
+
+        let (mut stale_vcs, mut stale_reviews) =
+            reviewed_two_unit_twig_variant(Some("wrong"), true);
+        upload_two_units(&stale_vcs, &mut stale_reviews, &["unit-a", "unit-b"]);
+        assert_eq!(
+            stale_reviews
+                .prepare_native_candidate(
+                    &mut stale_vcs,
+                    native_candidate_request("candidate-stale-undo", "t7")
+                )
+                .expect("prepare stale prefix"),
+            NativeCandidateOutcome::UnprovenBasis {
+                unit_id: "unit-b".into()
+            }
+        );
     }
 
     #[test]
