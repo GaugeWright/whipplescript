@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 7] = [
+pub const SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -48,12 +48,16 @@ pub const SCHEMA: [&str; 7] = [
     "CREATE INDEX IF NOT EXISTS flowing_attempt_pins_live_idx
         ON flowing_attempt_pins(source_cut_id, candidate_cut_id)
         WHERE released_at IS NULL",
+    "CREATE TABLE IF NOT EXISTS flowing_attempt_finishes (
+        op_id TEXT PRIMARY KEY,
+        receipt_json TEXT NOT NULL
+    )",
 ];
 
 /// A durable, attempt-owned pair of cut roots. The source holder still owns
 /// every selected unit; this row preserves the exact review basis and output
-/// across a gate worker crash. A cancelled attempt may release only this row
-/// after the ref authority confirms its cancellation and the source holder.
+/// across a gate worker crash. A terminal attempt may release only this row
+/// after the ref authority confirms its outcome and the source holder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowingAttemptPin {
     pub op_id: String,
@@ -88,10 +92,42 @@ pub enum ReleaseFlowingAttemptOutcome {
     Released,
     AlreadyReleased,
     Missing,
-    NotCancelled,
+    NotTerminal,
     Admitted,
     UnitHolderMissing { unit_id: String },
     Invalid { field: &'static str },
+}
+
+/// The ref-owned result of an exact gate attempt that did not pass. Failed
+/// and unrun stay distinct from cancellation and from a stale candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingAttemptFinishReceipt {
+    pub request: FlowingAdmissionRequest,
+    pub verdict: FlowingGateVerdict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingAttemptFinishRefusal {
+    IdentityMismatch,
+    InvalidRequest(FlowingAdmissionRefusal),
+    AttemptPinMissing,
+    AttemptPinMismatch,
+    AttemptPinReleased,
+    CandidateWitnessMissing,
+    CandidateWitnessMismatch,
+    GateCertificateMissing,
+    GateCertificateMismatch,
+    GatePlanIncomplete,
+    GatePassed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingAttemptFinishOutcome {
+    Finished(FlowingAttemptFinishReceipt),
+    Existing(FlowingAttemptFinishReceipt),
+    AlreadyAdmitted(Box<FlowingAdmissionReceipt>),
+    AlreadyCancelled(FlowingCancelReceipt),
+    Refused(FlowingAttemptFinishRefusal),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -369,6 +405,7 @@ pub enum FlowingCancelOutcome {
     Existing(FlowingCancelReceipt),
     AlreadyCancelled(FlowingCancelReceipt),
     AlreadyAdmitted(Box<FlowingAdmissionReceipt>),
+    AlreadyFinished(Box<FlowingAttemptFinishReceipt>),
     Refused(FlowingCancelRefusal),
 }
 
@@ -394,14 +431,22 @@ pub trait FlowingAdmissions {
         retained_at: &str,
     ) -> crate::StoreResult<RetainFlowingAttemptOutcome>;
     fn flowing_attempt_pin(&self, op_id: &str) -> crate::StoreResult<Option<FlowingAttemptPin>>;
-    /// Release a cancelled attempt only after its selected units still have
-    /// their durable source holder. An admitted attempt needs the separate
-    /// receipt/frontier reconciliation protocol before these roots can move.
-    fn release_cancelled_flowing_attempt(
+    /// Release a cancelled, failed or unrun attempt only after its selected
+    /// units still have their durable source holder. An admitted attempt needs
+    /// receipt/frontier reconciliation before these roots can move.
+    fn release_terminal_flowing_attempt(
         &mut self,
         op_id: &str,
         released_at: &str,
     ) -> crate::StoreResult<ReleaseFlowingAttemptOutcome>;
+    fn finish_flowing_attempt(
+        &mut self,
+        request: &FlowingAdmissionRequest,
+    ) -> crate::StoreResult<FlowingAttemptFinishOutcome>;
+    fn flowing_finish_for_attempt(
+        &self,
+        op_id: &str,
+    ) -> crate::StoreResult<Option<FlowingAttemptFinishReceipt>>;
     fn admit_flowing_prefix(
         &mut self,
         request: &FlowingAdmissionRequest,

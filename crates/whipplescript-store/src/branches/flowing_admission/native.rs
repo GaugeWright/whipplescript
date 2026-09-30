@@ -5,9 +5,10 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use super::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
+    FlowingAttemptFinishOutcome, FlowingAttemptFinishReceipt, FlowingAttemptFinishRefusal,
     FlowingAttemptPin, FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal,
-    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
-    ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
+    FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateVerdict,
+    FlowingUnitOutcome, ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
@@ -30,6 +31,34 @@ fn read_receipt(
         if receipt.request.op_id != stored_op_id {
             return Err(StoreError::Conflict(
                 "flowing admission receipt differs from its operation key".into(),
+            ));
+        }
+        Ok(receipt)
+    })
+    .transpose()
+}
+
+fn read_finish(
+    connection: &Connection,
+    op_id: &str,
+) -> StoreResult<Option<FlowingAttemptFinishReceipt>> {
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT op_id, receipt_json FROM flowing_attempt_finishes WHERE op_id = ?1",
+            [op_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(stored_op_id, json)| {
+        let receipt: FlowingAttemptFinishReceipt = serde_json::from_str(&json)?;
+        if receipt.request.op_id != stored_op_id
+            || !matches!(
+                receipt.verdict,
+                FlowingGateVerdict::Failed | FlowingGateVerdict::Unrun
+            )
+        {
+            return Err(StoreError::Conflict(
+                "flowing attempt finish differs from its operation key or terminal verdict".into(),
             ));
         }
         Ok(receipt)
@@ -265,6 +294,7 @@ impl FlowingAdmissions for BranchStore {
         }
         if read_receipt(&tx, op_id)?.is_some()
             || read_cancellation(&tx, "admission_op_id", op_id)?.is_some()
+            || read_finish(&tx, op_id)?.is_some()
         {
             return Ok(O::AttemptTerminal);
         }
@@ -314,7 +344,7 @@ impl FlowingAdmissions for BranchStore {
         read_attempt_pin(&self.connection, op_id)
     }
 
-    fn release_cancelled_flowing_attempt(
+    fn release_terminal_flowing_attempt(
         &mut self,
         op_id: &str,
         released_at: &str,
@@ -337,8 +367,15 @@ impl FlowingAdmissions for BranchStore {
         if read_receipt(&tx, op_id)?.is_some() {
             return Ok(O::Admitted);
         }
-        if read_cancellation(&tx, "admission_op_id", op_id)?.is_none() {
-            return Ok(O::NotCancelled);
+        let cancelled = read_cancellation(&tx, "admission_op_id", op_id)?;
+        let finished = read_finish(&tx, op_id)?;
+        if cancelled.is_none() && finished.is_none() {
+            return Ok(O::NotTerminal);
+        }
+        if cancelled.is_some() && finished.is_some() {
+            return Err(StoreError::Conflict(
+                "flowing attempt has conflicting terminal receipts".into(),
+            ));
         }
         let Some(witness) = read_witness(&tx, &pin.witness_digest)? else {
             return Err(StoreError::Conflict(
@@ -352,6 +389,17 @@ impl FlowingAdmissions for BranchStore {
                 "retained flowing attempt differs from its witness".into(),
             ));
         }
+        if let Some(finished) = finished {
+            if finished.request.candidate_witness_digest != pin.witness_digest
+                || finished.request.source_cut_id != pin.source_cut_id
+                || finished.request.candidate_cut_id != pin.candidate_cut_id
+                || !witness.matches_request(&finished.request)
+            {
+                return Err(StoreError::Conflict(
+                    "flowing attempt finish differs from its retained witness".into(),
+                ));
+            }
+        }
         if let Some(unit_id) = missing_unit_holder(&tx, &witness)? {
             return Ok(O::UnitHolderMissing { unit_id });
         }
@@ -361,6 +409,92 @@ impl FlowingAdmissions for BranchStore {
         )?;
         tx.commit()?;
         Ok(O::Released)
+    }
+
+    fn finish_flowing_attempt(
+        &mut self,
+        request: &FlowingAdmissionRequest,
+    ) -> StoreResult<FlowingAttemptFinishOutcome> {
+        use FlowingAttemptFinishOutcome as O;
+        use FlowingAttemptFinishRefusal as R;
+        if let Err(refusal) = validate_request(request) {
+            return Ok(O::Refused(R::InvalidRequest(refusal)));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = read_finish(&tx, &request.op_id)? {
+            if existing.request != *request {
+                return Ok(O::Refused(R::IdentityMismatch));
+            }
+            return Ok(O::Existing(existing));
+        }
+        if let Some(admitted) = read_receipt(&tx, &request.op_id)? {
+            if admitted.request != *request {
+                return Ok(O::Refused(R::IdentityMismatch));
+            }
+            return Ok(O::AlreadyAdmitted(Box::new(admitted)));
+        }
+        if let Some(cancelled) = read_cancellation(&tx, "admission_op_id", &request.op_id)? {
+            if cancelled.request.source_branch_id != request.source_branch_id
+                || cancelled.request.source_incarnation_id != request.source_incarnation_id
+            {
+                return Ok(O::Refused(R::IdentityMismatch));
+            }
+            return Ok(O::AlreadyCancelled(cancelled));
+        }
+        let Some(pin) = read_attempt_pin(&tx, &request.op_id)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            return Ok(O::Refused(R::AttemptPinMissing));
+        };
+        if pin.witness_digest != request.candidate_witness_digest
+            || pin.source_cut_id != request.source_cut_id
+            || pin.candidate_cut_id != request.candidate_cut_id
+        {
+            return Ok(O::Refused(R::AttemptPinMismatch));
+        }
+        if pin.released_at.is_some() {
+            return Ok(O::Refused(R::AttemptPinReleased));
+        }
+        let Some(witness) = read_witness(&tx, &request.candidate_witness_digest)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            return Ok(O::Refused(R::CandidateWitnessMissing));
+        };
+        if !witness.matches_request(request) {
+            return Ok(O::Refused(R::CandidateWitnessMismatch));
+        }
+        let Some(certificate) = read_gate_certificate(&tx, &request.certificate_handle)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            return Ok(O::Refused(R::GateCertificateMissing));
+        };
+        if !certificate.matches_request(request) {
+            return Ok(O::Refused(R::GateCertificateMismatch));
+        }
+        let verdict = match certificate.admission_refusal() {
+            Some(super::FlowingAdmissionRefusal::GateFailed) => FlowingGateVerdict::Failed,
+            Some(super::FlowingAdmissionRefusal::GateUnrun) => FlowingGateVerdict::Unrun,
+            // MUTATION-SUCCESS-EXPR: return Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            Some(_) => return Ok(O::Refused(R::GatePlanIncomplete)),
+            // MUTATION-SUCCESS-EXPR: return Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            None => return Ok(O::Refused(R::GatePassed)),
+        };
+        let receipt = FlowingAttemptFinishReceipt {
+            request: request.clone(),
+            verdict,
+        };
+        tx.execute(
+            "INSERT INTO flowing_attempt_finishes (op_id, receipt_json) VALUES (?1, ?2)",
+            params![&request.op_id, serde_json::to_string(&receipt)?],
+        )?;
+        tx.commit()?;
+        Ok(O::Finished(receipt))
+    }
+
+    fn flowing_finish_for_attempt(
+        &self,
+        op_id: &str,
+    ) -> StoreResult<Option<FlowingAttemptFinishReceipt>> {
+        read_finish(&self.connection, op_id)
     }
 
     fn admit_flowing_prefix(
@@ -387,6 +521,17 @@ impl FlowingAdmissions for BranchStore {
             return Ok(Refused(R::AttemptCancelled {
                 cancel_op_id: cancelled.request.cancel_op_id,
             }));
+        }
+        if let Some(finished) = read_finish(&tx, &request.op_id)? {
+            return Ok(if finished.request == *request {
+                Refused(match finished.verdict {
+                    FlowingGateVerdict::Failed => R::GateFailed,
+                    FlowingGateVerdict::Unrun => R::GateUnrun,
+                    FlowingGateVerdict::Passed => unreachable!("validated terminal receipt"),
+                })
+            } else {
+                Refused(R::IdentityMismatch)
+            });
         }
 
         let Some(source) = BranchStore::row_by_id(&tx, &request.source_branch_id)? else {
@@ -637,7 +782,7 @@ impl FlowingAdmissions for BranchStore {
         request: &FlowingCancelRequest,
     ) -> StoreResult<FlowingCancelOutcome> {
         use FlowingCancelOutcome::{
-            AlreadyAdmitted, AlreadyCancelled, Cancelled, Existing, Refused,
+            AlreadyAdmitted, AlreadyCancelled, AlreadyFinished, Cancelled, Existing, Refused,
         };
         use FlowingCancelRefusal as R;
 
@@ -672,6 +817,17 @@ impl FlowingAdmissions for BranchStore {
                     && admitted.request.source_incarnation_id == request.source_incarnation_id
                 {
                     AlreadyAdmitted(Box::new(admitted))
+                } else {
+                    Refused(R::IdentityMismatch)
+                },
+            );
+        }
+        if let Some(finished) = read_finish(&tx, &request.admission_op_id)? {
+            return Ok(
+                if finished.request.source_branch_id == request.source_branch_id
+                    && finished.request.source_incarnation_id == request.source_incarnation_id
+                {
+                    AlreadyFinished(Box::new(finished))
                 } else {
                     Refused(R::IdentityMismatch)
                 },
@@ -944,6 +1100,403 @@ mod tests {
                 .unwrap(),
             RetainFlowingAttemptOutcome::Retained(_)
         ));
+    }
+
+    fn terminal_request(
+        store: &BranchStore,
+        op_id: &str,
+        verdict: FlowingGateVerdict,
+    ) -> FlowingAdmissionRequest {
+        let mut attempt = request("unit-a", op_id);
+        let mut certificate = certificate_for(&attempt);
+        certificate.checks[0].verdict = verdict;
+        attempt.certificate_handle = certificate.handle().unwrap();
+        insert_gate_certificate(store, &certificate);
+        attempt
+    }
+
+    #[test]
+    fn failed_and_unrun_attempts_finish_before_their_roots_are_released() {
+        for verdict in [FlowingGateVerdict::Failed, FlowingGateVerdict::Unrun] {
+            let mut store = fixture();
+            let request = terminal_request(&store, "terminal", verdict);
+            pin_attempt(&mut store, &request);
+            assert_eq!(
+                store
+                    .release_terminal_flowing_attempt(&request.op_id, "t4")
+                    .unwrap(),
+                ReleaseFlowingAttemptOutcome::NotTerminal
+            );
+            let receipt = FlowingAttemptFinishReceipt {
+                request: request.clone(),
+                verdict,
+            };
+            assert_eq!(
+                store.finish_flowing_attempt(&request).unwrap(),
+                FlowingAttemptFinishOutcome::Finished(receipt.clone())
+            );
+            assert_eq!(
+                store.finish_flowing_attempt(&request).unwrap(),
+                FlowingAttemptFinishOutcome::Existing(receipt.clone())
+            );
+            assert_eq!(
+                store.flowing_finish_for_attempt(&request.op_id).unwrap(),
+                Some(receipt.clone())
+            );
+            let mut changed = request.clone();
+            changed.recorded_at = "changed".into();
+            assert_eq!(
+                store.finish_flowing_attempt(&changed).unwrap(),
+                FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::IdentityMismatch)
+            );
+            assert_eq!(
+                store.admit_flowing_prefix(&request).unwrap(),
+                FlowingAdmissionOutcome::Refused(match verdict {
+                    FlowingGateVerdict::Failed => FlowingAdmissionRefusal::GateFailed,
+                    FlowingGateVerdict::Unrun => FlowingAdmissionRefusal::GateUnrun,
+                    FlowingGateVerdict::Passed => unreachable!(),
+                })
+            );
+            assert_eq!(
+                store
+                    .cancel_flowing_attempt(&cancel(&request.op_id, "cancel-terminal"))
+                    .unwrap(),
+                FlowingCancelOutcome::AlreadyFinished(Box::new(receipt))
+            );
+            assert_eq!(
+                store
+                    .release_terminal_flowing_attempt(&request.op_id, "t5")
+                    .unwrap(),
+                ReleaseFlowingAttemptOutcome::Released
+            );
+            assert!(store.pinned_cuts("t5").unwrap().contains("source"));
+            assert!(!store.pinned_cuts("t5").unwrap().contains("candidate"));
+            assert_eq!(
+                store
+                    .retain_flowing_attempt(&request.op_id, &request.candidate_witness_digest, "t3")
+                    .unwrap(),
+                RetainFlowingAttemptOutcome::Released
+            );
+        }
+    }
+
+    #[test]
+    fn failed_attempt_finish_refuses_passed_or_incomplete_evidence_and_rolls_back_write_failure() {
+        let mut store = fixture();
+        let passed = request("unit-a", "passed");
+        pin_attempt(&mut store, &passed);
+        assert_eq!(
+            store.finish_flowing_attempt(&passed).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::GatePassed)
+        );
+        let mut incomplete = request("unit-a", "incomplete");
+        let mut certificate = certificate_for(&incomplete);
+        certificate.checks.clear();
+        incomplete.certificate_handle = certificate.handle().unwrap();
+        insert_gate_certificate(&store, &certificate);
+        pin_attempt(&mut store, &incomplete);
+        assert_eq!(
+            store.finish_flowing_attempt(&incomplete).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::GatePlanIncomplete)
+        );
+
+        let failed = terminal_request(&store, "failed-write", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &failed);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_finish BEFORE INSERT ON flowing_attempt_finishes \
+             BEGIN SELECT RAISE(ABORT, 'injected finish failure'); END",
+            )
+            .unwrap();
+        assert!(store.finish_flowing_attempt(&failed).is_err());
+        assert!(store
+            .flowing_finish_for_attempt(&failed.op_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .release_terminal_flowing_attempt(&failed.op_id, "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::NotTerminal
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_finish")
+            .unwrap();
+        assert!(matches!(
+            store.finish_flowing_attempt(&failed).unwrap(),
+            FlowingAttemptFinishOutcome::Finished(_)
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_private_pins SET released_at = 't4' WHERE pin_id = 'pin'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .release_terminal_flowing_attempt(&failed.op_id, "t5")
+                .unwrap(),
+            ReleaseFlowingAttemptOutcome::UnitHolderMissing {
+                unit_id: "unit-a".into()
+            }
+        );
+        assert!(store
+            .flowing_attempt_pin(&failed.op_id)
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+    }
+
+    #[test]
+    fn changed_terminal_receipt_cannot_release_a_different_pinned_witness() {
+        let mut store = fixture();
+        let request = terminal_request(&store, "changed-finish", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &request);
+        store.finish_flowing_attempt(&request).unwrap();
+        let mut altered = FlowingAttemptFinishReceipt {
+            request: request.clone(),
+            verdict: FlowingGateVerdict::Failed,
+        };
+        altered.request.candidate_witness_digest = "sha256:other".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_finishes SET receipt_json = ?1 WHERE op_id = ?2",
+                params![serde_json::to_string(&altered).unwrap(), &request.op_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.release_terminal_flowing_attempt(&request.op_id, "t5"),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its retained witness")
+        ));
+        assert!(store
+            .flowing_attempt_pin(&request.op_id)
+            .unwrap()
+            .unwrap()
+            .released_at
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_receipt_key_verdict_and_exclusivity_are_checked_before_release() {
+        let mut store = fixture();
+        let request = terminal_request(&store, "receipt-guard", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &request);
+        store.finish_flowing_attempt(&request).unwrap();
+        let mut altered = FlowingAttemptFinishReceipt {
+            request: request.clone(),
+            verdict: FlowingGateVerdict::Failed,
+        };
+        altered.request.op_id = "other".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_finishes SET receipt_json=?1 WHERE op_id=?2",
+                params![serde_json::to_string(&altered).unwrap(), &request.op_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_finish_for_attempt(&request.op_id),
+            Err(StoreError::Conflict(message)) if message.contains("operation key or terminal verdict")
+        ));
+        altered.request.op_id = request.op_id.clone();
+        altered.verdict = FlowingGateVerdict::Passed;
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_finishes SET receipt_json=?1 WHERE op_id=?2",
+                params![serde_json::to_string(&altered).unwrap(), &request.op_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_finish_for_attempt(&request.op_id),
+            Err(StoreError::Conflict(message)) if message.contains("operation key or terminal verdict")
+        ));
+        altered.verdict = FlowingGateVerdict::Failed;
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_finishes SET receipt_json=?1 WHERE op_id=?2",
+                params![serde_json::to_string(&altered).unwrap(), &request.op_id],
+            )
+            .unwrap();
+        let cancellation = cancel(&request.op_id, "conflicting-cancel");
+        store
+            .connection
+            .execute(
+                "INSERT INTO flowing_admission_cancellations \
+             (admission_op_id, cancel_op_id, request_json) VALUES (?1, ?2, ?3)",
+                params![
+                    &request.op_id,
+                    &cancellation.cancel_op_id,
+                    serde_json::to_string(&cancellation).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.release_terminal_flowing_attempt(&request.op_id, "t5"),
+            Err(StoreError::Conflict(message)) if message.contains("conflicting terminal receipts")
+        ));
+    }
+
+    #[test]
+    fn finish_checks_pin_witness_and_certificate_before_terminal_receipt() {
+        let mut store = fixture();
+        let mut invalid = request("unit-a", "invalid");
+        invalid.op_id.clear();
+        assert_eq!(
+            store.finish_flowing_attempt(&invalid).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::InvalidRequest(
+                FlowingAdmissionRefusal::Invalid { field: "op_id" }
+            ))
+        );
+
+        let mut store = fixture();
+        let missing = terminal_request(&store, "missing-pin", FlowingGateVerdict::Failed);
+        assert_eq!(
+            store.finish_flowing_attempt(&missing).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::AttemptPinMissing)
+        );
+
+        let mut store = fixture();
+        let changed = terminal_request(&store, "changed-pin", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &changed);
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET witness_digest='sha256:other' WHERE op_id=?1",
+                [&changed.op_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.finish_flowing_attempt(&changed).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::AttemptPinMismatch)
+        );
+
+        let mut store = fixture();
+        let released = terminal_request(&store, "released-pin", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &released);
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET released_at='t4' WHERE op_id=?1",
+                [&released.op_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.finish_flowing_attempt(&released).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::AttemptPinReleased)
+        );
+
+        let mut store = fixture();
+        let mut changed_witness =
+            terminal_request(&store, "changed-witness", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &changed_witness);
+        changed_witness.contribution_id = "other".into();
+        assert_eq!(
+            store.finish_flowing_attempt(&changed_witness).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(
+                FlowingAttemptFinishRefusal::CandidateWitnessMismatch
+            )
+        );
+
+        let mut store = fixture();
+        let mut changed_certificate =
+            terminal_request(&store, "changed-certificate", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &changed_certificate);
+        changed_certificate.coordinator = "other".into();
+        assert_eq!(
+            store.finish_flowing_attempt(&changed_certificate).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(
+                FlowingAttemptFinishRefusal::GateCertificateMismatch
+            )
+        );
+
+        let mut store = fixture();
+        let missing_witness =
+            terminal_request(&store, "missing-witness", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &missing_witness);
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_candidate_witnesses WHERE digest=?1",
+                [&missing_witness.candidate_witness_digest],
+            )
+            .unwrap();
+        assert_eq!(
+            store.finish_flowing_attempt(&missing_witness).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(
+                FlowingAttemptFinishRefusal::CandidateWitnessMissing
+            )
+        );
+
+        let mut store = fixture();
+        let missing_certificate =
+            terminal_request(&store, "missing-certificate", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &missing_certificate);
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_gate_certificates WHERE handle=?1",
+                [&missing_certificate.certificate_handle],
+            )
+            .unwrap();
+        assert_eq!(
+            store.finish_flowing_attempt(&missing_certificate).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(
+                FlowingAttemptFinishRefusal::GateCertificateMissing
+            )
+        );
+    }
+
+    #[test]
+    fn finish_reads_the_winning_admission_or_cancellation() {
+        let mut store = fixture();
+        let admitted = request("unit-a", "already-admitted");
+        pin_attempt(&mut store, &admitted);
+        let FlowingAdmissionOutcome::Admitted(receipt) =
+            store.admit_flowing_prefix(&admitted).unwrap()
+        else {
+            panic!("admission should land");
+        };
+        assert_eq!(
+            store.finish_flowing_attempt(&admitted).unwrap(),
+            FlowingAttemptFinishOutcome::AlreadyAdmitted(Box::new(receipt))
+        );
+        let mut changed = admitted.clone();
+        changed.recorded_at = "different".into();
+        assert_eq!(
+            store.finish_flowing_attempt(&changed).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::IdentityMismatch)
+        );
+
+        let mut store = fixture();
+        let failed = terminal_request(&store, "already-cancelled", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &failed);
+        let FlowingCancelOutcome::Cancelled(receipt) = store
+            .cancel_flowing_attempt(&cancel(&failed.op_id, "cancel-first"))
+            .unwrap()
+        else {
+            panic!("cancellation should land");
+        };
+        assert_eq!(
+            store.finish_flowing_attempt(&failed).unwrap(),
+            FlowingAttemptFinishOutcome::AlreadyCancelled(receipt)
+        );
+        let mut changed = failed.clone();
+        changed.source_incarnation_id = "other".into();
+        assert_eq!(
+            store.finish_flowing_attempt(&changed).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::IdentityMismatch)
+        );
+        assert!(store
+            .flowing_finish_for_attempt(&failed.op_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1331,23 +1884,23 @@ mod tests {
         assert!(store.pinned_cuts("t4").unwrap().contains("candidate"));
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .release_terminal_flowing_attempt("attempt-a", "t5")
                 .unwrap(),
-            ReleaseFlowingAttemptOutcome::NotCancelled
+            ReleaseFlowingAttemptOutcome::NotTerminal
         );
         store
             .cancel_flowing_attempt(&cancel("attempt-a", "cancel-a"))
             .unwrap();
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .release_terminal_flowing_attempt("attempt-a", "t5")
                 .unwrap(),
             ReleaseFlowingAttemptOutcome::Released
         );
         assert!(store.pinned_cuts("t5").unwrap().contains("candidate"));
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt("attempt-a", "t6")
+                .release_terminal_flowing_attempt("attempt-a", "t6")
                 .unwrap(),
             ReleaseFlowingAttemptOutcome::AlreadyReleased
         );
@@ -1362,7 +1915,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt("attempt-b", "t6")
+                .release_terminal_flowing_attempt("attempt-b", "t6")
                 .unwrap(),
             ReleaseFlowingAttemptOutcome::Released
         );
@@ -1397,7 +1950,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt("attempt-a", "t5")
+                .release_terminal_flowing_attempt("attempt-a", "t5")
                 .unwrap(),
             ReleaseFlowingAttemptOutcome::UnitHolderMissing {
                 unit_id: "unit-a".into()
@@ -1430,7 +1983,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            store.release_cancelled_flowing_attempt("attempt-a", "t5"),
+            store.release_terminal_flowing_attempt("attempt-a", "t5"),
             Err(StoreError::Conflict(message)) if message.contains("lost its witness")
         ));
         assert!(store
@@ -1450,7 +2003,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            store.release_cancelled_flowing_attempt("attempt-a", "t6"),
+            store.release_terminal_flowing_attempt("attempt-a", "t6"),
             Err(StoreError::Conflict(message)) if message.contains("differs from its witness")
         ));
         assert!(store
@@ -1474,7 +2027,7 @@ mod tests {
         ));
         assert_eq!(
             store
-                .release_cancelled_flowing_attempt(&request.op_id, "t5")
+                .release_terminal_flowing_attempt(&request.op_id, "t5")
                 .unwrap(),
             ReleaseFlowingAttemptOutcome::Admitted
         );
