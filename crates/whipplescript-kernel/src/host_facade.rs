@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_store::{NewEffect, NewEvent, RuleCommit, RuntimeStore, StoreError};
 
+use crate::construct_coverage::{embedded_std_registry_for_program, CheckedConstructBasis};
 use crate::gov::GovernanceAttestationVerifier;
 use crate::host_package::{PackageResolver, ResolvedPackage};
 use crate::host_protocol::{
@@ -92,6 +93,7 @@ pub struct GovernedHostFacade<S: RuntimeStore> {
     policy: PolicyEpochRef,
     envelope: VerifiedEnvelope,
     compiler_artifact_digest: Option<String>,
+    embedded_std_manifests: Option<&'static [(&'static str, &'static str)]>,
 }
 
 impl<S: RuntimeStore> GovernedHostFacade<S> {
@@ -106,6 +108,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             policy,
             envelope,
             compiler_artifact_digest: None,
+            embedded_std_manifests: None,
         })
     }
 
@@ -113,6 +116,15 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     /// for this facade. Version admission refuses when it was not supplied.
     pub fn with_compiler_artifact_digest(mut self, digest: impl Into<String>) -> Self {
         self.compiler_artifact_digest = Some(digest.into());
+        self
+    }
+
+    /// Bind the product host's shipped vocabulary to checked package admission.
+    pub fn with_embedded_std_manifests(
+        mut self,
+        manifests: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.embedded_std_manifests = Some(manifests);
         self
     }
 
@@ -425,26 +437,41 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                 )
             })?;
 
-        let admission = self
-            .kernel
-            .create_program_version_for_program_with_imports(
-                ProgramVersionInput {
-                    program_name: &package.agent,
-                    source_hash: &package.source_hash,
-                    ir_hash: &package.ir_hash,
-                    compiler_version: HOST_PROTOCOL,
-                    ir_snapshot: None,
-                },
+        let input = ProgramVersionInput {
+            program_name: &package.agent,
+            source_hash: &package.source_hash,
+            ir_hash: &package.ir_hash,
+            compiler_version: HOST_PROTOCOL,
+            ir_snapshot: None,
+        };
+        let import_basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: Some(&package.source_hash),
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest,
+            packages: &[],
+        };
+        let admission = if let Some(manifests) = self.embedded_std_manifests {
+            let registry = embedded_std_registry_for_program(&package.program, manifests)
+                .map_err(HostFacadeError::Resolver)?;
+            self.kernel
+                .create_program_version_for_program_with_imports_and_constructs(
+                    input,
+                    &package.program,
+                    &import_basis,
+                    &CheckedConstructBasis {
+                        registry: &registry,
+                        sources: &[],
+                    },
+                )
+        } else {
+            self.kernel.create_program_version_for_program_with_imports(
+                input,
                 &package.program,
-                &CheckedImportBasis {
-                    program_source_digest: &source_digest,
-                    version_source_digest: Some(&package.source_hash),
-                    lock_digest: NO_LOCK_DIGEST,
-                    compiler_artifact_digest,
-                    packages: &[],
-                },
+                &import_basis,
             )
-            .map_err(HostFacadeError::Store)?;
+        }
+        .map_err(HostFacadeError::Store)?;
         let version = whipplescript_store::ProgramVersionRecord {
             program_id: admission.program_id,
             version_id: admission.version_id,
@@ -830,26 +857,43 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                                 .to_owned(),
                         )
                     })?;
-                self.kernel
-                    .reattest_instance_program_with_imports(
+                let input = ProgramVersionInput {
+                    program_name: &package.agent,
+                    source_hash: &package.source_hash,
+                    ir_hash: &package.ir_hash,
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                };
+                let import_basis = CheckedImportBasis {
+                    program_source_digest: &source_digest,
+                    version_source_digest: Some(&package.source_hash),
+                    lock_digest: NO_LOCK_DIGEST,
+                    compiler_artifact_digest,
+                    packages: &[],
+                };
+                if let Some(manifests) = self.embedded_std_manifests {
+                    let registry = embedded_std_registry_for_program(&package.program, manifests)
+                        .map_err(HostFacadeError::Resolver)?;
+                    self.kernel
+                        .reattest_instance_program_with_imports_and_constructs(
+                            &instance.instance_id,
+                            input,
+                            &package.program,
+                            &import_basis,
+                            &CheckedConstructBasis {
+                                registry: &registry,
+                                sources: &[],
+                            },
+                        )
+                } else {
+                    self.kernel.reattest_instance_program_with_imports(
                         &instance.instance_id,
-                        ProgramVersionInput {
-                            program_name: &package.agent,
-                            source_hash: &package.source_hash,
-                            ir_hash: &package.ir_hash,
-                            compiler_version: HOST_PROTOCOL,
-                            ir_snapshot: None,
-                        },
+                        input,
                         &package.program,
-                        &CheckedImportBasis {
-                            program_source_digest: &source_digest,
-                            version_source_digest: Some(&package.source_hash),
-                            lock_digest: NO_LOCK_DIGEST,
-                            compiler_artifact_digest,
-                            packages: &[],
-                        },
+                        &import_basis,
                     )
-                    .map_err(HostFacadeError::Store)?;
+                }
+                .map_err(HostFacadeError::Store)?;
             }
             return Ok(Some(opened));
         }

@@ -2372,8 +2372,13 @@ impl GovernedHostRuntime {
             if version.ir_hash != package.ir_hash {
                 let compiler_artifact_digest =
                     native_compiler_artifact_digest().map_err(HostRuntimeError::Resolver)?;
+                let construct_registry = embedded_std_registry_for_program(
+                    &package.program,
+                    crate::std_manifests::EMBEDDED_STD_MANIFESTS,
+                )
+                .map_err(HostRuntimeError::Resolver)?;
                 self.kernel
-                    .reattest_instance_program_with_imports(
+                    .reattest_instance_program_with_imports_and_constructs(
                         &instance.instance_id,
                         ProgramVersionInput {
                             program_name: &package.agent,
@@ -2389,6 +2394,10 @@ impl GovernedHostRuntime {
                             lock_digest: NO_LOCK_DIGEST,
                             compiler_artifact_digest: &compiler_artifact_digest,
                             packages: &[],
+                        },
+                        &CheckedConstructBasis {
+                            registry: &construct_registry,
+                            sources: &[],
                         },
                     )
                     .map_err(HostRuntimeError::Store)?;
@@ -7125,6 +7134,20 @@ workflow Method {
             native_compiler_artifact_digest().expect("compiler digest")
         );
         assert!(witness.examined.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+        assert_eq!(
+            witness
+                .declarations
+                .expect("re-attestation captures declarations")
+                .edges
+                .iter()
+                .map(|edge| edge.registration_id.as_str())
+                .collect::<Vec<_>>(),
+            ["files.file_store"]
+        );
         // The re-attestation is an auditable event, and the instance runs.
         {
             let connection = rusqlite::Connection::open(&path).expect("raw store");

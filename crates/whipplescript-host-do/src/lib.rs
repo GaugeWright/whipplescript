@@ -231,7 +231,8 @@ workflow Method {
             verified.envelope,
         )
         .expect("host")
-        .with_compiler_artifact_digest("not-a-digest");
+        .with_compiler_artifact_digest("not-a-digest")
+        .with_embedded_std_manifests(crate::do_packages::EMBEDDED_STD_MANIFESTS);
         let local_import = AuthoredAgentPackage::from_documents(
             json!({
                 "schema": AGENT_PACKAGE_SCHEMA,
@@ -341,6 +342,18 @@ workflow Method {
             whipplescript_kernel::import_coverage::NO_LOCK_DIGEST
         );
         assert!(witness.examined.is_empty());
+        assert!(witness
+            .constructs
+            .as_ref()
+            .expect("checked constructs")
+            .edges
+            .is_empty());
+        assert!(witness
+            .declarations
+            .as_ref()
+            .expect("checked declarations")
+            .edges
+            .is_empty());
         let drifted = host
             .kernel_mut()
             .reattest_instance_program(
@@ -394,6 +407,66 @@ workflow Method {
             witness.version_source_digest
         );
         assert_eq!(replay_witness.compiler_artifact_digest, compiler_digest);
+        assert!(replay_witness
+            .constructs
+            .as_ref()
+            .expect("replayed constructs")
+            .edges
+            .is_empty());
+        assert!(replay_witness
+            .declarations
+            .as_ref()
+            .expect("replayed declarations")
+            .edges
+            .is_empty());
+        let declared_package = AuthoredAgentPackage::from_documents(
+            package.manifest_document(),
+            format!(
+                "file store project {{\n  root \".\"\n  allow read [\"**\"]\n  allow write [\"**\"]\n}}\n{}",
+                package.source_document()
+            ),
+            package.system_prompt_document(),
+        )
+        .expect("host package with a file-store declaration");
+        let declared_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-do-declared-store".to_owned(),
+            package_version_ref: declared_package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        host.open_instance(&declared_open, &declared_package)
+            .expect("declared hosted package");
+        let declared_roster = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("declared package operations");
+        let declared_operation = declared_roster
+            .operations
+            .last()
+            .expect("declared operation");
+        let declared_witness = host
+            .kernel()
+            .store()
+            .program_import_witness(
+                &declared_operation.version_id,
+                declared_operation
+                    .witness_digest
+                    .as_deref()
+                    .expect("declared witness digest"),
+            )
+            .expect("declared witness lookup")
+            .expect("declared witness");
+        assert_eq!(
+            declared_witness
+                .declarations
+                .expect("declared construct capture")
+                .edges
+                .iter()
+                .map(|edge| edge.registration_id.as_str())
+                .collect::<Vec<_>>(),
+            ["files.file_store"]
+        );
         let turn = StartTurnCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             command_id: "turn-do-1".to_owned(),

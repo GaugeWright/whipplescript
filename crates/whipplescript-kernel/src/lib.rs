@@ -1349,12 +1349,38 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_for_program_with_imports_basis(input, program, basis, None)
+    }
+
+    /// Admit a hosted product program with its checked construct basis in the
+    /// same version/import operation as its executable projection.
+    pub fn create_program_version_for_program_with_imports_and_constructs(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_for_program_with_imports_basis(
+            input,
+            program,
+            basis,
+            Some(construct_basis),
+        )
+    }
+
+    fn create_program_version_for_program_with_imports_basis(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
         let declared_profiles_json = declared_profiles_json(program);
         let declared_skills_json = declared_skills_json(program);
         let declared_schemas_json = declared_schemas_json(program);
         let analysis_summary_json = program_artifact::capture(&self.store, &input, program)?;
-        let witness =
-            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
         self.store.create_program_version_with_import_witness(
             NewProgramVersion {
                 program_name: input.program_name,
@@ -1531,8 +1557,37 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        let witness =
-            import_coverage::capture_basis(program, basis).map_err(StoreError::Conflict)?;
+        self.reattest_instance_program_with_imports_basis(instance_id, input, program, basis, None)
+    }
+
+    /// Re-attest a changed executable with import and construct evidence in
+    /// the same operation as its instance version move.
+    pub fn reattest_instance_program_with_imports_and_constructs(
+        &mut self,
+        instance_id: &str,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        self.reattest_instance_program_with_imports_basis(
+            instance_id,
+            input,
+            program,
+            basis,
+            Some(construct_basis),
+        )
+    }
+
+    fn reattest_instance_program_with_imports_basis(
+        &mut self,
+        instance_id: &str,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
         self.store.reattest_instance_program_with_import_witness(
             instance_id,
             NewProgramVersion {

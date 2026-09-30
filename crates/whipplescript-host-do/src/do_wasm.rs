@@ -495,6 +495,7 @@ fn hosted_facade(
         epoch,
         verified.envelope,
     )
+    .map(|facade| facade.with_embedded_std_manifests(crate::do_packages::EMBEDDED_STD_MANIFESTS))
     .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
