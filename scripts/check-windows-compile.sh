@@ -44,7 +44,7 @@ host="$(printf '%s\n' "$toolchain" | sed -n 's/^host: //p')"
 # target, whose Linux siblings the read sandbox holds to it (GaugeWright
 # FLEET.md stage 0). Keep the two together.
 inputs=(Cargo.toml Cargo.lock rust-toolchain.toml dist-workspace.toml
-        crates std examples models spec skills scripts/check-windows-compile.sh)
+        crates std examples models spec skills scripts/check-windows-compile.sh scripts/windows-cargo-timings.mjs)
 
 if [ "$host" = "$target" ]; then
     # A tree whose inputs this host has already compiled is answered from that
@@ -82,13 +82,17 @@ if [ "$host" = "$target" ]; then
             exit 0
         fi
     fi
+    timing_before="$(node scripts/windows-cargo-timings.mjs before 2>/dev/null || printf unavailable)"
     started=$SECONDS
-    if cargo build --workspace --profile dist --locked; then
+    if cargo build --workspace --profile dist --locked --timings; then
         status=0
     else
         status=$?
     fi
     elapsed=$((SECONDS - started))
+    # Diagnostics never replace Cargo status, and stale reports are explicit.
+    node scripts/windows-cargo-timings.mjs after "$timing_before" "$status" 2>/dev/null || \
+        printf 'CI_WINDOWS_CARGO_TIMING: {"version":1,"source":"cargo-html-1.95","status":"unavailable","reportSha256":null,"units":null}\n'
     if [ "$status" -ne 0 ]; then
         measure build failed "$elapsed"
         exit "$status"
