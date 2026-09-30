@@ -41,25 +41,16 @@ use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use whipplescript_core::improve_holdout::{self, MIN_SCENARIOS_FOR_SEALING, WEAR_OUT_AT};
 use whipplescript_parser::{IrGauge, IrProgram, BUILTIN_GAUGES};
 use whipplescript_store::improve::{
     fold_campaign_event, CampaignSummary, ImproveStore, NewEvidence, ScenarioRow,
 };
-use whipplescript_store::items::sha256_hex;
 use whipplescript_store::SqliteStore;
 
 use crate::improve_context::{ContextEdit, ContextSnapshot};
 use crate::{emit_json, CliOptions};
 
-/// Promotion-gate wear-out threshold (design note §8, k=3).
-const WEAR_OUT_AT: i64 = 3;
-/// Sealed fraction and floor (design note §8: 20% / floor 2). Below
-/// MIN_SCENARIOS_FOR_SEALING the campaign runs `unheld-out`: sealing 2 of 3
-/// scenarios would leave the proposer almost blind, which fabricates
-/// neither rigor nor progress.
-const SEALED_FRACTION: f64 = 0.2;
-const SEALED_FLOOR: usize = 2;
-const MIN_SCENARIOS_FOR_SEALING: usize = 4;
 /// Internal stopping backstop for the propose→evaluate loop. Deliberately
 /// NOT a surface: the operator's levers are the spend cap and the campaign
 /// verbs, never a sample count.
@@ -3024,38 +3015,12 @@ fn seal_scenarios<'a>(
     campaign_id: &str,
     scenarios: &'a [ScenarioRow],
 ) -> (Vec<&'a ScenarioRow>, Vec<&'a ScenarioRow>, bool) {
-    let eligible: Vec<&ScenarioRow> = scenarios.iter().filter(|s| !s.retired).collect();
-    if eligible.len() < MIN_SCENARIOS_FOR_SEALING {
-        return (eligible, Vec::new(), false);
-    }
-    let sealed_count = ((eligible.len() as f64 * SEALED_FRACTION).ceil() as usize)
-        .max(SEALED_FLOOR)
-        .min(eligible.len().saturating_sub(2));
-    let mut ranked: Vec<(&ScenarioRow, String)> = eligible
-        .iter()
-        .map(|scenario| {
-            // Sorting on this hex decides which scenarios are held out, so the
-            // encoding is part of the selection: a different one reshuffles the
-            // sealed set of every existing campaign. `sha256_hex` owns it, and
-            // pins it to a published vector.
-            (
-                *scenario,
-                sha256_hex(&format!("{campaign_id}|{}", scenario.name)),
-            )
-        })
-        .collect();
-    ranked.sort_by(|a, b| a.1.cmp(&b.1));
-    let sealed: Vec<&ScenarioRow> = ranked
-        .iter()
-        .take(sealed_count)
-        .map(|(scenario, _)| *scenario)
-        .collect();
-    let sealed_names: BTreeSet<&str> = sealed.iter().map(|s| s.name.as_str()).collect();
-    let open: Vec<&ScenarioRow> = eligible
-        .into_iter()
-        .filter(|scenario| !sealed_names.contains(scenario.name.as_str()))
-        .collect();
-    (open, sealed, true)
+    improve_holdout::seal_scenarios(
+        campaign_id,
+        scenarios,
+        |scenario| scenario.name.as_str(),
+        |scenario| scenario.retired,
+    )
 }
 
 // ---------------------------------------------------------------------------
