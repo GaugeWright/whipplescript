@@ -5484,6 +5484,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         version: NewProgramVersion<'_>,
         witness: &whipplescript_store::program_imports::ProgramImportWitness,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let operation_id = do_new_import_operation_id(&self.sql)?;
+        self.create_program_version_with_import_witness_at_id(version, witness, &operation_id)
+    }
+
+    fn create_program_version_with_import_witness_at_id(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &whipplescript_store::program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
         if !whipplescript_store::program_imports::matches_source_id(witness, version.source_hash) {
             return Err(StoreError::Conflict(
                 "import witness program source differs from the version".into(),
@@ -5501,13 +5512,12 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     &[text(&version_id), text(&digest), text(&json)],
                 )
                 .map_err(sql_err)?;
-            let operation_id = do_new_import_operation_id(&self.sql)?;
             self.sql
                 .execute(
                     "INSERT INTO program_import_operations \
                      (operation_id, version_id, witness_digest, kind) \
                      VALUES (?1, ?2, ?3, 'checked')",
-                    &[text(&operation_id), text(&version_id), text(&digest)],
+                    &[text(operation_id), text(&version_id), text(&digest)],
                 )
                 .map_err(sql_err)?;
             record = Some(
@@ -5515,7 +5525,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     program_id,
                     version_id,
                     witness_digest: digest.clone(),
-                    operation_id,
+                    operation_id: operation_id.to_owned(),
                 },
             );
             Ok(())
@@ -15196,6 +15206,87 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(rolled_back.is_empty());
+    }
+
+    #[test]
+    fn hosted_home_chosen_import_identity_is_exact_and_atomic() {
+        const OPERATION_ID: &str = "imp_22222222222222222222222222222222";
+        const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let version = |name| NewProgramVersion {
+            program_name: name,
+            source_hash: &SOURCE[..32],
+            ir_hash: SOURCE,
+            compiler_version: "test-compiler",
+            ir_snapshot: None,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        let witness = whipplescript_store::program_imports::ProgramImportWitness {
+            program_source_digest: SOURCE.into(),
+            version_source_digest: None,
+            lock_digest: SOURCE.into(),
+            compiler_artifact_digest: SOURCE.into(),
+            examined: vec![],
+            edges: vec![],
+            edge_digest: whipplescript_store::items::sha256_hex("[]"),
+            constructs: None,
+            declarations: None,
+        };
+        let mut store = store();
+        let accepted = store
+            .create_program_version_with_import_witness_at_id(
+                version("home-chosen"),
+                &witness,
+                OPERATION_ID,
+            )
+            .unwrap();
+        assert_eq!(accepted.operation_id, OPERATION_ID);
+        let exact = store
+            .program_import_operation(OPERATION_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.version_id, accepted.version_id);
+        assert_eq!(
+            exact.witness_digest.as_deref(),
+            Some(accepted.witness_digest.as_str())
+        );
+        assert!(store
+            .create_program_version_with_import_witness_at_id(
+                version("another-program"),
+                &witness,
+                OPERATION_ID,
+            )
+            .is_err());
+        assert!(
+            store
+                .create_program_version_with_import_witness_at_id(
+                    version("bad-id"),
+                    &witness,
+                    "bad-id",
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        let rows = store
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM programs WHERE name = 'another-program'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_i64(&rows[0][0]), 0);
     }
 
     /// The ported core methods run their real SQL against a real engine.

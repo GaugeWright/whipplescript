@@ -1350,7 +1350,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        self.create_program_version_for_program_with_imports_basis(input, program, basis, None)
+        self.create_program_version_for_program_with_imports_basis(
+            input, program, basis, None, None,
+        )
+    }
+
+    /// Admit a checked host program under an operation identity registered by
+    /// its Home before any runtime write. This makes cross-store crash recovery
+    /// an exact operation lookup rather than a version or witness guess.
+    pub fn create_program_version_for_program_with_imports_at_id(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        self.create_program_version_for_program_with_imports_basis(
+            input,
+            program,
+            basis,
+            None,
+            Some(operation_id),
+        )
     }
 
     /// Admit a hosted product program with its checked construct basis in the
@@ -1367,6 +1389,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             program,
             basis,
             Some(construct_basis),
+            None,
         )
     }
 
@@ -1376,29 +1399,37 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
         construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+        operation_id: Option<&str>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
         let declared_profiles_json = declared_profiles_json(program);
         let declared_skills_json = declared_skills_json(program);
         let declared_schemas_json = declared_schemas_json(program);
         let analysis_summary_json = program_artifact::capture(&self.store, &input, program)?;
         let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
-        self.store.create_program_version_with_import_witness(
-            NewProgramVersion {
-                program_name: input.program_name,
-                source_hash: input.source_hash,
-                ir_hash: input.ir_hash,
-                compiler_version: input.compiler_version,
-                ir_snapshot: input.ir_snapshot,
-                declared_capabilities_json: "[]",
-                declared_profiles_json: &declared_profiles_json,
-                declared_skills_json: &declared_skills_json,
-                declared_schemas_json: &declared_schemas_json,
-                analysis_summary_json: &analysis_summary_json,
-                generated_artifacts_json: "[]",
-                artifact_root: None,
-            },
-            &witness,
-        )
+        let version = NewProgramVersion {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: input.ir_hash,
+            compiler_version: input.compiler_version,
+            ir_snapshot: input.ir_snapshot,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: &declared_profiles_json,
+            declared_skills_json: &declared_skills_json,
+            declared_schemas_json: &declared_schemas_json,
+            analysis_summary_json: &analysis_summary_json,
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        if let Some(operation_id) = operation_id {
+            self.store.create_program_version_with_import_witness_at_id(
+                version,
+                &witness,
+                operation_id,
+            )
+        } else {
+            self.store
+                .create_program_version_with_import_witness(version, &witness)
+        }
     }
 
     /// Publish a complete typed-action executable under its composite identity.

@@ -1974,7 +1974,7 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
-            .run(|| self.create_program_version_retained(version, None))
+            .run(|| self.create_program_version_retained(version, None, None))
             .map(|(record, _, _)| record)
     }
 
@@ -1983,9 +1983,31 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_with_import_witness_id(version, witness, None)
+    }
+
+    /// Use a Home-registered operation identity in the same transaction as the
+    /// checked witness. The caller registers this identity before any target
+    /// write, so recovery can look up one exact operation after a crash.
+    pub fn create_program_version_with_import_witness_at_id(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        program_imports::validate_operation_id(operation_id)?;
+        self.create_program_version_with_import_witness_id(version, witness, Some(operation_id))
+    }
+
+    fn create_program_version_with_import_witness_id(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: Option<&str>,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
         let (record, digest, operation_id) = self
             .retained_publication()
-            .run(|| self.create_program_version_retained(version, Some(witness)))?;
+            .run(|| self.create_program_version_retained(version, Some(witness), operation_id))?;
         Ok(program_imports::ProgramImportAdmissionRecord {
             program_id: record.program_id,
             version_id: record.version_id,
@@ -2063,6 +2085,7 @@ impl SqliteStore {
         &mut self,
         version: NewProgramVersion<'_>,
         witness: Option<&program_imports::ProgramImportWitness>,
+        requested_operation_id: Option<&str>,
     ) -> StoreResult<(ProgramVersionRecord, Option<String>, String)> {
         let tx = self
             .connection
@@ -2171,10 +2194,13 @@ impl SqliteStore {
         } else {
             None
         };
-        let operation_id: String =
+        let operation_id: String = if let Some(id) = requested_operation_id {
+            id.to_owned()
+        } else {
             tx.query_row("SELECT 'imp_' || lower(hex(randomblob(16)))", [], |row| {
                 row.get(0)
-            })?;
+            })?
+        };
         tx.execute(
             "INSERT INTO program_import_operations \
              (operation_id, version_id, witness_digest, kind) \
@@ -8601,6 +8627,12 @@ pub trait RuntimeStore {
         version: NewProgramVersion<'_>,
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
+    fn create_program_version_with_import_witness_at_id(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
     fn program_import_witness(
         &self,
         version_id: &str,
@@ -8609,6 +8641,16 @@ pub trait RuntimeStore {
     fn program_import_operation_roster(
         &self,
     ) -> StoreResult<program_imports::ProgramImportOperationRoster>;
+    fn program_import_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportOperation>> {
+        Ok(self
+            .program_import_operation_roster()?
+            .operations
+            .into_iter()
+            .find(|operation| operation.operation_id == operation_id))
+    }
     /// Re-attest an instance's program under the current compiler: same
     /// authored identity, new IR (see `SqliteStore::reattest_instance_program`).
     fn reattest_instance_program(
@@ -9073,6 +9115,14 @@ impl RuntimeStore for SqliteStore {
         witness: &program_imports::ProgramImportWitness,
     ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
         self.create_program_version_with_import_witness(version, witness)
+    }
+    fn create_program_version_with_import_witness_at_id(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+        operation_id: &str,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_with_import_witness_at_id(version, witness, operation_id)
     }
     fn program_import_witness(
         &self,

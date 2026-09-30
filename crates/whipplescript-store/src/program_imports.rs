@@ -225,6 +225,22 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// Home-correlated accepting operations use the same opaque identity shape as
+/// store-minted operations, so one pending pointer names one target row.
+pub fn validate_operation_id(value: &str) -> StoreResult<()> {
+    let suffix = value.strip_prefix("imp_").unwrap_or("");
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StoreError::Conflict(
+            "invalid program import operation identity".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Native direct-source ids may be the first 128 bits of SHA-256; hosted ones
 /// retain all 256 bits. A host package may instead hash a checked composite
 /// identity containing those source bytes. The witness retains both digests.
@@ -382,6 +398,7 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
 mod tests {
     use super::*;
     use crate::{NewInstance, NewProgramVersion, SqliteStore};
+    use rusqlite::OptionalExtension;
 
     const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SOURCE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -470,6 +487,56 @@ mod tests {
             constructs: None,
             declarations: None,
         }
+    }
+
+    #[test]
+    fn home_chosen_operation_identity_commits_once_with_exact_witness() {
+        const OPERATION_ID: &str = "imp_11111111111111111111111111111111";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let checked = store
+            .create_program_version_with_import_witness_at_id(
+                version("home-chosen"),
+                &witness(LOCK),
+                OPERATION_ID,
+            )
+            .unwrap();
+        assert_eq!(checked.operation_id, OPERATION_ID);
+        let exact = crate::RuntimeStore::program_import_operation(&store, OPERATION_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.version_id, checked.version_id);
+        assert_eq!(
+            exact.witness_digest.as_deref(),
+            Some(checked.witness_digest.as_str())
+        );
+        assert_eq!(exact.kind, ProgramImportOperationKind::Checked);
+
+        assert!(store
+            .create_program_version_with_import_witness_at_id(
+                version("another-program"),
+                &witness(LOCK),
+                OPERATION_ID,
+            )
+            .is_err());
+        assert!(store
+            .create_program_version_with_import_witness_at_id(
+                version("bad-id"),
+                &witness(LOCK),
+                "not-an-operation-id",
+            )
+            .is_err());
+        let roster = store.program_import_operation_roster().unwrap();
+        assert_eq!(roster.operations.len(), 1, "both refused writes roll back");
+        assert!(store
+            .connection
+            .query_row(
+                "SELECT program_id FROM programs WHERE name = 'another-program'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
