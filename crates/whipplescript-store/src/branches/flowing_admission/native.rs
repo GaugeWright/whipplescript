@@ -6,7 +6,7 @@ use super::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
     FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
-    FlowingCandidateWitness, FlowingUnitOutcome,
+    FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
 };
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
@@ -55,6 +55,29 @@ fn read_witness(
             ));
         }
         Ok(witness)
+    })
+    .transpose()
+}
+
+fn read_gate_certificate(
+    connection: &Connection,
+    handle: &str,
+) -> StoreResult<Option<FlowingGateCertificate>> {
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT certificate_json FROM flowing_gate_certificates WHERE handle = ?1",
+            [handle],
+            |row| row.get(0),
+        )
+        .optional()?;
+    json.map(|json| {
+        let certificate: FlowingGateCertificate = serde_json::from_str(&json)?;
+        if certificate.handle()? != handle {
+            return Err(StoreError::Conflict(
+                "flowing gate certificate differs from its handle".into(),
+            ));
+        }
+        Ok(certificate)
     })
     .transpose()
 }
@@ -358,6 +381,15 @@ impl FlowingAdmissions for BranchStore {
         if !witness.matches_request(request) {
             return Ok(Refused(R::CandidateWitnessMismatch));
         }
+        let Some(certificate) = read_gate_certificate(&tx, &request.certificate_handle)? else {
+            return Ok(Refused(R::GateCertificateMissing));
+        };
+        if !certificate.matches_request(request) {
+            return Ok(Refused(R::GateCertificateMismatch));
+        }
+        if let Some(refusal) = certificate.admission_refusal() {
+            return Ok(Refused(refusal));
+        }
 
         let receipt = FlowingAdmissionReceipt {
             request: request.clone(),
@@ -480,6 +512,7 @@ impl FlowingAdmissions for BranchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branches::flowing_admission::{FlowingGateCheck, FlowingGateVerdict};
     use crate::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
@@ -604,11 +637,52 @@ mod tests {
             )
             .unwrap();
         for unit_id in ["unit-a", "unit-b"] {
+            let attempt = request(unit_id, "fixture");
             store
-                .record_candidate_witness(&witness_for(&request(unit_id, "fixture")))
+                .record_candidate_witness(&witness_for(&attempt))
                 .unwrap();
+            record_gate_certificate(&store, &attempt);
         }
         store
+    }
+
+    fn certificate_for(request: &FlowingAdmissionRequest) -> FlowingGateCertificate {
+        FlowingGateCertificate {
+            candidate_witness_digest: request.candidate_witness_digest.clone(),
+            expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
+            candidate_cut_id: request.candidate_cut_id.clone(),
+            candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            source_eligibility_epoch: request.expected_eligibility_epoch,
+            source_owner_epoch: request.expected_owner_epoch,
+            coordinator: request.coordinator.clone(),
+            policy_digest: "sha256:fixture-policy".into(),
+            rules_digest: "sha256:fixture-rules".into(),
+            graph_coverage_digest: "sha256:fixture-coverage".into(),
+            required_checks: vec!["full-workspace-bar".into()],
+            checks: vec![FlowingGateCheck {
+                check_id: "full-workspace-bar".into(),
+                input_digest: "sha256:fixture-input".into(),
+                evidence_digest: "sha256:fixture-evidence".into(),
+                verdict: FlowingGateVerdict::Passed,
+            }],
+        }
+    }
+
+    fn record_gate_certificate(store: &BranchStore, request: &FlowingAdmissionRequest) {
+        insert_gate_certificate(store, &certificate_for(request));
+    }
+
+    fn insert_gate_certificate(store: &BranchStore, certificate: &FlowingGateCertificate) {
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO flowing_gate_certificates (handle, certificate_json) VALUES (?1, ?2)",
+                params![
+                    certificate.handle().unwrap(),
+                    serde_json::to_string(certificate).unwrap()
+                ],
+            )
+            .unwrap();
     }
 
     fn witness_for(request: &FlowingAdmissionRequest) -> FlowingCandidateWitness {
@@ -630,7 +704,7 @@ mod tests {
     fn request(unit_id: &str, op_id: &str) -> FlowingAdmissionRequest {
         let mut request = FlowingAdmissionRequest {
             op_id: op_id.into(),
-            certificate_handle: "certificate-a".into(),
+            certificate_handle: String::new(),
             candidate_witness_digest: String::new(),
             contribution_id: "review-a".into(),
             revision_sequence: 1,
@@ -654,6 +728,7 @@ mod tests {
             recorded_at: "t4".into(),
         };
         request.candidate_witness_digest = witness_for(&request).digest().unwrap();
+        request.certificate_handle = certificate_for(&request).handle().unwrap();
         request
     }
 
@@ -695,6 +770,90 @@ mod tests {
             .unwrap()
             .unwrap()
             .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn native_ref_requires_a_matching_passing_gate_certificate() {
+        let mut store = fixture();
+        let mut attempt = request("unit-a", "admission-gate");
+        attempt.certificate_handle = "sha256:missing".into();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMissing)
+        );
+
+        let mut foreign = certificate_for(&attempt);
+        foreign.candidate_witness_digest = "sha256:other-candidate".into();
+        insert_gate_certificate(&store, &foreign);
+        attempt.certificate_handle = foreign.handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMismatch)
+        );
+
+        for (verdict, refusal) in [
+            (
+                FlowingGateVerdict::Failed,
+                FlowingAdmissionRefusal::GateFailed,
+            ),
+            (
+                FlowingGateVerdict::Unrun,
+                FlowingAdmissionRefusal::GateUnrun,
+            ),
+        ] {
+            let mut certificate = certificate_for(&attempt);
+            certificate.checks[0].verdict = verdict;
+            insert_gate_certificate(&store, &certificate);
+            attempt.certificate_handle = certificate.handle().unwrap();
+            assert_eq!(
+                store.admit_flowing_prefix(&attempt).unwrap(),
+                FlowingAdmissionOutcome::Refused(refusal)
+            );
+        }
+        let mut incomplete = certificate_for(&attempt);
+        incomplete.checks.clear();
+        insert_gate_certificate(&store, &incomplete);
+        attempt.certificate_handle = incomplete.handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn native_ref_treats_changed_gate_certificate_as_indeterminate() {
+        let mut store = fixture();
+        let attempt = request("unit-a", "admission-gate");
+        let mut changed = certificate_for(&attempt);
+        changed.rules_digest = "sha256:different-rules".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_gate_certificates SET certificate_json = ?1 WHERE handle = ?2",
+                params![
+                    serde_json::to_string(&changed).unwrap(),
+                    &attempt.certificate_handle
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt),
+            Err(StoreError::Conflict(message)) if message.contains("certificate differs")
+        ));
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
             .is_none());
     }
 
@@ -1140,6 +1299,13 @@ mod tests {
         no_op.candidate_witness_digest = store
             .record_candidate_witness(&witness_for(&no_op))
             .unwrap();
+        no_op.certificate_handle = certificate_for(&no_op).handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&no_op).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMissing),
+            "metadata-only admission still needs the exact gate"
+        );
+        record_gate_certificate(&store, &no_op);
         store
             .record_cut(CutRecord {
                 cut_id: "spurious-cut",
@@ -1206,6 +1372,8 @@ mod tests {
         };
         store.transition_flowing_source(&release).unwrap();
         request.expected_eligibility_epoch = 2;
+        request.certificate_handle = certificate_for(&request).handle().unwrap();
+        record_gate_certificate(&store, &request);
         store
             .connection
             .execute_batch(

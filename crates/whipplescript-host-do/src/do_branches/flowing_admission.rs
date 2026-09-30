@@ -8,7 +8,7 @@ use whipplescript_store::branches::flowing_admission::{
     check_fence, validate_cancel_request, validate_request, FlowingAdmissionOutcome,
     FlowingAdmissionReceipt, FlowingAdmissionRefusal, FlowingAdmissionRequest, FlowingAdmissions,
     FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal, FlowingCancelRequest,
-    FlowingCandidateWitness, FlowingUnitOutcome,
+    FlowingCandidateWitness, FlowingGateCertificate, FlowingUnitOutcome,
 };
 use whipplescript_store::branches::flowing_fence::FlowingSourceKind;
 use whipplescript_store::branches::{
@@ -50,6 +50,28 @@ fn read_witness<S: DoSql>(sql: &S, digest: &str) -> StoreResult<Option<FlowingCa
             ));
         }
         Ok(witness)
+    })
+    .transpose()
+}
+
+fn read_gate_certificate<S: DoSql>(
+    sql: &S,
+    handle: &str,
+) -> StoreResult<Option<FlowingGateCertificate>> {
+    sql.query(
+        "SELECT certificate_json FROM flowing_gate_certificates WHERE handle = ?1",
+        &[text(handle)],
+    )
+    .map_err(sql_err)?
+    .first()
+    .map(|row| {
+        let certificate: FlowingGateCertificate = serde_json::from_str(&as_text(&row[0]))?;
+        if certificate.handle()? != handle {
+            return Err(StoreError::Conflict(
+                "flowing gate certificate differs from its handle".into(),
+            ));
+        }
+        Ok(certificate)
     })
     .transpose()
 }
@@ -343,6 +365,16 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
             if !witness.matches_request(request) {
                 return Ok(Refused(R::CandidateWitnessMismatch));
             }
+            let Some(certificate) = read_gate_certificate(&self.sql, &request.certificate_handle)?
+            else {
+                return Ok(Refused(R::GateCertificateMissing));
+            };
+            if !certificate.matches_request(request) {
+                return Ok(Refused(R::GateCertificateMismatch));
+            }
+            if let Some(refusal) = certificate.admission_refusal() {
+                return Ok(Refused(refusal));
+            }
 
             let receipt = FlowingAdmissionReceipt {
                 request: request.clone(),
@@ -481,7 +513,9 @@ mod tests {
 
     use super::*;
     use crate::do_store::test_support::RusqliteDoSql;
-    use whipplescript_store::branches::flowing_admission::FlowingSelectedUnit;
+    use whipplescript_store::branches::flowing_admission::{
+        FlowingGateCheck, FlowingGateVerdict, FlowingSelectedUnit,
+    };
     use whipplescript_store::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
@@ -569,11 +603,50 @@ mod tests {
             sql.execute(statement, &[]).unwrap();
         }
         for unit_id in ["unit-a", "unit-b"] {
+            let attempt = request(unit_id, "fixture");
             store
-                .record_candidate_witness(&witness_for(&request(unit_id, "fixture")))
+                .record_candidate_witness(&witness_for(&attempt))
                 .unwrap();
+            record_gate_certificate(&sql, &attempt);
         }
         (sql, store)
+    }
+
+    fn certificate_for(request: &FlowingAdmissionRequest) -> FlowingGateCertificate {
+        FlowingGateCertificate {
+            candidate_witness_digest: request.candidate_witness_digest.clone(),
+            expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
+            candidate_cut_id: request.candidate_cut_id.clone(),
+            candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            source_eligibility_epoch: request.expected_eligibility_epoch,
+            source_owner_epoch: request.expected_owner_epoch,
+            coordinator: request.coordinator.clone(),
+            policy_digest: "sha256:fixture-policy".into(),
+            rules_digest: "sha256:fixture-rules".into(),
+            graph_coverage_digest: "sha256:fixture-coverage".into(),
+            required_checks: vec!["full-workspace-bar".into()],
+            checks: vec![FlowingGateCheck {
+                check_id: "full-workspace-bar".into(),
+                input_digest: "sha256:fixture-input".into(),
+                evidence_digest: "sha256:fixture-evidence".into(),
+                verdict: FlowingGateVerdict::Passed,
+            }],
+        }
+    }
+
+    fn record_gate_certificate(sql: &Sql, request: &FlowingAdmissionRequest) {
+        insert_gate_certificate(sql, &certificate_for(request));
+    }
+
+    fn insert_gate_certificate(sql: &Sql, certificate: &FlowingGateCertificate) {
+        sql.execute(
+            "INSERT OR IGNORE INTO flowing_gate_certificates (handle, certificate_json) VALUES (?1, ?2)",
+            &[
+                text(&certificate.handle().unwrap()),
+                text(&serde_json::to_string(certificate).unwrap()),
+            ],
+        )
+        .unwrap();
     }
 
     fn witness_for(request: &FlowingAdmissionRequest) -> FlowingCandidateWitness {
@@ -595,7 +668,7 @@ mod tests {
     fn request(unit_id: &str, op_id: &str) -> FlowingAdmissionRequest {
         let mut request = FlowingAdmissionRequest {
             op_id: op_id.into(),
-            certificate_handle: "certificate-a".into(),
+            certificate_handle: String::new(),
             candidate_witness_digest: String::new(),
             contribution_id: "review-a".into(),
             revision_sequence: 1,
@@ -619,6 +692,7 @@ mod tests {
             recorded_at: "t4".into(),
         };
         request.candidate_witness_digest = witness_for(&request).digest().unwrap();
+        request.certificate_handle = certificate_for(&request).handle().unwrap();
         request
     }
 
@@ -658,6 +732,88 @@ mod tests {
             .unwrap()
             .unwrap()
             .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn hosted_ref_requires_a_matching_passing_gate_certificate() {
+        let (sql, mut store) = fixture();
+        let mut attempt = request("unit-a", "admission-gate");
+        attempt.certificate_handle = "sha256:missing".into();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMissing)
+        );
+
+        let mut foreign = certificate_for(&attempt);
+        foreign.candidate_witness_digest = "sha256:other-candidate".into();
+        insert_gate_certificate(&sql, &foreign);
+        attempt.certificate_handle = foreign.handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMismatch)
+        );
+
+        for (verdict, refusal) in [
+            (
+                FlowingGateVerdict::Failed,
+                FlowingAdmissionRefusal::GateFailed,
+            ),
+            (
+                FlowingGateVerdict::Unrun,
+                FlowingAdmissionRefusal::GateUnrun,
+            ),
+        ] {
+            let mut certificate = certificate_for(&attempt);
+            certificate.checks[0].verdict = verdict;
+            insert_gate_certificate(&sql, &certificate);
+            attempt.certificate_handle = certificate.handle().unwrap();
+            assert_eq!(
+                store.admit_flowing_prefix(&attempt).unwrap(),
+                FlowingAdmissionOutcome::Refused(refusal)
+            );
+        }
+        let mut incomplete = certificate_for(&attempt);
+        incomplete.checks.clear();
+        insert_gate_certificate(&sql, &incomplete);
+        attempt.certificate_handle = incomplete.handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn hosted_ref_treats_changed_gate_certificate_as_indeterminate() {
+        let (sql, mut store) = fixture();
+        let attempt = request("unit-a", "admission-gate");
+        let mut changed = certificate_for(&attempt);
+        changed.rules_digest = "sha256:different-rules".into();
+        sql.execute(
+            "UPDATE flowing_gate_certificates SET certificate_json = ?1 WHERE handle = ?2",
+            &[
+                text(&serde_json::to_string(&changed).unwrap()),
+                text(&attempt.certificate_handle),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt),
+            Err(StoreError::Conflict(message)) if message.contains("certificate differs")
+        ));
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
             .is_none());
     }
 
@@ -863,6 +1019,8 @@ mod tests {
             })
             .unwrap();
         first.expected_eligibility_epoch = 2;
+        first.certificate_handle = certificate_for(&first).handle().unwrap();
+        record_gate_certificate(&store.sql, &first);
         let FlowingAdmissionOutcome::Admitted(receipt) =
             store.admit_flowing_prefix(&first).unwrap()
         else {
@@ -897,6 +1055,13 @@ mod tests {
         no_op.candidate_witness_digest = store
             .record_candidate_witness(&witness_for(&no_op))
             .unwrap();
+        no_op.certificate_handle = certificate_for(&no_op).handle().unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&no_op).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateCertificateMissing),
+            "metadata-only admission still needs the exact gate"
+        );
+        record_gate_certificate(&store.sql, &no_op);
         assert!(matches!(
             store.admit_flowing_prefix(&no_op).unwrap(),
             FlowingAdmissionOutcome::Admitted(_)

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 4] = [
+pub const SCHEMA: [&str; 5] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -32,6 +32,10 @@ pub const SCHEMA: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS flowing_candidate_witnesses (
         digest TEXT PRIMARY KEY,
         witness_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_gate_certificates (
+        handle TEXT PRIMARY KEY,
+        certificate_json TEXT NOT NULL
     )",
 ];
 
@@ -94,6 +98,104 @@ impl FlowingCandidateWitness {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowingGateVerdict {
+    Passed,
+    Failed,
+    Unrun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingGateCheck {
+    pub check_id: String,
+    pub input_digest: String,
+    pub evidence_digest: String,
+    pub verdict: FlowingGateVerdict,
+}
+
+/// An exact gate result envelope. No production issuer writes this table yet:
+/// the fleet must first execute a native cut and prove the required plan and
+/// current norm basis. Ref admission refuses without a retained certificate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingGateCertificate {
+    pub candidate_witness_digest: String,
+    pub expected_trunk_cut_id: Option<String>,
+    pub candidate_cut_id: String,
+    pub candidate_manifest_hash: String,
+    pub source_eligibility_epoch: i64,
+    pub source_owner_epoch: i64,
+    pub coordinator: String,
+    pub policy_digest: String,
+    pub rules_digest: String,
+    pub graph_coverage_digest: String,
+    pub required_checks: Vec<String>,
+    pub checks: Vec<FlowingGateCheck>,
+}
+
+impl FlowingGateCertificate {
+    pub fn handle(&self) -> crate::StoreResult<String> {
+        let bytes = serde_json::to_vec(&("native-gate-certificate-v1", self))?;
+        Ok(format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(&bytes)
+        ))
+    }
+
+    pub fn matches_request(&self, request: &FlowingAdmissionRequest) -> bool {
+        self.candidate_witness_digest == request.candidate_witness_digest
+            && self.expected_trunk_cut_id == request.expected_trunk_cut_id
+            && self.candidate_cut_id == request.candidate_cut_id
+            && self.candidate_manifest_hash == request.candidate_manifest_hash
+            && self.source_eligibility_epoch == request.expected_eligibility_epoch
+            && self.source_owner_epoch == request.expected_owner_epoch
+            && self.coordinator == request.coordinator
+    }
+
+    pub fn admission_refusal(&self) -> Option<FlowingAdmissionRefusal> {
+        if self.candidate_witness_digest.trim().is_empty()
+            || self.candidate_cut_id.trim().is_empty()
+            || self.candidate_manifest_hash.trim().is_empty()
+            || self.policy_digest.trim().is_empty()
+            || self.rules_digest.trim().is_empty()
+            || self.graph_coverage_digest.trim().is_empty()
+            || self.source_eligibility_epoch < 0
+            || self.source_owner_epoch < 0
+            || self.coordinator.trim().is_empty()
+            || self.required_checks.is_empty()
+            || self.required_checks.len() != self.checks.len()
+        {
+            return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (required, check) in self.required_checks.iter().zip(&self.checks) {
+            if required.trim().is_empty()
+                || required != &check.check_id
+                || !seen.insert(required)
+                || check.input_digest.trim().is_empty()
+                || check.evidence_digest.trim().is_empty()
+            {
+                return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
+            }
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| check.verdict == FlowingGateVerdict::Failed)
+        {
+            return Some(FlowingAdmissionRefusal::GateFailed);
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| check.verdict == FlowingGateVerdict::Unrun)
+        {
+            return Some(FlowingAdmissionRefusal::GateUnrun);
+        }
+        None
+    }
+}
+
 /// Exact request that the coordinator has gated against a proposed trunk
 /// result. The store rechecks mutable ref and source facts at commit; the
 /// caller must hold the norm-ledger exclusion and establish the certificate.
@@ -152,6 +254,11 @@ pub enum FlowingAdmissionRefusal {
     CandidateMismatch,
     CandidateWitnessMissing,
     CandidateWitnessMismatch,
+    GateCertificateMissing,
+    GateCertificateMismatch,
+    GatePlanIncomplete,
+    GateFailed,
+    GateUnrun,
     UnitMissing { unit_id: String },
     UnitBasisMissing { unit_id: String },
     UnitBasisMismatch { unit_id: String },
@@ -388,6 +495,77 @@ mod tests {
             }],
             recorded_at: "now".into(),
         }
+    }
+
+    fn gate_certificate(request: &FlowingAdmissionRequest) -> FlowingGateCertificate {
+        FlowingGateCertificate {
+            candidate_witness_digest: request.candidate_witness_digest.clone(),
+            expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
+            candidate_cut_id: request.candidate_cut_id.clone(),
+            candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            source_eligibility_epoch: request.expected_eligibility_epoch,
+            source_owner_epoch: request.expected_owner_epoch,
+            coordinator: request.coordinator.clone(),
+            policy_digest: "sha256:policy".into(),
+            rules_digest: "sha256:rules".into(),
+            graph_coverage_digest: "sha256:coverage".into(),
+            required_checks: vec!["all-targets".into()],
+            checks: vec![FlowingGateCheck {
+                check_id: "all-targets".into(),
+                input_digest: "sha256:input".into(),
+                evidence_digest: "sha256:result".into(),
+                verdict: FlowingGateVerdict::Passed,
+            }],
+        }
+    }
+
+    #[test]
+    fn gate_certificate_requires_exact_bindings_and_every_planned_result() {
+        let request = request();
+        let valid = gate_certificate(&request);
+        assert!(valid.matches_request(&request));
+        assert_eq!(valid.admission_refusal(), None);
+        assert_ne!(valid.handle().unwrap(), "certificate-1");
+
+        let mut wrong_candidate = valid.clone();
+        wrong_candidate.candidate_manifest_hash = "other".into();
+        assert!(!wrong_candidate.matches_request(&request));
+        assert_ne!(valid.handle().unwrap(), wrong_candidate.handle().unwrap());
+        let mut wrong_owner = valid.clone();
+        wrong_owner.source_owner_epoch += 1;
+        assert!(!wrong_owner.matches_request(&request));
+
+        let mut missing_policy = valid.clone();
+        missing_policy.policy_digest.clear();
+        assert_eq!(
+            missing_policy.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        let mut omitted = valid.clone();
+        omitted.checks.clear();
+        assert_eq!(
+            omitted.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        let mut duplicated = valid.clone();
+        duplicated.required_checks.push("all-targets".into());
+        duplicated.checks.push(duplicated.checks[0].clone());
+        assert_eq!(
+            duplicated.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        let mut failed = valid.clone();
+        failed.checks[0].verdict = FlowingGateVerdict::Failed;
+        assert_eq!(
+            failed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GateFailed)
+        );
+        let mut unrun = valid;
+        unrun.checks[0].verdict = FlowingGateVerdict::Unrun;
+        assert_eq!(
+            unrun.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GateUnrun)
+        );
     }
 
     fn fence() -> FlowingFenceState {
