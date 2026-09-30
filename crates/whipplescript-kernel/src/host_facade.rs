@@ -87,6 +87,47 @@ pub struct HostTurnAdmission {
     pub wire: Option<String>,
 }
 
+/// Exact hosted/chat program basis offered to the Home before a target write.
+/// The Home supplies and persists the target-store identity and operation ID.
+pub struct OpenInstanceOperationBasis<'a> {
+    pub request_id: &'a str,
+    pub package_version_ref: &'a str,
+    pub program_name: &'a str,
+    pub source_digest: &'a str,
+    pub version_source_digest: &'a str,
+    pub lock_digest: &'a str,
+    pub ir_hash: &'a str,
+    pub compiler_artifact_digest: &'a str,
+    pub policy: &'a PolicyEpochRef,
+    pub construct_basis: Option<&'a CheckedConstructBasis<'a>>,
+}
+
+/// Immutable checked target operation used to complete the Home pointer.
+pub struct OpenInstanceOperationEvidence<'a> {
+    pub request_id: &'a str,
+    pub operation_id: &'a str,
+    pub version_id: &'a str,
+    pub witness_digest: &'a str,
+}
+
+/// Product-owned pending/completed Home journal and exact retained-use door.
+/// A missing legacy pin must refuse rather than infer an origin from a version.
+pub trait OpenInstanceHomeJournal {
+    fn register(
+        &mut self,
+        basis: &OpenInstanceOperationBasis<'_>,
+    ) -> Result<String, HostFacadeError>;
+    fn complete_for_use(
+        &mut self,
+        evidence: &OpenInstanceOperationEvidence<'_>,
+    ) -> Result<(), HostFacadeError>;
+    fn allow_retained_use(
+        &mut self,
+        instance_ref: &str,
+        version_id: &str,
+    ) -> Result<(), HostFacadeError>;
+}
+
 /// The common governed facade over any WhippleScript runtime store.
 pub struct GovernedHostFacade<S: RuntimeStore> {
     kernel: RuntimeKernel<S>,
@@ -462,6 +503,27 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         command: &OpenInstanceCommand,
         packages: &P,
     ) -> Result<OpenedInstance, HostFacadeError> {
+        self.open_instance_inner(command, packages, None)
+    }
+
+    /// Open a Home-owned instance through a durable pending/completed operation.
+    /// This door also checks retained use on an exact replay. Changed-IR replay
+    /// remains refused until re-attestation can carry a Home-chosen operation ID.
+    pub fn open_instance_with_home_journal<P: PackageResolver + ?Sized>(
+        &mut self,
+        command: &OpenInstanceCommand,
+        packages: &P,
+        journal: &mut dyn OpenInstanceHomeJournal,
+    ) -> Result<OpenedInstance, HostFacadeError> {
+        self.open_instance_inner(command, packages, Some(journal))
+    }
+
+    fn open_instance_inner<P: PackageResolver + ?Sized>(
+        &mut self,
+        command: &OpenInstanceCommand,
+        packages: &P,
+        mut journal: Option<&mut dyn OpenInstanceHomeJournal>,
+    ) -> Result<OpenedInstance, HostFacadeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
         let package = packages
@@ -472,7 +534,12 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .checked_import_source_digest()
             .map_err(HostFacadeError::Resolver)?;
         self.check_package_ifc(&package)?;
-        if let Some(opened) = self.replayed_open_instance(command, &package)? {
+        if let Some((opened, version_id)) =
+            self.replayed_open_instance(command, &package, journal.is_some())?
+        {
+            if let Some(journal) = journal.as_mut() {
+                journal.allow_retained_use(&opened.instance_ref, &version_id)?;
+            }
             return Ok(opened);
         }
         let compiler_artifact_digest =
@@ -497,27 +564,73 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             compiler_artifact_digest,
             packages: &[],
         };
-        let admission = if let Some(manifests) = self.embedded_std_manifests {
-            let registry = embedded_std_registry_for_program(&package.program, manifests)
-                .map_err(HostFacadeError::Resolver)?;
-            self.kernel
+        let registry = self
+            .embedded_std_manifests
+            .map(|manifests| embedded_std_registry_for_program(&package.program, manifests))
+            .transpose()
+            .map_err(HostFacadeError::Resolver)?;
+        let construct_basis = registry.as_ref().map(|registry| CheckedConstructBasis {
+            registry,
+            sources: &[],
+        });
+        let operation_id = journal
+            .as_mut()
+            .map(|journal| {
+                journal.register(&OpenInstanceOperationBasis {
+                    request_id: &command.request_id,
+                    package_version_ref: &command.package_version_ref,
+                    program_name: &package.agent,
+                    source_digest: &source_digest,
+                    version_source_digest: &package.source_hash,
+                    lock_digest: NO_LOCK_DIGEST,
+                    ir_hash: &package.ir_hash,
+                    compiler_artifact_digest,
+                    policy: &command.policy,
+                    construct_basis: construct_basis.as_ref(),
+                })
+            })
+            .transpose()?;
+        let admission = match (construct_basis.as_ref(), operation_id.as_deref()) {
+            (Some(constructs), Some(operation_id)) => self
+                .kernel
+                .create_program_version_for_program_with_imports_and_constructs_at_id(
+                    input,
+                    &package.program,
+                    &import_basis,
+                    constructs,
+                    operation_id,
+                ),
+            (Some(constructs), None) => self
+                .kernel
                 .create_program_version_for_program_with_imports_and_constructs(
                     input,
                     &package.program,
                     &import_basis,
-                    &CheckedConstructBasis {
-                        registry: &registry,
-                        sources: &[],
-                    },
-                )
-        } else {
-            self.kernel.create_program_version_for_program_with_imports(
+                    constructs,
+                ),
+            (None, Some(operation_id)) => self
+                .kernel
+                .create_program_version_for_program_with_imports_at_id(
+                    input,
+                    &package.program,
+                    &import_basis,
+                    operation_id,
+                ),
+            (None, None) => self.kernel.create_program_version_for_program_with_imports(
                 input,
                 &package.program,
                 &import_basis,
-            )
+            ),
         }
         .map_err(HostFacadeError::Store)?;
+        if let Some(journal) = journal.as_mut() {
+            journal.complete_for_use(&OpenInstanceOperationEvidence {
+                request_id: &command.request_id,
+                operation_id: &admission.operation_id,
+                version_id: &admission.version_id,
+                witness_digest: &admission.witness_digest,
+            })?;
+        }
         let version = whipplescript_store::ProgramVersionRecord {
             program_id: admission.program_id,
             version_id: admission.version_id,
@@ -816,7 +929,8 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         &mut self,
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
-    ) -> Result<Option<OpenedInstance>, HostFacadeError> {
+        home_journal_required: bool,
+    ) -> Result<Option<(OpenedInstance, String)>, HostFacadeError> {
         for instance in self
             .kernel
             .store()
@@ -892,7 +1006,13 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             // Same authored program, different IR: re-attest under the
             // current compiler rather than strand the instance
             // (spec/agent-harness.md "Program identity across toolchains").
-            if version.ir_hash != package.ir_hash {
+            let current_version_id = if version.ir_hash != package.ir_hash {
+                if home_journal_required {
+                    return Err(HostFacadeError::Incomplete(
+                        "Home-journaled changed-IR replay needs an exact re-attestation operation"
+                            .to_owned(),
+                    ));
+                }
                 let source_digest = package
                     .checked_import_source_digest()
                     .map_err(HostFacadeError::Resolver)?;
@@ -917,7 +1037,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     compiler_artifact_digest,
                     packages: &[],
                 };
-                if let Some(manifests) = self.embedded_std_manifests {
+                let admission = if let Some(manifests) = self.embedded_std_manifests {
                     let registry = embedded_std_registry_for_program(&package.program, manifests)
                         .map_err(HostFacadeError::Resolver)?;
                     self.kernel
@@ -940,8 +1060,11 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     )
                 }
                 .map_err(HostFacadeError::Store)?;
-            }
-            return Ok(Some(opened));
+                admission.version_id
+            } else {
+                version.version_id
+            };
+            return Ok(Some((opened, current_version_id)));
         }
         Ok(None)
     }
@@ -1071,6 +1194,198 @@ workflow Method {
         let signed =
             SignedEnvelope::sign_for_test(&policy.to_json().expect("policy"), "gaugedesk-admin");
         VerifiedEnvelope::verify_signed_text(&signed.to_json()).expect("verified")
+    }
+
+    const HOME_OPERATION: &str = "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[derive(Default)]
+    struct TestOpenHomeJournal {
+        fail_at: Option<&'static str>,
+        registered: usize,
+        completed: usize,
+        retained: usize,
+    }
+
+    impl OpenInstanceHomeJournal for TestOpenHomeJournal {
+        fn register(
+            &mut self,
+            basis: &OpenInstanceOperationBasis<'_>,
+        ) -> Result<String, HostFacadeError> {
+            self.registered += 1;
+            assert_eq!(basis.request_id, "home-open");
+            assert!(!basis.source_digest.is_empty());
+            assert_eq!(basis.lock_digest, NO_LOCK_DIGEST);
+            assert!(!basis.compiler_artifact_digest.is_empty());
+            if self.fail_at == Some("register") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home registration refused".into(),
+                ));
+            }
+            Ok(HOME_OPERATION.into())
+        }
+
+        fn complete_for_use(
+            &mut self,
+            evidence: &OpenInstanceOperationEvidence<'_>,
+        ) -> Result<(), HostFacadeError> {
+            self.completed += 1;
+            assert_eq!(evidence.operation_id, HOME_OPERATION);
+            assert!(!evidence.version_id.is_empty());
+            assert!(!evidence.witness_digest.is_empty());
+            if self.fail_at == Some("complete") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home completion refused".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn allow_retained_use(
+            &mut self,
+            instance_ref: &str,
+            version_id: &str,
+        ) -> Result<(), HostFacadeError> {
+            self.retained += 1;
+            assert!(!instance_ref.is_empty());
+            assert!(!version_id.is_empty());
+            if self.fail_at == Some("retained") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home retained use refused".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn home_chat_open_registers_before_target_and_completes_before_instance() {
+        let package = package();
+        let mut host = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("store"),
+            7,
+            envelope(),
+        )
+        .expect("host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-open".into(),
+            package_version_ref: package.version_ref().into(),
+            policy: host.policy_ref().clone(),
+        };
+        let mut register_refusal = TestOpenHomeJournal {
+            fail_at: Some("register"),
+            ..Default::default()
+        };
+        assert!(host
+            .open_instance_with_home_journal(&open, &package, &mut register_refusal)
+            .is_err());
+        assert!(host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+
+        let mut completion_refusal = TestOpenHomeJournal {
+            fail_at: Some("complete"),
+            ..Default::default()
+        };
+        assert!(host
+            .open_instance_with_home_journal(&open, &package, &mut completion_refusal)
+            .is_err());
+        assert_eq!(completion_refusal.registered, 1);
+        assert_eq!(completion_refusal.completed, 1);
+        assert!(host.kernel().store().list_instances().unwrap().is_empty());
+        let before = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap();
+        assert_eq!(before.operations.len(), 1);
+        assert_eq!(before.operations[0].operation_id, HOME_OPERATION);
+
+        let mut journal = TestOpenHomeJournal::default();
+        let opened = host
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .expect("exact retry completes");
+        assert_eq!(journal.registered, 1);
+        assert_eq!(journal.completed, 1);
+        assert_eq!(
+            host.kernel()
+                .store()
+                .program_import_operation_roster()
+                .unwrap(),
+            before
+        );
+
+        journal.fail_at = Some("retained");
+        assert!(host
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .is_err());
+        assert_eq!(journal.retained, 1);
+        journal.fail_at = None;
+        assert_eq!(
+            host.open_instance_with_home_journal(&open, &package, &mut journal)
+                .expect("exact retained use"),
+            opened
+        );
+        assert_eq!(journal.retained, 2);
+    }
+
+    #[test]
+    fn home_chat_replay_refuses_unjournaled_changed_ir_move() {
+        let package = package();
+        let mut host = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("store"),
+            7,
+            envelope(),
+        )
+        .expect("host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-open".into(),
+            package_version_ref: package.version_ref().into(),
+            policy: host.policy_ref().clone(),
+        };
+        let mut journal = TestOpenHomeJournal::default();
+        let opened = host
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .expect("first admission");
+        let resolved = package.resolve_package(package.version_ref()).unwrap();
+        host.kernel_mut()
+            .reattest_instance_program(
+                &opened.instance_ref,
+                ProgramVersionInput {
+                    program_name: &resolved.agent,
+                    source_hash: &resolved.source_hash,
+                    ir_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
+                },
+            )
+            .expect("model pre-Home compiler drift");
+        let before = host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap();
+        let refusal = host
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .unwrap_err();
+        assert!(refusal
+            .to_string()
+            .contains("exact re-attestation operation"));
+        assert_eq!(
+            host.kernel()
+                .store()
+                .program_import_operation_roster()
+                .unwrap(),
+            before
+        );
+        assert_eq!(journal.retained, 0);
     }
 
     #[test]
