@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use super::NativeWorkspaceVcs;
 use crate::branches::flowing_admission::{
-    FlowingAdmissions, FlowingGateCertificate, FlowingGateCheck, FlowingGateEvidence,
+    FlowingAdmissions, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateCheck,
+    FlowingGateEvidence,
 };
 use crate::branches::flowing_fence::FlowingFence;
 use crate::branches::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
@@ -31,6 +32,7 @@ pub struct NativeGateCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeGatePlan {
     pub attempt_op_id: String,
+    pub candidate_witness_digest: String,
     pub coordinator: String,
     pub policy_digest: String,
     pub rules_digest: String,
@@ -46,7 +48,7 @@ pub trait NativeGatePlanAuthority {
     fn required_plan(
         &mut self,
         vcs: &NativeWorkspaceVcs,
-        witness_digest: &str,
+        witness: &FlowingCandidateWitness,
         attempt_op_id: &str,
     ) -> StoreResult<NativeGatePlan>;
 }
@@ -93,9 +95,13 @@ impl NativeWorkspaceVcs {
         if witness_digest.trim().is_empty() || attempt_op_id.trim().is_empty() {
             return Err(invalid("candidate or attempt identity is incomplete"));
         }
-        let plan = authority.required_plan(self, witness_digest, attempt_op_id)?;
+        let Some(witness) = self.branches.candidate_witness(witness_digest)? else {
+            return Err(invalid("candidate witness is missing"));
+        };
+        let plan = authority.required_plan(self, &witness, attempt_op_id)?;
         if plan.attempt_op_id.trim().is_empty()
             || plan.attempt_op_id != attempt_op_id
+            || plan.candidate_witness_digest != witness_digest
             || plan.coordinator.trim().is_empty()
             || plan.policy_digest.trim().is_empty()
             || plan.rules_digest.trim().is_empty()
@@ -116,9 +122,6 @@ impl NativeWorkspaceVcs {
         if scratch.exists() {
             return Err(invalid("scratch path must be absent"));
         }
-        let Some(witness) = self.branches.candidate_witness(witness_digest)? else {
-            return Err(invalid("candidate witness is missing"));
-        };
         let Some(pin) = self.branches.flowing_attempt_pin(&plan.attempt_op_id)? else {
             return Err(invalid("candidate attempt is not retained"));
         };
@@ -228,7 +231,7 @@ impl NativeWorkspaceVcs {
         {
             return Err(invalid("trunk or source changed during checks"));
         }
-        if authority.required_plan(self, witness_digest, attempt_op_id)? != plan {
+        if authority.required_plan(self, &witness, attempt_op_id)? != plan {
             return Err(invalid("required plan changed during checks"));
         }
         let certificate = FlowingGateCertificate {

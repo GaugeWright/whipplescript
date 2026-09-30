@@ -1399,6 +1399,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use crate::branches::flowing_admission::FlowingCandidateWitness;
     use crate::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
@@ -1423,7 +1424,7 @@ mod tests {
         fn required_plan(
             &mut self,
             _vcs: &NativeWorkspaceVcs,
-            _witness_digest: &str,
+            _witness: &FlowingCandidateWitness,
             _attempt_op_id: &str,
         ) -> StoreResult<NativeGatePlan> {
             Ok(self.0.clone())
@@ -1440,7 +1441,7 @@ mod tests {
         fn required_plan(
             &mut self,
             _vcs: &NativeWorkspaceVcs,
-            _witness_digest: &str,
+            _witness: &FlowingCandidateWitness,
             _attempt_op_id: &str,
         ) -> StoreResult<NativeGatePlan> {
             self.captures += 1;
@@ -1863,6 +1864,7 @@ mod tests {
         ));
         let plan = NativeGatePlan {
             attempt_op_id: "gate-attempt-a".into(),
+            candidate_witness_digest: candidate.candidate_witness_digest.clone(),
             coordinator: "coordinator".into(),
             policy_digest: "policy-v1".into(),
             rules_digest: "rules-v1".into(),
@@ -2081,6 +2083,7 @@ mod tests {
         ));
         let plan = NativeGatePlan {
             attempt_op_id: "gate-op".into(),
+            candidate_witness_digest: candidate.candidate_witness_digest.clone(),
             coordinator: "coordinator".into(),
             policy_digest: "policy".into(),
             rules_digest: "rules".into(),
@@ -2150,6 +2153,17 @@ mod tests {
             attempt_op_id: "foreign-op".into(),
             ..plan.clone()
         };
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &foreign_digest,
+                &foreign_pin,
+                &scratch,
+                &mut executor,
+            ),
+            "plan is incomplete",
+        );
+        assert!(!scratch.exists());
         expect_gate_refusal(
             run_fixture_gate(
                 &mut vcs,
