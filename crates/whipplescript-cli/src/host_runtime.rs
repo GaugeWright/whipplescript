@@ -3998,13 +3998,21 @@ fn sse_output_text_delta(line: &str) -> Option<String> {
         return None;
     }
     let event = serde_json::from_str::<Value>(payload).ok()?;
-    if event.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
-        return None;
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => event
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        Some("content_block_delta") if event["delta"]["type"] == "text_delta" => event
+            .pointer("/delta/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        None => event
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
     }
-    event
-        .get("delta")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 impl HostDriver for NativeHttpDriver<'_> {
@@ -4034,11 +4042,25 @@ impl HostDriver for NativeHttpDriver<'_> {
         });
         let status = response.status();
         let body = if expects_sse {
-            assemble_responses_sse(&self.read_sse_body(response))
+            assemble_native_sse(&request.url, &self.read_sse_body(response))
         } else {
             response.into_json::<Value>().unwrap_or(Value::Null)
         };
         IoResult::Http(Ok(HttpResponse { status, body }))
+    }
+}
+
+/// The native transport receives three provider stream dialects. Choose the
+/// assembler from the governed request URL so a Chat Completions or Messages
+/// stream is not silently interpreted as an empty Responses reply.
+fn assemble_native_sse(url: &str, raw: &str) -> Value {
+    let path = url.split('?').next().unwrap_or(url);
+    if path.ends_with("/chat/completions") {
+        whipplescript_kernel::harness_model::assemble_openai_chat_sse(raw)
+    } else if path.ends_with("/messages") {
+        whipplescript_kernel::harness_model::assemble_anthropic_messages_sse(raw)
+    } else {
+        assemble_responses_sse(raw)
     }
 }
 
@@ -7224,6 +7246,25 @@ workflow Method {
             .resolve(package.version_ref())
             .expect("resolve tool-free package");
         assert!(resolved.tools.is_empty());
+    }
+
+    #[test]
+    fn native_stream_assembly_uses_the_request_wire() {
+        let chat = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let response = assemble_native_sse("https://example.test/v1/chat/completions", chat);
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert_eq!(
+            sse_output_text_delta(chat.lines().next().unwrap()),
+            Some("hello".to_owned())
+        );
+
+        let messages = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        let response = assemble_native_sse("https://example.test/v1/messages", messages);
+        assert_eq!(response["content"][0]["text"], "hi");
+        assert_eq!(
+            sse_output_text_delta(messages.lines().next().unwrap()),
+            Some("hi".to_owned())
+        );
     }
 
     /// The delta sink observes the SSE stream as it arrives; it never
