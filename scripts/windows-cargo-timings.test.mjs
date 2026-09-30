@@ -44,3 +44,10 @@ test("actual pinned Cargo 1.95 unit format is accepted", () => {
   const parsed = parseTimingReport(html(actual));
   assert.equal(parsed.length, 1); assert.equal(parsed[0].sections, null);
 });
+
+test("595-unit natural report capacity is supported with independent byte bound", () => {
+  const units = Array.from({length:595}, (_,i) => ({...unit,i,sections:null}));
+  assert.equal(parseTimingReport(html(units)).length,595);
+  assert.throws(() => parseTimingReport(html(Array.from({length:2049},(_,i)=>({...unit,i})))));
+  assert.throws(() => parseTimingReport(html(Array.from({length:1200},(_,i)=>({...unit,i})))), /output-size/);
+});

@@ -11,7 +11,7 @@ export function parseTimingReport(html) {
   const matches = [...html.matchAll(/const UNIT_DATA = (\[[\s\S]*?\]);/g)];
   if (matches.length !== 1) throw new Error('format');
   const units = JSON.parse(matches[0][1]);
-  if (!Array.isArray(units) || units.length > 512) throw new Error('units');
+  if (!Array.isArray(units) || units.length > 2048) throw new Error('units');
   const seen = new Set();
   const result = units.map((u) => {
     if (!u || !Number.isSafeInteger(u.i) || u.i < 0 || seen.has(u.i) ||
