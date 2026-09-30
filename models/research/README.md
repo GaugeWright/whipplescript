@@ -618,4 +618,6 @@ the epoch marker and accepted-set snapshot seal atomically, and that completed
 evidence cannot mutate. It does not prove exact dependency routing, what
 revalidation checks, migration/retention for old pins, policy revocation,
 norm-ledger composition, recovery from independent storage failures, or
-implementation cost. No epoch protocol has been selected.
+implementation cost. The founder selected the Home journal and epoch seal in
+[DR-0150](../../spec/decision-records/0150-home-operation-journal-and-sealed-epoch-cuts.md);
+the model does not discharge those remaining product and gate obligations.
