@@ -282,6 +282,26 @@ lock scheduling and independently failing stores remain open.
 The model does not prove the native or hosted transactions implement these
 synchronized transitions.
 
+`flowing_attempt_pins.py` probes the failed/cancelled attempt lifetime with
+two coordinators selecting the same still-owed unit:
+
+```sh
+python3 models/research/flowing_attempt_pins.py
+```
+
+It explores 1,468 safe states through nine transitions. One attempt may fail,
+crash, and release its own durable pins while the other admits; a cancelled
+attempt may release its candidate, let a collector reclaim it, and leave the
+source available for a fresh attempt. A ref outage cannot acknowledge
+cancellation. At CAS, the unit holder's source pin transfers to ref-owned
+source and candidate pins atomically; those ref pins remain through receipt
+recovery and frontier reconciliation. Two weakenings collect an owed source
+after its holder pin is dropped, or collect a live candidate when another
+attempt releases pins it does not own. Cuts are abstract booleans and the
+model does not establish real blob closure, cross-store atomicity, exact
+cancellation identity, production collector behavior, or implementation
+conformance.
+
 `contribution_lifecycle.py` probes one branch with two declared contributions,
 where `u1` depends on `u0`. It separates the durable holder of each unit from
 a disposable gate attempt. Ready declaration, twig-to-branch sharing, bounded
