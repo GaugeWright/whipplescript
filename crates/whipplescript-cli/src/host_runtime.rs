@@ -245,6 +245,15 @@ pub enum TurnWitness {
     Unwitnessed { reason: String },
 }
 
+/// Original recorded workspace evidence, observed under current product access.
+/// This is evidence for the embedding product, never an execution grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedWorkspaceWitness {
+    pub receipt: TurnReceipt,
+    pub writes: Vec<WitnessedWrite>,
+    pub reads: Vec<String>,
+}
+
 pub trait ResourceResolver {
     /// Additional current product access, independent of the pinned runtime
     /// policy. A refusal terminates this invocation; detail is not disclosed.
@@ -2096,6 +2105,71 @@ impl GovernedHostRuntime {
         }
     }
 
+    /// Read the original certified workspace witness without running a turn,
+    /// resolving a provider, scanning a workspace or refreshing any evidence.
+    /// Missing certified evidence supplies no witness; broken references refuse.
+    pub fn turn_workspace_witness<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        resources: &R,
+    ) -> Result<Option<RecordedWorkspaceWitness>, HostRuntimeError> {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
+        let observed = (|| {
+            let Some(receipt) = self.stored_turn_receipt(command)? else {
+                return Ok(None);
+            };
+            let Some(reference) = &receipt.workspace_cut_ref else {
+                return Ok(None);
+            };
+            let run_id =
+                idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+            let Some(evidence) = self
+                .kernel
+                .store()
+                .list_evidence_for_subject("run", &run_id)
+                .map_err(HostRuntimeError::Store)?
+                .into_iter()
+                .find(|evidence| &evidence.evidence_id == reference)
+            else {
+                let reason = "recorded workspace witness is missing";
+                // MUTATION-SUCCESS-EXPR: Ok(None)
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(reason)));
+            };
+            if evidence.instance_id != command.instance_ref
+                || evidence.kind != "host.turn.workspace_cut"
+                || evidence.subject_type != "run"
+                || evidence.subject_id != run_id
+                || evidence.correlation_id.as_deref() != Some(command.command_id.as_str())
+                || evidence.causation_id.as_deref() != Some(command.command_id.as_str())
+            {
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "recorded workspace witness identity differs",
+                )));
+            }
+            #[derive(serde::Deserialize)]
+            struct Body {
+                complete: bool,
+                writes: Vec<WitnessedWrite>,
+                reads: Vec<String>,
+            }
+            let body: Body =
+                serde_json::from_str(&evidence.metadata_json).map_err(HostRuntimeError::Json)?;
+            if !body.complete {
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "recorded workspace witness is incomplete",
+                )));
+            }
+            Ok(Some(RecordedWorkspaceWitness {
+                receipt,
+                writes: body.writes,
+                reads: body.reads,
+            }))
+        })();
+        access.check()?;
+        observed
+    }
+
     /// The recorded failure reason for this exact admitted turn. No provider
     /// request, credential or raw response body crosses this projection.
     pub fn turn_failure_summary(
@@ -3052,17 +3126,15 @@ impl GovernedHostRuntime {
             .iter()
             .find(|effect| effect.effect_id == command.command_id)
         {
-            Some(effect) if effect.input_json != command_json => {
-                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                    "command id reused with different turn",
-                )));
+            Some(effect) => {
+                validate_recorded_turn_input(effect, command)?;
+                if is_terminal_effect(&effect.status) {
+                    let execution = self.finish_execution(command)?;
+                    access.check()?;
+                    return Ok(execution);
+                }
+                true
             }
-            Some(effect) if is_terminal_effect(&effect.status) => {
-                let execution = self.finish_execution(command)?;
-                access.check()?;
-                return Ok(execution);
-            }
-            Some(_) => true,
             None => {
                 access.check()?;
                 self.kernel
@@ -3779,10 +3851,12 @@ impl GovernedHostRuntime {
         Ok(projected)
     }
 
-    fn stored_execution(
+    fn stored_turn_receipt(
         &self,
         command: &StartTurnCommand,
-    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
+    ) -> Result<Option<TurnReceipt>, HostRuntimeError> {
+        command.validate()?;
+        self.require_policy(&command.policy)?;
         let events = self
             .kernel
             .store()
@@ -3829,6 +3903,39 @@ impl GovernedHostRuntime {
                 .map(str::to_owned),
         };
         receipt.validate_for(command)?;
+        let Some(effect) = self
+            .kernel
+            .store()
+            .list_effects(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|effect| effect.effect_id == command.command_id)
+        else {
+            let reason = "retained turn has no original command";
+            // MUTATION-SUCCESS-EXPR: Ok(None)
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(reason)));
+        };
+        validate_recorded_turn_input(&effect, command)?;
+        if !is_terminal_effect(&effect.status) {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "retained turn command is not terminal",
+            )));
+        }
+        Ok(Some(receipt))
+    }
+
+    fn stored_execution(
+        &self,
+        command: &StartTurnCommand,
+    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
+        let Some(receipt) = self.stored_turn_receipt(command)? else {
+            return Ok(None);
+        };
+        let events = self
+            .kernel
+            .store()
+            .list_events(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
         let mut projected = Vec::new();
         for event in events {
             if event.event_type != "host.turn.evidence" {
@@ -4065,6 +4172,19 @@ struct InstanceMetadata {
     protocol: String,
     package_version_ref: String,
     policy: PolicyEpochRef,
+}
+
+fn validate_recorded_turn_input(
+    effect: &whipplescript_store::EffectView,
+    command: &StartTurnCommand,
+) -> Result<(), HostRuntimeError> {
+    let original = serde_json::to_string(command).map_err(HostRuntimeError::Json)?;
+    if effect.kind != "agent.tell" || effect.input_json != original {
+        return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+            "command id reused with different turn",
+        )));
+    }
+    Ok(())
 }
 
 const LIVE_ACCESS_REFUSED: &str = "host turn access ended";
@@ -7745,6 +7865,188 @@ workflow HostChat {
             .clone()
             .expect("witnessed turn references its workspace cut");
         let cut = evidence_metadata(&runtime, &command1, &cut_ref);
+        let before_read = runtime.current_position(&command1.instance_ref).unwrap();
+        let provider_reads = secrets.calls.get();
+        let original = runtime
+            .turn_workspace_witness(&command1, &resources)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.receipt, receipt1);
+        assert_eq!(original.writes.len(), 1);
+        assert_eq!(original.writes[0].path, "src/out.md");
+        assert_eq!(original.writes[0].content_hash, sha256_hex(b"cut body"));
+        fs::write(workspace.join("src/out.md"), "later unimported work").unwrap();
+        let restarted = GovernedHostRuntime::open(&path, 21, &policy_text).unwrap();
+        assert_eq!(
+            restarted
+                .turn_workspace_witness(&command1, &resources)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            runtime.current_position(&command1.instance_ref).unwrap(),
+            before_read
+        );
+        assert_eq!(secrets.calls.get(), provider_reads);
+        fs::write(workspace.join("src/out.md"), "cut body").unwrap();
+        struct ReadAccess {
+            calls: Cell<usize>,
+            deny_at: usize,
+        }
+        impl ResourceResolver for ReadAccess {
+            fn check_live_access(&self) -> Result<(), String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.calls.get() >= self.deny_at {
+                    Err("private staff detail".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                unreachable!()
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        for deny_at in [1, 2] {
+            let access = ReadAccess {
+                calls: Cell::new(0),
+                deny_at,
+            };
+            let error = runtime
+                .turn_workspace_witness(&command1, &access)
+                .unwrap_err();
+            assert!(error.to_string().contains(LIVE_ACCESS_REFUSED));
+            assert!(!error.to_string().contains("private staff detail"));
+            assert_eq!(access.calls.get(), deny_at);
+        }
+        let mut changed = command1.clone();
+        changed.input.text = "different submitted input".into();
+        assert!(runtime
+            .turn_workspace_witness(&changed, &resources)
+            .unwrap_err()
+            .to_string()
+            .contains("command id reused"));
+        let replay_driver = ScriptedDriver::new(vec![]);
+        assert!(runtime
+            .run_turn_with_driver(&changed, &CutPackages, &secrets, &resources, &replay_driver)
+            .unwrap_err()
+            .to_string()
+            .contains("command id reused"));
+        assert!(replay_driver.requests.borrow().is_empty());
+        // Corrupt authoritative records, one field at a time, then restore the
+        // exact original. No live worktree or resolver scan can repair these.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        let original_input = serde_json::to_string(&command1).unwrap();
+        for (column, bad) in [
+            ("kind", "other"),
+            ("status", "queued"),
+            ("effect_id", "missing-original"),
+            ("input_json", "{}"),
+        ] {
+            let old: String = connection
+                .query_row(
+                    &format!("SELECT {column} FROM effects WHERE effect_id=?1"),
+                    [&command1.command_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE effects SET {column}=?1 WHERE effect_id=?2"),
+                    rusqlite::params![bad, &command1.command_id],
+                )
+                .unwrap();
+            assert!(
+                runtime
+                    .turn_workspace_witness(&command1, &resources)
+                    .is_err(),
+                "{column}"
+            );
+            let key = if column == "effect_id" {
+                bad
+            } else {
+                &command1.command_id
+            };
+            connection
+                .execute(
+                    &format!("UPDATE effects SET {column}=?1 WHERE effect_id=?2"),
+                    rusqlite::params![old, key],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT input_json FROM effects WHERE effect_id=?1",
+                    [&command1.command_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            original_input
+        );
+        for (column, bad) in [
+            ("kind", "other"),
+            ("correlation_id", "other-command"),
+            ("causation_id", "other-command"),
+            ("instance_id", "other-instance"),
+            ("evidence_id", "missing-reference"),
+            ("metadata_json", "{"),
+            (
+                "metadata_json",
+                "{\"complete\":false,\"writes\":[],\"reads\":[]}",
+            ),
+        ] {
+            let old: String = connection
+                .query_row(
+                    &format!("SELECT {column} FROM evidence WHERE evidence_id=?1"),
+                    [&cut_ref],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE evidence SET {column}=?1 WHERE evidence_id=?2"),
+                    rusqlite::params![bad, &cut_ref],
+                )
+                .unwrap();
+            assert!(
+                runtime
+                    .turn_workspace_witness(&command1, &resources)
+                    .is_err(),
+                "{column}"
+            );
+            let key = if column == "evidence_id" {
+                bad
+            } else {
+                &cut_ref
+            };
+            connection
+                .execute(
+                    &format!("UPDATE evidence SET {column}=?1 WHERE evidence_id=?2"),
+                    rusqlite::params![old, key],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            runtime
+                .turn_workspace_witness(&command1, &resources)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let mut absent = command1.clone();
+        absent.command_id = "not-run".into();
+        assert!(runtime
+            .turn_workspace_witness(&absent, &resources)
+            .unwrap()
+            .is_none());
+
         assert_eq!(cut.get("complete"), Some(&Value::Bool(true)));
         let writes = cut.get("writes").and_then(Value::as_array).expect("writes");
         assert_eq!(writes.len(), 1);
