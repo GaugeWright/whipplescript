@@ -23,6 +23,7 @@ test('Windows service launch uses only the pinned binary with a hard bound and c
 test('launch failures, deadline and unfamiliar output remain closed and diagnostic only', () => {
   const fixtures = [
     [{ error: { code: 'ETIMEDOUT', message: 'private path' } }, 'blocked', 'deadline'],
+    [{ error: { code: 'UNKNOWN', errno: -4094, message: 'private path' } }, 'unknown', 'launch-error'],
     [{ error: { code: 'ENOENT' } }, 'blocked', 'binary-unavailable'],
     [{ error: { code: 'EPERM' } }, 'blocked', 'launch-denied'],
     [{ error: { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' } }, 'unknown', 'launch-error'],
@@ -41,4 +42,16 @@ test('launch failures, deadline and unfamiliar output remain closed and diagnost
 
 test('other execution contexts make no launch or Windows readiness claim', () => {
   assert.equal(readiness({ platform: 'darwin', launch: () => { assert.fail('must not launch'); } }).status, 'unknown');
+});
+
+test('native error metadata is bounded and never promoted to a policy diagnosis', () => {
+  const unknown = readiness({ platform: 'win32', launch: () => ({ error: { code: 'UNKNOWN', errno: -4094, message: 'private' } }) });
+  assert.equal(unknown.errorCode, 'UNKNOWN');
+  assert.equal(unknown.errorNumber, -4094);
+  assert.equal(unknown.status, 'unknown');
+  const untrusted = readiness({ platform: 'win32', launch: () => ({ error: { code: 'private arbitrary code', errno: 'private' } }) });
+  assert.equal(untrusted.errorCode, 'OTHER');
+  assert.equal(untrusted.errorNumber, null);
+  assert.doesNotMatch(JSON.stringify(untrusted), /private/);
+  assert.equal(readiness({ platform: 'win32', launch: () => ({ error: { code: 'UNKNOWN', errno: Infinity } }) }).errorNumber, null);
 });

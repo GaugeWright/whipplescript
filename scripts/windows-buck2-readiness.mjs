@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 
 export const binary = 'C:\\tools\\buck2.exe';
 export function readiness({ platform = process.platform, launch = spawnSync } = {}) {
-  const receipt = { version: 1, scope: 'pinned-binary-launch', status: 'unknown', reason: 'unsupported-context', nativeCompileProven: false };
+  const receipt = { version: 1, scope: 'pinned-binary-launch', status: 'unknown', reason: 'unsupported-context', errorCode: null, errorNumber: null, nativeCompileProven: false };
   if (platform !== 'win32') return receipt;
   try {
     const result = launch(binary, ['--version'], {
@@ -12,6 +12,11 @@ export function readiness({ platform = process.platform, launch = spawnSync } = 
       windowsHide: true, shell: false,
     });
     if (result.error) {
+      // Native Windows launch errors can surface as UNKNOWN. Preserve stable
+      // bounded metadata without the message, path, arguments or environment.
+      const codes = ['ETIMEDOUT', 'ENOENT', 'EACCES', 'EPERM', 'UNKNOWN', 'ENOEXEC', 'EINVAL', 'EIO', 'E2BIG', 'ENOMEM', 'ENOBUFS', 'ENOTDIR'];
+      receipt.errorCode = codes.includes(result.error.code) ? result.error.code : 'OTHER';
+      receipt.errorNumber = Number.isSafeInteger(result.error.errno) && Math.abs(result.error.errno) <= 100000 ? result.error.errno : null;
       if (result.error.code === 'ETIMEDOUT') return { ...receipt, status: 'blocked', reason: 'deadline' };
       if (result.error.code === 'ENOENT') return { ...receipt, status: 'blocked', reason: 'binary-unavailable' };
       if (['EACCES', 'EPERM'].includes(result.error.code)) return { ...receipt, status: 'blocked', reason: 'launch-denied' };
