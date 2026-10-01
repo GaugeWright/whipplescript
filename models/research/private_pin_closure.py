@@ -32,6 +32,7 @@ class State:
     parked_pins: tuple[bool, bool] = (False, False)
     receipts: tuple[Handoff, ...] = ()
     trunk_receipts: tuple[int, ...] = ()
+    abandonment_receipt: tuple[int, ...] = ()
     twig_cuts: tuple[int, int] = (0, 0)
     branch_cut: int = 0
     members: tuple[str, str] = ("open", "open")  # open, resolved, parked
@@ -118,6 +119,25 @@ def admit(s: State, i: int) -> State:
                    branch_pins=at(s.branch_pins, i, False))
 
 
+def abandon_dependent_closure(s: State, defect: str = "") -> State:
+    # The physical source-content and dependent-basis proof is checked in
+    # flowing_abandonment.py. Here one ref transaction moves the source head,
+    # both unit dispositions and their exact receipt. The new branch cut
+    # invalidates any candidate checked against its predecessor.
+    if not s.ref_up or not s.topology_up or s.close == "closed":
+        raise ValueError("abandonment needs live ref and topology authority")
+    if s.units != ("branch", "branch"):
+        raise ValueError("dependent closure is incomplete or already admitted")
+    if not all(s.branch_pins):
+        raise ValueError("abandonment lost a retained source cut")
+    return replace(
+        s, units=("abandoned", "abandoned"),
+        branch_cut=s.branch_cut + 1,
+        twig_pins=(False, False), branch_pins=(False, False),
+        abandonment_receipt=(() if defect == "omit_abandonment_receipt" else (0, 1)),
+    )
+
+
 def request_close(s: State) -> State:
     if not s.topology_up or s.close != "open":
         raise ValueError("close request needs open topology")
@@ -175,6 +195,8 @@ def acknowledge_close(s: State, defect: str = "") -> State:
 
 
 def violation(s: State) -> str | None:
+    if set(s.trunk_receipts).intersection(s.abandonment_receipt):
+        return "source unit has both trunk and abandonment dispositions"
     for i in (0, 1):
         if s.drafts[i] == "private" and not s.draft_pins[i]:
             return "private draft lost its retained pin"
@@ -194,6 +216,8 @@ def violation(s: State) -> str | None:
             return "parked unit lost its pin"
         if s.units[i] == "accounted" and i not in s.trunk_receipts:
             return "accounted unit lacks durable trunk receipt"
+        if s.units[i] == "abandoned" and i not in s.abandonment_receipt:
+            return "abandoned unit lacks exact disposition receipt"
     if s.close == "closed":
         if s.ref_enabled:
             return "closure acknowledged before ref disable"
@@ -245,9 +269,20 @@ def scenarios() -> None:
     assert parked.close_report == ("twig0: none/parked",)
     assert violation(parked) is None
 
+    # An explicit dependent-closure disposition accounts both units and
+    # advances the branch cut, so an already checked prefix becomes stale.
+    together = handoff(declare(write_private(State(), 0), 0), 0)
+    together = handoff(declare(write_private(together, 1), 1), 1)
+    previous_cut = together.branch_cut
+    together = abandon_dependent_closure(together)
+    assert together.branch_cut == previous_cut + 1
+    assert together.abandonment_receipt == (0, 1)
+    assert violation(together) is None
+
     # Closure with an independently unavailable ref or topology remains
     # pending; neither absence is permission to discard pins.
     closing = request_close(write_private(State(), 0))
+    assert "disable" not in {event for event, _ in steps(replace(closing, ref_up=False))}
     for unavailable, action in ((replace(closing, ref_up=False), disable_admission),
                                 (replace(closing, topology_up=False), acknowledge_close)):
         try:
@@ -284,6 +319,10 @@ def mutants() -> None:
     parked = resolve_member(parked, 1)
     assert violation(acknowledge_close(parked, "close_omits_parked")) == (
         "close receipt omitted parked obligations")
+    both = handoff(declare(write_private(State(), 0), 0), 0)
+    both = handoff(declare(write_private(both, 1), 1), 1)
+    assert violation(abandon_dependent_closure(both, "omit_abandonment_receipt")) == (
+        "abandoned unit lacks exact disposition receipt")
 
 
 def steps(s: State):
@@ -299,13 +338,16 @@ def steps(s: State):
     for i in (0, 1):
         if s.units[i] == "branch" and s.twig_pins[i]:
             yield f"cleanup{i}", cleanup_twig_pin(s, i)
-        if s.units[i] == "branch" and s.ref_enabled:
+        if s.units[i] == "branch" and s.ref_enabled and s.ref_up:
             yield f"admit{i}", admit(s, i)
+    if s.units == ("branch", "branch") and s.ref_up and s.topology_up:
+        yield "abandon_dependent_closure", abandon_dependent_closure(s)
     if s.close == "open":
         yield "request_close", request_close(s)
     if s.close == "closing":
         if s.ref_enabled:
-            yield "disable", disable_admission(s)
+            if s.ref_up:
+                yield "disable", disable_admission(s)
         else:
             for i in (0, 1):
                 if s.drafts[i] == "private" or s.units[i] in ("twig", "branch"):
@@ -337,7 +379,7 @@ def main() -> None:
     mutants()
     count = explore()
     print(f"private pin closure: {count} safe states through ten transitions")
-    print("two member twigs, pinned handoff and closure, and eight mutants passed")
+    print("two member twigs, pinned handoff and closure, and nine mutants passed")
 
 
 if __name__ == "__main__":

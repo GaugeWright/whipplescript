@@ -235,17 +235,36 @@ branch closure for two member twigs:
 python3 models/research/private_pin_closure.py
 ```
 
-Its explorer reaches 440 safe states through ten transitions. Positive traces
+Its explorer reaches 450 safe states through ten transitions. Positive traces
 retain a private draft across session end, leave a conflicting handoff on the
 twig, overlap twig and branch pins during a successful handoff, report a CAS
 that wins before ref disable, and close with either an admitted or named
-parked obligation. Eight weakened variants lose a private pin or declared
+parked obligation. Nine weakened variants lose a private pin or declared
 unit, transfer without a durable pin or exact handoff receipt, acknowledge
-closure before ref disable or member resolution, drop a branch unit, or omit
-a parked obligation from the close receipt. The gate and CAS are abstracted;
+closure before ref disable or member resolution, drop a branch unit, omit a
+parked obligation from the close receipt, or omit the joint abandonment
+receipt. The gate and CAS are abstracted;
 `flowing_recovery.py` covers their immediate recovery seam. This model does
-not prove real cut retention, rehome/abandonment, dependency repair, external
-settlement, or native and hosted storage transactions.
+not prove real cut retention, rehome mechanics, abandonment content, dependency
+repair, external settlement, or native and hosted storage transactions.
+
+`flowing_abandonment.py` isolates the explicit abandonment transaction before
+that operation is composed into the full admission model:
+
+```sh
+python3 models/research/flowing_abandonment.py
+```
+
+It explores 126 safe states through twelve transitions. A prepared replacement
+cut remains pinned across crash and retry; a competing source-tail write makes
+the old preparation stale, while a fresh preparation preserves the tail. A
+competing trunk CAS accounts the selected units first and prevents their
+retrospective abandonment. Seven weakenings expose omitted dependent
+resolution, a receipt without content removal, content removal without a
+receipt, stale-head overwrite, lost prepared content, abandonment after trunk
+admission, and duplicate receipts under one operation id. Authorization, real
+cut derivation, physical lock order, and native/hosted atomic persistence remain
+outside this bounded model.
 
 `flowing_full_seam.py` synchronizes the private-pin model's selected-unit
 accounting with the norm/ref model's trunk CAS, and synchronizes closure's
@@ -255,12 +274,15 @@ disable with the ref-owned Hold epoch:
 python3 models/research/flowing_full_seam.py
 ```
 
-It explores 17,278 safe branch states and 12,863 safe abstract mixed-transport
-states through twelve transitions, plus 476 direct-twig states through nine.
+It explores 83,971 safe branch states and 61,275 safe abstract mixed-transport
+states through twelve transitions, plus 2,595 direct-twig states through nine.
 Scenarios show a CAS winning
 before close disable, a second member's unit parked at close, disable blocking
 a passed candidate, and a later member handoff making that candidate's source
-cut stale. The combined candidate now binds three fixed source atoms to two
+cut stale. An explicit abandonment of both dependent units also advances the
+source cut, so a checked candidate cannot CAS afterward; a weakening admits
+the same unit under both trunk and abandonment receipts. The combined
+candidate now binds three fixed source atoms to two
 selected units, replays their path effects, checks the dependent's read basis
 at the realized predecessor, and accounts both units even when the dependent
 neutralizes the predecessor's write. An equivalent no-op keeps its source atom
@@ -272,7 +294,17 @@ checked output content. Durable attempt pins now keep the source and candidate
 available through a coordinator crash, ref CAS, receipt recovery and frontier
 reconciliation; collection follows release. Dropping the candidate pin during
 gate work or releasing it before recovery lets collection lose a still-needed
-cut. Four earlier
+cut. The gate binds a digest of the selected units, source-atom witness,
+candidate content and outcome, lineage and policy bases; the ref CAS compares
+that exact digest. A post-check candidate swap is refused, while removing the
+comparison admits the swapped witness. This models equality of a canonical
+payload, not the authenticity of a production certificate or the actual
+encoding and storage of its digest. Independent norm and ref outages now
+interleave with the same lifecycle: a norm outage loses its captured validation,
+a ref outage blocks CAS and close disable, and a restored authority can retry
+while the selected units and pins remain owed. Fail-open weakenings admit a
+candidate with the norm or ref authority unavailable. These are availability
+states, not a physical cross-store crash or lock implementation. Four earlier
 weakenings admit a CAS without unit accounting, omit the ref fence at disable,
 trust the stale branch cut, or close before recovering an accepted receipt.
 The mixed mode carries one selected unit's atom through B→C→D beside the same
@@ -285,8 +317,8 @@ lineage, and the fixed atom is the only transported unit in this mode.
 The source atoms and read relation are fixed model inputs: actual cut-to-atom
 derivation, actual blob-closure and collector transactions, semantic edge
 discovery, failed/cancelled attempt pin release, source revisions through all
-mutation doors, certificate digest/authenticity at the ref authority, physical
-lock scheduling and independently failing stores remain open.
+mutation doors, certificate authenticity at the ref authority, physical
+lock scheduling and independently failing store transactions remain open.
 The model does not prove the native or hosted transactions implement these
 synchronized transitions.
 

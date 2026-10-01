@@ -6,10 +6,14 @@ Two member twigs and source units, one candidate, two coordinators. Unit 1
 depends on the version of unit 0 it read. When selected together, unit 1
 neutralizes unit 0's x write but applies a y write. The exact source atoms,
 their path effects, dependent read basis and per-unit outcomes must survive
-that neutralization in the certificate and the ref admission. An equivalent
-no-op still gets a checked admission and per-unit receipt. The model still
-abstracts real cut contents, semantic edge discovery, physical lock scheduling
-and independently failing stores.
+that neutralization in the certificate and the ref admission. The ref CAS
+also checks the digest of the precise candidate payload the gate verified;
+a post-check swap cannot reuse its certificate. An equivalent no-op still
+gets a checked admission and per-unit receipt. Independent norm/ref outages
+block admission and require recovery of their own authority state; fail-open
+mutants reach an admission with one unavailable. The model still abstracts
+real cut contents, semantic edge discovery, certificate authenticity, physical
+lock scheduling and cross-store crash transactions.
 The mixed-source mode additionally carries one unit through B, C and D, and
 checks each origin's Hold and policy epoch at the same norm/ref CAS. Transport
 and policy storage are abstract here; the source atoms and receipt must still
@@ -18,6 +22,8 @@ be derived from real cuts in production.
 
 from collections import deque
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
+import json
 
 import composed_admission as gate
 import private_pin_closure as work
@@ -68,6 +74,24 @@ class Candidate:
     actual_lineage: tuple[str, ...]
     certificate_lineage: tuple[str, ...]
     policy_epochs: tuple[int, int, int]
+
+
+def certificate_digest(candidate: Candidate) -> str:
+    """Bind the candidate fields the gate verified and the ref must consume."""
+    payload = {
+        "selected": candidate.selected,
+        "before": candidate.before,
+        "source_atoms": candidate.certificate_atoms,
+        "output_atoms": candidate.output_atoms,
+        "dependent_read_basis": candidate.dependent_read_basis,
+        "after": candidate.after,
+        "outcomes": candidate.outcomes,
+        "output_change_id": candidate.output_change_id,
+        "lineage": candidate.certificate_lineage,
+        "policy_epochs": candidate.policy_epochs,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return sha256(encoded).hexdigest()
 
 
 def source_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
@@ -141,7 +165,10 @@ class State:
     candidate_source_cut: int = -1
     admitted_source_cut: int = -1
     candidate: Candidate | None = None
+    candidate_certificate_digest: str | None = None
+    candidate_swapped: bool = False
     admitted_candidate: Candidate | None = None
+    admitted_certificate_digest: str | None = None
     admitted_trunk_before: tuple[int, int] | None = None
     source_attempt_pin: bool = False
     candidate_attempt_pin: bool = False
@@ -157,10 +184,32 @@ class State:
     release_used: bool = False
     admitted_policy_epochs: tuple[int, int, int] | None = None
     admitted_held: tuple[bool, bool, bool] | None = None
+    norm_up: bool = True
+    norm_outage_used: bool = False
+    ref_outage_used: bool = False
+    admitted_norm_up: bool | None = None
+    admitted_ref_up: bool | None = None
 
 
 def steps(state: State, defect: str = ""):
     a, w = state.admission, state.obligations
+    if not a.admission and not state.norm_outage_used:
+        # A failed norm transaction loses its exclusion and validation; the
+        # coordinator must recapture those premises after recovery.
+        yield "norm_outage", replace(
+            state, norm_up=False, norm_outage_used=True,
+            admission=replace(a, ledger_locked_by=-1,
+                              validated_revision=-1, validated_by=-1),
+        )
+    if not state.norm_up:
+        yield "norm_restore", replace(state, norm_up=True)
+    if not a.admission and not state.ref_outage_used:
+        yield "ref_outage", replace(
+            state, ref_outage_used=True,
+            obligations=replace(w, ref_up=False),
+        )
+    if not w.ref_up:
+        yield "ref_restore", replace(state, obligations=replace(w, ref_up=True))
     if state.source_kind == "mixed" and not a.admission:
         if state.transport_stage == 0 and w.units[0] == "branch":
             yield "transport_B_to_C", replace(
@@ -189,6 +238,14 @@ def steps(state: State, defect: str = ""):
                                state.policy_epochs[1], state.policy_epochs[2]),
             )
     for event, next_a in gate.steps(a):
+        if (not state.norm_up and defect != "fail_open_norm_outage" and
+                (event in ("gate_pass", "revoke_original_grant", "precheck_without_lock")
+                 or event.startswith("lock_and_validate"))):
+            continue
+        if (not w.ref_up and defect != "fail_open_ref_outage" and
+                (event in ("hold", "takeover", "recover_receipt")
+                 or event.startswith("cas_owner"))):
+            continue
         if event == "gate_pass":
             if state.source_kind == "mixed" and state.transport_stage != 2:
                 continue
@@ -222,6 +279,7 @@ def steps(state: State, defect: str = ""):
                 yield name, replace(state, admission=next_a,
                                     candidate_source_cut=source_cut,
                                     candidate=candidate,
+                                    candidate_certificate_digest=certificate_digest(candidate),
                                     source_attempt_pin=True,
                                     candidate_attempt_pin=(defect != "drop_candidate_pin"),
                                     candidate_available=True)
@@ -232,12 +290,18 @@ def steps(state: State, defect: str = ""):
         elif event.startswith("cas_owner"):
             source_cut = (w.branch_cut if state.source_kind != "twig"
                           else w.twig_cuts[0])
-            if not w.ref_up or (source_cut != state.candidate_source_cut and
-                                defect != "trust_stale_branch_cut"):
+            if ((not w.ref_up and defect != "fail_open_ref_outage") or
+                    (source_cut != state.candidate_source_cut and
+                     defect not in ("trust_stale_branch_cut",
+                                    "cas_ignores_abandonment"))):
                 continue
             if not state.source_available or not state.candidate_available:
                 continue
             if state.candidate is None:
+                continue
+            if (certificate_digest(state.candidate) !=
+                    state.candidate_certificate_digest and
+                    defect != "skip_certificate_digest_check"):
                 continue
             checked_lineage = (("D",) if defect == "current_branch_only"
                                else state.candidate.certificate_lineage)
@@ -252,13 +316,34 @@ def steps(state: State, defect: str = ""):
                                      admitted_policy_epochs=state.policy_epochs,
                                      admitted_held=state.held)
             elif (w.ref_enabled and state.candidate is not None and
-                  all(w.units[i] == holder_kind(state.source_kind)
-                      for i in state.candidate.selected)):
+                  (all(w.units[i] == holder_kind(state.source_kind)
+                       for i in state.candidate.selected) or
+                   (defect == "cas_ignores_abandonment" and
+                    all(w.units[i] == "abandoned"
+                        for i in state.candidate.selected)))):
                 next_w = w
                 if defect != "cas_omits_unit_accounting":
                     if state.source_kind != "twig":
+                        if defect == "cas_ignores_abandonment":
+                            next_w = replace(
+                                next_w, units=tuple(
+                                    "branch" if i in state.candidate.selected else status
+                                    for i, status in enumerate(next_w.units)
+                                ), branch_pins=tuple(
+                                    True if i in state.candidate.selected else pinned
+                                    for i, pinned in enumerate(next_w.branch_pins)
+                                ),
+                            )
                         for unit in state.candidate.selected:
-                            next_w = work.admit(next_w, unit)
+                            # The mutant pretends an unavailable ref accepted
+                            # the entry; retain the actual outage in the state.
+                            next_w = work.admit(
+                                replace(next_w, ref_up=True)
+                                if defect == "fail_open_ref_outage" else next_w,
+                                unit,
+                            )
+                            if not w.ref_up:
+                                next_w = replace(next_w, ref_up=False)
                     else:
                         next_w = replace(
                             w, units=work.at(w.units, 0, "accounted"),
@@ -269,8 +354,11 @@ def steps(state: State, defect: str = ""):
                                      obligations=next_w,
                                      admitted_source_cut=source_cut,
                                      admitted_candidate=state.candidate,
+                                     admitted_certificate_digest=state.candidate_certificate_digest,
                                      admitted_policy_epochs=state.policy_epochs,
                                      admitted_held=state.held,
+                                     admitted_norm_up=state.norm_up,
+                                     admitted_ref_up=w.ref_up,
                                      admitted_trunk_before=state.trunk_content,
                                      trunk_content=(state.trunk_content
                                                     if defect == "cas_omits_output"
@@ -304,6 +392,13 @@ def steps(state: State, defect: str = ""):
             yield event, replace(state, obligations=next_w)
 
     if state.candidate is not None:
+        if not a.admission and not state.candidate_swapped:
+            yield "swap_candidate_witness", replace(
+                state, candidate=replace(
+                    state.candidate,
+                    output_change_id=state.candidate.output_change_id + ":replaced",
+                ), candidate_swapped=True,
+            )
         if not state.candidate_attempt_pin and state.candidate_available:
             yield "collect_candidate", replace(state, candidate_available=False)
         source_holder_pin = any(
@@ -341,9 +436,15 @@ def violation(state: State):
     if a.trunk and state.admitted_source_cut != state.candidate_source_cut:
         return "stale branch cut admitted"
     if a.trunk:
+        if state.admitted_norm_up is not True:
+            return "norm authority unavailable at trunk CAS"
+        if state.admitted_ref_up is not True:
+            return "ref authority unavailable at trunk CAS"
         candidate = state.admitted_candidate
         if candidate is None:
             return "trunk admission lacks its exact candidate"
+        if certificate_digest(candidate) != state.admitted_certificate_digest:
+            return "admitted candidate differs from verified certificate digest"
         if candidate.certificate_lineage != candidate.actual_lineage:
             return "transport omitted an origin from the certificate"
         if state.admitted_policy_epochs is None or state.admitted_held is None:
@@ -416,6 +517,27 @@ def scenarios():
     assert both.trunk_content == (0, 1)
     assert both.obligations.trunk_receipts == (0, 1)
 
+    abandoned = scenario((
+        "write0", "declare0", "handoff0", "write1", "declare1",
+        "handoff1", "gate_pass_both", "abandon_dependent_closure",
+        "lock_and_validate_owner0",
+    ))
+    assert abandoned.obligations.abandonment_receipt == (0, 1)
+    assert not any(name.startswith("cas_owner") for name, _ in steps(abandoned))
+    broken_abandonment = State()
+    for wanted in (
+        "write0", "declare0", "handoff0", "write1", "declare1",
+        "handoff1", "gate_pass_both", "abandon_dependent_closure",
+        "lock_and_validate_owner0", "cas_owner0",
+    ):
+        matches = [after for name, after in
+                   steps(broken_abandonment, "cas_ignores_abandonment")
+                   if name == wanted]
+        assert len(matches) == 1, (wanted, broken_abandonment)
+        broken_abandonment = matches[0]
+    assert violation(broken_abandonment) == (
+        "source unit has both trunk and abandonment dispositions")
+
     equivalent = scenario((
         "write0", "declare0", "handoff0", "gate_pass",
         "lock_and_validate_owner0", "cas_owner0", "recover_receipt",
@@ -451,6 +573,26 @@ def scenarios():
     stale = scenario(prefix + ("write1", "declare1", "handoff1",
                                "lock_and_validate_owner0"))
     assert not any(name.startswith("cas_owner") for name, _ in steps(stale))
+
+    swapped = scenario(prefix + ("swap_candidate_witness",
+                                 "lock_and_validate_owner0"))
+    assert not any(name.startswith("cas_owner") for name, _ in steps(swapped))
+
+    missing_norm = scenario(prefix + ("norm_outage",))
+    assert not any(name.startswith("lock_and_validate")
+                   for name, _ in steps(missing_norm))
+    recovered_norm = scenario(prefix + (
+        "norm_outage", "norm_restore", "lock_and_validate_owner0", "cas_owner0",
+    ))
+    assert recovered_norm.admitted_norm_up
+
+    missing_ref = scenario(prefix + ("lock_and_validate_owner0", "ref_outage"))
+    assert not any(name.startswith("cas_owner") for name, _ in steps(missing_ref))
+    recovered_ref = scenario(prefix + (
+        "lock_and_validate_owner0", "ref_outage", "release_ledger_owner0",
+        "ref_restore", "lock_and_validate_owner0", "cas_owner0",
+    ))
+    assert recovered_ref.admitted_ref_up
 
     mixed_prefix = ("write0", "declare0", "handoff0",
                     "transport_B_to_C", "transport_C_to_D")
@@ -543,6 +685,21 @@ def witness_mutants():
     print("CAS output mutant: accounted units but omitted candidate content; " +
           " -> ".join(output_trace))
 
+    swapped = State()
+    swap_trace = (
+        "write0", "declare0", "handoff0", "gate_pass",
+        "swap_candidate_witness", "lock_and_validate_owner0", "cas_owner0",
+    )
+    for event in swap_trace:
+        matches = [successor for name, successor in
+                   steps(swapped, "skip_certificate_digest_check") if name == event]
+        assert len(matches) == 1, (event, swapped)
+        swapped = matches[0]
+    assert violation(swapped) == "admitted candidate differs from verified certificate digest"
+    print("certificate digest mutant: a post-check candidate swap reached CAS; " +
+          " -> ".join(swap_trace))
+
+
     early_release = State()
     release_trace = (
         "write0", "declare0", "handoff0", "gate_pass",
@@ -570,6 +727,26 @@ def witness_mutants():
           " -> ".join(missing_trace))
 
 
+def authority_failure_mutants():
+    prefix = ("write0", "declare0", "handoff0", "gate_pass")
+    for defect, trace, expected in (
+        ("fail_open_norm_outage",
+         prefix + ("norm_outage", "lock_and_validate_owner0", "cas_owner0"),
+         "norm authority unavailable at trunk CAS"),
+        ("fail_open_ref_outage",
+         prefix + ("lock_and_validate_owner0", "ref_outage", "cas_owner0"),
+         "ref authority unavailable at trunk CAS"),
+    ):
+        state = State()
+        for event in trace:
+            matches = [successor for name, successor in steps(state, defect)
+                       if name == event]
+            assert len(matches) == 1, (defect, event, state)
+            state = matches[0]
+        assert violation(state) == expected, (defect, violation(state))
+        print(f"{defect}: {expected}; " + " -> ".join(trace))
+
+
 def explore(defect="", depth=12, source_kind="branch"):
     initial = State(source_kind=source_kind)
     queue = deque([(initial, ())])
@@ -590,6 +767,7 @@ def explore(defect="", depth=12, source_kind="branch"):
 def main():
     scenarios()
     witness_mutants()
+    authority_failure_mutants()
     lineage_mutants()
     count, problem, _ = explore(depth=9, source_kind="twig")
     assert problem is None, problem
@@ -605,6 +783,7 @@ def main():
         ("CAS omits selected-unit accounting", "cas_omits_unit_accounting", 7),
         ("disable omits ref fence", "disable_without_ref_fence", 9),
         ("trust stale branch cut", "trust_stale_branch_cut", 10),
+        ("CAS ignores abandonment", "cas_ignores_abandonment", 12),
         ("close omits admitted receipt recovery", "close_omits_recovery", 12),
     ):
         count, problem, trace = explore(defect, depth)
