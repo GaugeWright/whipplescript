@@ -684,6 +684,22 @@ implementation cost. The founder selected the Home journal and epoch seal in
 [DR-0150](../../spec/decision-records/0150-home-operation-journal-and-sealed-epoch-cuts.md);
 the model does not discharge those remaining product and gate obligations.
 
+`project_home_coverage.py` checks the later project Home boundary with two
+projects running on one host:
+
+```sh
+python3 models/research/project_home_coverage.py
+```
+
+It reaches 228 safe states through eleven transitions. An operation can be
+registered, completed and used only in its project's Home; each epoch and
+seal advances independently, and the gate for project 0 consumes only that
+Home's cut even after project 1 changes. Five weakenings admit a wrong journal,
+a host-wide union roster, cross-project use, a borrowed seal or a shared
+epoch. This is an identity-isolation probe, not a coverage proof: it abstracts
+target-store incarnations and recovery, accepting-path inventory, gate
+content, key separation and actual per-project product storage.
+
 `home_store_cutover.py` probes a prerequisite for making that Home roster
 authoritative across older and newly created runtime stores:
 
