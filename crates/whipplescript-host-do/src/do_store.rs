@@ -1921,8 +1921,8 @@ fn effect_view_from_row(row: &[SqlValue]) -> EffectView {
     }
 }
 
-/// Maps a 9-column run row to a `RunView` (last column is the `EXISTS(...)`
-/// cancel-requested flag, 0/1).
+/// Maps a 10-column run row to a `RunView` (column 8 is the `EXISTS(...)`
+/// cancel-requested flag; column 9 is the terminal summary).
 fn run_view_from_row(row: &[SqlValue]) -> RunView {
     RunView {
         run_id: as_text(&row[0]),
@@ -1934,6 +1934,7 @@ fn run_view_from_row(row: &[SqlValue]) -> RunView {
         completed_at: as_opt_text(&row[6]),
         metadata_json: as_text(&row[7]),
         cancel_requested: as_i64(&row[8]) != 0,
+        summary: as_opt_text(&row[9]),
     }
 }
 
@@ -8435,7 +8436,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  completed_at, metadata_json, \
                  EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
                  WHERE request.instance_id = runs.instance_id \
-                 AND request.effect_id = runs.effect_id AND request.status = 'requested') \
+                 AND request.effect_id = runs.effect_id AND request.status = 'requested'), summary \
                  FROM runs WHERE runs.instance_id = ?1 ORDER BY started_at, run_id",
                 &[text(instance_id)],
             )
@@ -8458,7 +8459,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  completed_at, metadata_json, \
                  EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
                  WHERE request.instance_id = runs.instance_id \
-                 AND request.effect_id = runs.effect_id AND request.status = 'requested') \
+                 AND request.effect_id = runs.effect_id AND request.status = 'requested'), summary \
                  FROM runs WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 \
                  AND runs.status = 'running' ORDER BY started_at, run_id LIMIT 1",
                 &[text(instance_id), text(effect_id)],

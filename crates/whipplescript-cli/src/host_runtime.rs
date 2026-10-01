@@ -2090,6 +2090,24 @@ impl GovernedHostRuntime {
         }
     }
 
+    /// The recorded failure reason for this exact admitted turn. No provider
+    /// request, credential or raw response body crosses this projection.
+    pub fn turn_failure_summary(
+        &self,
+        command: &StartTurnCommand,
+    ) -> Result<Option<String>, HostRuntimeError> {
+        command.validate()?;
+        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        Ok(self
+            .kernel
+            .store()
+            .list_runs(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|run| run.run_id == run_id && run.status == "failed")
+            .and_then(|run| run.summary))
+    }
+
     /// Mint the out-of-band cancel capability for a command before driving it.
     /// The handle contains no provider secret or resource body.
     pub fn cancellation_handle(
@@ -4178,7 +4196,7 @@ impl HostDriver for NativeHttpDriver<'_> {
             name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
         });
         let status = response.status();
-        let body = if expects_sse {
+        let body = if expects_sse && (200..300).contains(&status) {
             assemble_native_sse(&request.url, &self.read_sse_body(response))
         } else {
             response.into_json::<Value>().unwrap_or(Value::Null)
@@ -7483,6 +7501,114 @@ workflow Method {
             .resolve(package.version_ref())
             .expect("resolve tool-free package");
         assert!(resolved.tools.is_empty());
+    }
+
+    #[test]
+    fn failed_turn_reason_is_recoverable_from_the_exact_runtime_run() {
+        struct Refused;
+        impl HostDriver for Refused {
+            fn fulfill(&self, _: &IoRequest) -> IoResult {
+                IoResult::Http(Ok(HttpResponse {
+                    status: 400,
+                    body: json!({"error":{"message":"invalid continuation"}}),
+                }))
+            }
+        }
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "open-first-chat".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let execution = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &Refused,
+            )
+            .unwrap();
+        assert_eq!(execution.receipt.unwrap().status, TurnStatus::Failed);
+        assert!(runtime
+            .turn_failure_summary(&command)
+            .unwrap()
+            .unwrap()
+            .contains("invalid continuation"));
+        assert!(runtime
+            .turn_failure_summary(&turn(&instance.instance_ref, &open.policy, 2))
+            .unwrap()
+            .is_none());
+        drop(runtime);
+        let reopened = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        assert!(reopened
+            .turn_failure_summary(&command)
+            .unwrap()
+            .unwrap()
+            .contains("invalid continuation"));
+    }
+
+    // WS-590: a streamed model request can be refused with ordinary JSON.
+    // The response status and actual reason must survive the native driver.
+    #[test]
+    fn native_stream_request_preserves_json_provider_refusal() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let start = loop {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(start) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break start + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..start])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request.len() < start + length {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let body = r#"{"error":{"message":"tool result has no matching call"}}"#;
+            write!(socket, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let request = IoRequest::Http(HttpRequest {
+            model_provenance: None,
+            url: format!("http://{address}/v1/responses"),
+            headers: vec![("accept".into(), "text/event-stream".into())],
+            body: json!({"input": "a continuation after a refused tool"}),
+        });
+        let IoResult::Http(result) =
+            NativeHttpDriver::new(Duration::from_secs(5)).fulfill(&request);
+        let response = result.unwrap();
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response.body["error"]["message"],
+            "tool result has no matching call"
+        );
+        server.join().unwrap();
     }
 
     #[test]

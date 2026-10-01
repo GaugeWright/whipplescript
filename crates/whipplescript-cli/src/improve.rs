@@ -8201,6 +8201,7 @@ mod tests {
             completed_at: None,
             metadata_json: metadata.to_string(),
             cancel_requested: false,
+            summary: None,
         };
         // 900 cache-read of 1200 input-side across the cached run; the
         // cache-blind run adds 300 uncached input-side tokens.
@@ -8232,6 +8233,7 @@ mod tests {
             completed_at: None,
             metadata_json: metadata.to_string(),
             cancel_requested: false,
+            summary: None,
         };
         let mut table = PriceTable::default();
         table.rates.insert(

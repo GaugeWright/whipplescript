@@ -1430,6 +1430,8 @@ pub struct RunView {
     pub completed_at: Option<String>,
     pub metadata_json: String,
     pub cancel_requested: bool,
+    /// The provider-owned terminal summary, opened under the run payload key.
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6635,7 +6637,8 @@ impl SqliteStore {
                     WHERE request.instance_id = runs.instance_id
                       AND request.effect_id = runs.effect_id
                       AND request.status = 'requested'
-                ) AS cancel_requested
+                ) AS cancel_requested,
+                whip_payload_open('runtime.runs.summary', runs.run_id, summary)
             FROM runs
             WHERE runs.instance_id = ?1
             ORDER BY started_at, run_id
@@ -6653,6 +6656,7 @@ impl SqliteStore {
                     completed_at: row.get(6)?,
                     metadata_json: row.get(7)?,
                     cancel_requested: row.get(8)?,
+                    summary: row.get(9)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -6686,7 +6690,8 @@ impl SqliteStore {
                     WHERE request.instance_id = runs.instance_id
                       AND request.effect_id = runs.effect_id
                       AND request.status = 'requested'
-                ) AS cancel_requested
+                ) AS cancel_requested,
+                whip_payload_open('runtime.runs.summary', runs.run_id, summary)
             FROM runs
             WHERE runs.instance_id = ?1
               AND runs.effect_id = ?2
@@ -6706,6 +6711,7 @@ impl SqliteStore {
                         completed_at: row.get(6)?,
                         metadata_json: row.get(7)?,
                         cancel_requested: row.get(8)?,
+                        summary: row.get(9)?,
                     })
                 },
             )

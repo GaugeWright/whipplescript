@@ -934,6 +934,7 @@ fn status_json_includes_effects_and_runs_provider_selection() {
         })
         .to_string(),
         cancel_requested: false,
+        summary: None,
     };
 
     let rendered = status_to_json_with_effects_and_runs(&status, &[effect], &[run]);

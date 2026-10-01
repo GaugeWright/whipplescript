@@ -238,6 +238,7 @@ fn native_lifecycle_summary_exposes_redacted_status_for_runs() {
             }
         })
         .to_string(),
+        summary: None,
         cancel_requested: true,
     };
     let run_json = run_to_json_with_lifecycle_and_artifacts(&run, &events, &BTreeMap::new());

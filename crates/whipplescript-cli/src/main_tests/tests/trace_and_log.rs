@@ -452,6 +452,7 @@ fn renders_run_cancellation_request_json() {
         started_at: "2026-01-01T00:00:00Z".to_owned(),
         completed_at: None,
         metadata_json: "{}".to_owned(),
+        summary: None,
         cancel_requested: true,
     };
 
@@ -488,6 +489,7 @@ fn renders_run_provider_selection_metadata_json() {
         })
         .to_string(),
         cancel_requested: false,
+        summary: None,
     };
 
     let rendered = run_to_json(&run);
