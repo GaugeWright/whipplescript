@@ -1918,6 +1918,40 @@ impl SqliteStore {
         chain_head_on(&self.connection, instance_id)
     }
 
+    /// Verify and pin an exact historical event-log prefix. A later append may
+    /// advance the live head without changing this cut; a missing sequence or
+    /// broken chain is refused before its digest is offered to a Home handoff.
+    pub fn chain_head_at(
+        &self,
+        instance_id: &str,
+        sequence: i64,
+    ) -> StoreResult<event_chain::ChainHead> {
+        if sequence <= 0 {
+            return Err(StoreError::Conflict(
+                "historical event-chain pin requires a positive sequence".into(),
+            ));
+        }
+        let digest: String = self
+            .connection
+            .query_row(
+                "SELECT entry_digest FROM events WHERE instance_id = ?1 AND sequence = ?2",
+                params![instance_id, sequence],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Conflict(format!(
+                    "historical event-chain sequence {sequence} is missing for instance `{instance_id}`"
+                ))
+            })?;
+        let pin = event_chain::ChainHead {
+            sequence: Some(sequence),
+            digest,
+        };
+        self.list_events_pinned(instance_id, &pin)?;
+        Ok(pin)
+    }
+
     /// [`RuntimeStore::last_activity`], read off the head of the log rather
     /// than by listing it — the same narrowing [`Self::chain_head`] does, for
     /// the same reason: this answers one question about the last row, and
@@ -16540,6 +16574,55 @@ mod tests {
             head, folded,
             "the recorded head must equal an independent fold of the prefix"
         );
+    }
+
+    #[test]
+    fn a_historical_chain_pin_survives_a_suffix_but_refuses_a_changed_prefix() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first event");
+        let first = store
+            .chain_head_at("instance-a", 1)
+            .expect("verified first cut");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("later suffix");
+        assert_eq!(
+            store
+                .chain_head_at("instance-a", 1)
+                .expect("same historical cut"),
+            first
+        );
+        assert_ne!(store.chain_head("instance-a").expect("live head"), first);
+        assert!(format!(
+            "{:?}",
+            store
+                .chain_head_at("instance-a", 0)
+                .expect_err("zero is not a historical event")
+        )
+        .contains("historical event-chain pin requires a positive sequence"));
+        assert!(format!(
+            "{:?}",
+            store
+                .chain_head_at("instance-a", 3)
+                .expect_err("missing cut")
+        )
+        .contains("historical event-chain sequence 3 is missing"));
+        store
+            .connection
+            .execute(
+                "UPDATE events SET event_type = 'substituted' WHERE instance_id = 'instance-a' AND sequence = 1",
+                [],
+            )
+            .expect("corrupt historical prefix");
+        assert!(format!(
+            "{:?}",
+            store
+                .chain_head_at("instance-a", 1)
+                .expect_err("changed prefix")
+        )
+        .contains("pinned prefix does not verify"));
     }
 
     #[test]

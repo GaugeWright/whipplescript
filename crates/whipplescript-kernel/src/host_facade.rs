@@ -142,6 +142,76 @@ pub trait OpenInstanceHomeJournal {
     ) -> Result<(), HostFacadeError>;
 }
 
+/// Exact source proof offered before a cross-store fork or adoption can write
+/// to its target. The Home resolves this to one completed source admission;
+/// a legacy or ambiguous source must not acquire a fabricated pin.
+pub struct ForkSourceHomeBasis<'a> {
+    pub source_store_incarnation: &'a str,
+    pub source_instance_ref: &'a str,
+    pub source_observed_version_id: &'a str,
+    pub source_sequence: u64,
+    pub source_chain_digest: &'a str,
+    pub source_thread_digest: &'a str,
+    pub policy: &'a PolicyEpochRef,
+}
+
+/// Durable pending handoff identity registered before target-open, seed, or
+/// fork-event writes. The target import is a separate Home operation; its
+/// request ID here links the two obligations without pretending they commit
+/// atomically across stores.
+pub struct ForkInstanceOperationBasis<'a> {
+    pub kind: &'a str,
+    pub request_id: &'a str,
+    pub source: &'a ForkSourceHomeBasis<'a>,
+    pub source_home_operation_id: &'a str,
+    pub target_store_incarnation: &'a str,
+    pub target_request_id: &'a str,
+    pub target_package_version_ref: &'a str,
+}
+
+/// Exact immutable target evidence offered for Home completion and replay.
+/// The Home checks the named events and both store identities before it permits
+/// the target to be used as the imported conversation.
+pub struct ForkInstanceOperationEvidence<'a> {
+    pub request_id: &'a str,
+    pub operation_id: &'a str,
+    pub source: &'a ForkSourceHomeBasis<'a>,
+    pub source_home_operation_id: &'a str,
+    pub target_store_incarnation: &'a str,
+    pub target_request_id: &'a str,
+    pub target_instance_ref: &'a str,
+    pub target_version_id: &'a str,
+    pub seed_event_id: &'a str,
+    pub seed_sequence: u64,
+    pub fork_event_id: &'a str,
+    pub fork_sequence: u64,
+}
+
+/// Product-owned Home door for native cross-store fork and adoption. The
+/// source pin and pending fork precede every target write. Completion may
+/// recover exact persisted target evidence after a crash, but must leave a
+/// post-seal operation pending until current-basis revalidation. Retained use
+/// checks both the target import and fork pointer; an open target alone is not
+/// an admitted chat. The embedding product must use the same door before turns.
+pub trait ForkInstanceHomeJournal: OpenInstanceHomeJournal {
+    fn pin_source_for_fork(
+        &mut self,
+        source: &ForkSourceHomeBasis<'_>,
+    ) -> Result<String, HostFacadeError>;
+    fn register_fork(
+        &mut self,
+        basis: &ForkInstanceOperationBasis<'_>,
+    ) -> Result<String, HostFacadeError>;
+    fn complete_fork_for_use(
+        &mut self,
+        evidence: &ForkInstanceOperationEvidence<'_>,
+    ) -> Result<(), HostFacadeError>;
+    fn allow_retained_fork_use(
+        &mut self,
+        evidence: &ForkInstanceOperationEvidence<'_>,
+    ) -> Result<(), HostFacadeError>;
+}
+
 /// Read and validate the identity that a Home operation must bind before any
 /// target write. A legacy or damaged store cannot join a Home admission.
 pub fn require_home_store_incarnation<S: RuntimeStore>(

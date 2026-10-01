@@ -30,7 +30,8 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::host_facade::{
-    HostFacadeError, OpenInstanceHomeJournal, OpenInstanceOperationBasis,
+    ForkInstanceHomeJournal, ForkInstanceOperationBasis, ForkInstanceOperationEvidence,
+    ForkSourceHomeBasis, HostFacadeError, OpenInstanceHomeJournal, OpenInstanceOperationBasis,
     OpenInstanceOperationEvidence,
 };
 use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
@@ -2317,7 +2318,7 @@ impl GovernedHostRuntime {
         };
         let admission = if let Some(operation_id) = operation_id.as_deref() {
             self.kernel
-                .create_program_version_for_program_with_imports_and_constructs_at_id(
+                .create_program_version_with_imports_and_constructs_at_id(
                     input,
                     &package.program,
                     &import_basis,
@@ -2428,7 +2429,7 @@ impl GovernedHostRuntime {
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
 
-        let source_metadata =
+        let (_, source_metadata) =
             Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
         let source_package = packages
             .resolve_package(&source_metadata.package_version_ref)
@@ -2477,19 +2478,11 @@ impl GovernedHostRuntime {
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
 
-        let source_metadata =
+        let (source_instance, source_metadata) =
             Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
         let _ = source_metadata; // identity + policy checked; content deliberately not re-derived
                                  // The recorded program name stands in for the unresolvable source
                                  // package's agent: it names whose thread is being carried.
-        let source_instance = source_runtime
-            .kernel
-            .store()
-            .get_instance(&command.source.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| {
-                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
-            })?;
         let source_version = source_runtime
             .kernel
             .store()
@@ -2508,6 +2501,335 @@ impl GovernedHostRuntime {
         )
     }
 
+    /// Fork only through the authenticated Home's source pin, pending handoff,
+    /// target import, exact seed, and completed handoff use door. A crash after
+    /// any target step retries the same identities; an incomplete handoff is
+    /// never returned as an admitted target.
+    pub fn fork_instance_from_with_home_journal<
+        P: PackageResolver + ?Sized,
+        J: ForkInstanceHomeJournal,
+    >(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+        journal: &mut J,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        self.home_fork_or_adopt(source_runtime, command, packages, journal, false)
+    }
+
+    /// Adopt an unreproducible authored source through the same Home handoff.
+    /// Only reproduction of the old source package is waived; its exact Home
+    /// pin, event cut, policy, snapshot and target admission remain required.
+    pub fn adopt_instance_from_with_home_journal<
+        P: PackageResolver + ?Sized,
+        J: ForkInstanceHomeJournal,
+    >(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+        journal: &mut J,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        self.home_fork_or_adopt(source_runtime, command, packages, journal, true)
+    }
+
+    fn home_fork_or_adopt<P: PackageResolver + ?Sized, J: ForkInstanceHomeJournal>(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+        journal: &mut J,
+        adopt: bool,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        command.validate()?;
+        self.require_policy(&command.policy)?;
+        source_runtime.require_policy(&command.policy)?;
+        let target_package = packages
+            .resolve_package(&command.package_version_ref)
+            .map_err(HostRuntimeError::Resolver)?;
+        validate_package(&target_package, &command.package_version_ref)?;
+        self.check_package_ifc(&target_package)?;
+        let (source_instance, source_metadata) =
+            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
+        let source_agent = if adopt {
+            let source_version = source_runtime
+                .kernel
+                .store()
+                .get_program_version(&source_instance.version_id)
+                .map_err(HostRuntimeError::Store)?;
+            let Some(source_version) = source_version else {
+                return Err(HostRuntimeError::Incomplete(
+                    "Home adoption source version is missing".into(),
+                ));
+            };
+            source_version.program_name
+        } else {
+            let source_package = packages
+                .resolve_package(&source_metadata.package_version_ref)
+                .map_err(HostRuntimeError::Resolver)?;
+            validate_package(&source_package, &source_metadata.package_version_ref)?;
+            source_runtime.check_package_ifc(&source_package)?;
+            source_runtime.validate_instance_binding(
+                &command.source.instance_ref,
+                &source_metadata.package_version_ref,
+                &command.policy,
+                packages,
+            )?;
+            source_package.agent
+        };
+        self.home_fork_to_target(
+            source_runtime,
+            command,
+            packages,
+            &target_package,
+            &source_agent,
+            &source_instance.version_id,
+            journal,
+            if adopt { "adopt" } else { "fork" },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn home_fork_to_target<P: PackageResolver + ?Sized, J: ForkInstanceHomeJournal>(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+        target_package: &ResolvedPackage,
+        source_agent: &str,
+        source_observed_version_id: &str,
+        journal: &mut J,
+        kind: &str,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        Self::check_source_fork_ready(source_runtime, command)?;
+        let source_store_incarnation =
+            require_home_store_incarnation(source_runtime.kernel.store())?;
+        let target_store_incarnation = require_home_store_incarnation(self.kernel.store())?;
+        let source_chain = source_runtime
+            .kernel
+            .store()
+            .chain_head_at(&command.source.instance_ref, command.source.sequence as i64)
+            .map_err(HostRuntimeError::Store)?;
+        let messages = source_runtime
+            .kernel
+            .snapshot_agent_thread(
+                &command.source.instance_ref,
+                source_agent,
+                Some(command.source.sequence as i64),
+            )
+            .map_err(HostRuntimeError::Store)?;
+        let mut snapshot_bytes = b"whipplescript.home-fork-thread.v1\0".to_vec();
+        snapshot_bytes.extend(
+            serde_json::to_vec(&whipplescript_kernel::harness_loop::chat_messages_to_json(
+                &messages,
+            ))
+            .map_err(HostRuntimeError::Json)?,
+        );
+        let source_thread_digest = sha256_hex(&snapshot_bytes);
+        let source = ForkSourceHomeBasis {
+            source_store_incarnation: &source_store_incarnation,
+            source_instance_ref: &command.source.instance_ref,
+            source_observed_version_id,
+            source_sequence: command.source.sequence,
+            source_chain_digest: &source_chain.digest,
+            source_thread_digest: &source_thread_digest,
+            policy: &command.policy,
+        };
+        let source_home_operation_id = journal
+            .pin_source_for_fork(&source)
+            .map_err(home_journal_error)?;
+        if source_home_operation_id.is_empty() {
+            return Err(HostRuntimeError::HomeJournal(
+                "Home fork source pin has no operation identity".into(),
+            ));
+        }
+        let operation_id = journal
+            .register_fork(&ForkInstanceOperationBasis {
+                kind,
+                request_id: &command.request_id,
+                source: &source,
+                source_home_operation_id: &source_home_operation_id,
+                target_store_incarnation: &target_store_incarnation,
+                target_request_id: &command.target_request_id,
+                target_package_version_ref: &command.package_version_ref,
+            })
+            .map_err(home_journal_error)?;
+        if operation_id.is_empty() {
+            return Err(HostRuntimeError::HomeJournal(
+                "Home fork registration has no operation identity".into(),
+            ));
+        }
+
+        let target = self.open_instance_with_home_journal(
+            &command.target_open_command(),
+            packages,
+            journal,
+        )?;
+        if target.instance_ref == command.source.instance_ref {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork target identity",
+            )));
+        }
+        let target_instance = self
+            .kernel
+            .store()
+            .get_instance(&target.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let Some(target_instance) = target_instance else {
+            return Err(HostRuntimeError::Incomplete(
+                "Home fork target disappeared after open".into(),
+            ));
+        };
+        require_same_home_store_incarnation(
+            source_runtime.kernel.store(),
+            &source_store_incarnation,
+        )?;
+        require_same_home_store_incarnation(self.kernel.store(), &target_store_incarnation)?;
+        let source_now = source_runtime
+            .kernel
+            .store()
+            .get_instance(&command.source.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let Some(source_now) = source_now else {
+            return Err(HostRuntimeError::Incomplete(
+                "Home fork source disappeared after target open".into(),
+            ));
+        };
+        if source_now.version_id != source_observed_version_id
+            || source_runtime
+                .kernel
+                .store()
+                .chain_head_at(&command.source.instance_ref, command.source.sequence as i64)
+                .map_err(HostRuntimeError::Store)?
+                != source_chain
+        {
+            return Err(HostRuntimeError::Incomplete(
+                "Home fork source changed before target seed".into(),
+            ));
+        }
+        let seed_key = idempotency_key(&[
+            &target.instance_ref,
+            &command.request_id,
+            "host-instance-thread-seed",
+        ]);
+        let seed_payload = json!({
+            "agent": target_package.agent,
+            "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
+            "source_instance_id": command.source.instance_ref,
+            "source_sequence": command.source.sequence as i64,
+        });
+        let fork_key = idempotency_key(&[
+            &target.instance_ref,
+            &command.request_id,
+            "host-instance-forked",
+        ]);
+        let fork_payload = json!({
+            "request_id": command.request_id,
+            "source": command.source,
+            "target_request_id": command.target_request_id,
+            "package_version_ref": command.package_version_ref,
+            "policy": command.policy,
+            "home_operation_id": operation_id,
+            "source_home_operation_id": source_home_operation_id,
+            "source_store_incarnation": source_store_incarnation,
+            "source_observed_version_id": source_observed_version_id,
+            "source_chain_digest": source_chain.digest,
+            "source_thread_digest": source_thread_digest,
+            "target_store_incarnation": target_store_incarnation,
+            "target_version_id": target_instance.version_id,
+            "kind": kind,
+        });
+        let existing_seed = self.exact_fork_event(
+            &target.instance_ref,
+            &seed_key,
+            "agent.thread.seeded",
+            &seed_payload,
+            "kernel",
+        )?;
+        let existing_fork = self.exact_fork_event(
+            &target.instance_ref,
+            &fork_key,
+            "host.instance.forked",
+            &fork_payload,
+            "host-runtime",
+        )?;
+        if existing_fork.is_some() && existing_seed.is_none() {
+            return Err(HostRuntimeError::Incomplete(
+                "recorded Home fork has no exact thread seed".into(),
+            ));
+        }
+        let seed = if let Some(seed) = existing_seed {
+            seed
+        } else {
+            self.kernel
+                .seed_agent_thread(AgentThreadSeed {
+                    instance_id: &target.instance_ref,
+                    agent: &target_package.agent,
+                    messages: &messages,
+                    source_instance_id: &command.source.instance_ref,
+                    source_sequence: command.source.sequence as i64,
+                    idempotency_key: &seed_key,
+                })
+                .map_err(HostRuntimeError::Store)?
+        };
+        let fork = if let Some(fork) = existing_fork {
+            fork
+        } else {
+            self.kernel
+                .store()
+                .append_event(NewEvent {
+                    instance_id: &target.instance_ref,
+                    event_type: "host.instance.forked",
+                    payload_json: &fork_payload.to_string(),
+                    source: "host-runtime",
+                    causation_id: None,
+                    correlation_id: Some(&command.request_id),
+                    idempotency_key: Some(&fork_key),
+                })
+                .map_err(HostRuntimeError::Store)?
+        };
+        require_same_home_store_incarnation(
+            source_runtime.kernel.store(),
+            &source_store_incarnation,
+        )?;
+        require_same_home_store_incarnation(self.kernel.store(), &target_store_incarnation)?;
+        let evidence = ForkInstanceOperationEvidence {
+            request_id: &command.request_id,
+            operation_id: &operation_id,
+            source: &source,
+            source_home_operation_id: &source_home_operation_id,
+            target_store_incarnation: &target_store_incarnation,
+            target_request_id: &command.target_request_id,
+            target_instance_ref: &target.instance_ref,
+            target_version_id: &target_instance.version_id,
+            seed_event_id: &seed.event_id,
+            seed_sequence: positive_sequence(seed.sequence)?,
+            fork_event_id: &fork.event_id,
+            fork_sequence: positive_sequence(fork.sequence)?,
+        };
+        journal
+            .complete_fork_for_use(&evidence)
+            .map_err(home_journal_error)?;
+        journal
+            .allow_retained_fork_use(&evidence)
+            .map_err(home_journal_error)?;
+        let target_instance_ref = target.instance_ref.clone();
+        let fork_sequence = evidence.fork_sequence;
+        let result = ForkedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target,
+            forked_at: EventPosition {
+                instance_ref: target_instance_ref,
+                sequence: fork_sequence,
+            },
+        };
+        result.validate_for(command)?;
+        Ok(result)
+    }
+
     /// The shared fork tail: source position and quiescence checks, target
     /// open (fully validated), replay short-circuit, thread seeding, and the
     /// `host.instance.forked` record.
@@ -2515,7 +2837,7 @@ impl GovernedHostRuntime {
         source_runtime: &GovernedHostRuntime,
         instance_ref: &str,
         command: &ForkInstanceCommand,
-    ) -> Result<InstanceMetadata, HostRuntimeError> {
+    ) -> Result<(whipplescript_store::InstanceView, InstanceMetadata), HostRuntimeError> {
         let source_instance = source_runtime
             .kernel
             .store()
@@ -2529,7 +2851,7 @@ impl GovernedHostRuntime {
                 "fork source package/policy binding",
             )));
         }
-        Ok(source_metadata)
+        Ok((source_instance, source_metadata))
     }
 
     fn fork_to_target<P: PackageResolver + ?Sized>(
@@ -2540,25 +2862,7 @@ impl GovernedHostRuntime {
         target_package: &ResolvedPackage,
         source_agent: &str,
     ) -> Result<ForkedInstance, HostRuntimeError> {
-        let current = source_runtime.current_position(&command.source.instance_ref)?;
-        if command.source.sequence > current.sequence {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "fork source position",
-            )));
-        }
-        let running = source_runtime
-            .kernel
-            .store()
-            .list_effects(&command.source.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .any(|effect| effect.status == "running");
-        if running {
-            return Err(HostRuntimeError::Incomplete(format!(
-                "source instance {} is not quiescent",
-                command.source.instance_ref
-            )));
-        }
+        Self::check_source_fork_ready(source_runtime, command)?;
 
         let target_command = command.target_open_command();
         let target = self.open_instance(&target_command, packages)?;
@@ -2652,6 +2956,32 @@ impl GovernedHostRuntime {
         };
         result.validate_for(command)?;
         Ok(result)
+    }
+
+    fn check_source_fork_ready(
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+    ) -> Result<(), HostRuntimeError> {
+        let current = source_runtime.current_position(&command.source.instance_ref)?;
+        if command.source.sequence > current.sequence {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source position",
+            )));
+        }
+        let running = source_runtime
+            .kernel
+            .store()
+            .list_effects(&command.source.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .any(|effect| effect.status == "running");
+        if running {
+            return Err(HostRuntimeError::Incomplete(format!(
+                "source instance {} is not quiescent",
+                command.source.instance_ref
+            )));
+        }
+        Ok(())
     }
 
     /// An idempotency key is only a locator. Verify the stored event's exact
@@ -5019,6 +5349,202 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestForkJournal {
+        fail_at: Option<&'static str>,
+        mutate_source_version: Option<(PathBuf, String, String)>,
+        remove_source_on_target_retained_use: Option<(PathBuf, String)>,
+        remove_target_on_retained_use: Option<PathBuf>,
+        completed_imports: BTreeSet<String>,
+        source_binding: Option<(String, String, String)>,
+        fork_registered: Option<(String, String, String)>,
+        fork_completed: Option<(String, String, String, String)>,
+        retained_forks: usize,
+    }
+
+    impl OpenInstanceHomeJournal for TestForkJournal {
+        fn register(
+            &mut self,
+            basis: &OpenInstanceOperationBasis<'_>,
+        ) -> Result<String, HostFacadeError> {
+            assert_eq!(basis.kind, "open");
+            assert_eq!(basis.target_store_incarnation.len(), 32);
+            assert!(!basis.source_digest.is_empty());
+            Ok(if basis.request_id == "home-fork-source" {
+                HOME_OPEN_OPERATION
+            } else {
+                HOME_REATTEST_OPERATION
+            }
+            .to_owned())
+        }
+
+        fn complete_for_use(
+            &mut self,
+            evidence: &OpenInstanceOperationEvidence<'_>,
+        ) -> Result<(), HostFacadeError> {
+            assert!(!evidence.version_id.is_empty());
+            assert!(!evidence.witness_digest.is_empty());
+            self.completed_imports
+                .insert(evidence.operation_id.to_owned());
+            Ok(())
+        }
+
+        fn allow_retained_use(
+            &mut self,
+            target_store_incarnation: &str,
+            request_id: &str,
+            instance_ref: &str,
+            version_id: &str,
+        ) -> Result<(), HostFacadeError> {
+            let operation = if request_id == "home-fork-source" {
+                HOME_OPEN_OPERATION
+            } else {
+                HOME_REATTEST_OPERATION
+            };
+            if !self.completed_imports.contains(operation) {
+                return Err(HostFacadeError::Incomplete(
+                    "Home import is not complete".into(),
+                ));
+            }
+            if request_id == "home-fork-source" {
+                self.source_binding = Some((
+                    target_store_incarnation.to_owned(),
+                    instance_ref.to_owned(),
+                    version_id.to_owned(),
+                ));
+            } else {
+                if let Some((path, source_ref)) = self.remove_source_on_target_retained_use.take() {
+                    rusqlite::Connection::open(path)
+                        .expect("source database")
+                        .execute("DELETE FROM instances WHERE instance_id = ?1", [source_ref])
+                        .expect("source disappears after retained target open");
+                }
+                if let Some(path) = self.remove_target_on_retained_use.take() {
+                    rusqlite::Connection::open(path)
+                        .expect("target database")
+                        .execute(
+                            "DELETE FROM instances WHERE instance_id = ?1",
+                            [instance_ref],
+                        )
+                        .expect("target disappears after retained open");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl ForkInstanceHomeJournal for TestForkJournal {
+        fn pin_source_for_fork(
+            &mut self,
+            source: &ForkSourceHomeBasis<'_>,
+        ) -> Result<String, HostFacadeError> {
+            if self.fail_at == Some("source") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home source pin refused".into(),
+                ));
+            }
+            if self.fail_at == Some("source_empty") {
+                return Ok(String::new());
+            }
+            assert_eq!(
+                self.source_binding.as_ref(),
+                Some(&(
+                    source.source_store_incarnation.to_owned(),
+                    source.source_instance_ref.to_owned(),
+                    source.source_observed_version_id.to_owned(),
+                ))
+            );
+            assert!(source.source_sequence > 0);
+            assert!(!source.source_chain_digest.is_empty());
+            assert!(!source.source_thread_digest.is_empty());
+            Ok(HOME_OPEN_OPERATION.to_owned())
+        }
+
+        fn register_fork(
+            &mut self,
+            basis: &ForkInstanceOperationBasis<'_>,
+        ) -> Result<String, HostFacadeError> {
+            if self.fail_at == Some("register") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home fork register refused".into(),
+                ));
+            }
+            if self.fail_at == Some("register_empty") {
+                return Ok(String::new());
+            }
+            assert_eq!(basis.source_home_operation_id, HOME_OPEN_OPERATION);
+            assert_eq!(basis.target_store_incarnation.len(), 32);
+            assert_eq!(basis.target_package_version_ref, "package:v2");
+            let observed = (
+                basis.request_id.to_owned(),
+                basis.target_store_incarnation.to_owned(),
+                basis.source.source_chain_digest.to_owned(),
+            );
+            if let Some(existing) = &self.fork_registered {
+                assert_eq!(existing, &observed, "retry keeps one Home basis");
+            } else {
+                self.fork_registered = Some(observed);
+            }
+            if let Some((path, instance_ref, version_id)) = self.mutate_source_version.take() {
+                rusqlite::Connection::open(path)
+                    .expect("source database")
+                    .execute(
+                        "UPDATE instances SET version_id = ?2 WHERE instance_id = ?1",
+                        rusqlite::params![instance_ref, version_id],
+                    )
+                    .expect("source version changes after Home registration");
+            }
+            Ok("fork_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned())
+        }
+
+        fn complete_fork_for_use(
+            &mut self,
+            evidence: &ForkInstanceOperationEvidence<'_>,
+        ) -> Result<(), HostFacadeError> {
+            assert!(self.fork_registered.is_some());
+            assert!(self.completed_imports.contains(HOME_REATTEST_OPERATION));
+            assert_eq!(evidence.source_home_operation_id, HOME_OPEN_OPERATION);
+            assert_eq!(
+                evidence.operation_id,
+                "fork_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            assert!(evidence.seed_sequence < evidence.fork_sequence);
+            assert!(!evidence.target_version_id.is_empty());
+            if self.fail_at == Some("complete") {
+                return Err(HostFacadeError::Incomplete(
+                    "Home fork complete refused".into(),
+                ));
+            }
+            let observed = (
+                evidence.target_instance_ref.to_owned(),
+                evidence.target_version_id.to_owned(),
+                evidence.seed_event_id.to_owned(),
+                evidence.fork_event_id.to_owned(),
+            );
+            if let Some(existing) = &self.fork_completed {
+                assert_eq!(existing, &observed, "retry completes same evidence");
+            } else {
+                self.fork_completed = Some(observed);
+            }
+            Ok(())
+        }
+
+        fn allow_retained_fork_use(
+            &mut self,
+            evidence: &ForkInstanceOperationEvidence<'_>,
+        ) -> Result<(), HostFacadeError> {
+            if self.fork_completed.as_ref().map(|item| item.0.as_str())
+                != Some(evidence.target_instance_ref)
+            {
+                return Err(HostFacadeError::Incomplete(
+                    "Home fork pointer is not complete".into(),
+                ));
+            }
+            self.retained_forks += 1;
+            Ok(())
+        }
+    }
+
     impl PackageResolver for Packages {
         fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
             let system_prompt = if version_ref == "package:v2" {
@@ -6165,12 +6691,14 @@ workflow UnsafeHostChat {
     }
 
     fn temp_store() -> std::path::PathBuf {
+        static NEXT_STORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let sequence = NEXT_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "whip-host-runtime-{}-{nonce}.sqlite",
+            "whip-host-runtime-{}-{nonce}-{sequence}.sqlite",
             std::process::id()
         ))
     }
@@ -6636,6 +7164,531 @@ workflow UnsafeHostChat {
             .to_string();
         assert!(serialized.contains("source answer"));
         assert!(serialized.contains("turn 2"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    #[test]
+    fn home_fork_registers_before_target_writes_and_recovers_exact_completion() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut journal = TestForkJournal::default();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let source_instance = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source Home admission");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("retained source Home use binds its exact instance");
+        let source_position = source
+            .current_position(&source_instance.instance_ref)
+            .expect("source position");
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-transfer".to_owned(),
+            source: source_position,
+            target_request_id: "home-fork-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        let original_source_input = source
+            .kernel
+            .store()
+            .get_instance(&source_instance.instance_ref)
+            .expect("source row")
+            .expect("source instance")
+            .input_json;
+        let mut changed_source: InstanceMetadata =
+            serde_json::from_str(&original_source_input).expect("source metadata");
+        changed_source.protocol = "different-host-protocol".to_owned();
+        let source_connection = rusqlite::Connection::open(&source_path).expect("source database");
+        source_connection
+            .execute(
+                "UPDATE instances SET input_json = ?2 WHERE instance_id = ?1",
+                rusqlite::params![
+                    source_instance.instance_ref,
+                    serde_json::to_string(&changed_source).expect("changed source metadata")
+                ],
+            )
+            .expect("change stored source binding");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("a changed source binding cannot be admitted")
+            .to_string()
+            .contains("fork source package/policy binding"));
+        source_connection
+            .execute(
+                "UPDATE instances SET input_json = ?2 WHERE instance_id = ?1",
+                rusqlite::params![source_instance.instance_ref, original_source_input],
+            )
+            .expect("restore stored source binding");
+
+        let mut future = command.clone();
+        future.source.sequence += 1;
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &future, &Packages, &mut journal)
+            .expect_err("source cannot fork from a future event")
+            .to_string()
+            .contains("fork source position"));
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
+
+        journal.fail_at = Some("source");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("unpinned source is not forkable")
+            .to_string()
+            .contains("Home source pin refused"));
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
+        journal.fail_at = Some("source_empty");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("source pin needs an operation identity")
+            .to_string()
+            .contains("Home fork source pin has no operation identity"));
+        journal.fail_at = Some("register");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("pending fork must register first")
+            .to_string()
+            .contains("Home fork register refused"));
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
+        journal.fail_at = Some("register_empty");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("pending fork needs an operation identity")
+            .to_string()
+            .contains("Home fork registration has no operation identity"));
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
+
+        journal.fail_at = Some("complete");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("incomplete Home pointer cannot expose target")
+            .to_string()
+            .contains("Home fork complete refused"));
+        let pending_target = target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("persisted target");
+        assert_eq!(pending_target.len(), 1);
+        assert!(journal.fork_completed.is_none());
+        assert_eq!(journal.retained_forks, 0);
+
+        journal.fail_at = None;
+        let recovered = target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect("same operation recovers after crash");
+        assert_eq!(recovered.target.instance_ref, pending_target[0].instance_id);
+        assert!(journal.fork_completed.is_some());
+        assert_eq!(journal.retained_forks, 1);
+        assert_eq!(
+            target
+                .kernel
+                .store()
+                .list_events(&recovered.target.instance_ref)
+                .expect("target events")
+                .iter()
+                .filter(|event| event.event_type == "agent.thread.seeded")
+                .count(),
+            1
+        );
+        assert_eq!(
+            target
+                .kernel
+                .store()
+                .list_events(&recovered.target.instance_ref)
+                .expect("target events")
+                .iter()
+                .filter(|event| event.event_type == "host.instance.forked")
+                .count(),
+            1
+        );
+        let replayed = target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect("completed Home fork replays exactly");
+        assert_eq!(replayed, recovered);
+        assert_eq!(journal.retained_forks, 2);
+        rusqlite::Connection::open(&target_path)
+            .expect("target database")
+            .execute(
+                "DELETE FROM events WHERE instance_id = ?1 AND event_type = 'agent.thread.seeded'",
+                [&recovered.target.instance_ref],
+            )
+            .expect("simulate missing retained seed");
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("a fork marker cannot replace the missing seed")
+            .to_string()
+            .contains("recorded Home fork has no exact thread seed"));
+        journal.remove_target_on_retained_use = Some(target_path.clone());
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("target removed during Home admission cannot be seeded")
+            .to_string()
+            .contains("Home fork target disappeared after open"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    #[test]
+    fn home_adoption_keeps_the_source_pin_when_old_authored_content_drifted() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut journal = TestForkJournal::default();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let opened = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source admitted");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source retained use bound");
+        let position = source
+            .current_position(&opened.instance_ref)
+            .expect("source position");
+        drop(source);
+        rusqlite::Connection::open(&source_path)
+            .expect("source store")
+            .execute(
+                "UPDATE program_versions SET source_hash = 'authored-by-an-older-build'",
+                [],
+            )
+            .expect("age authored source identity");
+        let source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("reopened source");
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-adoption".to_owned(),
+            source: position,
+            target_request_id: "home-fork-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .is_err());
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
+        let adopted = target
+            .adopt_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect("Home-pinned adoption");
+        assert_eq!(adopted.target.package_version_ref, "package:v2");
+        assert!(journal.fork_completed.is_some());
+        let marker = target
+            .kernel
+            .store()
+            .list_events(&adopted.target.instance_ref)
+            .expect("target events")
+            .into_iter()
+            .find(|event| event.event_type == "host.instance.forked")
+            .expect("adoption marker");
+        assert_eq!(
+            serde_json::from_str::<Value>(&marker.payload_json).expect("payload")["kind"],
+            "adopt"
+        );
+        let source_connection = rusqlite::Connection::open(&source_path).expect("source database");
+        source_connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("allow a broken historical fixture");
+        source_connection
+            .execute(
+                "UPDATE instances SET version_id = 'missing-home-source-version' WHERE instance_id = ?1",
+                [&opened.instance_ref],
+            )
+            .expect("remove source version binding");
+        assert!(target
+            .adopt_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("adoption needs the source version")
+            .to_string()
+            .contains("Home adoption source version is missing"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    #[test]
+    fn home_fork_refuses_a_source_version_move_after_pending_registration() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut journal = TestForkJournal::default();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let opened = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source admitted");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source retained use bound");
+        let source_position = source
+            .current_position(&opened.instance_ref)
+            .expect("source position");
+        let alternate = source
+            .open_instance(
+                &OpenInstanceCommand {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    request_id: "source-alternate-version".to_owned(),
+                    package_version_ref: "package:v2".to_owned(),
+                    policy: source.policy_ref().clone(),
+                },
+                &Packages,
+            )
+            .expect("alternate version exists");
+        let alternate_version = source
+            .kernel
+            .store()
+            .get_instance(&alternate.instance_ref)
+            .expect("alternate instance read")
+            .expect("alternate instance")
+            .version_id;
+        let original_version = source
+            .kernel
+            .store()
+            .get_instance(&opened.instance_ref)
+            .expect("original instance read")
+            .expect("original instance")
+            .version_id;
+        journal.mutate_source_version = Some((
+            source_path.clone(),
+            opened.instance_ref.clone(),
+            alternate_version,
+        ));
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-moving-source".to_owned(),
+            source: source_position,
+            target_request_id: "home-fork-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        let failure = target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("source move after registration cannot seed target");
+        assert!(
+            failure
+                .to_string()
+                .contains("Home fork source changed before target seed"),
+            "got: {failure:?}"
+        );
+        assert!(journal.fork_registered.is_some());
+        assert!(journal.fork_completed.is_none());
+        let pending = target.kernel.store().list_instances().expect("target rows");
+        assert_eq!(pending.len(), 1);
+        assert!(target
+            .kernel
+            .store()
+            .list_events(&pending[0].instance_id)
+            .expect("target events")
+            .iter()
+            .all(|event| event.event_type != "agent.thread.seeded"));
+        rusqlite::Connection::open(&source_path)
+            .expect("source database")
+            .execute(
+                "UPDATE instances SET version_id = ?2 WHERE instance_id = ?1",
+                rusqlite::params![opened.instance_ref, original_version],
+            )
+            .expect("restore original source version");
+        journal.remove_source_on_target_retained_use =
+            Some((source_path.clone(), opened.instance_ref.clone()));
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("source removed during target admission cannot seed")
+            .to_string()
+            .contains("Home fork source disappeared after target open"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    #[test]
+    fn home_fork_refuses_reusing_the_source_instance_as_its_target() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut journal = TestForkJournal::default();
+        let mut source = GovernedHostRuntime::open(&path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let opened = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source admitted");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source pin bound");
+        let position = source
+            .current_position(&opened.instance_ref)
+            .expect("source position");
+        let mut target =
+            GovernedHostRuntime::open(&path, 9, &policy_text).expect("same store target handle");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-same-instance".to_owned(),
+            source: position,
+            target_request_id: source_open.request_id,
+            package_version_ref: source_open.package_version_ref,
+            policy: target.policy_ref().clone(),
+        };
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("fork must create a distinct instance")
+            .to_string()
+            .contains("fork target identity"));
+        assert!(journal.fork_registered.is_some());
+        assert!(journal.fork_completed.is_none());
+
+        drop(target);
+        drop(source);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn home_fork_refuses_a_running_source_before_target_registration() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut journal = TestForkJournal::default();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let opened = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source admitted");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source pin bound");
+        source
+            .run_turn_with_driver(
+                &turn(&opened.instance_ref, &source_open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &ScriptedDriver::new(vec![json!({
+                    "output_text": "source answer",
+                    "usage": { "input_tokens": 10, "output_tokens": 3 }
+                })]),
+            )
+            .expect("source has a turn effect");
+        let changed = rusqlite::Connection::open(&source_path)
+            .expect("source database")
+            .execute(
+                "UPDATE effects SET status = 'running' WHERE instance_id = ?1",
+                [&opened.instance_ref],
+            )
+            .expect("simulate in-flight source effect");
+        assert!(changed > 0);
+        let position = source
+            .current_position(&opened.instance_ref)
+            .expect("source position");
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-fork-running-source".to_owned(),
+            source: position,
+            target_request_id: "home-fork-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        assert!(target
+            .fork_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect_err("running source cannot be forked")
+            .to_string()
+            .contains("is not quiescent"));
+        assert!(journal.fork_registered.is_none());
+        assert!(target
+            .kernel
+            .store()
+            .list_instances()
+            .expect("targets")
+            .is_empty());
 
         drop(target);
         drop(source);

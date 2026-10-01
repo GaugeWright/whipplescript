@@ -1276,7 +1276,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        self.create_program_version_with_imports_basis(input, program, basis, None)
+        self.create_program_version_with_imports_basis(input, program, basis, None, None)
     }
 
     /// Admit a plain host version with both import and exact construct edges.
@@ -1288,7 +1288,34 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         basis: &import_coverage::CheckedImportBasis<'_>,
         construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
-        self.create_program_version_with_imports_basis(input, program, basis, Some(construct_basis))
+        self.create_program_version_with_imports_basis(
+            input,
+            program,
+            basis,
+            Some(construct_basis),
+            None,
+        )
+    }
+
+    /// The plain native host version under a Home-chosen operation identity.
+    /// Its executable metadata matches the ordinary CLI open path while its
+    /// checked import and construct witness can recover at the exact ID.
+    pub fn create_program_version_with_imports_and_constructs_at_id(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+        construct_basis: &construct_coverage::CheckedConstructBasis<'_>,
+        operation_id: &str,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        self.create_program_version_with_imports_basis(
+            input,
+            program,
+            basis,
+            Some(construct_basis),
+            Some(operation_id),
+        )
     }
 
     fn create_program_version_with_imports_basis(
@@ -1297,25 +1324,33 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         program: &IrProgram,
         basis: &import_coverage::CheckedImportBasis<'_>,
         construct_basis: Option<&construct_coverage::CheckedConstructBasis<'_>>,
+        operation_id: Option<&str>,
     ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
         let witness = Self::capture_checked_program_witness(program, basis, construct_basis)?;
-        self.store.create_program_version_with_import_witness(
-            NewProgramVersion {
-                program_name: input.program_name,
-                source_hash: input.source_hash,
-                ir_hash: input.ir_hash,
-                ir_snapshot: None,
-                compiler_version: input.compiler_version,
-                declared_capabilities_json: "[]",
-                declared_profiles_json: "[]",
-                declared_skills_json: "[]",
-                declared_schemas_json: "[]",
-                analysis_summary_json: "{}",
-                generated_artifacts_json: "[]",
-                artifact_root: None,
-            },
-            &witness,
-        )
+        let version = NewProgramVersion {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: input.ir_hash,
+            ir_snapshot: None,
+            compiler_version: input.compiler_version,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        if let Some(operation_id) = operation_id {
+            self.store.create_program_version_with_import_witness_at_id(
+                version,
+                &witness,
+                operation_id,
+            )
+        } else {
+            self.store
+                .create_program_version_with_import_witness(version, &witness)
+        }
     }
 
     pub fn create_program_version_for_program(
