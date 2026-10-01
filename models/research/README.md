@@ -441,6 +441,23 @@ let a second operation finish before admission. This is a lock schedule model,
 not a measurement of the actual store APIs; FB-3 must enforce the same order
 at every production path that needs both authorities.
 
+`flowing_home_lock_order.py` updates the final schedule for the accepted Home
+journal and epoch seal, ahead of the norm ledger and ref authority:
+
+```sh
+python3 models/research/flowing_home_lock_order.py
+```
+
+It reaches 5,922 safe states through ten transitions. Positive traces let a
+later unrelated Home entry proceed, let a competing writer finish under the
+same Home → norm → ref order, and release exclusion after independent Home,
+norm or ref outages. Eight weakenings expose reversed lock acquisition,
+stale affected-premise recapture, early Home or norm release, Hold bypass,
+fail-open Home outage, stranded exclusion and a trunk CAS without its selected
+unit receipt. The selected prefix and Home seal are abstract inputs; this
+schedule does not establish actual lock ownership, full source-content
+derivation, path coverage or cross-store crash recovery in a host.
+
 `home_cut_authorities.py` extends that question to the native runtime admission
 roster, which is in a different SQLite file from the norm ledger and ref:
 
