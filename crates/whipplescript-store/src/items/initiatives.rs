@@ -3,6 +3,40 @@
 
 use crate::{StoreError, StoreResult};
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+use super::{readiness::Unready, WorkItem};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitiativeMember {
+    pub item: WorkItem,
+    pub unready_reasons: Vec<Unready>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitiativeInspection {
+    pub initiative: WorkItem,
+    pub members: Vec<InitiativeMember>,
+    pub state_counts: BTreeMap<String, usize>,
+    pub at: String,
+}
+
+pub fn inspection(
+    initiative: WorkItem,
+    members: Vec<InitiativeMember>,
+    at: String,
+) -> InitiativeInspection {
+    let mut state_counts = BTreeMap::new();
+    for member in &members {
+        *state_counts.entry(member.item.status.clone()).or_default() += 1;
+    }
+    InitiativeInspection {
+        initiative,
+        members,
+        state_counts,
+        at,
+    }
+}
 
 /// Absent kind is the legacy task kind. A reserved kind cannot silently fall
 /// back to task and acquire execution semantics.
@@ -50,7 +84,174 @@ pub fn validate_closure(kind: &str, unfinished: usize, summary: Option<&str>) ->
 }
 
 #[cfg(feature = "native")]
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
+
+#[cfg(feature = "native")]
+use crate::tracker_membership::{
+    MembershipChange, MembershipOutcome, TrackerMembership, TrackerMembershipReceipt,
+    TrackerMemberships,
+};
+
+#[cfg(feature = "native")]
+fn native_membership_receipt(
+    conn: &Connection,
+    operation_id: &str,
+) -> StoreResult<Option<TrackerMembershipReceipt>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT receipt_json FROM tracker_control_receipts WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|value| serde_json::from_str(&value).map_err(Into::into))
+        .transpose()
+}
+
+#[cfg(feature = "native")]
+impl TrackerMemberships for super::WorkItemStore {
+    fn membership_receipt(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<TrackerMembershipReceipt>> {
+        native_membership_receipt(&self.connection, operation_id)
+    }
+
+    fn change_membership_once(
+        &mut self,
+        request: &TrackerMembership,
+    ) -> StoreResult<TrackerMembershipReceipt> {
+        match self.protection.clone() {
+            Some(protection) => protection.retain(|| self.change_membership_once_retained(request)),
+            None => self.change_membership_once_retained(request),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl super::WorkItemStore {
+    fn change_membership_once_retained(
+        &mut self,
+        request: &TrackerMembership,
+    ) -> StoreResult<TrackerMembershipReceipt> {
+        let fingerprint = request.fingerprint()?;
+        let tx = self.discovery_transaction()?;
+        if let Some(existing) = native_membership_receipt(&tx, &request.operation_id)? {
+            existing.validate_for(request)?;
+            return Ok(existing);
+        }
+        for (id, queue, subject, expected_kind) in [
+            (
+                request.task_id.as_str(),
+                request.task_queue.as_str(),
+                request.task_subject_id.as_str(),
+                "task",
+            ),
+            (
+                request.initiative_id.as_str(),
+                request.initiative_queue.as_str(),
+                request.initiative_subject_id.as_str(),
+                "initiative",
+            ),
+        ] {
+            let actual_queue: Option<String> = tx
+                .query_row(
+                    "SELECT queue FROM tracker_issues WHERE issue_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual_queue.as_deref() != Some(queue)
+                || super::content_id_of(&tx, id)?.as_deref() != Some(subject)
+                || native_kind(&tx, id)? != Some(expected_kind)
+            {
+                return Err(StoreError::Conflict(
+                    "initiative membership endpoints differ from their binding".into(),
+                ));
+            }
+        }
+        let present = tx
+            .query_row(
+                "SELECT 1 FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = 'belongs-to'",
+                params![request.task_id, request.initiative_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let now = super::tx_now(&tx)?;
+        let (outcome, event_ids) = match request.change {
+            MembershipChange::Add if present => (MembershipOutcome::AlreadyMember, Vec::new()),
+            MembershipChange::Add => {
+                let payload = serde_json::json!({
+                    "from": request.task_subject_id,
+                    "to": request.initiative_subject_id,
+                    "kind": "belongs-to",
+                    "dep_kind": null,
+                });
+                let event = super::tx_append_raw(
+                    &tx,
+                    Some(&request.initiative_subject_id),
+                    None,
+                    "relation.added",
+                    &payload.to_string(),
+                    Some(&request.actor),
+                    Some(&request.effect_id),
+                    &now,
+                )?;
+                tx.execute(
+                    "INSERT INTO tracker_relations (from_issue, to_issue, kind, dep_kind) VALUES (?1, ?2, 'belongs-to', NULL)",
+                    params![request.task_id, request.initiative_id],
+                )?;
+                (MembershipOutcome::Added, vec![event])
+            }
+            MembershipChange::Remove => {
+                // The tombstone is necessary even when this clone currently
+                // sees no edge: an imported concurrent add must still fold it.
+                let payload = serde_json::json!({
+                    "from": request.task_subject_id,
+                    "to": request.initiative_subject_id,
+                    "kind": "belongs-to",
+                });
+                let event = super::tx_append_raw(
+                    &tx,
+                    Some(&request.initiative_subject_id),
+                    None,
+                    "relation.removed",
+                    &payload.to_string(),
+                    Some(&request.actor),
+                    Some(&request.effect_id),
+                    &now,
+                )?;
+                tx.execute(
+                    "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = 'belongs-to'",
+                    params![request.task_id, request.initiative_id],
+                )?;
+                (
+                    MembershipOutcome::Removed {
+                        was_member: present,
+                    },
+                    vec![event],
+                )
+            }
+        };
+        let receipt = TrackerMembershipReceipt {
+            operation_id: request.operation_id.clone(),
+            fingerprint,
+            task_id: request.task_id.clone(),
+            initiative_id: request.initiative_id.clone(),
+            outcome,
+            event_ids,
+            recorded_at: now,
+        };
+        receipt.validate_for(request)?;
+        tx.execute(
+            "INSERT INTO tracker_control_receipts (operation_id, receipt_json) VALUES (?1, ?2)",
+            params![request.operation_id, serde_json::to_string(&receipt)?],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+}
 
 #[cfg(feature = "native")]
 pub(super) fn native_kind(conn: &Connection, id: &str) -> StoreResult<Option<&'static str>> {
@@ -106,6 +307,34 @@ impl super::WorkItemStore {
             .collect::<std::collections::BTreeSet<_>>();
         self.list_items(None, None)
             .map(|items| items.into_iter().filter(|i| ids.contains(&i.id)).collect())
+    }
+
+    /// A read transaction pins the group, relation set, member overlays and
+    /// readiness explanations to the same SQLite snapshot.
+    pub fn inspect_initiative_at(&self, id: &str, at: &str) -> StoreResult<InitiativeInspection> {
+        let at = super::readiness::canonical_instant(at).ok_or_else(|| {
+            StoreError::Conflict("initiative inspection needs a UTC instant".into())
+        })?;
+        let tx = self.connection.unchecked_transaction()?;
+        let initiative = self
+            .get_item(id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown initiative {id}")))?;
+        if issue_kind(&initiative.metadata)? != "initiative" {
+            return Err(StoreError::Conflict(format!("{id} is not an initiative")));
+        }
+        let members = self
+            .initiative_members(id)?
+            .into_iter()
+            .map(|item| {
+                let unready_reasons = self.unready_reasons_at(&item.id, &at)?;
+                Ok(InitiativeMember {
+                    item,
+                    unready_reasons,
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(inspection(initiative, members, at))
     }
 }
 

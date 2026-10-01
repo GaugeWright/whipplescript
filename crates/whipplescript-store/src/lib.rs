@@ -73,6 +73,7 @@ pub use runtime_protection::RuntimeEventMetadata;
 pub mod tracker_closure;
 pub mod tracker_control;
 pub mod tracker_filing;
+pub mod tracker_membership;
 pub mod tracker_result;
 /// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
 /// grammar validates statically in the parser and dynamically at the

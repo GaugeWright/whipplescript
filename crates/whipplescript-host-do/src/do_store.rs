@@ -41,6 +41,7 @@ mod tracker_closure;
 mod tracker_control;
 mod tracker_control_ops;
 mod tracker_filing;
+mod tracker_membership;
 mod tracker_result;
 pub(crate) mod transaction;
 
@@ -9530,6 +9531,50 @@ fn do_file_item_on(
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn inspect_initiative_at(
+        &self,
+        id: &str,
+        at: &str,
+    ) -> StoreResult<whipplescript_store::items::initiatives::InitiativeInspection> {
+        use whipplescript_store::items::initiatives::{inspection, InitiativeMember};
+        let at = whipplescript_store::items::readiness::canonical_instant(at).ok_or_else(|| {
+            StoreError::Conflict("initiative inspection needs a UTC instant".into())
+        })?;
+        recovery::atomic_result(&self.sql, false, &mut || {
+            let initiative = self
+                .get_item(id)?
+                .ok_or_else(|| StoreError::Conflict(format!("unknown initiative {id}")))?;
+            if whipplescript_store::items::initiatives::issue_kind(&initiative.metadata)?
+                != "initiative"
+            {
+                return Err(StoreError::Conflict(format!("{id} is not an initiative")));
+            }
+            let rows = self.sql.query(
+                "SELECT from_issue FROM tracker_relations WHERE to_issue = ?1 AND kind = 'belongs-to' ORDER BY from_issue",
+                &[text(id)],
+            ).map_err(sql_err)?;
+            let source = readiness::DoReadiness(&self.sql);
+            let members = rows
+                .iter()
+                .map(|row| {
+                    let member_id = as_text(&row[0]);
+                    let item = self.get_item(&member_id)?.ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "initiative member {member_id} is unavailable"
+                        ))
+                    })?;
+                    let unready_reasons = whipplescript_store::items::readiness::unready_reasons(
+                        &source, &member_id, &at,
+                    )?;
+                    Ok(InitiativeMember {
+                        item,
+                        unready_reasons,
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?;
+            Ok(inspection(initiative, members, at.clone()))
+        })
+    }
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         do_content_id(&self.sql, id)
     }

@@ -3803,6 +3803,14 @@ pub trait WorkItems {
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>>;
 
+    /// The initiative and all current members with readiness explanations at
+    /// one injected instant and one backend read snapshot.
+    fn inspect_initiative_at(
+        &self,
+        id: &str,
+        at: &str,
+    ) -> StoreResult<initiatives::InitiativeInspection>;
+
     /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
     /// Advisory: it records who *should* act and never restricts who may claim.
     /// Default: no-op, for a store with no assignment plane.
@@ -3928,6 +3936,13 @@ pub trait WorkItems {
 
 #[cfg(feature = "native")]
 impl WorkItems for WorkItemStore {
+    fn inspect_initiative_at(
+        &self,
+        id: &str,
+        at: &str,
+    ) -> StoreResult<initiatives::InitiativeInspection> {
+        WorkItemStore::inspect_initiative_at(self, id, at)
+    }
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         WorkItemStore::subject_content_id(self, id)
     }

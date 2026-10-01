@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::coordination::*;
 use crate::items::*;
+use crate::tracker_membership::{TrackerMembership, TrackerMembershipReceipt, TrackerMemberships};
 use crate::*;
 
 /// The three native stores, presented as one handle implementing all three store
@@ -31,6 +32,22 @@ pub struct NativeStores {
     /// Wiring a live frontier (with the kernel canonicalizer installed) is
     /// the call sites' job as they move behind the bound (F4).
     pub frontier: Option<crate::vcs::NativeWorkspaceVcs>,
+}
+
+impl TrackerMemberships for NativeStores {
+    fn change_membership_once(
+        &mut self,
+        request: &TrackerMembership,
+    ) -> StoreResult<TrackerMembershipReceipt> {
+        self.items.change_membership_once(request)
+    }
+
+    fn membership_receipt(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<TrackerMembershipReceipt>> {
+        self.items.membership_receipt(operation_id)
+    }
 }
 
 impl NativeStores {
@@ -1072,6 +1089,13 @@ impl Coordination for NativeStores {
 }
 
 impl WorkItems for NativeStores {
+    fn inspect_initiative_at(
+        &self,
+        id: &str,
+        at: &str,
+    ) -> StoreResult<items::initiatives::InitiativeInspection> {
+        self.items.inspect_initiative_at(id, at)
+    }
     fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
         self.items.set_event_effect_id(effect_id);
     }
