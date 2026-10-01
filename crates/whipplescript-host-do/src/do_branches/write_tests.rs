@@ -3,6 +3,29 @@ use crate::do_store::{test_support::RusqliteDoSql, tests::FaultySql};
 use whipplescript_store::branches::write_commit::conformance;
 
 #[test]
+fn hosted_branch_without_final_guard_boundary_refuses_guarded_publication() {
+    let mut branches = DoBranches::new(RusqliteDoSql::with_runtime_schema()).unwrap();
+    let before = branches.ensure_mainline("t0").unwrap();
+    let mut called = false;
+    assert!(branches
+        .commit_write_guarded(conformance::cut("guarded", None), &mut || {
+            called = true;
+            Ok(())
+        })
+        .is_err());
+    assert!(
+        !called,
+        "a preflight check must not masquerade as a final transaction guard"
+    );
+    assert_eq!(
+        branches.get_branch(MAINLINE_BRANCH_ID).unwrap(),
+        Some(before)
+    );
+    assert!(branches.get_cut("guarded").unwrap().is_none());
+    assert!(branches.get_op("op-guarded").unwrap().is_none());
+}
+
+#[test]
 fn hosted_authority_obeys_retained_publication() {
     whipplescript_store::content::publication::conformance::check(|| {
         DoContentBlobs::new(RusqliteDoSql::with_runtime_schema()).expect("content authority")
@@ -120,6 +143,11 @@ fn a_sql_host_cannot_invoke_retained_publication_twice() {
         broken.get(&id).expect("durable preparation").as_deref(),
         Some(&b"prepared"[..])
     );
+}
+
+#[test]
+fn hosted_import_commit_conformance() {
+    conformance::check_import(&mut DoBranches::new(RusqliteDoSql::with_runtime_schema()).unwrap());
 }
 
 #[test]

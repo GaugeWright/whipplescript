@@ -19,6 +19,11 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Embeddings can fence a native imported diff with their original current
+  authority. A final refusal rolls back the branch head, cut and operation
+  receipt; exact recovery also requires current authority under retention.
+  Backends without a final transaction check refuse guarded publication.
+
 - The owned harness knows the limits of the newest models. Claude Fable 5 and
   5.1 compact against their 1M window and default to a 128K output ceiling,
   not 200k and 64K. GPT-6, GPT-5.6, GPT-5.4 and GPT-5.5 compact at their

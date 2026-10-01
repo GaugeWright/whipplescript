@@ -23308,6 +23308,10 @@ assert missing.value
 /// wins, since a later `.env` for the same name replaces this one.
 fn whip(bin: &str, store: &TempStorePath) -> Command {
     let mut command = Command::new(bin);
+    // Filesystem projections belong to the same isolated fixture as its
+    // stores. Otherwise issue discovery enrolls this shared source checkout
+    // against whichever test's item store reaches it first.
+    command.current_dir(&store.dir);
     for (name, path) in store.side_store_env() {
         command.env(name, path);
     }

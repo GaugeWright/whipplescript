@@ -484,6 +484,19 @@ pub trait Branches: flowing_fence::FlowingFence {
         cut: CutRecord<'_>,
         evidence: Option<&write_evidence::WriteEvidenceRef>,
     ) -> StoreResult<AdvanceOutcome>;
+    /// Commit a fresh head/cut/receipt while the embedding application's original
+    /// authority remains current. The bounded check runs inside the backend
+    /// transaction immediately before commit; it must not reopen this branch
+    /// authority, acquire locks, await, or perform external effects.
+    /// A backend without that transaction boundary refuses rather than running
+    /// a check outside it and treating the result as a later grant.
+    fn commit_write_guarded(
+        &mut self,
+        _cut: CutRecord<'_>,
+        _check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<AdvanceOutcome> {
+        write_commit::guard_unavailable()
+    }
     fn write_evidence(&self, cut_id: &str)
         -> StoreResult<Option<write_evidence::WriteEvidenceRef>>;
 
@@ -1230,7 +1243,14 @@ impl Branches for BranchStore {
         cut: CutRecord<'_>,
         evidence: Option<&write_evidence::WriteEvidenceRef>,
     ) -> StoreResult<AdvanceOutcome> {
-        write_commit::native(self, cut, evidence)
+        write_commit::native(self, cut, evidence, &mut || Ok(()))
+    }
+    fn commit_write_guarded(
+        &mut self,
+        cut: CutRecord<'_>,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<AdvanceOutcome> {
+        write_commit::native(self, cut, None, check)
     }
     fn write_evidence(
         &self,

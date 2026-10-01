@@ -383,6 +383,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                     write_commit::INSERT_OP,
                     &[
                         text(&format!("op-{}", cut.cut_id)),
+                        text(write_commit::operation_kind(cut)),
                         text(&deltas),
                         opt_text(cut.origin),
                         text(cut.recorded_at),

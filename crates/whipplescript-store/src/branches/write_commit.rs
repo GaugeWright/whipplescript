@@ -9,9 +9,28 @@ pub const INSERT_CUT: &str = "INSERT INTO cuts \
     (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, origin, actor, intent, recorded_at) \
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 pub const INSERT_OP: &str = "INSERT INTO ops (op_id, kind, deltas, origin, recorded_at) \
-    VALUES (?1, 'write', ?2, ?3, ?4)";
+    VALUES (?1, ?2, ?3, ?4, ?5)";
 pub const ADVANCE_HEAD: &str = "UPDATE branches SET head_cut_id = ?2, \
     head_manifest_hash = ?3, updated_at = ?4 WHERE branch_id = ?1";
+
+/// Imported scratch diffs keep their existing operation provenance while
+/// sharing the same atomic cut/head/receipt transaction as file writes.
+pub fn operation_kind(cut: CutRecord<'_>) -> &'static str {
+    if cut.origin == Some("import") {
+        "import"
+    } else {
+        "write"
+    }
+}
+
+/// A branch backend without a final current-authority transaction check must
+/// refuse the guarded operation even when the embedding's preflight is live.
+#[allow(clippy::needless_return)] // Explicit terminal expression supplies the typed false-success trial.
+pub(super) fn guard_unavailable() -> StoreResult<AdvanceOutcome> {
+    use StoreError::Conflict;
+    // MUTATION-SUCCESS-EXPR: Ok(AdvanceOutcome::NotFound)
+    return Err(Conflict("guarded branch publication is unavailable".into()));
+}
 
 /// Shared native/hosted preflight, evaluated inside the backend transaction.
 pub enum WritePreparation {
@@ -70,6 +89,7 @@ pub(super) fn native(
     store: &mut super::BranchStore,
     cut: CutRecord<'_>,
     evidence: Option<&super::write_evidence::WriteEvidenceRef>,
+    check: &mut dyn FnMut() -> StoreResult<()>,
 ) -> StoreResult<AdvanceOutcome> {
     if let Some(evidence) = evidence {
         evidence.validate()?;
@@ -90,6 +110,7 @@ pub(super) fn native(
         WritePreparation::Ready { after, deltas } => (after, deltas),
         WritePreparation::Refused(outcome) => return Ok(outcome),
     };
+    check()?;
     // Strict INSERTs are deliberate: a first-wins no-op could bind the new
     // head to an earlier, different receipt under the same identity.
     tx.execute(
@@ -129,6 +150,7 @@ pub(super) fn native(
         INSERT_OP,
         params![
             format!("op-{}", cut.cut_id),
+            operation_kind(cut),
             deltas,
             cut.origin,
             cut.recorded_at
@@ -145,6 +167,7 @@ pub(super) fn native(
             ],
         )?;
     }
+    check()?;
     tx.commit()?;
     Ok(AdvanceOutcome::Advanced(after))
 }
@@ -167,6 +190,47 @@ pub mod conformance {
             intent: Some("action:fixture"),
             recorded_at: "t1",
         }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    pub fn check_import(store: &mut impl Branches) {
+        let before = store.ensure_mainline("t0").unwrap();
+        let mut imported = cut("imported", None);
+        imported.origin = Some("import");
+        let AdvanceOutcome::Advanced(after) = store.commit_write(imported).unwrap() else {
+            panic!("import must atomically publish");
+        };
+        assert_eq!(
+            store
+                .get_cut("imported")
+                .unwrap()
+                .unwrap()
+                .origin
+                .as_deref(),
+            Some("import")
+        );
+        let receipt = store.get_op("op-imported").unwrap().unwrap();
+        assert_eq!(receipt.kind, "import");
+        assert_eq!(
+            receipt.deltas,
+            vec![OpBranchDelta {
+                branch_id: MAINLINE_BRANCH_ID.into(),
+                before: Some(OpBranchState::of(&before)),
+                after: OpBranchState::of(&after),
+            }]
+        );
+        store
+            .record_op("op-collision", "other", &[], None, "t0")
+            .unwrap();
+        let mut colliding = cut("collision", Some("imported"));
+        colliding.origin = Some("import");
+        assert!(store.commit_write(colliding).is_err());
+        assert_eq!(
+            store.get_branch(MAINLINE_BRANCH_ID).unwrap().as_ref(),
+            Some(after.as_ref())
+        );
+        assert!(store.get_cut("collision").unwrap().is_none());
+        assert_eq!(store.get_op("op-collision").unwrap().unwrap().kind, "other");
     }
 
     #[allow(clippy::unwrap_used)]
@@ -268,6 +332,66 @@ pub mod conformance {
 mod tests {
     use super::*;
     use crate::branches::{BranchStore, Branches, MAINLINE_BRANCH_ID};
+
+    #[test]
+    fn absent_backend_guard_never_becomes_an_unchecked_publication() {
+        assert!(guard_unavailable().is_err());
+    }
+
+    #[test]
+    fn native_guarded_commit_refuses_expiry_before_commit_and_rolls_back_all_native_facts() {
+        let path = crate::scratch::path("guarded-branch-commit");
+        let mut store = BranchStore::open(&path).unwrap();
+        let before = store.ensure_mainline("t0").unwrap();
+        let observer = BranchStore::open(&path).unwrap();
+        observer
+            .connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let mut admitted = true;
+        let mut checks = 0;
+        let outcome = store.commit_write_guarded(conformance::cut("candidate", None), &mut || {
+            checks += 1;
+            // The actual native writer excludes a second connection through
+            // both authorization checks; no fresh native fact is visible yet.
+            assert!(observer
+                .connection
+                .execute(
+                    "UPDATE branches SET updated_at='competitor' WHERE branch_id='main'",
+                    []
+                )
+                .is_err());
+            assert!(observer.get_cut("candidate")?.is_none());
+            assert!(observer.get_op("op-candidate")?.is_none());
+            if !admitted {
+                return Err(StoreError::Conflict("original session expired".into()));
+            }
+            admitted = false;
+            Ok(())
+        });
+        assert!(outcome.is_err());
+        assert_eq!(
+            checks, 2,
+            "expiry must be observed at the final commit boundary"
+        );
+        assert_eq!(store.get_branch(MAINLINE_BRANCH_ID).unwrap(), Some(before));
+        assert!(store.get_cut("candidate").unwrap().is_none());
+        assert!(store.get_op("op-candidate").unwrap().is_none());
+        assert!(matches!(
+            store
+                .commit_write_guarded(conformance::cut("candidate", None), &mut || Ok(()))
+                .unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
+        drop(observer);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_import_commit_conformance() {
+        conformance::check_import(&mut BranchStore::open_in_memory().unwrap());
+    }
 
     #[test]
     fn native_write_commit_conformance() {

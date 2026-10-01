@@ -4634,73 +4634,140 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
     ) -> StoreResult<VcsWriteOutcome> {
+        self.import_diff_checked(branch_id, changed, removed, cut_id, at, None)
+    }
+
+    /// Import under the original embedding authority. Immutable preparation
+    /// grants no access: fresh native publication rechecks inside its final
+    /// branch transaction, and exact recovery rechecks under input retention.
+    pub fn import_diff_guarded(
+        &mut self,
+        branch_id: &str,
+        changed: &BTreeMap<String, String>,
+        removed: &[String],
+        cut_id: &str,
+        at: &str,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<VcsWriteOutcome> {
+        self.import_diff_checked(branch_id, changed, removed, cut_id, at, Some(check))
+    }
+
+    fn import_diff_checked(
+        &mut self,
+        branch_id: &str,
+        changed: &BTreeMap<String, String>,
+        removed: &[String],
+        cut_id: &str,
+        at: &str,
+        mut check: Option<&mut dyn FnMut() -> StoreResult<()>>,
+    ) -> StoreResult<VcsWriteOutcome> {
+        if let Some(check) = check.as_mut() {
+            check()?;
+        }
+        use StoreError::Conflict;
         self.require_legacy_source(branch_id, "import")?;
         let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsWriteOutcome::BranchMissing);
         };
-        if row.head_cut_id.as_deref() == Some(cut_id) {
-            // The idempotent retry: this effect's import already landed.
-            return Ok(VcsWriteOutcome::Written {
-                cut_id: cut_id.to_owned(),
-                manifest_hash: row.head_manifest_hash.unwrap_or_default(),
-            });
-        }
+        let replay = row.head_cut_id.as_deref() == Some(cut_id);
+        let original = if replay {
+            let Some(cut) = self.branches.get_cut(cut_id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: row.head_manifest_hash.clone().unwrap_or_default() })
+                return Err(Conflict("import head has no recorded cut".into()));
+            };
+            let Some(op) = self.branches.get_op(&format!("op-{cut_id}"))? else {
+                // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: row.head_manifest_hash.clone().unwrap_or_default() })
+                return Err(Conflict("import head has no operation receipt".into()));
+            };
+            if cut.branch_id != branch_id
+                || cut.origin.as_deref() != Some("import")
+                || row.head_manifest_hash.as_deref() != Some(cut.manifest_hash.as_str())
+                || op.kind != "import"
+                || op.origin.as_deref() != Some("import")
+                || op.deltas.len() != 1
+                || op.deltas[0].branch_id != branch_id
+                || op.deltas[0].after.head_cut_id.as_deref() != Some(cut_id)
+                || op.deltas[0].after.head_manifest_hash.as_deref()
+                    != Some(cut.manifest_hash.as_str())
+            {
+                return Err(StoreError::Conflict(
+                    "import recovery evidence differs".into(),
+                ));
+            }
+            Some(cut)
+        } else {
+            None
+        };
         if row.status != BranchStatus::Active {
             return Ok(VcsWriteOutcome::BranchNotActive);
         }
-        let mut manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
-        for (path, hash) in changed {
-            manifest.insert(path.clone(), hash.clone());
-        }
+        let base = if let Some(original) = &original {
+            match original.parent_cut_id.as_deref() {
+                Some(parent) => {
+                    let Some(parent) = self.branches.get_cut(parent)? else {
+                        // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: original.manifest_hash.clone() })
+                        return Err(Conflict("import recovery parent is unavailable".into()));
+                    };
+                    Some(parent.manifest_hash)
+                }
+                None => None,
+            }
+        } else {
+            row.head_manifest_hash.clone()
+        };
+        let mut changes: BTreeMap<String, Option<String>> = changed
+            .iter()
+            .map(|(path, hash)| (path.clone(), Some(hash.clone())))
+            .collect();
         for path in removed {
-            manifest.remove(path);
+            changes.insert(path.clone(), None);
         }
-        let manifest_hash = self.store_manifest(&manifest)?;
-        match self.branches.advance_head(
-            branch_id,
-            row.head_cut_id.as_deref(),
-            cut_id,
-            &manifest_hash,
-            at,
-        )? {
-            AdvanceOutcome::Advanced(advanced) => {
-                self.branches.record_cut(CutRecord {
-                    cut_id,
-                    change_id: cut_id,
-                    branch_id,
-                    manifest_hash: &manifest_hash,
-                    parent_cut_id: row.head_cut_id.as_deref(),
-                    origin: Some("import"),
-                    actor: self.actor.as_deref(),
-                    intent: self.intent.as_deref(),
-                    recorded_at: at,
-                })?;
-                self.log_op(
-                    &format!("op-{cut_id}"),
-                    "import",
-                    vec![Self::op_delta(Some(&row), &advanced)],
-                    Some("import"),
-                    at,
-                )?;
+        let prepared = crate::content::publication::PreparedBlobs::new(&self.content);
+        let manifest_hash = self.advance_manifest_using(&prepared, base.as_deref(), &changes)?;
+        let mut retained = prepared.ids();
+        retained.extend(changed.values().cloned());
+        if let Some(original) = original {
+            if original.manifest_hash != manifest_hash {
+                return Err(StoreError::Conflict(
+                    "import retry changes its original diff".into(),
+                ));
+            }
+            return self.content.publish_retained(&retained, || {
+                if let Some(check) = check.as_mut() {
+                    check()?;
+                }
                 Ok(VcsWriteOutcome::Written {
                     cut_id: cut_id.to_owned(),
                     manifest_hash,
                 })
+            });
+        }
+        let branches = &mut self.branches;
+        let outcome = self.content.publish_retained(&retained, || {
+            let cut = CutRecord {
+                cut_id,
+                change_id: cut_id,
+                branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: row.head_cut_id.as_deref(),
+                origin: Some("import"),
+                actor: self.actor.as_deref(),
+                intent: self.intent.as_deref(),
+                recorded_at: at,
+            };
+            match check {
+                Some(check) => branches.commit_write_guarded(cut, check),
+                None => branches.commit_write(cut),
             }
-            AdvanceOutcome::Stale {
-                current_head_cut_id,
-            } => {
-                if current_head_cut_id.as_deref() == Some(cut_id) {
-                    // Raced with our own retry: the import landed.
-                    return Ok(VcsWriteOutcome::Written {
-                        cut_id: cut_id.to_owned(),
-                        manifest_hash,
-                    });
-                }
-                Err(StoreError::Conflict(
-                    "branch head moved during the import; retry".to_owned(),
-                ))
-            }
+        })?;
+        let stale = "branch head moved during the import; retry";
+        match outcome {
+            AdvanceOutcome::Advanced(_) => Ok(VcsWriteOutcome::Written {
+                cut_id: cut_id.to_owned(),
+                manifest_hash,
+            }),
+            // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash })
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(stale.into())),
             AdvanceOutcome::NotActive { .. } => Ok(VcsWriteOutcome::BranchNotActive),
             AdvanceOutcome::NotFound => Ok(VcsWriteOutcome::BranchMissing),
         }
@@ -7198,6 +7265,78 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn import_diff_guarded_refuses_expired_authority_on_fresh_publication_and_exact_recovery() {
+        let mut vcs = vcs();
+        vcs.init("t0").unwrap();
+        let before = vcs.branches.get_branch(MAINLINE_BRANCH_ID).unwrap();
+        let hash = vcs.content.put_text("office payload").unwrap();
+        let changed = BTreeMap::from([("file.txt".into(), hash)]);
+        let mut remaining = 2;
+        assert!(vcs
+            .import_diff_guarded(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "guarded",
+                "t1",
+                &mut || {
+                    if remaining == 0 {
+                        return Err(StoreError::Conflict("original lease ended".into()));
+                    }
+                    remaining -= 1;
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert_eq!(remaining, 0);
+        assert_eq!(vcs.branches.get_branch(MAINLINE_BRANCH_ID).unwrap(), before);
+        assert!(vcs.get_cut("guarded").unwrap().is_none());
+        assert!(vcs.branches.get_op("op-guarded").unwrap().is_none());
+        assert!(matches!(
+            vcs.import_diff_guarded(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "guarded",
+                "t2",
+                &mut || Ok(())
+            )
+            .unwrap(),
+            VcsWriteOutcome::Written { .. }
+        ));
+        let original = vcs.get_cut("guarded").unwrap();
+        // Recovery is a current response under retention, not a grant derived
+        // from yesterday's cut/receipt. Expire between entry and that response.
+        let mut current = true;
+        assert!(vcs
+            .import_diff_guarded(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "guarded",
+                "t3",
+                &mut || {
+                    if !current {
+                        return Err(StoreError::Conflict("original lease ended".into()));
+                    }
+                    current = false;
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert_eq!(vcs.get_cut("guarded").unwrap(), original);
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("guarded")
+        );
+    }
+
     /// import_diff commits a whole scratch diff as ONE effect-keyed cut,
     /// and the crash-retry (same cut id) is a no-op success — never a
     /// double-apply, never a spurious conflict.
@@ -7266,6 +7405,272 @@ mod tests {
             vcs.read("draft_a", "b.md").expect("read").as_deref(),
             Some("B new")
         );
+    }
+
+    #[test]
+    fn import_diff_refuses_receipt_collision_missing_payload_and_changed_replay_without_head_moves()
+    {
+        let mut vcs = vcs();
+        vcs.init("t0").unwrap();
+        let hash = vcs.content.put_text("exact imported bytes").unwrap();
+        let changed = BTreeMap::from([("file.txt".into(), hash.clone())]);
+        let before = vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap();
+        vcs.branches
+            .record_op("op-collision", "other", &[], None, "t0")
+            .unwrap();
+        assert!(vcs
+            .import_diff(MAINLINE_BRANCH_ID, &changed, &[], "collision", "t1")
+            .is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(vcs.get_cut("collision").unwrap().is_none());
+        assert_eq!(vcs.get_op("op-collision").unwrap().unwrap().kind, "other");
+        let absent = BTreeMap::from([("file.txt".into(), "absent-body".into())]);
+        assert!(vcs
+            .import_diff(MAINLINE_BRANCH_ID, &absent, &[], "missing", "t1")
+            .is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(vcs.get_cut("missing").unwrap().is_none());
+        assert!(vcs.get_op("op-missing").unwrap().is_none());
+        vcs.import_diff(MAINLINE_BRANCH_ID, &changed, &[], "applied", "t1")
+            .unwrap();
+        let applied = vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap();
+        let original_op = vcs.get_op("op-applied").unwrap().unwrap();
+        assert_eq!(original_op.kind, "import");
+        let replacement = vcs.content.put_text("changed imported bytes").unwrap();
+        let different = BTreeMap::from([("file.txt".into(), replacement)]);
+        assert!(vcs
+            .import_diff(MAINLINE_BRANCH_ID, &different, &[], "applied", "t2")
+            .is_err());
+        assert!(vcs
+            .import_diff(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &["file.txt".into()],
+                "applied",
+                "t2"
+            )
+            .is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap(),
+            applied
+        );
+        assert_eq!(vcs.get_op("op-applied").unwrap().unwrap(), original_op);
+        vcs.content.erase(&hash, "t3").unwrap();
+        assert!(vcs
+            .import_diff(MAINLINE_BRANCH_ID, &changed, &[], "applied", "t3")
+            .is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap(),
+            applied
+        );
+    }
+
+    #[test]
+    fn import_diff_never_recovers_from_a_head_without_cut_and_receipt() {
+        for with_cut in [false, true] {
+            let mut vcs = vcs();
+            vcs.init("t0").unwrap();
+            let body = vcs.content.put_text("bytes").unwrap();
+            let changed = BTreeMap::from([("file.txt".into(), body)]);
+            let manifest = vcs.store_manifest(&changed).unwrap();
+            vcs.branches
+                .advance_head(MAINLINE_BRANCH_ID, None, "orphan", &manifest, "t1")
+                .unwrap();
+            if with_cut {
+                vcs.branches
+                    .record_cut(CutRecord {
+                        cut_id: "orphan",
+                        change_id: "orphan",
+                        branch_id: MAINLINE_BRANCH_ID,
+                        manifest_hash: &manifest,
+                        parent_cut_id: None,
+                        origin: Some("import"),
+                        actor: None,
+                        intent: None,
+                        recorded_at: "t1",
+                    })
+                    .unwrap();
+            }
+            assert!(
+                vcs.import_diff(MAINLINE_BRANCH_ID, &changed, &[], "orphan", "t2")
+                    .is_err(),
+                "cut={with_cut}"
+            );
+            assert!(vcs.get_op("op-orphan").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn import_diff_refuses_inconsistent_legacy_recovery_evidence_and_missing_parent() {
+        for corruption in ["cut", "receipt", "parent"] {
+            let mut vcs = vcs();
+            vcs.init("t0").unwrap();
+            let before = vcs
+                .branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap();
+            let body = vcs.content.put_text("bytes").unwrap();
+            let changed = BTreeMap::from([("file.txt".into(), body)]);
+            let manifest = vcs.store_manifest(&changed).unwrap();
+            let AdvanceOutcome::Advanced(after) = vcs
+                .branches
+                .advance_head(MAINLINE_BRANCH_ID, None, "orphan", &manifest, "t1")
+                .unwrap()
+            else {
+                panic!("legacy fixture head");
+            };
+            vcs.branches
+                .record_cut(CutRecord {
+                    cut_id: "orphan",
+                    change_id: "orphan",
+                    branch_id: MAINLINE_BRANCH_ID,
+                    manifest_hash: &manifest,
+                    parent_cut_id: (corruption == "parent").then_some("missing-parent"),
+                    origin: Some(if corruption == "cut" {
+                        "write:other"
+                    } else {
+                        "import"
+                    }),
+                    actor: None,
+                    intent: None,
+                    recorded_at: "t1",
+                })
+                .unwrap();
+            let deltas = vec![OpBranchDelta {
+                branch_id: MAINLINE_BRANCH_ID.into(),
+                before: Some(OpBranchState::of(&before)),
+                after: OpBranchState::of(&after),
+            }];
+            vcs.branches
+                .record_op(
+                    "op-orphan",
+                    if corruption == "receipt" {
+                        "other"
+                    } else {
+                        "import"
+                    },
+                    &deltas,
+                    Some("import"),
+                    "t1",
+                )
+                .unwrap();
+            assert!(
+                vcs.import_diff(MAINLINE_BRANCH_ID, &changed, &[], "orphan", "t2")
+                    .is_err(),
+                "{corruption}"
+            );
+            assert_eq!(
+                vcs.branches
+                    .get_branch(MAINLINE_BRANCH_ID)
+                    .unwrap()
+                    .as_ref(),
+                Some(after.as_ref())
+            );
+        }
+    }
+
+    #[test]
+    fn import_diff_refuses_a_real_head_race_without_publishing_candidate_cut_or_receipt() {
+        struct RacingContent {
+            inner: ContentStore,
+            branch_path: std::path::PathBuf,
+            raced: std::cell::Cell<bool>,
+        }
+        impl ContentBlobs for RacingContent {
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
+                self.inner.put(body)
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
+                self.inner.get(id)
+            }
+            fn publish_retained<T>(
+                &self,
+                ids: &[String],
+                publish: impl FnOnce() -> StoreResult<T>,
+            ) -> StoreResult<T> {
+                self.inner.publish_retained(ids, || {
+                    // Another actual native connection commits after this import
+                    // observed its base and before its final branch CAS.
+                    if !self.raced.replace(true) {
+                        let mut other = BranchStore::open(&self.branch_path)?;
+                        other.commit_write(CutRecord {
+                            cut_id: "concurrent",
+                            change_id: "concurrent",
+                            branch_id: MAINLINE_BRANCH_ID,
+                            manifest_hash: &ids[0],
+                            parent_cut_id: None,
+                            origin: Some("write:race"),
+                            actor: None,
+                            intent: None,
+                            recorded_at: "t1",
+                        })?;
+                    }
+                    publish()
+                })
+            }
+        }
+        let original = vcs();
+        let branch_path = original.dir.join("branches.sqlite");
+        let content_path = original.dir.join("content.sqlite");
+        let mut candidate = WorkspaceVcs::from_parts(
+            BranchStore::open(&branch_path).unwrap(),
+            RacingContent {
+                inner: ContentStore::open(content_path).unwrap(),
+                branch_path,
+                raced: std::cell::Cell::new(false),
+            },
+        );
+        candidate.init("t0").unwrap();
+        let body = candidate.content.put_text("imported bytes").unwrap();
+        let changed = BTreeMap::from([("file.txt".into(), body)]);
+        assert!(candidate
+            .import_diff(MAINLINE_BRANCH_ID, &changed, &[], "candidate", "t2")
+            .is_err());
+        assert!(
+            candidate.content.raced.get(),
+            "the competing native writer ran"
+        );
+        assert_eq!(
+            candidate
+                .branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("concurrent")
+        );
+        assert!(candidate.get_cut("concurrent").unwrap().is_some());
+        assert!(candidate.get_op("op-concurrent").unwrap().is_some());
+        assert!(candidate.get_cut("candidate").unwrap().is_none());
+        assert!(candidate.get_op("op-candidate").unwrap().is_none());
     }
 
     /// The workstream sync loop: members greedily admit into the shared

@@ -246,6 +246,12 @@ pub enum TurnWitness {
 }
 
 pub trait ResourceResolver {
+    /// Additional current product access, independent of the pinned runtime
+    /// policy. A refusal terminates this invocation; detail is not disclosed.
+    fn check_live_access(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String>;
 
     /// Attest the exact skill catalogue this turn puts in the system prompt.
@@ -2814,9 +2820,16 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
         self.admit_command(command, packages)?;
+        access.check()?;
         let binding = self.resolve_provider(command, secrets)?;
-        let sink = |delta: &str| resources.observe_text_delta(delta);
+        let sink = |delta: &str| {
+            if access.check().is_ok() {
+                resources.observe_text_delta(delta);
+            }
+        };
         // Mid-stream cooperative cancel (spec/agent-harness.md "Cancellation"):
         // the transport polls the durable request surface between streamed
         // lines and releases the stream early; the machine converts that
@@ -2826,8 +2839,8 @@ impl GovernedHostRuntime {
             command.instance_ref.clone(),
             command.command_id.clone(),
         );
-        let observed = || probe.observed();
-        let released = || probe.released();
+        let observed = || access.check().is_err() || probe.observed();
+        let released = || access.refused.get() || probe.released();
         let driver = NativeHttpDriver::new(binding.timeout)
             .with_delta_sink(&sink)
             .with_cancel_probe(&observed)
@@ -2835,7 +2848,7 @@ impl GovernedHostRuntime {
         self.run_admitted_turn(
             command,
             packages,
-            resources,
+            &access,
             binding,
             &driver,
             TurnRunInspection {
@@ -2891,12 +2904,15 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
         H: HostDriver,
     {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
         self.admit_command(command, packages)?;
+        access.check()?;
         let binding = self.resolve_provider(command, secrets)?;
         self.run_admitted_turn(
             command,
             packages,
-            resources,
+            &access,
             binding,
             driver,
             TurnRunInspection {
@@ -2962,7 +2978,7 @@ impl GovernedHostRuntime {
         &mut self,
         command: &StartTurnCommand,
         packages: &P,
-        resources: &R,
+        access: &LiveTurnAccess<'_, R>,
         binding: ResolvedProviderBinding,
         driver: &H,
         inspection: TurnRunInspection<'_>,
@@ -2972,7 +2988,10 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
         H: HostDriver,
     {
+        let resources = access.resources;
+        access.check()?;
         if let Some(execution) = self.stored_execution(command)? {
+            access.check()?;
             return Ok(execution);
         }
         let package = packages
@@ -3002,10 +3021,13 @@ impl GovernedHostRuntime {
                 )));
             }
             Some(effect) if is_terminal_effect(&effect.status) => {
-                return self.finish_execution(command);
+                let execution = self.finish_execution(command)?;
+                access.check()?;
+                return Ok(execution);
             }
             Some(_) => true,
             None => {
+                access.check()?;
                 self.kernel
                     .commit_rule(RuleCommit {
                         instance_id: &command.instance_ref,
@@ -3057,9 +3079,10 @@ impl GovernedHostRuntime {
                 .images
                 .iter()
                 .map(|image| {
-                    let resolved = resources
-                        .resolve_image(image)
-                        .map_err(HostRuntimeError::Resolver)?;
+                    access.check()?;
+                    let resolved = resources.resolve_image(image);
+                    access.check()?;
+                    let resolved = resolved.map_err(HostRuntimeError::Resolver)?;
                     if resolved.media_type.trim().is_empty() {
                         return Err(HostRuntimeError::Resolver(
                             "resolved image has no media type".to_owned(),
@@ -3081,6 +3104,7 @@ impl GovernedHostRuntime {
             offered: &package.tools,
             admitted_resources: &command.resources,
             resolver: resources,
+            access,
         };
         let client = match binding.provider {
             ModelProvider::OpenAi => MessagesApiClient::new(
@@ -3170,6 +3194,10 @@ impl GovernedHostRuntime {
             context_bundles: context.contributions,
             pinned_skills: Vec::new(),
         };
+        let driver = LiveAccessDriver {
+            inner: driver,
+            access,
+        };
         self.kernel
             .run_brokered_agent_turn(
                 &BrokeredTurnContext {
@@ -3182,7 +3210,7 @@ impl GovernedHostRuntime {
                 },
                 &client,
                 &executor,
-                driver,
+                &driver,
                 &NoopCompactor,
                 &input,
             )
@@ -3192,7 +3220,9 @@ impl GovernedHostRuntime {
         // resolver, so the receipt aggregates the durable segments instead of
         // trusting any single resolver instance.
         self.record_witness_segment(command, resources)?;
-        self.finish_execution(command)
+        let execution = self.finish_execution(command)?;
+        access.check()?;
+        Ok(execution)
     }
 
     /// Record the turn segment's workspace witness as durable evidence
@@ -4000,10 +4030,50 @@ struct InstanceMetadata {
     policy: PolicyEpochRef,
 }
 
+const LIVE_ACCESS_REFUSED: &str = "host turn access ended";
+
+struct LiveTurnAccess<'a, R: ResourceResolver + ?Sized> {
+    resources: &'a R,
+    refused: std::cell::Cell<bool>,
+}
+impl<'a, R: ResourceResolver + ?Sized> LiveTurnAccess<'a, R> {
+    fn new(resources: &'a R) -> Self {
+        Self {
+            resources,
+            refused: std::cell::Cell::new(false),
+        }
+    }
+    fn check(&self) -> Result<(), HostRuntimeError> {
+        if self.refused.get() || self.resources.check_live_access().is_err() {
+            self.refused.set(true);
+            return Err(HostRuntimeError::Resolver(LIVE_ACCESS_REFUSED.into()));
+        }
+        Ok(())
+    }
+}
+
+struct LiveAccessDriver<'a, R: ResourceResolver + ?Sized, H: HostDriver> {
+    inner: &'a H,
+    access: &'a LiveTurnAccess<'a, R>,
+}
+impl<R: ResourceResolver + ?Sized, H: HostDriver> HostDriver for LiveAccessDriver<'_, R, H> {
+    fn fulfill(&self, request: &IoRequest) -> IoResult {
+        if self.access.check().is_err() {
+            return IoResult::Http(Err(TransportError::Transport(LIVE_ACCESS_REFUSED.into())));
+        }
+        let result = self.inner.fulfill(request);
+        if self.access.check().is_err() {
+            return IoResult::Http(Err(TransportError::Transport(LIVE_ACCESS_REFUSED.into())));
+        }
+        result
+    }
+}
+
 struct ResolverToolExecutor<'a, R: ResourceResolver + ?Sized> {
     offered: &'a [ToolSpec],
     admitted_resources: &'a [ResourceRef],
     resolver: &'a R,
+    access: &'a LiveTurnAccess<'a, R>,
 }
 
 impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> {
@@ -4026,7 +4096,20 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
                 content: "tool is not declared by the pinned package".to_owned(),
             };
         }
-        match self.resolver.execute_tool(self.admitted_resources, call) {
+        if self.access.check().is_err() {
+            return ToolOutcome {
+                status: ToolStatus::Error,
+                content: LIVE_ACCESS_REFUSED.into(),
+            };
+        }
+        let result = self.resolver.execute_tool(self.admitted_resources, call);
+        if self.access.check().is_err() {
+            return ToolOutcome {
+                status: ToolStatus::Error,
+                content: LIVE_ACCESS_REFUSED.into(),
+            };
+        }
+        match result {
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
                 content,
@@ -5113,6 +5196,428 @@ workflow UnsafeHostChat {
         assert_eq!(labels.tools, known("package:v1"));
     }
 
+    struct LiveResources {
+        allowed: Cell<bool>,
+        tool_calls: Cell<usize>,
+        revoke_on_tool: bool,
+    }
+    impl ResourceResolver for LiveResources {
+        fn check_live_access(&self) -> Result<(), String> {
+            if self.allowed.get() {
+                Ok(())
+            } else {
+                Err("private refusal detail".into())
+            }
+        }
+        fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+            Err("unused image".into())
+        }
+        fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+            self.tool_calls.set(self.tool_calls.get() + 1);
+            if self.revoke_on_tool {
+                self.allowed.set(false);
+            }
+            Ok("private tool result".into())
+        }
+    }
+
+    #[test]
+    fn live_access_denies_before_provider_and_denies_retained_result() {
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "live-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let resources = LiveResources {
+            allowed: Cell::new(false),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(vec![json!({"output_text":"private answer"})]);
+        let err = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
+        assert!(!err.to_string().contains("private"));
+        assert_eq!(secrets.calls.get(), 0);
+        assert!(driver.requests.borrow().is_empty());
+        resources.allowed.set(true);
+        runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap();
+        assert_eq!(driver.requests.borrow().len(), 1);
+        resources.allowed.set(false);
+        let err = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
+        assert_eq!(driver.requests.borrow().len(), 1);
+        drop(runtime);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn live_driver_discards_response_and_latches_refusal() {
+        struct RevokingDriver<'a> {
+            resources: &'a LiveResources,
+            calls: Cell<usize>,
+        }
+        impl HostDriver for RevokingDriver<'_> {
+            fn fulfill(&self, _: &IoRequest) -> IoResult {
+                self.calls.set(self.calls.get() + 1);
+                self.resources.allowed.set(false);
+                IoResult::Http(Ok(HttpResponse {
+                    status: 200,
+                    body: json!({"private":"response"}),
+                }))
+            }
+        }
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let access = LiveTurnAccess::new(&resources);
+        let inner = RevokingDriver {
+            resources: &resources,
+            calls: Cell::new(0),
+        };
+        let driver = LiveAccessDriver {
+            inner: &inner,
+            access: &access,
+        };
+        let request = IoRequest::Http(HttpRequest {
+            model_provenance: None,
+            url: "https://example.invalid".into(),
+            headers: vec![],
+            body: json!({}),
+        });
+        for _ in 0..2 {
+            let IoResult::Http(result) = driver.fulfill(&request);
+            assert!(
+                matches!(result, Err(TransportError::Transport(ref text)) if text == LIVE_ACCESS_REFUSED)
+            );
+            resources.allowed.set(true);
+        }
+        assert_eq!(inner.calls.get(), 1);
+        let denied = LiveResources {
+            allowed: Cell::new(false),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let denied_access = LiveTurnAccess::new(&denied);
+        let denied_driver = LiveAccessDriver {
+            inner: &inner,
+            access: &denied_access,
+        };
+        let IoResult::Http(result) = denied_driver.fulfill(&request);
+        assert!(result.is_err());
+        assert_eq!(inner.calls.get(), 1);
+    }
+
+    #[test]
+    fn live_tool_discards_result_and_refuses_new_calls() {
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: true,
+        };
+        let access = LiveTurnAccess::new(&resources);
+        let offered = [ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: json!({}),
+        }];
+        let executor = ResolverToolExecutor {
+            offered: &offered,
+            admitted_resources: &[],
+            resolver: &resources,
+            access: &access,
+        };
+        let call = ToolCall {
+            id: "call".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        };
+        let outcome = executor.execute(&call);
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert_eq!(outcome.content, LIVE_ACCESS_REFUSED);
+        resources.allowed.set(true);
+        assert_eq!(executor.execute(&call).content, LIVE_ACCESS_REFUSED);
+        assert_eq!(resources.tool_calls.get(), 1);
+        let denied = LiveResources {
+            allowed: Cell::new(false),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let denied_access = LiveTurnAccess::new(&denied);
+        let executor = ResolverToolExecutor {
+            offered: &offered,
+            admitted_resources: &[],
+            resolver: &denied,
+            access: &denied_access,
+        };
+        assert_eq!(executor.execute(&call).content, LIVE_ACCESS_REFUSED);
+        assert_eq!(denied.tool_calls.get(), 0);
+    }
+
+    #[test]
+    fn live_turn_stops_after_tool_revocation_before_next_model_request() {
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "live-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: true,
+        };
+        let driver = ScriptedDriver::new(vec![
+            json!({"output":[{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"}]}),
+        ]);
+        let err = runtime
+            .run_turn_with_driver(
+                &turn(&instance.instance_ref, &open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &driver,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
+        assert_eq!(resources.tool_calls.get(), 1);
+        assert_eq!(driver.requests.borrow().len(), 1);
+        drop(runtime);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn live_image_revocation_suppresses_resolver_failure_and_model_dispatch() {
+        struct Images(Cell<bool>);
+        impl ResourceResolver for Images {
+            fn check_live_access(&self) -> Result<(), String> {
+                if self.0.get() {
+                    Ok(())
+                } else {
+                    Err("private denial".into())
+                }
+            }
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                self.0.set(false);
+                Err("private image failure".into())
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "image-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let mut command = turn(&instance.instance_ref, &open.policy, 1);
+        command.input.images.push(command.resources[0].clone());
+        let driver = ScriptedDriver::new(vec![]);
+        let error = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Images(Cell::new(true)),
+                &driver,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(LIVE_ACCESS_REFUSED));
+        assert!(!error.to_string().contains("private"));
+        assert!(driver.requests.borrow().is_empty());
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_native_turn_releases_stream_when_first_delta_revokes_access() {
+        use std::io::{Read, Write};
+        struct LocalSecrets(String);
+        impl SecretResolver for LocalSecrets {
+            fn resolve_provider(
+                &self,
+                _: &ProviderBindingRef,
+                _: &str,
+            ) -> Result<ResolvedProviderBinding, String> {
+                Ok(ResolvedProviderBinding::new(
+                    ModelProvider::OpenAi,
+                    "synthetic",
+                    "gpt-test",
+                    &self.0,
+                    256,
+                    Duration::from_secs(5),
+                ))
+            }
+        }
+        struct StreamResources {
+            live: LiveResources,
+            deltas: RefCell<Vec<String>>,
+        }
+        impl ResourceResolver for StreamResources {
+            fn check_live_access(&self) -> Result<(), String> {
+                self.live.check_live_access()
+            }
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                unreachable!()
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+            fn observe_text_delta(&self, delta: &str) {
+                self.deltas.borrow_mut().push(delta.into());
+                self.live.allowed.set(false);
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(start) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break start + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .expect("model request has a bounded JSON body");
+            while bytes.len() < header_end + length {
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"private later delta\"}\n\n",
+                "data: [DONE]\n\n");
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let path = temp_store();
+        let mut runtime =
+            GovernedHostRuntime::open(&path, 7, &signed_policy_at(&format!("http://{address}")))
+                .unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "stream-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let resources = StreamResources {
+            live: LiveResources {
+                allowed: Cell::new(true),
+                tool_calls: Cell::new(0),
+                revoke_on_tool: false,
+            },
+            deltas: RefCell::new(vec![]),
+        };
+        let err = runtime
+            .run_turn(
+                &turn(&instance.instance_ref, &open.policy, 1),
+                &Packages,
+                &LocalSecrets(format!("http://{address}")),
+                &resources,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
+        assert_eq!(&*resources.deltas.borrow(), &["first"]);
+        server.join().unwrap();
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_image_does_not_release_content_or_allow_changed_command_replay() {
+        struct MissingMedia;
+        impl ResourceResolver for MissingMedia {
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                Ok(ResolvedImage {
+                    media_type: " ".into(),
+                    bytes: b"private image".to_vec(),
+                })
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "media-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let mut command = turn(&instance.instance_ref, &open.policy, 1);
+        command.input.images.push(command.resources[0].clone());
+        let driver = ScriptedDriver::new(vec![json!({"output_text":"must not be requested"})]);
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let err = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &MissingMedia, &driver)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resolved image has no media type"),
+            "{err:?}"
+        );
+        assert!(driver.requests.borrow().is_empty());
+        // Image resolution follows durable effect admission. A subsequent
+        // invocation cannot use that command identity for different input.
+        command.input.text = "changed task".into();
+        let err = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &MissingMedia, &driver)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("command id reused with different turn"),
+            "{err:?}"
+        );
+        assert!(driver.requests.borrow().is_empty());
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+    }
+
     struct CancellingDriver {
         handle: HostCancellationHandle,
         fired: Cell<bool>,
@@ -5141,6 +5646,10 @@ workflow UnsafeHostChat {
     }
 
     fn signed_policy() -> String {
+        signed_policy_at("https://provider.invalid")
+    }
+
+    fn signed_policy_at(base_url: &str) -> String {
         let labeled = |principal| ResourcePolicy {
             reader: BTreeSet::from(["Operator".to_owned()]),
             writer: BTreeSet::from(["Operator".to_owned()]),
@@ -5170,7 +5679,7 @@ workflow UnsafeHostChat {
                 ProviderBindingPolicy {
                     provider: "openai".to_owned(),
                     model: "gpt-test".to_owned(),
-                    base_url: "https://provider.invalid".to_owned(),
+                    base_url: base_url.to_owned(),
                     credential_ref: "credential:model".to_owned(),
                     wire: None,
                 },
