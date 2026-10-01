@@ -6222,6 +6222,142 @@ workflow ProjCtxSmoke {
 }
 
 #[test]
+fn owned_harness_renders_live_tracker_data_without_promoting_its_role() {
+    // Exercise the actual harness assembly and user-role rendering, including
+    // its persisted provenance. The system/developer-only assembler must not
+    // receive untrusted tracker records.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let ws = std::env::temp_dir().join(format!(
+        "whip-tracker-ctx-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = fs::remove_dir_all(&ws);
+    fs::create_dir_all(ws.join(".whipplescript")).expect("ws dir");
+    assert!(Command::new("git")
+        .arg("init")
+        .arg(&ws)
+        .output()
+        .expect("git")
+        .status
+        .success());
+    let filed = whip(bin, &stores)
+        .current_dir(&ws)
+        .args([
+            "--json",
+            "issue",
+            "new",
+            "--tracker",
+            "q",
+            "--title",
+            "live-startup-marker",
+        ])
+        .output()
+        .expect("file task");
+    assert!(
+        filed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filed.stderr)
+    );
+    let store_path = ws.join(".whipplescript").join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let workflow = ws.join("ctx.whip");
+    fs::write(
+        &workflow,
+        r#"use std.files
+class Done { note string }
+
+file store workspace_files {
+  root "."
+  allow read ["**"]
+}
+
+workflow TrackerCtxSmoke {
+  output result Done
+
+  agent helper {
+    provider owned
+    profile "repo-reader"
+    capacity 1
+  }
+
+  rule begin
+    when started
+    when helper is available
+  => {
+    tell helper as turn
+      with access to workspace_files {
+        read ["**"]
+      }
+    """
+    Summarize and stop.
+    """
+
+    after turn succeeds {
+      complete result { note "done" }
+    }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    // The discovery roots at WHIPPLESCRIPT_HARNESS_WORKSPACE (owned_workspace_root).
+    let dev = whip(bin, &stores)
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        dev.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&dev.stderr)
+    );
+    let dev: Value = serde_json::from_slice(&dev.stdout).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json_isolated(
+        bin,
+        &stores,
+        &[
+            "--store",
+            store,
+            "--json",
+            "evidence",
+            "instance",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+    assert!(
+        evidence.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("context.bundle")
+                && item.get("summary").and_then(Value::as_str) == Some("tracker-discovery")
+        }),
+        "expected live tracker context provenance from a completed native turn"
+    );
+
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn dev_native_fixture_records_provider_lifecycle_and_artifacts_from_source_workflow() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

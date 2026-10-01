@@ -41,6 +41,8 @@ use crate::StoreError;
 use crate::StoreResult;
 
 #[cfg(feature = "native")]
+pub mod discovery;
+#[cfg(feature = "native")]
 mod filing;
 #[cfg(feature = "native")]
 mod protection;
@@ -321,6 +323,7 @@ pub struct WorkItemStore {
     /// dozen public methods with well over a hundred call sites, almost all of
     /// them tests that have no effect to name.
     event_effect_id: Option<String>,
+    discovery_writer: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "native")]
@@ -342,7 +345,9 @@ impl WorkItemStore {
     pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
         let connection =
             crate::native_existing::open(path.as_ref(), "work-item", SATELLITE_SCHEMA_VERSION)?;
-        Self::from_existing_connection(connection, None)
+        let store = Self::from_existing_connection(connection, None)?;
+        store.repair_discovery()?;
+        Ok(store)
     }
 
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -353,7 +358,9 @@ impl WorkItemStore {
         }
         let connection = Connection::open(path)?;
         crate::establish_wal(&connection)?;
-        Self::from_connection(connection)
+        let store = Self::from_connection(connection)?;
+        store.repair_discovery()?;
+        Ok(store)
     }
 
     /// In-memory work-item store, for tests that need a handle satisfying
@@ -376,6 +383,7 @@ impl WorkItemStore {
 
     fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
+        connection.execute_batch(discovery::SCHEMA)?;
         connection.execute_batch(crate::tracker_filing::SCHEMA)?;
         // DR-0054 Phase B parity: this store had no schema stamp and no
         // downgrade guard, so an older binary read a newer file as whatever
@@ -468,9 +476,7 @@ impl WorkItemStore {
         filed_by: Option<&str>,
         assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let (item_id, _) = tx_file_item(
             &tx,
             queue,
@@ -576,9 +582,7 @@ impl WorkItemStore {
     ) -> StoreResult<ClaimOutcome> {
         let at = readiness::canonical_instant(at)
             .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let outcome = control_ops::claim_item(
             &tx,
@@ -605,9 +609,7 @@ impl WorkItemStore {
         actor: &str,
         expires: Option<&str>,
     ) -> StoreResult<RenewOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let outcome = control_ops::renew_claim(
             &tx,
@@ -633,9 +635,7 @@ impl WorkItemStore {
         item_id: &str,
         expect_holder: Option<&str>,
     ) -> StoreResult<ReleaseOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
             tx.commit()?;
@@ -653,9 +653,7 @@ impl WorkItemStore {
 
     /// See `WorkItems::subscribe_events`.
     pub fn subscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let head: i64 = tx.query_row(
             "SELECT COALESCE(MAX(event_seq), 0) FROM tracker_events",
             [],
@@ -825,9 +823,7 @@ impl WorkItemStore {
     /// active lease the actor holds across ALL issues is released in one
     /// transaction, so no intermediate state keeps a held lease.
     pub fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let leases: Vec<(String, String)> = tx
             .prepare(&format!(
@@ -863,9 +859,7 @@ impl WorkItemStore {
         summary: Option<&str>,
         expect_holder: Option<&str>,
     ) -> StoreResult<FinishOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
             tx.commit()?;
@@ -918,9 +912,7 @@ impl WorkItemStore {
         reason: Option<&str>,
         expect_holder: Option<&str>,
     ) -> StoreResult<FinishOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
             tx.commit()?;
@@ -950,9 +942,7 @@ impl WorkItemStore {
     /// it is ready again unless something blocks it. An `archived` issue stays
     /// archived: archiving is the statement that nobody will look again.
     pub fn reopen_item(&mut self, item_id: &str, note: Option<&str>) -> StoreResult<ReopenOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         match tx_status(&tx, item_id)?.as_deref() {
             None => {
@@ -993,9 +983,7 @@ impl WorkItemStore {
     /// Returns `false` if the issue is absent or no longer open, so reassigning
     /// a closed issue is a no-op rather than a silent rewrite of history.
     pub fn assign_item(&mut self, item_id: &str, assignee: Option<&str>) -> StoreResult<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let outcome = control_ops::assign_item(
             &tx,
@@ -1040,9 +1028,7 @@ impl WorkItemStore {
         labels: &[String],
     ) -> StoreResult<Option<Vec<String>>> {
         let labels = normalize_labels(labels)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let current: Option<String> = tx
             .query_row(
                 "SELECT whip_payload_open('tracker.issue.labels_json', issue_id, labels_json) \
@@ -1135,9 +1121,7 @@ impl WorkItemStore {
                 )));
             }
         }
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let from_cid = content_id_of(&tx, from)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
@@ -1182,9 +1166,7 @@ impl WorkItemStore {
                 "unknown relation kind `{kind}`"
             )));
         }
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let from_cid = content_id_of(&tx, from)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
@@ -1238,9 +1220,7 @@ impl WorkItemStore {
         author: Option<&str>,
         body: &str,
     ) -> StoreResult<Option<String>> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let Some(content_id) = content_id_of(&tx, item_id)? else {
             tx.commit()?;
@@ -1296,9 +1276,7 @@ impl WorkItemStore {
         note: Option<&str>,
         added_by: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let Some(content_id) = content_id_of(&tx, item_id)? else {
             tx.commit()?;
@@ -1384,9 +1362,7 @@ impl WorkItemStore {
         basis: Option<&str>,
         basis_fingerprint_json: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let Some(content_id) = content_id_of(&tx, item_id)? else {
             tx.commit()?;
@@ -1441,9 +1417,7 @@ impl WorkItemStore {
         role: &str,
         added_by: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let Some(content_id) = content_id_of(&tx, item_id)? else {
             tx.commit()?;
@@ -1479,9 +1453,7 @@ impl WorkItemStore {
         anchor_id: &str,
         removed_by: Option<&str>,
     ) -> StoreResult<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let Some(content_id) = content_id_of(&tx, item_id)? else {
             return Ok(false);
@@ -1567,9 +1539,7 @@ impl WorkItemStore {
     /// DAG) and updates the linear projection column for the known display
     /// fields. Returns `false` if the issue does not exist.
     pub fn set_field(&mut self, item_id: &str, field: &str, value: &str) -> StoreResult<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let exists: bool = tx
             .query_row(
@@ -1607,9 +1577,7 @@ impl WorkItemStore {
         value: &str,
         expect_token: &str,
     ) -> StoreResult<SetFieldOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let exists: bool = tx
             .query_row(
@@ -1680,9 +1648,7 @@ impl WorkItemStore {
         body: &str,
         created_by: Option<&str>,
     ) -> StoreResult<Assertion> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let next: i64 = tx.query_row(
             "UPDATE tracker_assertion_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
@@ -1816,9 +1782,7 @@ impl WorkItemStore {
     /// heads) plus the projection update. Retired, not deleted — staleness
     /// and audit read history; retirement only ends current standing.
     pub fn retire_assertion(&mut self, id: &str, actor: Option<&str>) -> StoreResult<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let alias = if id.starts_with("AS-") {
             id.to_owned()
@@ -1869,67 +1833,9 @@ impl WorkItemStore {
     }
 
     pub fn rebuild_projection(&mut self) -> StoreResult<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases; \
-             DELETE FROM tracker_comments; DELETE FROM tracker_evidence; \
-             DELETE FROM tracker_assertions; DELETE FROM tracker_anchors;",
-        )?;
-        // The event log is keyed by opaque content_id; the projections are
-        // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
-        let alias_of: std::collections::HashMap<String, String> = tx
-            .prepare("SELECT content_id, alias FROM tracker_aliases")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        // (event_id, issue_id/content_id, kind, payload_json, created_at, parents)
-        type ProjectionEventRow = (String, Option<String>, String, String, String, Vec<String>);
-        let events: Vec<ProjectionEventRow> = tx
-            .prepare(
-                "SELECT event_id, issue_id, kind, whip_tracker_event_open(event_id, kind, payload_json), created_at, parents_json \
-                 FROM tracker_events ORDER BY event_seq",
-            )?
-            .query_map([], |row| {
-                let parents: Vec<String> =
-                    serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
-                Ok((
-                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    parents,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        // Fold in a deterministic TOPOLOGICAL order (parents strictly before
-        // children; concurrent events by event_id). `event_seq` is insertion
-        // order, which is NOT causal after a merge — folding by it can apply a
-        // field_set before its own `issue.created` (lost UPDATE) or a superseded
-        // value last, so two clones holding the same event set would project
-        // different columns. Topological order is content-derived and identical
-        // on every clone.
-        for id in topological_event_order(&events, |e| e.0.as_str(), |e| e.5.as_slice()) {
-            let (event_id, content_id, kind, payload_json, created_at, _parents) = &events[id];
-            let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
-            let issue_alias = content_id
-                .as_deref()
-                .and_then(|c| alias_of.get(c))
-                .map(String::as_str);
-            fold_event(
-                &tx,
-                Some(event_id.as_str()),
-                issue_alias,
-                kind,
-                &payload,
-                created_at,
-                &alias_of,
-            )?;
-        }
-        initiatives::native_validate_projection(&tx)?;
-        tx.commit()?;
-        Ok(())
+        let tx = self.discovery_transaction()?;
+        tx_rebuild_projection(&tx)?;
+        tx.commit()
     }
 
     /// Export every event in transport form (ADR-0002 phase B1 slice iii) — the
@@ -2003,9 +1909,7 @@ impl WorkItemStore {
         checkpoint: &crate::norm::NormCheckpoint,
     ) -> StoreResult<()> {
         checkpoint.validate()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         if load_norm_checkpoint(&tx)?
             .as_ref()
             .is_some_and(|existing| existing != checkpoint)
@@ -2114,9 +2018,7 @@ impl WorkItemStore {
         verifier: &dyn crate::norm::NormVerifier,
     ) -> StoreResult<String> {
         let event = signed.tracker_event()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let pin = load_norm_checkpoint(&tx)?;
         let view =
             crate::norm::admit_norm(&load_norm_events(&tx)?, pin.as_ref(), &event, verifier)?;
@@ -2141,9 +2043,7 @@ impl WorkItemStore {
                 "norm import contains a non-norm event".into(),
             ));
         }
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let Some(pin) = load_norm_checkpoint(&tx)? else {
             // MUTATION-SUCCESS-EXPR: Ok(0)
             return Err(StoreError::Conflict("norm import is unpinned".into()));
@@ -2203,9 +2103,7 @@ impl WorkItemStore {
     pub fn import_events(&mut self, events: &[TrackerEvent]) -> StoreResult<ImportReport> {
         let mut report = ImportReport::default();
         {
-            let tx = self
-                .connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx = self.discovery_transaction()?;
             for event in events {
                 // Norm authority needs its authenticated admission door. A
                 // content hash alone cannot admit or replace governance.
@@ -2388,10 +2286,11 @@ impl WorkItemStore {
                     }
                 }
             }
+            // Import and materialization share a commit: no writer or crash can
+            // expose a new event set with the previous derived state.
+            tx_rebuild_projection(&tx)?;
             tx.commit()?;
         }
-        // Materialize projections from the unioned log (folds forks in on read).
-        self.rebuild_projection()?;
         Ok(report)
     }
 
@@ -2567,6 +2466,67 @@ fn tx_file_item(
 /// event's `issue_id` and in relation payloads, so two clones' logs union
 /// correctly. `WS-N` is only a local alias for a human; the projection tables
 /// stay keyed by it (clone-local), the event log by the opaque `content_id`.
+#[cfg(feature = "native")]
+fn tx_rebuild_projection(tx: &Transaction<'_>) -> StoreResult<()> {
+    tx.execute_batch(
+        "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases; \
+         DELETE FROM tracker_comments; DELETE FROM tracker_evidence; \
+         DELETE FROM tracker_assertions; DELETE FROM tracker_anchors;",
+    )?;
+    // The event log is keyed by opaque content_id; the projections are
+    // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
+    let alias_of: std::collections::HashMap<String, String> = tx
+        .prepare("SELECT content_id, alias FROM tracker_aliases")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    // (event_id, issue_id/content_id, kind, payload_json, created_at, parents)
+    type ProjectionEventRow = (String, Option<String>, String, String, String, Vec<String>);
+    let events: Vec<ProjectionEventRow> = tx
+        .prepare(
+            "SELECT event_id, issue_id, kind, whip_tracker_event_open(event_id, kind, payload_json), created_at, parents_json \
+             FROM tracker_events ORDER BY event_seq",
+        )?
+        .query_map([], |row| {
+            let parents: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                parents,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Fold in a deterministic TOPOLOGICAL order (parents strictly before
+    // children; concurrent events by event_id). `event_seq` is insertion
+    // order, which is NOT causal after a merge — folding by it can apply a
+    // field_set before its own `issue.created` (lost UPDATE) or a superseded
+    // value last, so two clones holding the same event set would project
+    // different columns. Topological order is content-derived and identical
+    // on every clone.
+    for id in topological_event_order(&events, |e| e.0.as_str(), |e| e.5.as_slice()) {
+        let (event_id, content_id, kind, payload_json, created_at, _parents) = &events[id];
+        let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
+        let issue_alias = content_id
+            .as_deref()
+            .and_then(|c| alias_of.get(c))
+            .map(String::as_str);
+        fold_event(
+            tx,
+            Some(event_id.as_str()),
+            issue_alias,
+            kind,
+            &payload,
+            created_at,
+            &alias_of,
+        )?;
+    }
+    initiatives::native_validate_projection(tx)?;
+    Ok(())
+}
+
 #[cfg(feature = "native")]
 const TRACKER_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;

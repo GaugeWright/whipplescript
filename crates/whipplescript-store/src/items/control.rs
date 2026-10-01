@@ -147,9 +147,7 @@ impl WorkItemStore {
         request: &TrackerControl,
     ) -> StoreResult<TrackerControlReceipt> {
         let fingerprint = request.fingerprint()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         if let Some(existing) = receipt(&tx, &request.operation_id)? {
             existing.validate_for(request)?;
             return Ok(existing);

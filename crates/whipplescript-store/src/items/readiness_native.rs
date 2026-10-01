@@ -335,9 +335,7 @@ impl WorkItemStore {
         review_at: &str,
         actor: Option<&str>,
     ) -> StoreResult<String> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let source = NativeReadiness(&tx);
         let queue = source
@@ -370,9 +368,7 @@ impl WorkItemStore {
         wait: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<usize> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         let now = tx_now(&tx)?;
         let content_id = content_id_of(&tx, issue)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {issue}")))?;

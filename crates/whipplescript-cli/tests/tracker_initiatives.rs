@@ -120,3 +120,124 @@ fn initiative_cli_keeps_shared_members_and_outcome_state_independent() {
     assert_eq!(good(root.path(), &["show", a_id])["progress"]["total"], 0);
     assert_eq!(good(root.path(), &["show", b_id])["progress"]["total"], 1);
 }
+
+#[test]
+fn initiative_files_are_enrolled_automatically_and_follow_cli_edits() {
+    let root = tempfile::tempdir().expect("root");
+    assert!(Command::new("git")
+        .arg("init")
+        .arg(root.path())
+        .output()
+        .expect("git")
+        .status
+        .success());
+    let group = good(
+        root.path(),
+        &[
+            "new",
+            "--tracker",
+            "q",
+            "--kind",
+            "initiative",
+            "--title",
+            "discovery initiative",
+        ],
+    );
+    let task = good(
+        root.path(),
+        &[
+            "new",
+            "--tracker",
+            "q",
+            "--title",
+            "searchable ungrouped task",
+        ],
+    );
+    let group_id = group["id"].as_str().expect("group");
+    let task_id = task["id"].as_str().expect("task");
+    let path = root
+        .path()
+        .join(format!("tracker/initiatives/{group_id}.hjson"));
+    let task_path = root.path().join(format!("tracker/tasks/{task_id}.hjson"));
+    assert!(task_path.exists());
+    good(root.path(), &["link", task_id, "belongs-to", group_id]);
+    good(root.path(), &["set", task_id, "body", "fresh body marker"]);
+    let data: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("file")).expect("JSON HJSON subset");
+    assert_eq!(data["members"][0]["body"], "fresh body marker");
+    let rg = Command::new("rg")
+        .current_dir(root.path())
+        .args(["-l", "fresh body marker"])
+        .output()
+        .expect("rg");
+    assert!(rg.status.success());
+    assert!(String::from_utf8_lossy(&rg.stdout)
+        .contains(&format!("tracker/initiatives/{group_id}.hjson")));
+    good(root.path(), &["unlink", task_id, "belongs-to", group_id]);
+    let data: Value = serde_json::from_slice(&std::fs::read(&path).expect("file")).expect("JSON");
+    assert_eq!(data["progress"]["total"], 0);
+    assert!(task_path.exists());
+}
+
+#[test]
+fn tracker_commands_still_work_without_git_installed() {
+    let root = tempfile::tempdir().expect("root");
+    let out = Command::new(env!("CARGO_BIN_EXE_whip"))
+        .current_dir(root.path())
+        .env("PATH", "")
+        .env(
+            "WHIPPLESCRIPT_ITEMS_STORE",
+            root.path().join("items.sqlite"),
+        )
+        .args([
+            "--json",
+            "issue",
+            "new",
+            "--tracker",
+            "q",
+            "--title",
+            "standalone",
+        ])
+        .output()
+        .expect("whip");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!root.path().join("tracker").exists());
+}
+
+#[test]
+fn durable_export_does_not_depend_on_a_writable_discovery_view() {
+    let root = tempfile::tempdir().expect("root");
+    assert!(Command::new("git")
+        .arg("init")
+        .arg(root.path())
+        .output()
+        .expect("git")
+        .status
+        .success());
+    let task = good(
+        root.path(),
+        &["new", "--tracker", "q", "--title", "backup-marker"],
+    );
+    std::fs::write(
+        root.path().join("tracker/.whipplescript-discovery-owner"),
+        "foreign owner",
+    )
+    .expect("simulate unavailable view");
+    assert!(
+        !run(root.path(), &["show", task["id"].as_str().expect("id")])
+            .status
+            .success()
+    );
+    let events = good(root.path(), &["export"]);
+    assert!(!events.as_array().expect("events").is_empty());
+    assert!(events.to_string().contains("backup-marker"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("tracker/.whipplescript-discovery-owner"))
+            .expect("preserved"),
+        "foreign owner"
+    );
+}

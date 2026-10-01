@@ -33,9 +33,7 @@ impl WorkItemStore {
         filing: &TrackerFiling,
     ) -> StoreResult<TrackerFilingReceipt> {
         let fingerprint = filing.fingerprint()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.discovery_transaction()?;
         if let Some(existing) = receipt(&tx, &filing.operation_id)? {
             if existing.fingerprint != fingerprint {
                 return Err(StoreError::Conflict(

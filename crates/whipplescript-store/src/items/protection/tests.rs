@@ -698,3 +698,32 @@ fn label_changes_stay_sealed_and_replay_under_protection() {
         vec!["later-label-canary".to_owned()]
     );
 }
+
+#[test]
+fn discovery_never_exports_a_protected_tracker() {
+    let fixture = Fixture::new();
+    let protected =
+        WorkItemStore::create_protected(fixture.path(), protection(Arc::new(Codec::default())))
+            .expect("protected");
+    fault(
+        protected.enroll_discovery(&fixture.0),
+        "protected tracker cannot publish plaintext discovery",
+    );
+    fault(
+        protected.discovery_summary(10),
+        "protected tracker cannot publish plaintext discovery",
+    );
+    assert!(!fixture.0.join("tracker").exists());
+    assert!(std::process::Command::new("git")
+        .arg("init")
+        .arg(&fixture.0)
+        .output()
+        .expect("git")
+        .status
+        .success());
+    fault(
+        super::super::discovery::enroll_checkout(&protected, &fixture.0),
+        "protected tracker cannot publish plaintext discovery",
+    );
+    assert!(!fixture.0.join(".rgignore").exists());
+}

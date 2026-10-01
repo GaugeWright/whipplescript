@@ -80,6 +80,16 @@ impl ContextSnapshot {
                 ));
             }
             if metadata.is_dir() {
+                // A workspace context grant predates local tracker enrollment.
+                // Do not silently carry the workstation ledger into an
+                // isolated evaluation when capturing that same source tree.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if (name == "tracker" || name.starts_with(".tracker-stage-"))
+                    && path.join(".whipplescript-discovery-owner").is_file()
+                {
+                    continue;
+                }
                 Self::read_tree(root, &path, result)?;
                 continue;
             }
@@ -300,6 +310,43 @@ mod tests {
         assert!(!pruned.files.contains_key("AGENTS.md"));
     }
 
+    #[test]
+    fn context_capture_excludes_generated_tracker_views_but_keeps_authored_data() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("source.txt"), "source").expect("source");
+        for name in ["tracker", ".tracker-stage-interrupted"] {
+            let generated = root.path().join(name);
+            std::fs::create_dir(&generated).expect("generated");
+            std::fs::write(
+                generated.join(".whipplescript-discovery-owner"),
+                "/workstation/items.sqlite",
+            )
+            .expect("owner");
+            std::fs::write(generated.join("task.hjson"), "private-work-marker").expect("work");
+        }
+        let authored = root.path().join("authored");
+        std::fs::create_dir(&authored).expect("authored");
+        std::fs::write(authored.join("task.hjson"), "explicit context data").expect("data");
+        let (_, snapshot) = ContextSnapshot::capture(root.path()).expect("capture");
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(
+            snapshot.files["authored/task.hjson"],
+            "explicit context data"
+        );
+        assert!(!snapshot
+            .files
+            .values()
+            .any(|body| body.contains("private-work-marker")));
+        let destination = tempfile::tempdir().expect("isolated");
+        snapshot
+            .materialize(destination.path())
+            .expect("materialize");
+        assert!(!destination.path().join("tracker").exists());
+        assert!(!destination
+            .path()
+            .join(".tracker-stage-interrupted")
+            .exists());
+    }
     #[test]
     fn capture_and_materialize_keep_an_exact_text_tree() {
         let base =

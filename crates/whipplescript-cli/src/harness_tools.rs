@@ -5463,14 +5463,41 @@ pub fn run_owned_agent_turn(
     // the kernel assembler renders them in canonical order (context-assembly
     // Phase 1). Per-contribution provenance (`assembled.contributions`) is recorded as
     // `context.bundle` evidence by `run_brokered_agent_turn` (Decision 5).
-    let assembled = assemble(owned_context_bundles(
+    let mut context_bundles = owned_context_bundles(
         &tools,
         &owned_context_date(),
         &workspace.display().to_string(),
         &skill_catalogue,
         &project_instructions,
         &mcp_trust,
-    ));
+    );
+    let tracker_path = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE").map(PathBuf::from);
+    let mut tracker_summary = None;
+    match crate::tracker_context::startup(
+        tracker_path.as_deref(),
+        &workspace,
+        context_workspace.is_some(),
+    ) {
+        Ok(Some(summary)) => tracker_summary = Some(summary),
+        Ok(None) => {}
+        Err(error) => context_bundles.push(contribution(
+            "tracker-discovery-unavailable",
+            "store:tracker-discovery",
+            "v1",
+            InstructionAuthority::Runtime,
+            InstructionRole::System,
+            "045-tracker-discovery",
+            ContributionLifecycle::Turn,
+            format!("Tracker discovery unavailable: {error:?}"),
+        )),
+    }
+    let mut assembled = assemble(context_bundles);
+    let mut user = input_json.to_string();
+    if let Some(summary) = tracker_summary {
+        let (rendered, provenance) = crate::tracker_context::render_user(&user, summary);
+        user = rendered;
+        assembled.contributions.push(provenance);
+    }
     let max_steps = owned_max_steps();
     let topology = native_agent_topology(
         program_path,
@@ -5493,7 +5520,7 @@ pub fn run_owned_agent_turn(
         model_provenance: Default::default(),
         system: assembled.system_role,
         developer: assembled.developer_role,
-        user: input_json.to_string(),
+        user,
         tools,
         max_steps,
         result_tool: result_contract

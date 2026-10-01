@@ -61,10 +61,12 @@ impl WorkItemStore {
         }
         crate::payload_protection::register_sql_functions(&connection, protection.clone())?;
         register_event_functions(&connection, protection.clone())?;
+        let discovery_writer = super::discovery::register_writer(&connection)?;
         Ok(Self {
             connection,
             protection,
             event_effect_id: None,
+            discovery_writer,
         })
     }
 

@@ -169,6 +169,7 @@ mod otel;
 mod project_context;
 mod review_commands;
 mod skills_loader;
+mod tracker_context;
 mod turn_server;
 mod web_tools;
 use lsp_server::{lsp, lsp_byte_to_position};
@@ -34774,10 +34775,25 @@ fn issue(options: &CliOptions) -> ExitCode {
     let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
-    let mut store = match WorkItemStore::open(items_store_path()) {
+    // Durable backup observes the ledger even when a local search destination
+    // is unavailable. Export must neither enroll nor repair filesystem views.
+    let opened = if command == "export" {
+        WorkItemStore::open_read_only(items_store_path())
+    } else {
+        WorkItemStore::open(items_store_path())
+    };
+    let mut store = match opened {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
+    if command != "export" {
+        if let Err(error) = whipplescript_store::items::discovery::enroll_checkout(
+            &store,
+            &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ) {
+            return report_store_error("failed to establish tracker discovery", error);
+        }
+    }
     if let Some(code) = issue_readiness::verbs(&mut store, options, command, usage) {
         return code;
     }

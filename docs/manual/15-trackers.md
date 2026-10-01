@@ -42,6 +42,47 @@ error[type.invalid_literal]: rule `r` compares finite-domain value to unknown `c
 A `case` over the status of an issue must cover the five values or carry a `_`
 arm. The compiler names the arms that are absent.
 
+## Finding work through ordinary search
+
+In a Git checkout, a native `whip issue` invocation automatically enrolls the
+checkout for discovery from its plain local store. The store then maintains
+`tracker/initiatives/<id>.hjson` and `tracker/tasks/<id>.hjson` whenever native
+writers change work. Each initiative file contains its full member records;
+task files also expose work that belongs to no initiative. These are JSON,
+which is a subset of HJSON, with stable IDs, bodies, comments, relationships,
+evidence, code anchors and explicit timing conditions.
+
+Ordinary search finds the files:
+
+```sh
+rg 'login' tracker/
+```
+
+The checkout excludes the generated files from Git and adds local ripgrep
+allow rules so plain `rg` can find them. Existing ignore rules are preserved;
+an existing unrelated `tracker/` directory or a tracked `.rgignore` that lacks
+the allow rules requires operator configuration. Files are read-only views;
+claim and edit through the tracker. No export or refresh command is needed.
+Event backup with `whip issue export` uses a read-only ledger connection and
+continues independently of unavailable discovery destinations.
+
+`durable_status` records the stored state. Claims include expiry and waits
+include their conditions; the files do not cache readiness or `in_progress`.
+Native owned harness turns with `WHIPPLESCRIPT_ITEMS_STORE` configured receive
+a bounded startup snapshot of initiatives and currently ready tasks as
+untrusted data. Isolated turns do not open the workstation tracker for this
+snapshot, and protected stores never emit plaintext discovery files.
+
+Enrollment installs a local SQL writer guard. Writers must support the
+publication protocol; older connections opened before enrollment also refuse
+mutations, so they cannot silently make the files stale. Read-only export
+continues to observe the ledger.
+
+A completed write publishes a complete generation. An interrupted publication
+leaves the view unavailable until a writable reopen repairs it. The tracker
+store remains authoritative; generated files are neither editable work lists
+nor instructions to an agent.
+
 ## Assignment
 
 An issue can name who should act on it:
