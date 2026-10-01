@@ -178,6 +178,25 @@ This is an explicit-scenario content abstraction: a trusted selection supplies
 the source atoms, and no native or hosted store yet persists these derivation
 edges with a ref move. It does not close FB-1 or FB-2.
 
+`flowing_derived_cut_commit.py` checks the separate crash boundary for making
+that derived output visible:
+
+```sh
+python3 models/research/flowing_derived_cut_commit.py
+```
+
+Two selected units share one mixed output. The immutable candidate bodies,
+cut and complete source edge publish under an attempt pin before the ref move;
+one ref-authority transaction verifies them and commits both unit receipts,
+target head and continuing retention. Crashes before or after this transaction
+leave a recoverable state. Seven split-write mutants
+expose a head without a cut, lineage or receipts; a premature receipt; a partial
+mixed receipt; unpublished bodies; or retention released before the ref entry
+takes over. This is a bounded metadata and lifetime model, not a proof of SQL
+transaction scope, real blob publication, content reconciliation, or hosted
+implementation. The existing legacy transport advances the target head before
+recording its cut, and flowing transport remains refused.
+
 `revision_lineage.py` probes the other half of that boundary: every
 acknowledged mutation of a selected unit's meaning must advance the ref-owned
 source epoch before the topology head changes. It models eight mutation
