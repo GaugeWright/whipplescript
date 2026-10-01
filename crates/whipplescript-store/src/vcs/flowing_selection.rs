@@ -162,6 +162,70 @@ pub enum FlowingTargetEffectsOutcome {
     UnexpectedEffect { path: String },
 }
 
+/// Ordered per-unit effects of one mixed target cut. This is a content
+/// comparison only; no holder transfers until an atomic batch receipt exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingBatchUnitEffect {
+    unit_id: String,
+    source_branch_id: String,
+    source_cut_id: String,
+    basis_digest: String,
+    effects: Vec<FlowingTargetEffect>,
+}
+
+impl FlowingBatchUnitEffect {
+    pub fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+    pub fn source_branch_id(&self) -> &str {
+        &self.source_branch_id
+    }
+    pub fn source_cut_id(&self) -> &str {
+        &self.source_cut_id
+    }
+    pub fn basis_digest(&self) -> &str {
+        &self.basis_digest
+    }
+    pub fn effects(&self) -> &[FlowingTargetEffect] {
+        &self.effects
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingBatchTargetEffects {
+    target_branch_id: String,
+    target_before_cut_id: Option<String>,
+    target_after_cut_id: String,
+    target_after_manifest_hash: String,
+    units: Vec<FlowingBatchUnitEffect>,
+}
+
+impl FlowingBatchTargetEffects {
+    pub fn target_branch_id(&self) -> &str {
+        &self.target_branch_id
+    }
+    pub fn target_before_cut_id(&self) -> Option<&str> {
+        self.target_before_cut_id.as_deref()
+    }
+    pub fn target_after_cut_id(&self) -> &str {
+        &self.target_after_cut_id
+    }
+    pub fn target_after_manifest_hash(&self) -> &str {
+        &self.target_after_manifest_hash
+    }
+    pub fn units(&self) -> &[FlowingBatchUnitEffect] {
+        &self.units
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingBatchTargetEffectsOutcome {
+    Verified(FlowingBatchTargetEffects),
+    EmptySelection,
+    DuplicateUnit { unit_id: String },
+    Refused(FlowingTargetEffectsOutcome),
+}
+
 /// A content-derived, complete direct-twig prefix at an unchanged trunk base.
 /// The recorded cut is a GC root, but this is preparation, not a gate verdict
 /// or permission to advance the trunk ref.
@@ -1371,6 +1435,166 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.verify_target_effects(unit_id, target_cut_id, false)
     }
 
+    /// Compare one recorded target cut with an ordered batch of bound source
+    /// units. Consecutive writes to the same path compose, including an undo
+    /// that leaves the target's net content unchanged. Every changed target
+    /// path must be explained by the batch. This neither records derivation
+    /// lineage, source ordering or dependency compatibility, nor authorizes
+    /// a head move or holder transfer.
+    pub fn verify_private_batch_target_effects(
+        &self,
+        unit_ids: &[&str],
+        target_cut_id: &str,
+    ) -> StoreResult<FlowingBatchTargetEffectsOutcome> {
+        use FlowingBatchTargetEffectsOutcome as R;
+        use FlowingTargetEffectsOutcome as E;
+        if unit_ids.is_empty() {
+            return Ok(R::EmptySelection);
+        }
+        let mut seen_units = BTreeSet::new();
+        for unit_id in unit_ids {
+            if !seen_units.insert(*unit_id) {
+                return Ok(R::DuplicateUnit {
+                    unit_id: (*unit_id).to_owned(),
+                });
+            }
+        }
+        let Some(target_cut) = self.branches.get_cut(target_cut_id)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+            return Ok(R::Refused(E::TargetCutMissing));
+        };
+        let target_branch_id = target_cut.branch_id.clone();
+        let before_manifest_hash = if let Some(parent_id) = target_cut.parent_cut_id.as_deref() {
+            let Some(parent) = self.branches.get_cut(parent_id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+                return Ok(R::Refused(E::TargetCutMismatch));
+            };
+            Some(parent.manifest_hash)
+        } else {
+            None
+        };
+        let Some(after_root) = self.load_manifest_opt_raw(&target_cut.manifest_hash)? else {
+            let missing_cut_id = target_cut.cut_id;
+            let refusal = E::MissingManifest {
+                cut_id: missing_cut_id,
+            };
+            // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+            return Ok(R::Refused(refusal));
+        };
+        // The one-unit verifier owns target ancestry and branch-point
+        // validation. A mixed cut may differ from its first unit's final
+        // effect or contain paths owned by later units; those are the two
+        // content refusals this batch comparison can resolve. Every other
+        // refusal, including an invalid target cut, remains final.
+        let preflight = self.verify_private_target_effects(unit_ids[0], target_cut_id)?;
+        if !matches!(
+            preflight,
+            E::Verified(_) | E::OmittedEffect { .. } | E::UnexpectedEffect { .. }
+        ) {
+            return Ok(R::Refused(preflight));
+        }
+
+        let mut simulated: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut units = Vec::with_capacity(unit_ids.len());
+        for unit_id in unit_ids {
+            let Some(unit) = self.branches.contribution_declaration(unit_id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+                return Ok(R::Refused(E::UnitMissing));
+            };
+            let Some(basis) = self.branches.contribution_basis(unit_id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+                return Ok(R::Refused(E::BasisMissing));
+            };
+            let Some(source) = self.branches.get_branch(&unit.source_branch_id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(R::Verified(FlowingBatchTargetEffects { target_branch_id: String::new(), target_before_cut_id: None, target_after_cut_id: target_cut_id.to_owned(), target_after_manifest_hash: String::new(), units: Vec::new() }))
+                return Ok(R::Refused(E::TargetNotParent));
+            };
+            if source.parent_branch_id.as_deref() != Some(target_branch_id.as_str()) {
+                return Ok(R::Refused(E::TargetNotParent));
+            }
+            let selected = match self.net_source_paths(&basis)? {
+                Ok(selected) => selected,
+                Err(refusal) => return Ok(R::Refused(refusal)),
+            };
+            let mut effects = Vec::new();
+            for (path, (expected_before, expected_after)) in selected {
+                let current = if let Some(current) = simulated.get(path) {
+                    current.clone()
+                } else {
+                    self.manifest_entry(before_manifest_hash.as_deref(), path)?
+                };
+                if current.as_deref() != expected_before && current.as_deref() != expected_after {
+                    return Ok(R::Refused(E::BeforeMismatch {
+                        path: path.to_owned(),
+                    }));
+                }
+                let disposition = if expected_before == expected_after {
+                    FlowingEffectDisposition::Neutralized
+                } else if current.as_deref() == expected_after {
+                    FlowingEffectDisposition::Equivalent
+                } else {
+                    FlowingEffectDisposition::Applied
+                };
+                effects.push(FlowingTargetEffect {
+                    path: path.to_owned(),
+                    before: current,
+                    after: expected_after.map(str::to_owned),
+                    disposition,
+                });
+                simulated.insert(path.to_owned(), expected_after.map(str::to_owned));
+            }
+            units.push(FlowingBatchUnitEffect {
+                unit_id: unit.unit_id,
+                source_branch_id: unit.source_branch_id,
+                source_cut_id: unit.source_cut_id,
+                basis_digest: basis.basis_digest,
+                effects,
+            });
+        }
+        for (path, expected) in &simulated {
+            if self.manifest_entry(Some(&target_cut.manifest_hash), path)? != *expected {
+                return Ok(R::Refused(E::OmittedEffect { path: path.clone() }));
+            }
+        }
+        let before_is_tree = match before_manifest_hash.as_deref() {
+            Some(hash) => matches!(
+                self.load_manifest_opt_raw(hash)?,
+                Some(RawManifest::Tree(_))
+            ),
+            None => false,
+        };
+        let changed_paths: BTreeSet<String> = if let Some(before_root) = before_manifest_hash
+            .as_deref()
+            .filter(|_| before_is_tree && matches!(after_root, RawManifest::Tree(_)))
+        {
+            crate::manifest_tree::diff(&self.content, before_root, &target_cut.manifest_hash)?
+                .into_iter()
+                .map(|change| change.path)
+                .collect()
+        } else {
+            let before = self.load_manifest(before_manifest_hash.as_deref())?;
+            let after = self.load_manifest(Some(&target_cut.manifest_hash))?;
+            before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .cloned()
+                .collect()
+        };
+        for path in changed_paths {
+            if !simulated.contains_key(&path) {
+                return Ok(R::Refused(E::UnexpectedEffect { path }));
+            }
+        }
+        Ok(R::Verified(FlowingBatchTargetEffects {
+            target_branch_id,
+            target_before_cut_id: target_cut.parent_cut_id,
+            target_after_cut_id: target_cut.cut_id,
+            target_after_manifest_hash: target_cut.manifest_hash,
+            units,
+        }))
+    }
+
     /// Check one bound unit against a recorded trunk candidate. This is a
     /// content proof only: admission still needs the gate certificate, source
     /// fence and atomic ref/receipt transaction. A branch handoff cannot use
@@ -1892,6 +2116,53 @@ mod tests {
 
     fn bound_unit() -> WorkspaceVcs<BranchStore, ContentStore> {
         bound_unit_with_flowing_target(false)
+    }
+
+    fn bind_extra_unit(
+        vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
+        source_branch_id: &str,
+        path: &str,
+        body: Option<&str>,
+        cut_id: &str,
+        pin_id: &str,
+        unit_id: &str,
+    ) {
+        vcs.write(source_branch_id, path, body, cut_id, "t7")
+            .expect("write extra source cut");
+        let cut = vcs
+            .branches
+            .get_cut(cut_id)
+            .expect("read extra source cut")
+            .expect("extra source cut exists");
+        assert_eq!(
+            vcs.branches
+                .pin_private_cut(PinPrivateCut {
+                    pin_id,
+                    twig_branch_id: source_branch_id,
+                    cut_id,
+                    manifest_hash: &cut.manifest_hash,
+                    principal: "s:author",
+                    retained_at: "t8",
+                })
+                .expect("pin extra source cut"),
+            PinPrivateCutOutcome::Pinned
+        );
+        declare(vcs, unit_id, pin_id);
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                pin_id,
+                &selection::parse(&format!("change({cut_id})"))
+                    .expect("parse extra source selection"),
+            )
+            .expect("select extra source change")
+        else {
+            panic!("bound extra source change")
+        };
+        assert_eq!(
+            vcs.bind_private_selection(unit_id, &selection, "t9")
+                .expect("bind extra source selection"),
+            BindContributionBasisOutcome::Bound
+        );
     }
 
     fn bound_direct_twig() -> WorkspaceVcs<BranchStore, ContentStore> {
@@ -4068,6 +4339,318 @@ mod tests {
             .pinned_cuts("year-3000")
             .unwrap()
             .contains("twig-a"));
+    }
+
+    #[test]
+    fn mixed_target_comparison_composes_two_bound_writes_to_one_path() {
+        let mut vcs = bound_unit();
+        vcs.write("twig", "a.txt", Some("B"), "twig-b", "t7")
+            .unwrap();
+        pin(&mut vcs, "twig-b", "pin-b");
+        declare(&mut vcs, "unit-b", "pin-b");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-b", &selection::parse("change(twig-b)").unwrap())
+            .unwrap()
+        else {
+            panic!("second bound source change")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-b", &selection, "t8")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        vcs.write("branch", "a.txt", Some("B"), "target-b", "t9")
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(batch) = vcs
+            .verify_private_batch_target_effects(&["unit-a", "unit-b"], "target-b")
+            .unwrap()
+        else {
+            panic!("ordered source writes explain the one target path")
+        };
+        assert_eq!(batch.target_branch_id(), "branch");
+        assert_eq!(batch.target_before_cut_id(), None);
+        assert_eq!(batch.units().len(), 2);
+        assert_eq!(
+            batch.units()[0].effects[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            batch.units()[1].effects[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            batch.units()[1].effects[0].before,
+            batch.units()[0].effects[0].after
+        );
+        assert_eq!(
+            vcs.verify_private_target_effects("unit-a", "target-b")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::OmittedEffect {
+                path: "a.txt".into()
+            }
+        );
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-b", "unit-a"], "target-b")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::BeforeMismatch {
+                    path: "a.txt".into()
+                }
+            )
+        );
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a"], "target-b")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(FlowingTargetEffectsOutcome::OmittedEffect {
+                path: "a.txt".into()
+            })
+        );
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-a"], "target-b")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::DuplicateUnit {
+                unit_id: "unit-a".into()
+            }
+        );
+        let mut with_extra = vcs.manifest("branch").unwrap().unwrap();
+        with_extra.insert(
+            "extra.txt".into(),
+            vcs.content.put_text("unselected").unwrap(),
+        );
+        let extra_hash = vcs.store_manifest(&with_extra).unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-extra",
+                change_id: "mixed-output",
+                branch_id: "branch",
+                manifest_hash: &extra_hash,
+                parent_cut_id: None,
+                origin: Some("transport:batch"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t10",
+            })
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-b"], "target-extra")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::UnexpectedEffect {
+                    path: "extra.txt".into()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn mixed_target_comparison_keeps_both_units_when_net_content_is_unchanged() {
+        let mut vcs = bound_unit();
+        vcs.write("twig", "a.txt", None, "twig-undo", "t7").unwrap();
+        pin(&mut vcs, "twig-undo", "pin-undo");
+        declare(&mut vcs, "unit-undo", "pin-undo");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-undo", &selection::parse("change(twig-undo)").unwrap())
+            .unwrap()
+        else {
+            panic!("undo source change")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-undo", &selection, "t8")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let empty_hash = vcs.store_manifest(&BTreeMap::new()).unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-undo",
+                change_id: "mixed-output",
+                branch_id: "branch",
+                manifest_hash: &empty_hash,
+                parent_cut_id: None,
+                origin: Some("transport:batch"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t9",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(batch) = vcs
+            .verify_private_batch_target_effects(&["unit-a", "unit-undo"], "target-undo")
+            .unwrap()
+        else {
+            panic!("both source effects explain the no-op target cut")
+        };
+        assert_eq!(batch.units().len(), 2);
+        assert_eq!(
+            batch.units()[0].effects()[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            batch.units()[1].effects()[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(batch.units()[1].effects()[0].after, None);
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .is_none());
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-undo")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn mixed_target_comparison_refuses_missing_target_and_source_facts() {
+        let mut vcs = bound_unit();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a"], "missing-cut")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::TargetCutMissing
+            )
+        );
+        vcs.write("branch", "a.txt", Some("A"), "target-a", "t10")
+            .unwrap();
+        let target = vcs.branches.get_cut("target-a").unwrap().unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "orphan-parent",
+                change_id: "orphan-parent",
+                branch_id: "branch",
+                manifest_hash: &target.manifest_hash,
+                parent_cut_id: Some("missing-parent"),
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t11",
+            })
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a"], "orphan-parent")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::TargetCutMismatch
+            )
+        );
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "missing-manifest",
+                change_id: "missing-manifest",
+                branch_id: "branch",
+                manifest_hash: "absent-manifest",
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t12",
+            })
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a"], "missing-manifest")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::MissingManifest {
+                    cut_id: "missing-manifest".into()
+                }
+            )
+        );
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "missing-unit"], "target-a")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(FlowingTargetEffectsOutcome::UnitMissing)
+        );
+        declare(&mut vcs, "unit-unbound", "pin-a");
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-unbound"], "target-a")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(FlowingTargetEffectsOutcome::BasisMissing)
+        );
+        vcs.create_branch("other", None, MAINLINE_BRANCH_ID, "t13")
+            .unwrap();
+        bind_extra_unit(
+            &mut vcs,
+            "other",
+            "b.txt",
+            Some("B"),
+            "other-b",
+            "pin-other",
+            "unit-other",
+        );
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-other"], "target-a")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(FlowingTargetEffectsOutcome::TargetNotParent)
+        );
+        vcs.branches.test_connection().execute(
+            "UPDATE flowing_contributions SET source_branch_id = 'absent' WHERE unit_id = 'unit-other'",
+            [],
+        ).unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-other"], "target-a")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(FlowingTargetEffectsOutcome::TargetNotParent)
+        );
+    }
+
+    #[test]
+    fn mixed_target_comparison_refuses_a_later_unit_on_unrelated_before_content() {
+        let mut vcs = bound_unit();
+        bind_extra_unit(
+            &mut vcs,
+            "twig",
+            "b.txt",
+            Some("B"),
+            "twig-b",
+            "pin-b",
+            "unit-b",
+        );
+        vcs.write("branch", "b.txt", Some("other"), "branch-other", "t10")
+            .unwrap();
+        let a = vcs
+            .branches
+            .contribution_basis("unit-a")
+            .unwrap()
+            .unwrap()
+            .atoms[0]
+            .after
+            .clone()
+            .unwrap();
+        let b = vcs
+            .branches
+            .contribution_basis("unit-b")
+            .unwrap()
+            .unwrap()
+            .atoms[0]
+            .after
+            .clone()
+            .unwrap();
+        let candidate_hash = vcs
+            .store_manifest(&BTreeMap::from([("a.txt".into(), a), ("b.txt".into(), b)]))
+            .unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-mixed",
+                change_id: "target-mixed",
+                branch_id: "branch",
+                manifest_hash: &candidate_hash,
+                parent_cut_id: Some("branch-other"),
+                origin: Some("transport:batch"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t11",
+            })
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_target_effects(&["unit-a", "unit-b"], "target-mixed")
+                .unwrap(),
+            FlowingBatchTargetEffectsOutcome::Refused(
+                FlowingTargetEffectsOutcome::BeforeMismatch {
+                    path: "b.txt".into()
+                }
+            )
+        );
     }
 
     #[test]
