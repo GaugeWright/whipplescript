@@ -19,6 +19,15 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- The owned harness knows the limits of the newest models. Claude Fable 5 and
+  5.1 compact against their 1M window and default to a 128K output ceiling,
+  not 200k and 64K. GPT-6, GPT-5.6, GPT-5.4 and GPT-5.5 compact at their
+  922,000-token prompt limit, the rest of GPT-5 at 272,000, and Grok 4.5 to
+  4.7 at 500k. An unlisted Claude, GPT, o-series or Grok model now gets a
+  250k window rather than 128k–200k. Any other unlisted model keeps its
+  default. The limits are one table checked daily against models.dev
+  (DR-0161).
+
 - An authenticated host opts in to recorded presented-root renames with
   `"workspace_root_renames": "recorded"` on its turn request; the Durable
   Object worker forwards it into the placement's agent configuration, which

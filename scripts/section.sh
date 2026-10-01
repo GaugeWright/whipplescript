@@ -92,7 +92,8 @@ case "${1:-}" in
   substrate-refusals)   scripts/check-substrate-refusals.sh ;;
   build-coverage)       node scripts/check-build-coverage.mjs ;;
   gate-test-filters)
-    node --test scripts/check-windows-compile.test.mjs scripts/windows-cargo-timings.test.mjs scripts/windows-buck2-readiness.test.mjs
+    node --test scripts/check-windows-compile.test.mjs scripts/windows-cargo-timings.test.mjs \
+      scripts/windows-buck2-readiness.test.mjs scripts/model-catalog.test.mjs
     python3 scripts/test-cargo-test-helper.py
     node scripts/check-cargo-test-guarded.mjs --selftest
     node scripts/check-cargo-test-guarded.mjs ;;

@@ -44,70 +44,116 @@ fn openai_request_key(cache_key: Option<&str>) -> Option<String> {
     })
 }
 
-/// The context window (tokens) of a provider model, for the conversation-compaction
-/// trigger (context-assembly Phase 4). This is a **model capability**, derived from
-/// the provider + model id — never an operator config knob. The numbers are the
-/// window WhippleScript's requests actually get. Unknown models fall back to a
-/// conservative family default.
-pub fn model_context_window(wire: ModelWire, model: &str) -> u64 {
+/// The model limits table, `model_limits.json` beside this file: each model's
+/// largest prompt and, for Claude, its output ceiling (WhippleScript DR-0161).
+///
+/// A table rather than match arms, because providers release models every few
+/// weeks and a number per model with its source is what a release changes.
+/// The kernel's tests hold every catalog-sourced entry to `model_catalog.json`,
+/// and the fleet's daily `model-catalog` job holds that extract to models.dev,
+/// so a release nobody added is named within a day instead of discovered as a
+/// window four times too small.
+#[derive(Debug, Deserialize)]
+struct ModelLimitTable {
+    models: Vec<ModelLimit>,
+}
+
+/// What the runtime reads of one row. The file's `about` says what every field
+/// means, and the kernel's tests parse it strictly and say what each must hold.
+#[derive(Debug, Deserialize)]
+struct ModelLimit {
+    #[serde(rename = "match")]
+    pattern: String,
+    input: u64,
+    output: Option<u64>,
+}
+
+static MODEL_LIMITS: std::sync::LazyLock<ModelLimitTable> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("model_limits.json"))
+        .expect("model_limits.json is parsed by the kernel's own tests")
+});
+
+/// The window of a model no entry matches, when it belongs to a provider the
+/// daily catalog check tracks: Claude, OpenAI's GPT and o-series, and Grok.
+///
+/// Generous, because the model is almost certainly newer than the table and
+/// each provider's newest models have the largest windows; the founder set the
+/// floor at 250k (DR-0161). Overstating is the dangerous direction — the
+/// provider refuses a prompt before compaction runs — and the daily check
+/// bounds how long an unlisted model can stay that way.
+const TRACKED_FALLBACK_INPUT: u64 = 250_000;
+
+/// The window of an unrecognized model on an OpenAI-shaped wire that is not
+/// one of the tracked providers': an open model behind a generic endpoint,
+/// where nothing tracks the catalog and 128k is the common case.
+const UNTRACKED_FALLBACK_INPUT: u64 = 128_000;
+
+/// The window of a model that is not Claude, spoken to on the Anthropic wire.
+const ANTHROPIC_WIRE_FALLBACK_INPUT: u64 = 200_000;
+
+/// The output ceiling of a Claude model no entry names. Every current Claude
+/// model allows at least this many, and naming more than a model allows is
+/// refused outright.
+const CLAUDE_FALLBACK_OUTPUT: u64 = 64_000;
+
+/// The table entry for a model id: the longest `match` the id contains with no
+/// letter or digit on either side, after any routing prefix up to the last `/`.
+fn model_limit(model: &str) -> Option<&'static ModelLimit> {
     let model = model.to_ascii_lowercase();
-    // Match on the bare id. A metered-gateway name carries its provider
-    // (`openai/gpt-5-mini`) because unified billing routes by that form, and the
-    // capability belongs to the model rather than to the routing prefix.
+    let bare = model.rsplit('/').next().unwrap_or(model.as_str());
+    MODEL_LIMITS
+        .models
+        .iter()
+        .filter(|limit| contains_token(bare, &limit.pattern))
+        .max_by_key(|limit| limit.pattern.len())
+}
+
+/// Whether `pattern` occurs in `id` with neither neighbour an ASCII letter or
+/// digit, so `gpt-4` names `gpt-4-0613` but not `gpt-4o`, and `o3` names
+/// `o3-mini` but not `gpt-5.3-codex`.
+fn contains_token(id: &str, pattern: &str) -> bool {
+    id.match_indices(pattern).any(|(start, _)| {
+        let before = id[..start].chars().next_back();
+        let after = id[start + pattern.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+fn is_claude_model(lowered: &str) -> bool {
+    lowered.contains("claude") || lowered.starts_with("anthropic/")
+}
+
+/// The largest prompt (tokens) a provider model accepts, for the
+/// conversation-compaction trigger (context-assembly Phase 4). This is a
+/// **model capability**, derived from the model id — never an operator config
+/// knob — and read from the model limits table. For a model the table does not
+/// name, the fallback depends on whether its provider is one the daily catalog
+/// check tracks.
+pub fn model_context_window(wire: ModelWire, model: &str) -> u64 {
+    if let Some(limit) = model_limit(model) {
+        return limit.input;
+    }
+    let model = model.to_ascii_lowercase();
+    // Read the family off the bare id. A metered-gateway name carries its
+    // provider (`openai/gpt-5-mini`) because unified billing routes by that
+    // form, and the capability belongs to the model rather than to the prefix.
     //
     // Live 400s on 2026-08-11/12: the o-series test below was `starts_with('o')`,
     // which every `openai/`-prefixed name satisfies. So `openai/gpt-5-mini` was
     // read as a reasoning model with a 200k window, and — because the output
-    // limit reuses this number — the turn asked for 200,000 completion tokens
-    // against that model's 128,000 ceiling and was refused outright.
+    // limit then reused this number — the turn asked for 200,000 completion
+    // tokens against that model's 128,000 ceiling and was refused outright. The
+    // output limit no longer reads this number (see [`model_output_limit`]).
     let bare = model.rsplit('/').next().unwrap_or(model.as_str());
-    let is_claude = model.contains("claude") || model.starts_with("anthropic/");
-    if is_claude {
-        return if model.contains("opus-5")
-            || model.contains("sonnet-5")
-            || model.contains("opus-4-6")
-            || model.contains("opus-4-7")
-            || model.contains("opus-4-8")
-            || model.contains("sonnet-4-6")
-        {
-            1_000_000
-        } else {
-            200_000
-        };
-    }
-    // Claude models are 200k standard context.
-    if wire == ModelWire::AnthropicMessages {
-        return 200_000;
-    }
-    // xAI publishes few, stable windows: the fast variants carry 2M, the
-    // grok-4 family and grok-code 256k, and everything earlier or unrecognized
-    // falls back to grok-3's 131k (conservative default).
-    //
-    // Keyed on the model id rather than on the wire, because the wire no longer
-    // distinguishes them: xAI speaks chat completions, and so do the dozen other
-    // endpoints that can serve a grok model. A window is a property of the model
-    // wherever it is served from — the same reason the Claude test above reads
-    // the name.
-    if bare.contains("grok") {
-        return if bare.contains("grok-4-fast") || bare.contains("grok-4.1-fast") {
-            2_000_000
-        } else if bare.contains("grok-4") || bare.contains("grok-code") {
-            256_000
-        } else {
-            131_072
-        };
-    }
-    // Any remaining OpenAI-wire endpoint serves arbitrary models whose windows we
-    // can't know; fall back to the OpenAI heuristic (conservative default for an
-    // unrecognized id).
-    if bare.contains("gpt-4.1") {
-        1_000_000
-    } else if bare.contains("gpt-4o") || bare.contains("gpt-4-turbo") {
-        128_000
-    } else if is_openai_reasoning_model(bare) {
-        200_000
+    let openai =
+        bare.starts_with("gpt-") || bare.starts_with("chatgpt-") || is_openai_reasoning_model(bare);
+    if is_claude_model(&model) || openai || bare.contains("grok") {
+        TRACKED_FALLBACK_INPUT
+    } else if wire == ModelWire::AnthropicMessages {
+        ANTHROPIC_WIRE_FALLBACK_INPUT
     } else {
-        128_000
+        UNTRACKED_FALLBACK_INPUT
     }
 }
 
@@ -130,18 +176,9 @@ fn is_openai_reasoning_model(bare: &str) -> bool {
 /// number even when nobody chose one. It can: the Claude ceilings are few and
 /// published, unlike the OpenAI catalogue — see [`model_output_limit`].
 fn anthropic_output_limit(model: &str) -> u64 {
-    let model = model.to_ascii_lowercase();
-    if model.contains("opus-5")
-        || model.contains("sonnet-5")
-        || model.contains("opus-4-6")
-        || model.contains("opus-4-7")
-        || model.contains("opus-4-8")
-        || model.contains("sonnet-4-6")
-    {
-        128_000
-    } else {
-        64_000
-    }
+    model_limit(model)
+        .and_then(|limit| limit.output)
+        .unwrap_or(CLAUDE_FALLBACK_OUTPUT)
 }
 
 /// The output limit to request, or `None` to send none at all.
@@ -168,8 +205,7 @@ fn anthropic_output_limit(model: &str) -> u64 {
 /// who wants a smaller budget still sets one explicitly, and that value is sent.
 pub fn model_output_limit(wire: ModelWire, model: &str) -> Option<u64> {
     let lowered = model.to_ascii_lowercase();
-    let is_claude = lowered.contains("claude") || lowered.starts_with("anthropic/");
-    if is_claude || wire == ModelWire::AnthropicMessages {
+    if is_claude_model(&lowered) || wire == ModelWire::AnthropicMessages {
         Some(anthropic_output_limit(&lowered))
     } else {
         None
@@ -2329,7 +2365,7 @@ mod tests {
         );
         assert_eq!(
             model_context_window(ModelWire::OpenAiResponses, "gpt-4.1"),
-            1_000_000
+            1_047_576
         );
         assert_eq!(
             model_context_window(ModelWire::OpenAiResponses, "o3"),
@@ -2339,7 +2375,7 @@ mod tests {
             model_context_window(ModelWire::OpenAiResponses, "o3-mini"),
             200_000
         );
-        // An unrecognized OpenAI model takes the conservative family default.
+        // A model from no tracked provider takes the open-model default.
         assert_eq!(
             model_context_window(ModelWire::OpenAiResponses, "some-future-model"),
             128_000
@@ -2349,9 +2385,9 @@ mod tests {
             model_context_window(ModelWire::OpenAiChatCompat, "llama-3.3-70b"),
             128_000
         );
-        // xAI: fast variants carry 2M, grok-4/grok-code 256k, and anything
-        // unrecognized takes grok-3's conservative 131k. `grok-4-fast` must be
-        // tested before the `grok-4` prefix claims it.
+        // xAI: fast variants carry 2M, grok-4/grok-code 256k, grok-3 131k, and
+        // an unrecognized grok takes the tracked providers' fallback. The
+        // longest match wins, so `grok-4` does not claim `grok-4-fast`.
         assert_eq!(
             model_context_window(ModelWire::OpenAiChatCompat, "grok-4-fast"),
             2_000_000
@@ -2370,7 +2406,7 @@ mod tests {
         );
         assert_eq!(
             model_context_window(ModelWire::OpenAiChatCompat, "some-future-grok"),
-            131_072
+            TRACKED_FALLBACK_INPUT
         );
         // The output limit stays provider-derived: only Anthropic names one.
         assert_eq!(
@@ -2389,7 +2425,7 @@ mod tests {
         for wire in [ModelWire::OpenAiResponses, ModelWire::OpenAiChatCompat] {
             assert_eq!(
                 model_context_window(wire, "openai/gpt-5-mini"),
-                128_000,
+                272_000,
                 "the `openai/` prefix must not claim the o-series window"
             );
             assert_eq!(
@@ -2401,7 +2437,7 @@ mod tests {
             // prefixed o-series model keeps its own window.
             assert_eq!(model_context_window(wire, "openai/o3"), 200_000);
             // And a bare name is unaffected.
-            assert_eq!(model_context_window(wire, "gpt-5-mini"), 128_000);
+            assert_eq!(model_context_window(wire, "gpt-5-mini"), 272_000);
         }
     }
 
@@ -2463,6 +2499,304 @@ mod tests {
         assert!(!is_openai_reasoning_model("openai/gpt-5-mini"));
         assert!(!is_openai_reasoning_model("omni-moderation-latest"));
         assert!(!is_openai_reasoning_model("o3x-experimental"));
+    }
+
+    const MODEL_CATALOG: &str = include_str!("model_catalog.json");
+
+    /// The whole of `model_limits.json`, every field, refusing any it does not
+    /// know. The runtime reads only `match`, `input` and `output`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictModelLimitTable {
+        schema: String,
+        about: Vec<String>,
+        models: Vec<StrictModelLimit>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictModelLimit {
+        #[serde(rename = "match")]
+        pattern: String,
+        input: u64,
+        output: Option<u64>,
+        source: String,
+        checked: Option<String>,
+        below: Option<String>,
+        note: Option<String>,
+    }
+
+    fn strict_model_limits() -> StrictModelLimitTable {
+        serde_json::from_str(include_str!("model_limits.json"))
+            .expect("model_limits.json must parse with exactly the fields its `about` names")
+    }
+
+    /// A catalog id less a trailing snapshot date (`-20251001`, `-2024-08-06`),
+    /// which resolves to its base model's entry rather than needing its own.
+    fn undated(id: &str) -> &str {
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        if let Some((base, date)) = id.rsplit_once('-') {
+            if date.len() == 8 && digits(date) {
+                return base;
+            }
+        }
+        if id.len() > 11 && id.is_char_boundary(id.len() - 11) {
+            let (base, tail) = id.split_at(id.len() - 11);
+            let parts: Vec<&str> = tail.split('-').collect();
+            if parts.len() == 4
+                && parts[0].is_empty()
+                && parts[1].len() == 4
+                && parts[2].len() == 2
+                && parts[3].len() == 2
+                && parts[1..].iter().all(|part| digits(part))
+            {
+                return base;
+            }
+        }
+        id
+    }
+
+    #[test]
+    fn model_limits_table_is_well_formed() {
+        let table = strict_model_limits();
+        assert_eq!(table.schema, "whipplescript.model-limits.v1");
+        assert!(
+            !table.about.is_empty(),
+            "the file must say what its fields mean"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &table.models {
+            let name = &entry.pattern;
+            assert!(seen.insert(name.clone()), "{name} is listed twice");
+            assert!(
+                !name.is_empty()
+                    && *name == name.trim().to_ascii_lowercase()
+                    && !name.contains('/'),
+                "{name:?}: a match is a lowercase model id, without a routing prefix"
+            );
+            assert!(entry.input > 0, "{name}: input must be positive");
+            // Only the Anthropic wire is sent an output ceiling, so only a
+            // Claude entry states one, and every Claude entry must.
+            assert_eq!(
+                entry.output.is_some(),
+                name.contains("claude"),
+                "{name}: `output` belongs on Claude entries and only there"
+            );
+            assert_ne!(entry.output, Some(0), "{name}: output must be positive");
+            if entry.source == "catalog" {
+                assert!(
+                    entry.checked.is_none(),
+                    "{name}: a catalog entry is dated by model_catalog.json's `read`"
+                );
+            } else {
+                assert!(
+                    entry.source.starts_with("https://"),
+                    "{name}: a source is `catalog` or the provider page the number was read from"
+                );
+                let checked = entry.checked.as_deref().unwrap_or_default();
+                assert!(
+                    checked.len() == 10
+                        && checked.split('-').map(str::len).eq([4, 2, 2])
+                        && checked.bytes().all(|b| b.is_ascii_digit() || b == b'-'),
+                    "{name}: a provider-page entry needs `checked`, the YYYY-MM-DD it was read"
+                );
+            }
+            for text in [&entry.below, &entry.note].into_iter().flatten() {
+                assert!(!text.trim().is_empty(), "{name}: an empty explanation");
+            }
+        }
+    }
+
+    /// Every model the catalog extract lists has an entry of its own, and the
+    /// runtime resolves it to the catalog's numbers: never above them, and below
+    /// them only with a reason. This is the test the fleet's daily
+    /// `model-catalog` job points at when models.dev moves.
+    #[test]
+    fn model_limits_agree_with_the_catalog() {
+        let table = strict_model_limits();
+        let catalog: Value = serde_json::from_str(MODEL_CATALOG).unwrap();
+        let mut drift = Vec::new();
+        let mut listed = std::collections::BTreeSet::new();
+        for (provider, wire) in [
+            ("anthropic", ModelWire::AnthropicMessages),
+            ("openai", ModelWire::OpenAiResponses),
+            ("xai", ModelWire::OpenAiChatCompat),
+        ] {
+            let models = catalog["providers"][provider]
+                .as_object()
+                .unwrap_or_else(|| panic!("model_catalog.json lists no {provider} models"));
+            for (id, limit) in models {
+                let input = limit
+                    .get("input")
+                    .or_else(|| limit.get("context"))
+                    .and_then(Value::as_u64)
+                    .unwrap();
+                let base = undated(id);
+                listed.insert(base.to_owned());
+                let Some(entry) = table.models.iter().find(|entry| entry.pattern == base) else {
+                    let output = limit.get("output").filter(|_| provider == "anthropic");
+                    let output = output
+                        .map(|o| format!(", \"output\": {o}"))
+                        .unwrap_or_default();
+                    drift.push(format!(
+                        "{provider}/{id}: no entry. The catalog says: \
+                         {{ \"match\": \"{base}\", \"input\": {input}{output}, \"source\": \"catalog\" }}"
+                    ));
+                    continue;
+                };
+                let window = model_context_window(wire, id);
+                if window > input {
+                    drift.push(format!(
+                        "{provider}/{id}: input {window} overstates the catalog's {input}, \
+                         so the provider refuses a prompt before compaction runs"
+                    ));
+                } else if window < input && entry.below.is_none() {
+                    drift.push(format!(
+                        "{provider}/{id}: input {window} is below the catalog's {input}; \
+                         raise it, or say in `below` why requests get less"
+                    ));
+                }
+                if provider == "anthropic" {
+                    let output = limit["output"].as_u64().unwrap();
+                    let sent = model_output_limit(wire, id).unwrap();
+                    if sent > output {
+                        drift.push(format!(
+                            "{provider}/{id}: output {sent} overstates the catalog's {output}, \
+                             so every turn that names no budget is refused"
+                        ));
+                    } else if sent < output && entry.below.is_none() {
+                        drift.push(format!(
+                            "{provider}/{id}: output {sent} is below the catalog's {output}; \
+                             raise it, or say in `below` why"
+                        ));
+                    }
+                }
+            }
+        }
+        for entry in table
+            .models
+            .iter()
+            .filter(|entry| entry.source == "catalog")
+        {
+            if !listed.contains(&entry.pattern) {
+                drift.push(format!(
+                    "{}: says `source: catalog`, but the catalog no longer lists it; \
+                     drop the entry, or name the provider page that still does",
+                    entry.pattern
+                ));
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "model_limits.json disagrees with model_catalog.json:\n  {}\n\
+             Check each number against the provider's own model page before you trust it.",
+            drift.join("\n  ")
+        );
+    }
+
+    /// The models GaugeDesk's catalog defaults to and offers (gaugedesk-src
+    /// DR-0271), under every spelling a deployment sends them in.
+    #[test]
+    fn model_limits_name_the_newest_models() {
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "anthropic/claude-fable-5-1",
+            "us.anthropic.claude-fable-5-1-v1:0",
+            "claude-opus-5-5@20260922",
+        ] {
+            assert_eq!(
+                model_context_window(ModelWire::AnthropicMessages, model),
+                1_000_000,
+                "{model}"
+            );
+            assert_eq!(
+                model_output_limit(ModelWire::AnthropicMessages, model),
+                Some(128_000),
+                "{model}"
+            );
+        }
+        // GPT-6 and GPT-5.6: a 1,050,000 window, of which 922,000 may be
+        // prompt. The trigger measures the prompt, so it gets the smaller.
+        for model in [
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "openai/gpt-6.1-sol",
+        ] {
+            for wire in [ModelWire::OpenAiResponses, ModelWire::OpenAiChatCompat] {
+                assert_eq!(model_context_window(wire, model), 922_000, "{model}");
+                assert_eq!(model_output_limit(wire, model), None, "{model}");
+            }
+        }
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiChatCompat, "grok-4.7"),
+            500_000
+        );
+    }
+
+    #[test]
+    fn model_limits_fall_back_by_whether_a_provider_is_tracked() {
+        // A tracked provider's model the table does not name yet is almost
+        // certainly newer than the table, so it gets the generous floor.
+        for (wire, model) in [
+            (ModelWire::AnthropicMessages, "claude-haiku-5"),
+            (ModelWire::OpenAiResponses, "gpt-6.2-sol"),
+            (ModelWire::OpenAiChatCompat, "openai/gpt-7"),
+            (ModelWire::OpenAiChatCompat, "grok-5"),
+        ] {
+            assert_eq!(
+                model_context_window(wire, model),
+                TRACKED_FALLBACK_INPUT,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            model_output_limit(ModelWire::AnthropicMessages, "claude-haiku-5"),
+            Some(CLAUDE_FALLBACK_OUTPUT)
+        );
+        // Anything else is an open model behind some endpoint, where nothing
+        // tracks the catalog and 128k is the common window.
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiChatCompat, "qwen3-coder-480b"),
+            UNTRACKED_FALLBACK_INPUT
+        );
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiChatCompat, "openai/gpt-oss-120b"),
+            128_000,
+            "gpt-oss begins like OpenAI's own ids, and is listed so it is not read as one"
+        );
+        assert_eq!(
+            model_context_window(ModelWire::AnthropicMessages, "kimi-k2"),
+            ANTHROPIC_WIRE_FALLBACK_INPUT
+        );
+    }
+
+    #[test]
+    fn model_limits_match_a_whole_id_token() {
+        assert!(contains_token("gpt-4-0613", "gpt-4"));
+        assert!(contains_token(
+            "us.anthropic.claude-opus-4-8-v1:0",
+            "claude-opus-4-8"
+        ));
+        assert!(!contains_token("gpt-4o", "gpt-4"));
+        assert!(!contains_token("gpt-5.3-codex", "o3"));
+        assert!(!contains_token("claude-opus-4-80", "claude-opus-4-8"));
+        // A dated snapshot resolves to its base model's entry.
+        assert_eq!(
+            model_limit("claude-haiku-4-5-20251001").map(|limit| limit.pattern.as_str()),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(undated("gpt-4o-2024-08-06"), "gpt-4o");
+        assert_eq!(undated("claude-opus-4-5-20251101"), "claude-opus-4-5");
+        assert_eq!(
+            undated("grok-4.20-multi-agent-0309"),
+            "grok-4.20-multi-agent-0309"
+        );
     }
 
     struct FakeTransport {
