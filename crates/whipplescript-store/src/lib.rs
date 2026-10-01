@@ -6516,6 +6516,35 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// The decrypted event under an exact replay key. Fetch identity and
+    /// payload in one read so a recovery caller can verify the old meaning
+    /// without a second lookup or an unbounded log scan.
+    pub fn event_view_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<EventView>> {
+        self.connection
+            .query_row(
+                "SELECT event_id, sequence, event_type, \
+                 whip_runtime_event_open(event_id, event_type, payload_json), source, occurred_at \
+                 FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![instance_id, idempotency_key],
+                |row| {
+                    Ok(EventView {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                        event_type: row.get(2)?,
+                        payload_json: row.get(3)?,
+                        source: row.get(4)?,
+                        occurred_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         self.list_facts_on(instance_id, "\n              AND consumed_at IS NULL")
     }

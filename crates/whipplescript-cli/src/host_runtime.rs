@@ -2562,9 +2562,6 @@ impl GovernedHostRuntime {
 
         let target_command = command.target_open_command();
         let target = self.open_instance(&target_command, packages)?;
-        if let Some(replayed) = self.replayed_fork_instance(command, &target)? {
-            return Ok(replayed);
-        }
         if target.instance_ref == command.source.instance_ref {
             return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
                 "fork target identity",
@@ -2579,20 +2576,44 @@ impl GovernedHostRuntime {
                 Some(command.source.sequence as i64),
             )
             .map_err(HostRuntimeError::Store)?;
-        self.kernel
-            .seed_agent_thread(AgentThreadSeed {
-                instance_id: &target.instance_ref,
-                agent: &target_package.agent,
-                messages: &messages,
-                source_instance_id: &command.source.instance_ref,
-                source_sequence: command.source.sequence as i64,
-                idempotency_key: &idempotency_key(&[
-                    &target.instance_ref,
-                    &command.request_id,
-                    "host-instance-thread-seed",
-                ]),
-            })
-            .map_err(HostRuntimeError::Store)?;
+        let seed_key = idempotency_key(&[
+            &target.instance_ref,
+            &command.request_id,
+            "host-instance-thread-seed",
+        ]);
+        let seed_payload = json!({
+            "agent": target_package.agent,
+            "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
+            "source_instance_id": command.source.instance_ref,
+            "source_sequence": command.source.sequence as i64,
+        });
+        let seed = self.exact_fork_event(
+            &target.instance_ref,
+            &seed_key,
+            "agent.thread.seeded",
+            &seed_payload,
+            "kernel",
+        )?;
+        if let Some(replayed) = self.replayed_fork_instance(command, &target)? {
+            if seed.is_none() {
+                return Err(HostRuntimeError::Incomplete(
+                    "recorded fork has no exact thread seed".into(),
+                ));
+            }
+            return Ok(replayed);
+        }
+        if seed.is_none() {
+            self.kernel
+                .seed_agent_thread(AgentThreadSeed {
+                    instance_id: &target.instance_ref,
+                    agent: &target_package.agent,
+                    messages: &messages,
+                    source_instance_id: &command.source.instance_ref,
+                    source_sequence: command.source.sequence as i64,
+                    idempotency_key: &seed_key,
+                })
+                .map_err(HostRuntimeError::Store)?;
+        }
         let payload = json!({
             "request_id": command.request_id,
             "source": command.source,
@@ -2631,6 +2652,39 @@ impl GovernedHostRuntime {
         };
         result.validate_for(command)?;
         Ok(result)
+    }
+
+    /// An idempotency key is only a locator. Verify the stored event's exact
+    /// meaning before treating a crash retry as completion of the old step.
+    fn exact_fork_event(
+        &self,
+        instance_ref: &str,
+        key: &str,
+        event_type: &str,
+        expected_payload: &Value,
+        source: &str,
+    ) -> Result<Option<whipplescript_store::StoredEvent>, HostRuntimeError> {
+        let Some(event) = self
+            .kernel
+            .store()
+            .event_view_by_idempotency_key(instance_ref, key)
+            .map_err(HostRuntimeError::Store)?
+        else {
+            return Ok(None);
+        };
+        if event.event_type != event_type
+            || event.source != source
+            || serde_json::from_str::<Value>(&event.payload_json).map_err(HostRuntimeError::Json)?
+                != *expected_payload
+        {
+            return Err(HostRuntimeError::Incomplete(
+                "fork event key names different evidence".into(),
+            ));
+        }
+        Ok(Some(whipplescript_store::StoredEvent {
+            event_id: event.event_id,
+            sequence: event.sequence,
+        }))
     }
 
     fn replayed_fork_instance(
@@ -6582,6 +6636,155 @@ workflow UnsafeHostChat {
             .to_string();
         assert!(serialized.contains("source answer"));
         assert!(serialized.contains("turn 2"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    #[test]
+    fn fork_retry_recovers_exact_seed_and_refuses_a_conflicting_seed() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "fork-retry-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let source_instance = source
+            .open_instance(&source_open, &Packages)
+            .expect("source instance");
+        let position = source
+            .current_position(&source_instance.instance_ref)
+            .expect("source position");
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "fork-retry".to_owned(),
+            source: position.clone(),
+            target_request_id: "fork-retry-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        let opened = target
+            .open_instance(&command.target_open_command(), &Packages)
+            .expect("target import/open survived crash");
+        let key = idempotency_key(&[
+            &opened.instance_ref,
+            &command.request_id,
+            "host-instance-thread-seed",
+        ]);
+        target
+            .kernel
+            .seed_agent_thread(AgentThreadSeed {
+                instance_id: &opened.instance_ref,
+                agent: "assistant",
+                messages: &[],
+                source_instance_id: &position.instance_ref,
+                source_sequence: position.sequence as i64,
+                idempotency_key: &key,
+            })
+            .expect("seed survived crash");
+        let recovered = target
+            .fork_instance_from(&source, &command, &Packages)
+            .expect("retry finishes fork from exact seed");
+        assert_eq!(recovered.target, opened);
+        assert_eq!(
+            target
+                .kernel
+                .store()
+                .list_events(&opened.instance_ref)
+                .expect("target events")
+                .iter()
+                .filter(|event| event.event_type == "agent.thread.seeded")
+                .count(),
+            1
+        );
+
+        let missing_seed = ForkInstanceCommand {
+            request_id: "fork-missing-seed".to_owned(),
+            target_request_id: "fork-missing-seed-target".to_owned(),
+            ..command.clone()
+        };
+        let unseeded_target = target
+            .open_instance(&missing_seed.target_open_command(), &Packages)
+            .expect("unseeded target");
+        target
+            .kernel
+            .store()
+            .append_event(NewEvent {
+                instance_id: &unseeded_target.instance_ref,
+                event_type: "host.instance.forked",
+                payload_json: &json!({
+                    "request_id": missing_seed.request_id,
+                    "source": missing_seed.source,
+                    "target_request_id": missing_seed.target_request_id,
+                    "package_version_ref": missing_seed.package_version_ref,
+                    "policy": missing_seed.policy,
+                })
+                .to_string(),
+                source: "host-runtime",
+                causation_id: None,
+                correlation_id: Some(&missing_seed.request_id),
+                idempotency_key: Some(&idempotency_key(&[
+                    &unseeded_target.instance_ref,
+                    &missing_seed.request_id,
+                    "host-instance-forked",
+                ])),
+            })
+            .expect("fork marker without seed");
+        assert!(target
+            .fork_instance_from(&source, &missing_seed, &Packages)
+            .expect_err("a fork marker cannot stand in for its thread seed")
+            .to_string()
+            .contains("recorded fork has no exact thread seed"));
+
+        let conflict = ForkInstanceCommand {
+            request_id: "fork-conflicting-seed".to_owned(),
+            target_request_id: "fork-conflicting-target".to_owned(),
+            ..command.clone()
+        };
+        let conflicting_target = target
+            .open_instance(&conflict.target_open_command(), &Packages)
+            .expect("other target");
+        let conflicting_key = idempotency_key(&[
+            &conflicting_target.instance_ref,
+            &conflict.request_id,
+            "host-instance-thread-seed",
+        ]);
+        target
+            .kernel
+            .store()
+            .append_event(NewEvent {
+                instance_id: &conflicting_target.instance_ref,
+                event_type: "agent.thread.seeded",
+                payload_json: &json!({
+                    "agent": "assistant",
+                    "messages": [],
+                    "source_instance_id": position.instance_ref,
+                    "source_sequence": 999,
+                })
+                .to_string(),
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&conflicting_key),
+            })
+            .expect("conflicting seed exists");
+        assert!(target
+            .fork_instance_from(&source, &conflict, &Packages)
+            .expect_err("a colliding key cannot settle a different source cut")
+            .to_string()
+            .contains("fork event key names different evidence"));
 
         drop(target);
         drop(source);
