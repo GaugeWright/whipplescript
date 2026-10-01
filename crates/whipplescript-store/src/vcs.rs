@@ -4635,7 +4635,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
     ) -> StoreResult<VcsWriteOutcome> {
-        self.import_diff_checked(branch_id, changed, removed, cut_id, at, None)
+        self.import_diff_checked(branch_id, changed, removed, cut_id, at, None, None)
     }
 
     /// Import under the original embedding authority. Immutable preparation
@@ -4650,9 +4650,35 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         check: &mut dyn FnMut() -> StoreResult<()>,
     ) -> StoreResult<VcsWriteOutcome> {
-        self.import_diff_checked(branch_id, changed, removed, cut_id, at, Some(check))
+        self.import_diff_checked(branch_id, changed, removed, cut_id, at, None, Some(check))
     }
 
+    /// Bind a flat retained-result manifest to this original guarded import.
+    /// Evidence remains outside target history and roots its named payloads for
+    /// native collection. A replay must preserve the exact original reference.
+    #[allow(clippy::too_many_arguments)] // One native import and its original evidence/guard.
+    pub fn import_diff_guarded_with_evidence(
+        &mut self,
+        branch_id: &str,
+        changed: &BTreeMap<String, String>,
+        removed: &[String],
+        cut_id: &str,
+        at: &str,
+        evidence: &crate::branches::write_evidence::WriteEvidenceRef,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<VcsWriteOutcome> {
+        self.import_diff_checked(
+            branch_id,
+            changed,
+            removed,
+            cut_id,
+            at,
+            Some(evidence),
+            Some(check),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared native import, optional immutable evidence and original guard.
     fn import_diff_checked(
         &mut self,
         branch_id: &str,
@@ -4660,6 +4686,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         removed: &[String],
         cut_id: &str,
         at: &str,
+        evidence: Option<&crate::branches::write_evidence::WriteEvidenceRef>,
         mut check: Option<&mut dyn FnMut() -> StoreResult<()>>,
     ) -> StoreResult<VcsWriteOutcome> {
         if let Some(check) = check.as_mut() {
@@ -4695,6 +4722,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     "import recovery evidence differs".into(),
                 ));
             }
+            if self.branches.write_evidence(cut_id)?.as_ref() != evidence {
+                let reason = "import retry changes its original result evidence";
+                // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: row.head_manifest_hash.clone().unwrap_or_default() })
+                return Err(Conflict(reason.into()));
+            }
             Some(cut)
         } else {
             None
@@ -4727,6 +4759,28 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let manifest_hash = self.advance_manifest_using(&prepared, base.as_deref(), &changes)?;
         let mut retained = prepared.ids();
         retained.extend(changed.values().cloned());
+        if let Some(evidence) = evidence {
+            evidence.validate()?;
+            let body = match self.content.get(&evidence.content_hash)? {
+                Some(body) => body,
+                None => {
+                    let reason = "import result evidence unavailable";
+                    // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: manifest_hash.clone() })
+                    return Err(Conflict(reason.into()));
+                }
+            };
+            crate::content::verify_body(&evidence.content_hash, &body, "import result evidence")?;
+            let manifest: BTreeMap<String, String> = match serde_json::from_slice(&body) {
+                Ok(manifest) => manifest,
+                Err(_) => {
+                    let reason = "import result evidence is not a retained content manifest";
+                    // MUTATION-SUCCESS-EXPR: Ok(VcsWriteOutcome::Written { cut_id: cut_id.to_owned(), manifest_hash: manifest_hash.clone() })
+                    return Err(Conflict(reason.into()));
+                }
+            };
+            retained.push(evidence.content_hash.clone());
+            retained.extend(manifest.into_values());
+        }
         if let Some(original) = original {
             if original.manifest_hash != manifest_hash {
                 return Err(StoreError::Conflict(
@@ -4756,9 +4810,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 intent: self.intent.as_deref(),
                 recorded_at: at,
             };
-            match check {
-                Some(check) => branches.commit_write_guarded(cut, check),
-                None => branches.commit_write(cut),
+            match (check, evidence) {
+                (Some(check), Some(evidence)) => {
+                    branches.commit_write_guarded_with_evidence(cut, Some(evidence), check)
+                }
+                (Some(check), None) => branches.commit_write_guarded(cut, check),
+                (None, evidence) => branches.commit_write_with_evidence(cut, evidence),
             }
         })?;
         let stale = "branch head moved during the import; retry";
@@ -7264,6 +7321,268 @@ mod tests {
             .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
+    }
+
+    fn import_result_fixture(
+        vcs: &TempVcs,
+    ) -> (
+        crate::branches::write_evidence::WriteEvidenceRef,
+        String,
+        String,
+    ) {
+        let artifact = vcs
+            .content
+            .put_text("original synthetic artifact")
+            .expect("prepare artifact payload");
+        let descriptor = vcs
+            .content
+            .put_text("original command and ordered owner witness")
+            .expect("prepare original descriptor");
+        let root = vcs
+            .content
+            .put_text(
+                &serde_json::to_string(&BTreeMap::from([
+                    ("artifacts/report.txt", artifact.clone()),
+                    ("original_descriptor", descriptor.clone()),
+                ]))
+                .expect("serialize result manifest"),
+            )
+            .expect("prepare result manifest");
+        (
+            crate::branches::write_evidence::WriteEvidenceRef {
+                schema_ref: "retained-result-manifest.v1".into(),
+                label_ref: "office-private".into(),
+                content_hash: root,
+            },
+            artifact,
+            descriptor,
+        )
+    }
+
+    #[test]
+    fn guarded_import_result_evidence_survives_collection_and_reopen_outside_target_history() {
+        let mut original = vcs();
+        original.init("t0").unwrap();
+        let (evidence, artifact, descriptor) = import_result_fixture(&original);
+        let orphan = original
+            .content
+            .put_text("unreferenced preparation")
+            .unwrap();
+        let changed = BTreeMap::from([(
+            "project.txt".into(),
+            original.content.put_text("project result").unwrap(),
+        )]);
+        original
+            .import_diff_guarded_with_evidence(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "original-result",
+                "t1",
+                &evidence,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        let cut = original.get_cut("original-result").unwrap().unwrap();
+        let op = original.get_op("op-original-result").unwrap().unwrap();
+        assert_eq!(
+            original.write_evidence("original-result").unwrap(),
+            Some(evidence.clone())
+        );
+        let manifest = original.cut_manifest("original-result").unwrap().unwrap();
+        assert_eq!(manifest, changed);
+        original.purge_unreachable("t2").unwrap();
+        assert!(original.content.get(&orphan).unwrap().is_none());
+        assert_eq!(
+            original
+                .content
+                .get_text(&artifact)
+                .unwrap()
+                .text()
+                .unwrap(),
+            "original synthetic artifact"
+        );
+        assert!(original.content.get(&descriptor).unwrap().is_some());
+        assert!(original
+            .content
+            .get(&evidence.content_hash)
+            .unwrap()
+            .is_some());
+        let mut reopened = NativeWorkspaceVcs::open(
+            original.dir.join("branches.sqlite"),
+            original.dir.join("content.sqlite"),
+        )
+        .unwrap();
+        reopened
+            .import_diff_guarded_with_evidence(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "original-result",
+                "t3",
+                &evidence,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(reopened.get_cut("original-result").unwrap(), Some(cut));
+        assert_eq!(reopened.get_op("op-original-result").unwrap(), Some(op));
+        assert_eq!(
+            reopened.write_evidence("original-result").unwrap(),
+            Some(evidence)
+        );
+    }
+
+    #[test]
+    fn guarded_import_result_evidence_cannot_change_or_disappear_on_replay() {
+        for changed_field in [
+            "schema",
+            "label",
+            "content",
+            "legacy",
+            "erased-root",
+            "erased-child",
+        ] {
+            let mut vcs = vcs();
+            vcs.init("t0").unwrap();
+            let (original, artifact, _) = import_result_fixture(&vcs);
+            let changed = BTreeMap::new();
+            vcs.import_diff_guarded_with_evidence(
+                MAINLINE_BRANCH_ID,
+                &changed,
+                &[],
+                "original",
+                "t1",
+                &original,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let before = vcs.get_branch(MAINLINE_BRANCH_ID).unwrap();
+            let original_cut = vcs.get_cut("original").unwrap();
+            let mut supplied = original.clone();
+            match changed_field {
+                "schema" => supplied.schema_ref.push_str("changed"),
+                "label" => supplied.label_ref.push_str("changed"),
+                "content" => supplied.content_hash = vcs.content.put_text("{}").unwrap(),
+                "erased-root" => {
+                    vcs.content.erase(&original.content_hash, "t2").unwrap();
+                }
+                "erased-child" => {
+                    vcs.content.erase(&artifact, "t2").unwrap();
+                }
+                "legacy" => {}
+                _ => unreachable!(),
+            }
+            let result = if changed_field == "legacy" {
+                vcs.import_diff_guarded(
+                    MAINLINE_BRANCH_ID,
+                    &changed,
+                    &[],
+                    "original",
+                    "t3",
+                    &mut || Ok(()),
+                )
+            } else {
+                vcs.import_diff_guarded_with_evidence(
+                    MAINLINE_BRANCH_ID,
+                    &changed,
+                    &[],
+                    "original",
+                    "t3",
+                    &supplied,
+                    &mut || Ok(()),
+                )
+            };
+            assert!(result.is_err(), "{changed_field}");
+            assert_eq!(vcs.get_branch(MAINLINE_BRANCH_ID).unwrap(), before);
+            assert_eq!(vcs.get_cut("original").unwrap(), original_cut);
+            assert_eq!(vcs.write_evidence("original").unwrap(), Some(original));
+        }
+    }
+
+    #[test]
+    fn guarded_import_result_evidence_rejects_missing_or_invalid_preparation() {
+        for preparation in ["root", "child", "body", "schema", "label"] {
+            let mut vcs = vcs();
+            vcs.init("t0").unwrap();
+            let (mut evidence, artifact, _) = import_result_fixture(&vcs);
+            match preparation {
+                "root" => {
+                    vcs.content.erase(&evidence.content_hash, "t1").unwrap();
+                }
+                "child" => {
+                    vcs.content.erase(&artifact, "t1").unwrap();
+                }
+                "body" => {
+                    evidence.content_hash = vcs.content.put_text("not a result manifest").unwrap()
+                }
+                "schema" => evidence.schema_ref.clear(),
+                "label" => evidence.label_ref.clear(),
+                _ => unreachable!(),
+            }
+            let before = vcs.get_branch(MAINLINE_BRANCH_ID).unwrap();
+            assert!(
+                vcs.import_diff_guarded_with_evidence(
+                    MAINLINE_BRANCH_ID,
+                    &BTreeMap::new(),
+                    &[],
+                    "candidate",
+                    "t2",
+                    &evidence,
+                    &mut || Ok(())
+                )
+                .is_err(),
+                "{preparation}"
+            );
+            assert_eq!(vcs.get_branch(MAINLINE_BRANCH_ID).unwrap(), before);
+            assert!(vcs.get_cut("candidate").unwrap().is_none());
+            assert!(vcs.get_op("op-candidate").unwrap().is_none());
+            assert!(vcs.write_evidence("candidate").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn guarded_import_result_evidence_late_refusal_rolls_back_head_cut_receipt_and_evidence() {
+        for refusal in ["authority", "evidence-insert"] {
+            let mut vcs = vcs();
+            vcs.init("t0").unwrap();
+            let (evidence, _, _) = import_result_fixture(&vcs);
+            let observer = rusqlite::Connection::open(vcs.dir.join("branches.sqlite")).unwrap();
+            observer.busy_timeout(std::time::Duration::ZERO).unwrap();
+            if refusal == "evidence-insert" {
+                observer.execute_batch("CREATE TRIGGER refuse_result BEFORE INSERT ON cut_evidence BEGIN SELECT RAISE(ABORT, 'result unavailable'); END;").unwrap();
+            }
+            let before = vcs.get_branch(MAINLINE_BRANCH_ID).unwrap();
+            let mut inside_writer = false;
+            let result = vcs.import_diff_guarded_with_evidence(
+                MAINLINE_BRANCH_ID,
+                &BTreeMap::new(),
+                &[],
+                "candidate",
+                "t1",
+                &evidence,
+                &mut || {
+                    if observer.execute_batch("BEGIN IMMEDIATE").is_err() {
+                        inside_writer = true;
+                        if refusal == "authority" {
+                            return Err(StoreError::Conflict(
+                                "original authority ended inside native writer".into(),
+                            ));
+                        }
+                    } else {
+                        observer.execute_batch("ROLLBACK").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{refusal}");
+            if refusal == "authority" {
+                assert!(inside_writer);
+            }
+            assert_eq!(vcs.get_branch(MAINLINE_BRANCH_ID).unwrap(), before);
+            assert!(vcs.get_cut("candidate").unwrap().is_none());
+            assert!(vcs.get_op("op-candidate").unwrap().is_none());
+            assert!(vcs.write_evidence("candidate").unwrap().is_none());
+        }
     }
 
     #[test]

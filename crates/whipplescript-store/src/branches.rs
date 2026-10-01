@@ -497,6 +497,16 @@ pub trait Branches: flowing_fence::FlowingFence {
     ) -> StoreResult<AdvanceOutcome> {
         write_commit::guard_unavailable()
     }
+    /// Commit retained result evidence and the original embedding guard in the
+    /// same head/cut/receipt transaction. Unsupported backends fail closed.
+    fn commit_write_guarded_with_evidence(
+        &mut self,
+        _cut: CutRecord<'_>,
+        _evidence: Option<&write_evidence::WriteEvidenceRef>,
+        _check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<AdvanceOutcome> {
+        write_commit::guard_unavailable()
+    }
     fn write_evidence(&self, cut_id: &str)
         -> StoreResult<Option<write_evidence::WriteEvidenceRef>>;
 
@@ -1251,6 +1261,14 @@ impl Branches for BranchStore {
         check: &mut dyn FnMut() -> StoreResult<()>,
     ) -> StoreResult<AdvanceOutcome> {
         write_commit::native(self, cut, None, check)
+    }
+    fn commit_write_guarded_with_evidence(
+        &mut self,
+        cut: CutRecord<'_>,
+        evidence: Option<&write_evidence::WriteEvidenceRef>,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<AdvanceOutcome> {
+        write_commit::native(self, cut, evidence, check)
     }
     fn write_evidence(
         &self,
