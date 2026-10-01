@@ -2156,6 +2156,10 @@ impl GovernedHostRuntime {
         packages: &P,
         mut journal: Option<&mut dyn OpenInstanceHomeJournal>,
     ) -> Result<OpenedInstance, HostRuntimeError> {
+        let target_store_incarnation = journal
+            .as_ref()
+            .map(|_| require_home_store_incarnation(self.kernel.store()))
+            .transpose()?;
         command.validate()?;
         self.require_policy(&command.policy)?;
         let package = packages
@@ -2166,12 +2170,23 @@ impl GovernedHostRuntime {
             .checked_import_source_digest()
             .map_err(HostRuntimeError::Resolver)?;
         self.check_package_ifc(&package)?;
-        if let Some((opened, version_id)) =
-            self.replayed_open_instance(command, &package, &source_digest, &mut journal)?
-        {
+        if let Some((opened, version_id)) = self.replayed_open_instance(
+            command,
+            &package,
+            &source_digest,
+            target_store_incarnation.as_deref(),
+            &mut journal,
+        )? {
             if let Some(journal) = journal.as_mut() {
                 journal
-                    .allow_retained_use(&command.request_id, &opened.instance_ref, &version_id)
+                    .allow_retained_use(
+                        target_store_incarnation
+                            .as_deref()
+                            .expect("Home identity checked"),
+                        &command.request_id,
+                        &opened.instance_ref,
+                        &version_id,
+                    )
                     .map_err(home_journal_error)?;
             }
             return Ok(opened);
@@ -2192,6 +2207,9 @@ impl GovernedHostRuntime {
             .as_mut()
             .map(|journal| {
                 journal.register(&OpenInstanceOperationBasis {
+                    target_store_incarnation: target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
                     kind: "open",
                     instance_ref: None,
                     from_version_id: None,
@@ -2243,8 +2261,17 @@ impl GovernedHostRuntime {
         }
         .map_err(HostRuntimeError::Store)?;
         if let Some(journal) = journal.as_mut() {
+            require_same_home_store_incarnation(
+                self.kernel.store(),
+                target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
+            )?;
             journal
                 .complete_for_use(&OpenInstanceOperationEvidence {
+                    target_store_incarnation: target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
                     request_id: &command.request_id,
                     operation_id: &admission.operation_id,
                     instance_ref: None,
@@ -2579,6 +2606,7 @@ impl GovernedHostRuntime {
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
         source_digest: &str,
+        target_store_incarnation: Option<&str>,
         journal: &mut Option<&mut dyn OpenInstanceHomeJournal>,
     ) -> Result<Option<(OpenedInstance, String)>, HostRuntimeError> {
         for instance in self
@@ -2660,6 +2688,7 @@ impl GovernedHostRuntime {
                 if let Some(journal) = journal.as_mut() {
                     journal
                         .allow_retained_use(
+                            target_store_incarnation.expect("Home identity checked"),
                             &command.request_id,
                             &instance.instance_id,
                             &version.version_id,
@@ -2681,6 +2710,8 @@ impl GovernedHostRuntime {
                     .as_mut()
                     .map(|journal| {
                         journal.register(&OpenInstanceOperationBasis {
+                            target_store_incarnation: target_store_incarnation
+                                .expect("Home identity checked"),
                             kind: "reattest",
                             instance_ref: Some(&instance.instance_id),
                             from_version_id: Some(&version.version_id),
@@ -2734,8 +2765,14 @@ impl GovernedHostRuntime {
                 }
                 .map_err(HostRuntimeError::Store)?;
                 if let Some(journal) = journal.as_mut() {
+                    require_same_home_store_incarnation(
+                        self.kernel.store(),
+                        target_store_incarnation.expect("Home identity checked"),
+                    )?;
                     journal
                         .complete_for_use(&OpenInstanceOperationEvidence {
+                            target_store_incarnation: target_store_incarnation
+                                .expect("Home identity checked"),
                             request_id: &command.request_id,
                             operation_id: &admission.operation_id,
                             instance_ref: Some(&instance.instance_id),
@@ -4371,6 +4408,19 @@ fn home_journal_error(error: HostFacadeError) -> HostRuntimeError {
     HostRuntimeError::HomeJournal(error.to_string())
 }
 
+fn require_home_store_incarnation(store: &SqliteStore) -> Result<String, HostRuntimeError> {
+    whipplescript_kernel::host_facade::require_home_store_incarnation(store)
+        .map_err(home_journal_error)
+}
+
+fn require_same_home_store_incarnation(
+    store: &SqliteStore,
+    expected: &str,
+) -> Result<(), HostRuntimeError> {
+    whipplescript_kernel::host_facade::require_same_home_store_incarnation(store, expected)
+        .map_err(home_journal_error)
+}
+
 impl fmt::Display for HostRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -4715,6 +4765,7 @@ mod tests {
             &mut self,
             basis: &OpenInstanceOperationBasis<'_>,
         ) -> Result<String, HostFacadeError> {
+            assert_eq!(basis.target_store_incarnation.len(), 32);
             assert_eq!(basis.request_id, "home-chat-open");
             assert!(!basis.source_digest.is_empty());
             assert!(!basis.compiler_artifact_digest.is_empty());
@@ -4743,6 +4794,7 @@ mod tests {
             &mut self,
             evidence: &OpenInstanceOperationEvidence<'_>,
         ) -> Result<(), HostFacadeError> {
+            assert_eq!(evidence.target_store_incarnation.len(), 32);
             assert_eq!(evidence.request_id, "home-chat-open");
             assert!(!evidence.version_id.is_empty());
             assert!(!evidence.witness_digest.is_empty());
@@ -4759,10 +4811,12 @@ mod tests {
 
         fn allow_retained_use(
             &mut self,
+            target_store_incarnation: &str,
             request_id: &str,
             instance_ref: &str,
             version_id: &str,
         ) -> Result<(), HostFacadeError> {
+            assert_eq!(target_store_incarnation.len(), 32);
             assert_eq!(request_id, "home-chat-open");
             assert!(!instance_ref.is_empty());
             assert!(!version_id.is_empty());
@@ -8419,6 +8473,53 @@ workflow Method {
     }
 
     #[test]
+    fn cli_home_completion_refuses_a_changed_target_store_incarnation() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let actual = require_home_store_incarnation(&store).expect("incarnation");
+        require_same_home_store_incarnation(&store, &actual).expect("same target");
+        let foreign = SqliteStore::open_in_memory().expect("foreign store");
+        let foreign_id = require_home_store_incarnation(&foreign).expect("foreign incarnation");
+        assert_ne!(actual, foreign_id);
+        assert!(format!(
+            "{:?}",
+            require_same_home_store_incarnation(&store, &foreign_id)
+        )
+        .contains("incarnation changed"));
+    }
+
+    #[test]
+    fn cli_home_open_refuses_a_target_without_store_incarnation_before_registration() {
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &signed_policy()).expect("runtime");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER runtime_store_incarnation_no_delete; \
+                 DELETE FROM runtime_store_incarnation WHERE id = 1;",
+            )
+            .unwrap();
+        let command = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-chat-open".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let mut journal = TestHomeJournal::default();
+        let refusal = runtime.open_instance_with_home_journal(&command, &Packages, &mut journal);
+        assert!(format!("{refusal:?}").contains("Home target store has no incarnation"));
+        assert!(journal.registered.is_empty());
+        assert!(runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+        drop(runtime);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn cli_home_replay_keeps_pending_reattest_unusable_until_recovery() {
         let path = temp_store();
         let policy_text = signed_policy();
@@ -8468,6 +8569,12 @@ workflow Method {
         assert!(format!("{pending:?}").contains("pending Home re-attestation"));
         journal
             .complete_for_use(&OpenInstanceOperationEvidence {
+                target_store_incarnation: &runtime
+                    .kernel
+                    .store()
+                    .store_incarnation()
+                    .unwrap()
+                    .expect("runtime identity"),
                 request_id: &open.request_id,
                 operation_id: HOME_REATTEST_OPERATION,
                 instance_ref: Some(&first.instance_ref),

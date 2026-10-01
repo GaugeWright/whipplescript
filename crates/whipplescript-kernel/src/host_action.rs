@@ -16,9 +16,10 @@ use crate::workflow_input::{validate_workflow_start_input, WorkflowInputFact};
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
 /// Exact checked-action basis offered to the Home before this runtime writes
-/// content or a program version. The Home also supplies the target-store
-/// identity, which is outside the kernel's knowledge.
+/// content or a program version. The runtime supplies its durable incarnation;
+/// the Home binds that identity to its own target-store pointer.
 pub struct HostActionOperationBasis<'a> {
+    pub target_store_incarnation: &'a str,
     pub instance_ref: &'a str,
     pub command_fingerprint: &'a str,
     pub version_ref: &'a str,
@@ -33,6 +34,7 @@ pub struct HostActionOperationBasis<'a> {
 
 /// The immutable target evidence to which a pending Home pointer is completed.
 pub struct HostActionOperationEvidence<'a> {
+    pub target_store_incarnation: &'a str,
     pub instance_ref: &'a str,
     pub command_fingerprint: &'a str,
     pub operation_id: &'a str,
@@ -45,7 +47,8 @@ pub struct HostActionOperationEvidence<'a> {
 /// pending pointer before returning its operation ID and return that same ID
 /// on an exact retry. `complete_for_use` binds the checked program operation's
 /// evidence and enforces the current epoch before an instance can start.
-/// Retained instances need their original Home admission checked again.
+/// Retained instances need their original Home admission and target-store
+/// incarnation checked again, even when the logical target name is unchanged.
 pub trait HostActionHomeJournal {
     fn register(&mut self, basis: &HostActionOperationBasis<'_>)
         -> Result<String, HostFacadeError>;
@@ -55,6 +58,7 @@ pub trait HostActionHomeJournal {
     ) -> Result<(), HostFacadeError>;
     fn allow_retained_use(
         &mut self,
+        target_store_incarnation: &str,
         instance_ref: &str,
         command_fingerprint: &str,
         version_id: &str,
@@ -247,6 +251,10 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         construct_basis: Option<&CheckedConstructBasis<'_>>,
         mut journal: Option<&mut dyn HostActionHomeJournal>,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
+        let target_store_incarnation = journal
+            .as_ref()
+            .map(|_| crate::host_facade::require_home_store_incarnation(self.store()))
+            .transpose()?;
         if let Some(journal) = journal.as_deref_mut() {
             if let Some(receipt) = self.existing_action_admission(admission)? {
                 let instance = self
@@ -259,6 +267,9 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
                         )
                     })?;
                 journal.allow_retained_use(
+                    target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
                     admission.instance_ref(),
                     admission.fingerprint(),
                     &instance.version_id,
@@ -279,6 +290,9 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         );
         let operation_id = if let Some(journal) = journal.as_deref_mut() {
             let basis = HostActionOperationBasis {
+                target_store_incarnation: target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
                 instance_ref: admission.instance_ref(),
                 command_fingerprint: admission.fingerprint(),
                 version_ref: action.version_ref(),
@@ -345,7 +359,16 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         }
         .map_err(HostFacadeError::Store)?;
         if let Some(journal) = journal {
+            crate::host_facade::require_same_home_store_incarnation(
+                self.store(),
+                target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
+            )?;
             journal.complete_for_use(&HostActionOperationEvidence {
+                target_store_incarnation: target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
                 instance_ref: admission.instance_ref(),
                 command_fingerprint: admission.fingerprint(),
                 operation_id: &version_admission.operation_id,

@@ -88,8 +88,9 @@ pub struct HostTurnAdmission {
 }
 
 /// Exact hosted/chat program basis offered to the Home before a target write.
-/// The Home supplies and persists the target-store identity and operation ID.
+/// The Home persists the runtime's target-store incarnation and operation ID.
 pub struct OpenInstanceOperationBasis<'a> {
+    pub target_store_incarnation: &'a str,
     pub kind: &'a str,
     /// Present for re-attestation, binding the Home pointer to one instance.
     pub instance_ref: Option<&'a str>,
@@ -108,6 +109,7 @@ pub struct OpenInstanceOperationBasis<'a> {
 
 /// Immutable checked target operation used to complete the Home pointer.
 pub struct OpenInstanceOperationEvidence<'a> {
+    pub target_store_incarnation: &'a str,
     pub request_id: &'a str,
     pub operation_id: &'a str,
     /// Present when the checked operation moved an existing instance.
@@ -119,7 +121,9 @@ pub struct OpenInstanceOperationEvidence<'a> {
 /// Product-owned pending/completed Home journal and exact retained-use door.
 /// `allow_retained_use` may recover an interrupted target write by the exact
 /// registered request and operation; a missing legacy pin must refuse rather
-/// than infer an origin from a version.
+/// than infer an origin from a version. Registration, completion, and retained
+/// use must bind the same target-store incarnation; a reused path or DO name
+/// cannot inherit an older pointer.
 pub trait OpenInstanceHomeJournal {
     fn register(
         &mut self,
@@ -131,10 +135,40 @@ pub trait OpenInstanceHomeJournal {
     ) -> Result<(), HostFacadeError>;
     fn allow_retained_use(
         &mut self,
+        target_store_incarnation: &str,
         request_id: &str,
         instance_ref: &str,
         version_id: &str,
     ) -> Result<(), HostFacadeError>;
+}
+
+/// Read and validate the identity that a Home operation must bind before any
+/// target write. A legacy or damaged store cannot join a Home admission.
+pub fn require_home_store_incarnation<S: RuntimeStore>(
+    store: &S,
+) -> Result<String, HostFacadeError> {
+    let id = store
+        .store_incarnation()
+        .map_err(HostFacadeError::Store)?
+        .ok_or_else(|| {
+            HostFacadeError::Incomplete("Home target store has no incarnation".into())
+        })?;
+    whipplescript_store::store_incarnation::validate(&id).map_err(HostFacadeError::Store)?;
+    Ok(id)
+}
+
+/// Refuse completion if the runtime no longer names the registered target.
+pub fn require_same_home_store_incarnation<S: RuntimeStore>(
+    store: &S,
+    expected: &str,
+) -> Result<(), HostFacadeError> {
+    if require_home_store_incarnation(store)? == expected {
+        Ok(())
+    } else {
+        Err(HostFacadeError::Incomplete(
+            "Home target store incarnation changed during admission".into(),
+        ))
+    }
 }
 
 /// The common governed facade over any WhippleScript runtime store.
@@ -533,6 +567,10 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         packages: &P,
         mut journal: Option<&mut dyn OpenInstanceHomeJournal>,
     ) -> Result<OpenedInstance, HostFacadeError> {
+        let target_store_incarnation = journal
+            .as_ref()
+            .map(|_| require_home_store_incarnation(self.kernel.store()))
+            .transpose()?;
         command.validate()?;
         self.require_policy(&command.policy)?;
         let package = packages
@@ -543,11 +581,17 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .checked_import_source_digest()
             .map_err(HostFacadeError::Resolver)?;
         self.check_package_ifc(&package)?;
-        if let Some((opened, version_id)) =
-            self.replayed_open_instance(command, &package, &mut journal)?
-        {
+        if let Some((opened, version_id)) = self.replayed_open_instance(
+            command,
+            &package,
+            target_store_incarnation.as_deref(),
+            &mut journal,
+        )? {
             if let Some(journal) = journal.as_mut() {
                 journal.allow_retained_use(
+                    target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
                     &command.request_id,
                     &opened.instance_ref,
                     &version_id,
@@ -590,6 +634,9 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .as_mut()
             .map(|journal| {
                 journal.register(&OpenInstanceOperationBasis {
+                    target_store_incarnation: target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
                     kind: "open",
                     instance_ref: None,
                     from_version_id: None,
@@ -640,7 +687,16 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         }
         .map_err(HostFacadeError::Store)?;
         if let Some(journal) = journal.as_mut() {
+            require_same_home_store_incarnation(
+                self.kernel.store(),
+                target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
+            )?;
             journal.complete_for_use(&OpenInstanceOperationEvidence {
+                target_store_incarnation: target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
                 request_id: &command.request_id,
                 operation_id: &admission.operation_id,
                 instance_ref: None,
@@ -946,6 +1002,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         &mut self,
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
+        target_store_incarnation: Option<&str>,
         journal: &mut Option<&mut dyn OpenInstanceHomeJournal>,
     ) -> Result<Option<(OpenedInstance, String)>, HostFacadeError> {
         for instance in self
@@ -1026,6 +1083,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             let current_version_id = if version.ir_hash != package.ir_hash {
                 if let Some(journal) = journal.as_mut() {
                     journal.allow_retained_use(
+                        target_store_incarnation.expect("Home identity checked"),
                         &command.request_id,
                         &instance.instance_id,
                         &version.version_id,
@@ -1068,6 +1126,8 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     .as_mut()
                     .map(|journal| {
                         journal.register(&OpenInstanceOperationBasis {
+                            target_store_incarnation: target_store_incarnation
+                                .expect("Home identity checked"),
                             kind: "reattest",
                             instance_ref: Some(&instance.instance_id),
                             from_version_id: Some(&version.version_id),
@@ -1113,7 +1173,13 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                 }
                 .map_err(HostFacadeError::Store)?;
                 if let Some(journal) = journal.as_mut() {
+                    require_same_home_store_incarnation(
+                        self.kernel.store(),
+                        target_store_incarnation.expect("Home identity checked"),
+                    )?;
                     journal.complete_for_use(&OpenInstanceOperationEvidence {
+                        target_store_incarnation: target_store_incarnation
+                            .expect("Home identity checked"),
                         request_id: &command.request_id,
                         operation_id: &admission.operation_id,
                         instance_ref: Some(&instance.instance_id),
@@ -1263,6 +1329,7 @@ workflow Method {
     #[derive(Default)]
     struct TestOpenHomeJournal {
         fail_at: Option<&'static str>,
+        target_store_incarnation: Option<String>,
         registered: usize,
         completed: usize,
         retained: usize,
@@ -1274,6 +1341,16 @@ workflow Method {
             basis: &OpenInstanceOperationBasis<'_>,
         ) -> Result<String, HostFacadeError> {
             self.registered += 1;
+            assert_eq!(basis.target_store_incarnation.len(), 32);
+            if let Some(expected) = &self.target_store_incarnation {
+                if expected != basis.target_store_incarnation {
+                    return Err(HostFacadeError::Incomplete(
+                        "Home target store incarnation changed".into(),
+                    ));
+                }
+            } else {
+                self.target_store_incarnation = Some(basis.target_store_incarnation.to_owned());
+            }
             assert_eq!(basis.request_id, "home-open");
             assert!(!basis.source_digest.is_empty());
             assert_eq!(basis.lock_digest, NO_LOCK_DIGEST);
@@ -1304,6 +1381,11 @@ workflow Method {
             evidence: &OpenInstanceOperationEvidence<'_>,
         ) -> Result<(), HostFacadeError> {
             self.completed += 1;
+            assert_eq!(evidence.target_store_incarnation.len(), 32);
+            assert_eq!(
+                self.target_store_incarnation.as_deref(),
+                Some(evidence.target_store_incarnation)
+            );
             assert!(matches!(
                 evidence.operation_id,
                 HOME_OPERATION | HOME_REATTEST_OPERATION
@@ -1324,10 +1406,16 @@ workflow Method {
 
         fn allow_retained_use(
             &mut self,
+            target_store_incarnation: &str,
             request_id: &str,
             instance_ref: &str,
             version_id: &str,
         ) -> Result<(), HostFacadeError> {
+            assert_eq!(target_store_incarnation.len(), 32);
+            assert_eq!(
+                self.target_store_incarnation.as_deref(),
+                Some(target_store_incarnation)
+            );
             self.retained += 1;
             assert_eq!(request_id, "home-open");
             assert!(!instance_ref.is_empty());
@@ -1416,6 +1504,111 @@ workflow Method {
             opened
         );
         assert_eq!(journal.retained, 2);
+    }
+
+    #[test]
+    fn home_chat_refuses_reused_pointer_after_target_store_replacement() {
+        let package = package();
+        let mut first = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("first store"),
+            7,
+            envelope(),
+        )
+        .expect("first host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-open".into(),
+            package_version_ref: package.version_ref().into(),
+            policy: first.policy_ref().clone(),
+        };
+        let mut journal = TestOpenHomeJournal::default();
+        first
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .expect("first target admitted");
+        let first_id = journal.target_store_incarnation.clone().unwrap();
+
+        let mut replacement = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("replacement store"),
+            7,
+            envelope(),
+        )
+        .expect("replacement host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        assert_ne!(
+            replacement.kernel().store().store_incarnation().unwrap(),
+            Some(first_id)
+        );
+        let refused = replacement.open_instance_with_home_journal(&open, &package, &mut journal);
+        assert!(format!("{refused:?}").contains("incarnation changed"));
+        assert!(replacement
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+    }
+
+    #[test]
+    fn home_completion_refuses_a_changed_target_store_incarnation() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let actual = require_home_store_incarnation(&store).expect("incarnation");
+        require_same_home_store_incarnation(&store, &actual).expect("same target");
+        let foreign = SqliteStore::open_in_memory().expect("foreign store");
+        let foreign_id = require_home_store_incarnation(&foreign).expect("foreign incarnation");
+        assert_ne!(actual, foreign_id);
+        assert!(format!(
+            "{:?}",
+            require_same_home_store_incarnation(&store, &foreign_id)
+        )
+        .contains("incarnation changed"));
+    }
+
+    #[test]
+    fn home_open_refuses_a_target_without_store_incarnation_before_registration() {
+        let path = std::env::temp_dir().join(format!(
+            "whip-home-missing-incarnation-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut host = GovernedHostFacade::from_verified_store(
+            SqliteStore::open(&path).expect("store"),
+            7,
+            envelope(),
+        )
+        .expect("host")
+        .with_compiler_artifact_digest("a".repeat(64));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER runtime_store_incarnation_no_delete; \
+                 DELETE FROM runtime_store_incarnation WHERE id = 1;",
+            )
+            .unwrap();
+        let package = package();
+        let command = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-open".into(),
+            package_version_ref: package.version_ref().into(),
+            policy: host.policy_ref().clone(),
+        };
+        let mut journal = TestOpenHomeJournal::default();
+        let refusal = host.open_instance_with_home_journal(&command, &package, &mut journal);
+        assert!(format!("{refusal:?}").contains("Home target store has no incarnation"));
+        assert_eq!(journal.registered, 0);
+        assert!(host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .is_empty());
+        drop(host);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

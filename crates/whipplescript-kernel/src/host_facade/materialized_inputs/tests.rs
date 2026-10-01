@@ -161,6 +161,7 @@ impl HostActionHomeJournal for TestHomeJournal {
         &mut self,
         basis: &HostActionOperationBasis<'_>,
     ) -> Result<String, HostFacadeError> {
+        assert_eq!(basis.target_store_incarnation.len(), 32);
         assert_eq!(basis.source_digest.len(), 64);
         assert_eq!(basis.ir_hash.len(), 32);
         assert_eq!(basis.facts_digest.len(), 64);
@@ -175,6 +176,7 @@ impl HostActionHomeJournal for TestHomeJournal {
         &mut self,
         evidence: &HostActionOperationEvidence<'_>,
     ) -> Result<(), HostFacadeError> {
+        assert_eq!(evidence.target_store_incarnation.len(), 32);
         assert_eq!(
             evidence.operation_id,
             "imp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -186,10 +188,12 @@ impl HostActionHomeJournal for TestHomeJournal {
 
     fn allow_retained_use(
         &mut self,
+        target_store_incarnation: &str,
         _instance_ref: &str,
         _command_fingerprint: &str,
         version_id: &str,
     ) -> Result<(), HostFacadeError> {
+        assert_eq!(target_store_incarnation.len(), 32);
         assert!(!version_id.is_empty());
         self.calls.push("retained");
         self.check("retained")

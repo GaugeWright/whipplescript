@@ -142,6 +142,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                         )
                     })?;
                 journal.allow_retained_use(
+                    super::require_home_store_incarnation(self.kernel.store())?.as_str(),
                     admission.instance_ref(),
                     admission.fingerprint(),
                     &instance.version_id,
