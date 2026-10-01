@@ -274,13 +274,15 @@ disable with the ref-owned Hold epoch:
 python3 models/research/flowing_full_seam.py
 ```
 
-It explores 83,971 safe branch states and 61,275 safe abstract mixed-transport
-states through twelve transitions, plus 2,595 direct-twig states through nine.
-Scenarios show a CAS winning
-before close disable, a second member's unit parked at close, disable blocking
-a passed candidate, and a later member handoff making that candidate's source
-cut stale. An explicit abandonment of both dependent units also advances the
-source cut, so a checked candidate cannot CAS afterward; a weakening admits
+It explores 109,723 safe branch states and 67,591 safe abstract mixed-transport
+states through twelve transitions, plus 3,477 direct-twig states through nine.
+Scenarios show a CAS winning before close disable, a second member's unit
+parked at close, and disable blocking a passed candidate. A later member
+handoff extends active source ancestry without invalidating the selected
+immutable prefix, so that prefix can still enter trunk while the new tail
+remains owed. A ref-fenced rewrite removes the selected prefix from active
+ancestry and blocks its old candidate. An explicit abandonment of both
+dependent units does the same; a weakening admits
 the same unit under both trunk and abandonment receipts. The combined
 candidate now binds three fixed source atoms to two
 selected units, replays their path effects, checks the dependent's read basis
@@ -306,7 +308,7 @@ while the selected units and pins remain owed. Fail-open weakenings admit a
 candidate with the norm or ref authority unavailable. These are availability
 states, not a physical cross-store crash or lock implementation. Four earlier
 weakenings admit a CAS without unit accounting, omit the ref fence at disable,
-trust the stale branch cut, or close before recovering an accepted receipt.
+trust a rewritten source prefix, or close before recovering an accepted receipt.
 The mixed mode carries one selected unit's atom through B→C→D beside the same
 norm/ref CAS, pin and accounting state. It checks every recorded origin's
 current Hold and policy epoch there. A Hold blocks a passed candidate, and a

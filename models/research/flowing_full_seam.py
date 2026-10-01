@@ -11,7 +11,9 @@ also checks the digest of the precise candidate payload the gate verified;
 a post-check swap cannot reuse its certificate. An equivalent no-op still
 gets a checked admission and per-unit receipt. Independent norm/ref outages
 block admission and require recovery of their own authority state; fail-open
-mutants reach an admission with one unavailable. The model still abstracts
+mutants reach an admission with one unavailable. A later tail retains its
+selected prefix in source ancestry; abandonment or rewrite removes it, so only
+the latter invalidate an already checked candidate. The model still abstracts
 real cut contents, semantic edge discovery, certificate authenticity, physical
 lock scheduling and cross-store crash transactions.
 The mixed-source mode additionally carries one unit through B, C and D, and
@@ -162,8 +164,13 @@ class State:
     trunk_content: tuple[int, int] = (0, 0)
     admission: gate.State = field(default_factory=gate.State)
     obligations: work.State = field(default_factory=work.State)
+    # Active-head ancestry, distinct from retained content bodies. A later
+    # append extends it; a rewrite/abandonment starts a new chain.
+    source_ancestry: tuple[int, ...] = (0,)
+    source_rewrite_used: bool = False
     candidate_source_cut: int = -1
     admitted_source_cut: int = -1
+    admitted_source_ancestry: tuple[int, ...] = ()
     candidate: Candidate | None = None
     candidate_certificate_digest: str | None = None
     candidate_swapped: bool = False
@@ -189,6 +196,11 @@ class State:
     ref_outage_used: bool = False
     admitted_norm_up: bool | None = None
     admitted_ref_up: bool | None = None
+
+
+def source_head(state: State) -> int:
+    return (state.obligations.twig_cuts[0] if state.source_kind == "twig"
+            else state.obligations.branch_cut)
 
 
 def steps(state: State, defect: str = ""):
@@ -237,6 +249,24 @@ def steps(state: State, defect: str = ""):
                 policy_epochs=(state.policy_epochs[0] + 1,
                                state.policy_epochs[1], state.policy_epochs[2]),
             )
+    if (state.candidate is not None and not a.admission and
+            not state.source_rewrite_used and w.ref_up and w.ref_enabled and
+            all(w.units[i] == holder_kind(state.source_kind)
+                for i in state.candidate.selected)):
+        # A ref-fenced rewrite or repair can retain the immutable old body
+        # under an attempt pin while removing it from the active head's
+        # ancestry. That is different from appending an unselected tail.
+        next_cut = source_head(state) + 1
+        rewritten = (replace(w, twig_cuts=work.at(w.twig_cuts, 0, next_cut),
+                             epoch=w.epoch + 1)
+                     if state.source_kind == "twig" else
+                     replace(w, branch_cut=next_cut,
+                             epoch=w.epoch + 1))
+        yield "rewrite_selected_prefix", replace(
+            state, obligations=rewritten,
+            source_ancestry=(next_cut,),
+            source_rewrite_used=True,
+        )
     for event, next_a in gate.steps(a):
         if (not state.norm_up and defect != "fail_open_norm_outage" and
                 (event in ("gate_pass", "revoke_original_grant", "precheck_without_lock")
@@ -288,12 +318,11 @@ def steps(state: State, defect: str = ""):
             # the same eligibility effect and can race a candidate.
             yield event, replace(state, admission=next_a)
         elif event.startswith("cas_owner"):
-            source_cut = (w.branch_cut if state.source_kind != "twig"
-                          else w.twig_cuts[0])
             if ((not w.ref_up and defect != "fail_open_ref_outage") or
-                    (source_cut != state.candidate_source_cut and
-                     defect not in ("trust_stale_branch_cut",
-                                    "cas_ignores_abandonment"))):
+                    (state.candidate_source_cut not in state.source_ancestry and
+                     defect != "trust_stale_branch_cut" and
+                     not (defect == "cas_ignores_abandonment" and
+                          w.abandonment_receipt))):
                 continue
             if not state.source_available or not state.candidate_available:
                 continue
@@ -312,7 +341,8 @@ def steps(state: State, defect: str = ""):
                 continue
             if defect == "disable_without_ref_fence" and not w.ref_enabled:
                 yield event, replace(state, admission=next_a,
-                                     admitted_source_cut=source_cut,
+                                     admitted_source_cut=state.candidate_source_cut,
+                                     admitted_source_ancestry=state.source_ancestry,
                                      admitted_policy_epochs=state.policy_epochs,
                                      admitted_held=state.held)
             elif (w.ref_enabled and state.candidate is not None and
@@ -352,7 +382,8 @@ def steps(state: State, defect: str = ""):
                         )
                 yield event, replace(state, admission=next_a,
                                      obligations=next_w,
-                                     admitted_source_cut=source_cut,
+                                     admitted_source_cut=state.candidate_source_cut,
+                                     admitted_source_ancestry=state.source_ancestry,
                                      admitted_candidate=state.candidate,
                                      admitted_certificate_digest=state.candidate_certificate_digest,
                                      admitted_policy_epochs=state.policy_epochs,
@@ -389,7 +420,16 @@ def steps(state: State, defect: str = ""):
             if not a.admission or a.receipt or defect == "close_omits_recovery":
                 yield event, replace(state, obligations=next_w)
         else:
-            yield event, replace(state, obligations=next_w)
+            ancestry = state.source_ancestry
+            if state.source_kind == "twig":
+                if next_w.twig_cuts[0] != w.twig_cuts[0]:
+                    ancestry += (next_w.twig_cuts[0],)
+            elif next_w.branch_cut != w.branch_cut:
+                ancestry = ((next_w.branch_cut,)
+                            if event == "abandon_dependent_closure" else
+                            ancestry + (next_w.branch_cut,))
+            yield event, replace(state, obligations=next_w,
+                                 source_ancestry=ancestry)
 
     if state.candidate is not None:
         if not a.admission and not state.candidate_swapped:
@@ -420,6 +460,8 @@ def steps(state: State, defect: str = ""):
 
 def violation(state: State):
     a, w = state.admission, state.obligations
+    if not state.source_ancestry or state.source_ancestry[-1] != source_head(state):
+        return "source head differs from its recorded ancestry"
     if problem := gate.violation(a):
         return problem
     if problem := work.violation(w):
@@ -433,8 +475,8 @@ def violation(state: State):
             return "candidate cut was collected before recovery finished"
     if (a.trunk == 1) != bool(w.trunk_receipts):
         return "trunk CAS and selected-unit accounting split"
-    if a.trunk and state.admitted_source_cut != state.candidate_source_cut:
-        return "stale branch cut admitted"
+    if a.trunk and state.admitted_source_cut not in state.admitted_source_ancestry:
+        return "selected source prefix was absent from admitted head ancestry"
     if a.trunk:
         if state.admitted_norm_up is not True:
             return "norm authority unavailable at trunk CAS"
@@ -568,10 +610,27 @@ def scenarios():
                               "disable"))
     assert not any(name.startswith("cas_owner") for name, _ in steps(held))
 
-    # A second member changes the branch cut after capture. The old candidate
-    # must not pass merely because its norm and owner premises are still good.
-    stale = scenario(prefix + ("write1", "declare1", "handoff1",
-                               "lock_and_validate_owner0"))
+    # A later member extends the same source ancestry. The selected prefix
+    # stays immutable and eligible while the later unit remains owed.
+    tailed = scenario(prefix + (
+        "write1", "declare1", "handoff1", "lock_and_validate_owner0",
+        "cas_owner0", "recover_receipt",
+    ))
+    assert tailed.admitted_source_cut == 1
+    assert tailed.admitted_source_ancestry == (0, 1, 2)
+    assert tailed.obligations.units == ("accounted", "branch")
+    assert tailed.obligations.trunk_receipts == (0,)
+    tailed_after_lock = scenario(prefix + (
+        "lock_and_validate_owner0", "write1", "declare1", "handoff1",
+        "cas_owner0",
+    ))
+    assert tailed_after_lock.obligations.units == ("accounted", "branch")
+
+    # A revision-fenced rewrite retains the old body under the attempt pin,
+    # but removes it from the active head's ancestry. Its old gate cannot CAS.
+    stale = scenario(prefix + (
+        "rewrite_selected_prefix", "lock_and_validate_owner0",
+    ))
     assert not any(name.startswith("cas_owner") for name, _ in steps(stale))
 
     swapped = scenario(prefix + ("swap_candidate_witness",
