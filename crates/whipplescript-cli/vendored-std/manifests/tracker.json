@@ -61,6 +61,28 @@
           "validation": "none"
         },
         {
+          "id": "tracker.membership",
+          "effect_kind": "tracker.membership",
+          "source_forms": ["add", "remove"],
+          "input_schema": "tracker.membership.input",
+          "output_schema": "TrackerMembership",
+          "required_capabilities": ["tracker.membership"],
+          "provider_kinds": ["builtin-tracker"],
+          "projected_facts": ["effect.output"],
+          "validation": "none"
+        },
+        {
+          "id": "tracker.inspect",
+          "effect_kind": "tracker.inspect",
+          "source_forms": ["inspect"],
+          "input_schema": "tracker.inspect.input",
+          "output_schema": "TrackerInspection",
+          "required_capabilities": ["tracker.inspect"],
+          "provider_kinds": ["builtin-tracker"],
+          "projected_facts": ["effect.output"],
+          "validation": "none"
+        },
+        {
           "id": "tracker.assign",
           "effect_kind": "capability.call",
           "source_forms": ["call tracker.assign for <request> timeout <duration>"],
@@ -150,6 +172,33 @@
           "requires": [{ "kind": "Capability", "name": "tracker.finish" }],
           "provides": [{ "kind": "EffectHandle", "type": "TrackerFinish" }],
           "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.membership.add",
+          "construct_family": "effect_operation",
+          "keyword": "add",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.membership" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerMembership" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.membership.remove",
+          "construct_family": "effect_operation",
+          "keyword": "remove",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.membership" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerMembership" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.inspect",
+          "construct_family": "effect_operation",
+          "keyword": "inspect",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.inspect" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerInspection" }],
+          "lowering_target": "typed_effect_call"
         }
       ]
     }
@@ -182,6 +231,14 @@
     {
       "id": "tracker.assign",
       "description": "Compare and set an issue's assignee without changing its claim or granting recipient access."
+    },
+    {
+      "id": "tracker.membership",
+      "description": "Atomically add or remove a task's membership in an initiative."
+    },
+    {
+      "id": "tracker.inspect",
+      "description": "Read one initiative and its current member states and readiness at one instant."
     },
     {
       "id": "tracker.wait_closed",
@@ -232,6 +289,20 @@
       "config": {}
     },
     {
+      "id": "builtin-tracker-membership",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.membership",
+      "effect_kind": "tracker.membership",
+      "config": {}
+    },
+    {
+      "id": "builtin-tracker-inspect",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.inspect",
+      "effect_kind": "tracker.inspect",
+      "config": {}
+    },
+    {
       "id": "builtin-tracker-assign",
       "provider_kind": "builtin-tracker",
       "capability": "tracker.assign",
@@ -259,6 +330,8 @@
         "tracker.release",
         "tracker.release_count",
         "tracker.finish",
+        "tracker.membership",
+        "tracker.inspect",
         "tracker.wait_closed",
         "tracker.assign"
       ],
@@ -305,6 +378,20 @@
       "id": "binding-tracker-finish",
       "program_id": null,
       "capability": "tracker.finish",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-membership",
+      "program_id": null,
+      "capability": "tracker.membership",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-inspect",
+      "program_id": null,
+      "capability": "tracker.inspect",
       "provider": "builtin-tracker",
       "config": {}
     },

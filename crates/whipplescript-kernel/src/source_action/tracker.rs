@@ -1,6 +1,7 @@
 //! Managed tracker filing. The authored item is captured once at admission;
 //! settlement exposes only the durable tracker address.
 
+pub mod initiative;
 pub mod lifecycle;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -2157,6 +2157,11 @@ the constructs of the source.
 | `exec "<command>" as result` | An `exec.command` effect in the dev profile. The effect needs a `use std.script` statement and a `WHIPPLESCRIPT_EXEC_ALLOW` value that is not empty. The two items seed the `script.raw` capability. The effect makes `exit_code` and `stdout` available. |
 | `exec <capability> with <record> -> Type as result` | A hosted `exec.command` effect. The effect needs the `script.<capability>` capability, typed JSON on stdin, verification of the SHA-256 value of the manifest, and typed ingestion of stdout. |
 | `file issue into <tracker> { ... }` | A `tracker.file` effect. |
+| `file initiative into <tracker> { ... } as x` | Files an initiative-kind tracker item without an assignee. |
+| `add <task> to initiative <initiative> [as x]` | A retry-stable `tracker.membership` effect that adds a set membership. |
+| `remove <task> from initiative <initiative> [as x]` | A retry-stable `tracker.membership` effect that removes a set membership. |
+| `inspect initiative <initiative> as <snapshot>` | A `tracker.inspect` effect that reads current member states and readiness across declared trackers. |
+| `finish initiative <initiative> { summary <text> }` | A `tracker.finish` effect that records an explicit outcome. |
 | `claim <item> [as x]` | A `tracker.claim` effect. An item that a different rule already claimed is a failure that you can branch on. |
 | `release <item>` | A `tracker.release` effect. |
 | `finish <item> [{ summary ... }]` | A `tracker.finish` effect. |

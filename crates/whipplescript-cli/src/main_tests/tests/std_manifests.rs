@@ -450,6 +450,8 @@ rule work_ready_item
         ("tracker.renew", "renew"),
         ("tracker.release", "release"),
         ("tracker.finish", "finish"),
+        ("tracker.membership", "add"),
+        ("tracker.inspect", "inspect"),
     ] {
         let contracts: Vec<_> = registry
             .effect_contracts
@@ -485,16 +487,18 @@ rule work_ready_item
     // now merge-folds against the parser-compiled contract (the loop above
     // already asserted the single folded row), so a contract WITHOUT its
     // parser partner is no longer the pretense — the fold is honest.
-    // The six construct rows arrive from the embedded manifest merge; the
-    // claim/renew/release rows are the reserved-keyword privilege tuples'
-    // first real exercisers (typed_effect_call, corrected by T4).
+    // The tracker declaration and eight effect-operation construct rows arrive
+    // from the embedded manifest merge. Each verb must retain its typed effect
+    // call; membership has two source verbs sharing one effect contract.
     let tracker_constructs: Vec<_> = registry
         .constructs
         .iter()
         .filter(|form| form.library_id == "std.tracker")
         .collect();
-    assert_eq!(tracker_constructs.len(), 6, "{tracker_constructs:?}");
-    for keyword in ["file", "claim", "renew", "release", "finish"] {
+    assert_eq!(tracker_constructs.len(), 9, "{tracker_constructs:?}");
+    for keyword in [
+        "file", "claim", "renew", "release", "finish", "add", "remove", "inspect",
+    ] {
         assert!(
             tracker_constructs.iter().any(|form| form.keyword == keyword
                 && form.lowering_target == "typed_effect_call"

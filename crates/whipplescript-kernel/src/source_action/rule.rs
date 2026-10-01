@@ -904,6 +904,19 @@ fn project_with_retained_regions(
                             source_path: c.source_path,
                         },
                     ),
+                    BodyEffectKind::TrackerMembership { .. }
+                    | BodyEffectKind::TrackerInspect { .. } => super::tracker::initiative::project(
+                        statement,
+                        super::tracker::initiative::Context {
+                            ir: c.ir,
+                            typed: c.typed,
+                            frame: c.frame,
+                            frontier: c.frontier,
+                            effects: c.effects,
+                            events: c.events,
+                            source_path: c.source_path,
+                        },
+                    ),
                     _ => super::timer::project(
                         statement,
                         c.frame,

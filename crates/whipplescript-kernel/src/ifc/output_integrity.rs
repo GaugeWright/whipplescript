@@ -48,6 +48,8 @@ pub(super) fn transfer(
         | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
+        | IrEffectKind::TrackerMembership
+        | IrEffectKind::TrackerInspect
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend

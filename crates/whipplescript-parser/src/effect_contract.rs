@@ -8,6 +8,8 @@ pub enum Resource {
     None,
     Named(String),
     Binding(String),
+    /// Two independently checked tracker addresses for a membership change.
+    Pair(String, String),
 }
 impl Resource {
     pub(crate) fn legacy_name(&self, bindings: &BTreeMap<String, String>) -> Option<String> {
@@ -15,6 +17,7 @@ impl Resource {
             Self::None => None,
             Self::Named(name) => Some(name.clone()),
             Self::Binding(name) => bindings.get(name).cloned(),
+            Self::Pair(_, _) => None,
         }
     }
 }
@@ -84,6 +87,12 @@ impl Contract {
             body::BodyEffectKind::TrackerClaim { item, .. }
             | body::BodyEffectKind::TrackerRelease { item }
             | body::BodyEffectKind::TrackerFinish { item, .. } => Resource::Binding(item.clone()),
+            body::BodyEffectKind::TrackerMembership {
+                task, initiative, ..
+            } => Resource::Pair(task.clone(), initiative.clone()),
+            body::BodyEffectKind::TrackerInspect { initiative } => {
+                Resource::Binding(initiative.clone())
+            }
             body::BodyEffectKind::LeaseRenew {
                 acquire_binding, ..
             } => Resource::Binding(acquire_binding.clone()),

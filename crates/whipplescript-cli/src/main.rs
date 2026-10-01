@@ -20659,7 +20659,7 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 &FixtureCapabilityProvider,
             )?,
             "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
-            | "tracker.finish" => {
+            | "tracker.finish" | "tracker.membership" | "tracker.inspect" => {
                 run_queue_effect_generic(kernel, id, effect, &wall_clock_instant(), &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
@@ -21319,7 +21319,7 @@ fn run_claimable_effect(
         "event.emit" => run_event_effect(store_path, instance_id, effect, options),
         "workflow.invoke" => run_workflow_invoke_effect(store_path, instance_id, effect, options),
         "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
-        | "tracker.finish" => run_queue_effect(
+        | "tracker.finish" | "tracker.membership" | "tracker.inspect" => run_queue_effect(
             store_path,
             instance_id,
             effect,

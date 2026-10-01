@@ -8,6 +8,8 @@ use crate::effect_contract::{Contract, Resource};
 pub struct Effect {
     pub contract: Contract,
     pub resource_subject: Option<BindingId>,
+    #[serde(default)]
+    pub second_resource_subject: Option<BindingId>,
     /// None for non-tell effects; Some(empty) proves an unreachable tell.
     pub agent_targets: Option<Vec<String>>,
 }
@@ -26,19 +28,24 @@ pub(super) fn collect(
             continue;
         };
         let contract = Contract::from_statement(effect);
-        let resource_subject = match &contract.resource {
-            Resource::Binding(name) => {
-                let Some(binding) = plan.blocks[node.block.0].environment.get(name) else {
-                    let issue = error(
-                        node.span,
-                        format!("effect resource binding `{name}` has no lexical subject"),
-                    );
-                    // MUTATION-SUCCESS-EXPR: Ok(effects)
-                    return Err(vec![issue]);
-                };
-                Some(*binding)
-            }
-            _ => None,
+        let checked_subject = |name: &str| -> Result<BindingId, Vec<Diagnostic>> {
+            let Some(binding) = plan.blocks[node.block.0].environment.get(name) else {
+                let issue = error(
+                    node.span,
+                    format!("effect resource binding `{name}` has no lexical subject"),
+                );
+                // MUTATION-SUCCESS-EXPR: Ok(effects)
+                return Err(vec![issue]);
+            };
+            Ok(*binding)
+        };
+        let (resource_subject, second_resource_subject) = match &contract.resource {
+            Resource::Binding(name) => (Some(checked_subject(name)?), None),
+            Resource::Pair(first, second) => (
+                Some(checked_subject(first)?),
+                Some(checked_subject(second)?),
+            ),
+            _ => (None, None),
         };
         let agent_targets = if contract.agent.is_some() {
             let Some(agents) = sites.get(&NodeId(index)).and_then(|site| targets.get(site)) else {
@@ -55,6 +62,7 @@ pub(super) fn collect(
             Effect {
                 contract,
                 resource_subject,
+                second_resource_subject,
                 agent_targets,
             },
         );
@@ -83,12 +91,24 @@ pub(super) fn validate(
             // MUTATION-SUCCESS-EXPR: Ok(())
             return Err("effect contract differs from its source statement".into());
         }
-        let subject = match &checked.contract.resource {
-            Resource::Binding(name) => plan.blocks[node.block.0].environment.get(name).copied(),
-            _ => None,
+        let (subject, second) = match &checked.contract.resource {
+            Resource::Binding(name) => (
+                plan.blocks[node.block.0].environment.get(name).copied(),
+                None,
+            ),
+            Resource::Pair(first, second) => (
+                plan.blocks[node.block.0].environment.get(first).copied(),
+                plan.blocks[node.block.0].environment.get(second).copied(),
+            ),
+            _ => (None, None),
         };
         if checked.resource_subject != subject
-            || (matches!(checked.contract.resource, Resource::Binding(_)) && subject.is_none())
+            || checked.second_resource_subject != second
+            || (matches!(
+                checked.contract.resource,
+                Resource::Binding(_) | Resource::Pair(_, _)
+            ) && subject.is_none())
+            || (matches!(checked.contract.resource, Resource::Pair(_, _)) && second.is_none())
         {
             // MUTATION-SUCCESS-EXPR: Ok(())
             return Err("effect contract has no matching resource subject".into());

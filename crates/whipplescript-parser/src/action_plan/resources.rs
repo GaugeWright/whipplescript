@@ -244,7 +244,34 @@ fn resolve_one(
             let BodyStmt::Effect(statement) = statement.as_ref() else {
                 unreachable!("validated effect")
             };
-            return operand(&statement.kind, proof, resolved);
+            let mut checked = operand(&statement.kind, proof, resolved)?;
+            if matches!(statement.kind, BodyEffectKind::TrackerInspect { .. }) {
+                checked.resources.extend(
+                    walker
+                        .program
+                        .trackers()
+                        .iter()
+                        .map(|tracker| tracker.name.clone()),
+                );
+            }
+            return Ok(checked);
+        }
+        Resource::Pair(_, _) => {
+            let first =
+                walker.binding(effect.resource_subject.expect("validated first subject"))?;
+            let second = walker.binding(
+                effect
+                    .second_resource_subject
+                    .expect("validated second subject"),
+            )?;
+            let NodeKind::Statement(statement) = &typed.plan.nodes[id.0].kind else {
+                unreachable!("validated effect")
+            };
+            let BodyStmt::Effect(statement) = statement.as_ref() else {
+                unreachable!("validated effect")
+            };
+            let resolved = operand(&statement.kind, first, resolved)?;
+            return operand(&statement.kind, second, resolved);
         }
     }
     Ok(resolved)
@@ -255,7 +282,7 @@ fn operand(
     proof: Proof,
     mut resolved: ResolvedEffect,
 ) -> Result<ResolvedEffect, Box<Diagnostic>> {
-    resolved.controls = proof.controls;
+    resolved.controls.extend(proof.controls);
     let mut selected_kind = None;
     for address in proof.addresses {
         let kind = match (kind, address.role) {
@@ -267,6 +294,12 @@ fn operand(
             }
             (BodyEffectKind::TrackerFinish { .. }, Role::Item | Role::Claim) => {
                 IrEffectKind::TrackerFinish
+            }
+            (BodyEffectKind::TrackerMembership { .. }, Role::Item | Role::Claim) => {
+                IrEffectKind::TrackerMembership
+            }
+            (BodyEffectKind::TrackerInspect { .. }, Role::Item | Role::Claim) => {
+                IrEffectKind::TrackerInspect
             }
             (BodyEffectKind::LeaseRenew { .. }, Role::Claim) => IrEffectKind::TrackerRenew,
             (BodyEffectKind::LeaseRenew { .. }, Role::Lease) => IrEffectKind::LeaseRenew,
@@ -610,6 +643,32 @@ rule run when Ticket as key => {{ file issue into jobs {{ title "task" }} as ite
         assert_eq!(
             named(&plan, &resolved, "lease_renewed").resources,
             BTreeSet::from(["resource:slots".into()])
+        );
+    }
+
+    #[test]
+    fn initiative_membership_checks_both_original_tracker_addresses() {
+        let source = format!(
+            r#"{HEADER}
+rule run when Ticket as key => {{
+ file issue into jobs {{ title "task" }} as task
+ file initiative into other {{ title "group" }} as group
+ add task to initiative group as linked
+ inspect initiative group as snapshot
+ remove task from initiative group as unlinked
+}}"#
+        );
+        let plan = typed(&source);
+        let resolved = resolve(&plan, &context("Ticket as key")).expect("resource proof");
+        for name in ["linked", "unlinked"] {
+            assert_eq!(
+                named(&plan, &resolved, name).resources,
+                BTreeSet::from(["jobs".into(), "other".into()]),
+            );
+        }
+        assert_eq!(
+            named(&plan, &resolved, "snapshot").resources,
+            BTreeSet::from(["jobs".into(), "other".into()]),
         );
     }
 

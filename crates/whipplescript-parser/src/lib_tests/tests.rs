@@ -26581,7 +26581,7 @@ fn every_effect_kind_round_trips_through_its_kind_string() {
             kind.as_str()
         );
     }
-    assert_eq!(IrEffectKind::ALL.len(), 25);
+    assert_eq!(IrEffectKind::ALL.len(), 27);
     assert_eq!(IrEffectKind::from_kind_str("nothing.here"), None);
 }
 
@@ -26914,6 +26914,7 @@ fn all_lists_every_effect_kind_and_every_kind_round_trips() {
             | K::FileWrite
             | K::FileImport
             | K::FileExport => kind,
+            K::TrackerMembership | K::TrackerInspect => kind,
         };
         vec![
             K::AgentTell,
@@ -26932,6 +26933,8 @@ fn all_lists_every_effect_kind_and_every_kind_round_trips() {
             K::TrackerRenew,
             K::TrackerRelease,
             K::TrackerFinish,
+            K::TrackerMembership,
+            K::TrackerInspect,
             K::LeaseAcquire,
             K::LeaseRenew,
             K::LedgerAppend,

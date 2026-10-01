@@ -3809,6 +3809,39 @@ pub fn parse_effect_statements(
             });
             consumed_delta = brace_delta(&statement);
             index = next_index;
+        } else if trimmed.starts_with("add ") || trimmed.starts_with("remove ") {
+            let words = trimmed.split_whitespace().collect::<Vec<_>>();
+            let change = words.first().copied().unwrap_or_default();
+            let task = words.get(1).copied().unwrap_or_default();
+            let initiative = words.get(4).copied().unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "tracker.membership".into(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![task.into(), initiative.into(), change.into()],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+        } else if let Some(rest) = trimmed.strip_prefix("inspect initiative ") {
+            let initiative = rest.split_whitespace().next().unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "tracker.inspect".into(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![initiative.into()],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("decide ") {
             // Inline anonymous coercion: decide "<prompt>" -> { fields } as x.
             let prompt = rest
@@ -4889,6 +4922,43 @@ pub fn parsed_effect_input_json(
                 insert_json_field(&mut input, "payload", Value::Object(fields));
             }
             input
+        }
+        "tracker.membership" => {
+            let task = parse_field_value_scoped(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+                live_facts,
+                live_effects,
+                live_ir,
+            );
+            let initiative = parse_field_value_scoped(
+                effect.args.get(1).map(String::as_str).unwrap_or_default(),
+                context,
+                live_facts,
+                live_effects,
+                live_ir,
+            );
+            json!({
+                "task": task,
+                "initiative": initiative,
+                "change": effect.args.get(2),
+                "resources": ir.trackers.iter().map(|tracker| tracker.name.as_str()).collect::<Vec<_>>(),
+                "rule": rule.name,
+            })
+        }
+        "tracker.inspect" => {
+            let initiative = parse_field_value_scoped(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+                live_facts,
+                live_effects,
+                live_ir,
+            );
+            json!({
+                "initiative": initiative,
+                "resources": ir.trackers.iter().map(|tracker| tracker.name.as_str()).collect::<Vec<_>>(),
+                "rule": rule.name,
+            })
         }
         "signal.emit" => {
             let event_name = effect.args.get(1).cloned().unwrap_or_default();
@@ -8845,6 +8915,25 @@ release w
             release.kind, "tracker.release",
             "a work-item release must stay tracker.release: {effects:?}"
         );
+    }
+
+    #[test]
+    fn legacy_lowering_recognizes_initiative_set_and_inspection_effects() {
+        let effects = parse_effect_statements(
+            "add task to initiative group as linked\nremove task from initiative group as unlinked\ninspect initiative group as snapshot",
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].kind, "tracker.membership");
+        assert_eq!(effects[0].args, ["task", "group", "add"]);
+        assert_eq!(effects[1].kind, "tracker.membership");
+        assert_eq!(effects[1].args, ["task", "group", "remove"]);
+        assert_eq!(effects[2].kind, "tracker.inspect");
+        assert_eq!(effects[2].args, ["group"]);
+        assert_eq!(effects[2].binding.as_deref(), Some("snapshot"));
     }
 
     /// A real acquire binding in the same parse rewrites its release.

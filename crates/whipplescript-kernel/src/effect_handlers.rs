@@ -15,6 +15,9 @@ use std::path::Path;
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::items::WorkItems;
+use whipplescript_store::tracker_membership::{
+    MembershipChange, MembershipOutcome, TrackerMembership, TrackerMemberships,
+};
 use whipplescript_store::vcs::FrontierRead;
 use whipplescript_store::workstreams::Workstreams;
 use whipplescript_store::{
@@ -2302,7 +2305,37 @@ fn tracker_finish_result(
     }
 }
 
-pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
+fn initiative_inspection_value(
+    snapshot: &whipplescript_store::items::initiatives::InitiativeInspection,
+) -> Value {
+    let members = snapshot
+        .members
+        .iter()
+        .map(|member| {
+            json!({
+                "queue": member.item.queue,
+                "id": member.item.id,
+                "title": member.item.title,
+                "status": member.item.status,
+                "ready": member.unready_reasons.is_empty(),
+                "unready_reasons": member.unready_reasons.iter().map(|reason| reason.describe()).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "initiative": {
+            "queue": snapshot.initiative.queue,
+            "id": snapshot.initiative.id,
+            "title": snapshot.initiative.title,
+            "status": snapshot.initiative.status,
+        },
+        "members": members,
+        "state_counts": snapshot.state_counts,
+        "at": snapshot.at,
+    })
+}
+
+pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + TrackerMemberships + FrontierRead>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
@@ -2503,6 +2536,124 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
             }
             tracker_finish_result(result, queue, id, title, summary.as_deref())
         }
+        "tracker.membership" => (|| {
+            let task = input
+                .get("task")
+                .and_then(Value::as_object)
+                .ok_or("membership has no task address")?;
+            let initiative = input
+                .get("initiative")
+                .and_then(Value::as_object)
+                .ok_or("membership has no initiative address")?;
+            let text = |address: &serde_json::Map<String, Value>, field: &str| {
+                address
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("membership address has no {field}"))
+            };
+            let task_id = text(task, "id")?;
+            let task_queue = text(task, "queue")?;
+            let initiative_id = text(initiative, "id")?;
+            let initiative_queue = text(initiative, "queue")?;
+            let change = match input.get("change").and_then(Value::as_str) {
+                Some("add") => MembershipChange::Add,
+                Some("remove") => MembershipChange::Remove,
+                _ => return Err("membership has no valid change".into()),
+            };
+            let resources = input
+                .get("resources")
+                .and_then(Value::as_array)
+                .ok_or("membership has no checked tracker resources")?
+                .iter()
+                .map(|value| value.as_str().filter(|name| !name.trim().is_empty()))
+                .collect::<Option<std::collections::BTreeSet<_>>>()
+                .ok_or("membership has invalid checked tracker resources")?;
+            if !resources.contains(task_queue.as_str())
+                || !resources.contains(initiative_queue.as_str())
+            {
+                return Err("membership address is outside its checked tracker resources".into());
+            }
+            let task_subject_id = kernel
+                .store()
+                .subject_content_id(&task_id)
+                .map_err(|error| format!("membership task lookup failed: {error:?}"))?
+                .ok_or("membership task is unavailable")?;
+            let initiative_subject_id = kernel
+                .store()
+                .subject_content_id(&initiative_id)
+                .map_err(|error| format!("membership initiative lookup failed: {error:?}"))?
+                .ok_or("membership initiative is unavailable")?;
+            let request = TrackerMembership {
+                operation_id: idempotency_key(&[
+                    instance_id,
+                    &effect.effect_id,
+                    "tracker-membership",
+                ]),
+                instance_id: instance_id.into(),
+                effect_id: effect.effect_id.clone(),
+                actor: format!("workflow:{instance_id}"),
+                task_id,
+                task_queue,
+                task_subject_id,
+                initiative_id,
+                initiative_queue,
+                initiative_subject_id,
+                change,
+            };
+            let receipt = kernel
+                .store_mut()
+                .change_membership_once(&request)
+                .map_err(|error| format!("membership failed: {error:?}"))?;
+            receipt
+                .validate_for(&request)
+                .map_err(|error| format!("membership receipt failed: {error:?}"))?;
+            let outcome = match receipt.outcome {
+                MembershipOutcome::Added => "added",
+                MembershipOutcome::AlreadyMember => "already_member",
+                MembershipOutcome::Removed { was_member: true } => "removed",
+                MembershipOutcome::Removed { was_member: false } => "already_absent",
+            };
+            Ok(json!({"task": task, "initiative": initiative, "outcome": outcome}))
+        })(),
+        "tracker.inspect" => (|| {
+            let initiative = input
+                .get("initiative")
+                .and_then(Value::as_object)
+                .ok_or("inspection has no initiative address")?;
+            let id = initiative
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or("inspection has no initiative id")?;
+            let queue = initiative
+                .get("queue")
+                .and_then(Value::as_str)
+                .filter(|queue| !queue.trim().is_empty())
+                .ok_or("inspection has no initiative queue")?;
+            let allowed = input
+                .get("resources")
+                .and_then(Value::as_array)
+                .ok_or("inspection has no checked tracker resources")?
+                .iter()
+                .map(|value| value.as_str().map(str::to_owned))
+                .collect::<Option<std::collections::BTreeSet<_>>>()
+                .ok_or("inspection resources are invalid")?;
+            if !allowed.contains(queue) {
+                return Err(
+                    "inspection initiative is outside its checked tracker resources".into(),
+                );
+            }
+            let snapshot = kernel
+                .store()
+                .inspect_initiative_for_queues_at(id, now, &allowed)
+                .map_err(|error| format!("inspection failed: {error:?}"))?;
+            if snapshot.initiative.queue != queue {
+                return Err("inspection initiative differs from its checked address".into());
+            }
+            Ok(initiative_inspection_value(&snapshot))
+        })(),
         other => Err(format!("unknown queue effect kind `{other}`")),
     };
     kernel.store_mut().set_event_effect_id(None);
@@ -5233,6 +5384,268 @@ mod queue_effect_refusal_tests {
     }
 
     #[test]
+    fn initiative_membership_and_inspection_execute_across_tracker_queues() {
+        let store = NativeStores::open_in_memory().expect("stores open");
+        let mut kernel = RuntimeKernel::new(store);
+        let task = kernel
+            .store_mut()
+            .file_item(
+                "product",
+                "Ship search",
+                "work",
+                &[],
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("task");
+        let initiative = kernel
+            .store_mut()
+            .file_item(
+                "company",
+                "Agent discovery",
+                "outcome",
+                &[],
+                &json!({"kind": "initiative"}),
+                None,
+                None,
+            )
+            .expect("initiative");
+        let task_address = json!({"queue":"product","id":task.id,"title":task.title});
+        let initiative_address =
+            json!({"queue":"company","id":initiative.id,"title":initiative.title});
+        let membership = json!({
+            "task": task_address,
+            "initiative": initiative_address,
+            "change": "add",
+            "resources": ["company", "product"],
+        })
+        .to_string();
+        let effects = [NewEffect {
+            input_json: &membership,
+            ..queued("tracker.membership", "{}")
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-membership"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit membership");
+        let claimable = kernel.claimable_effects("instance-a").expect("claimable");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-a",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("membership settles");
+        let events = kernel.store().list_events("instance-a").expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "fact.derived"
+                && event.payload_json.contains("tracker.membership.completed")
+                && event.payload_json.contains("\"outcome\":\"added\"")
+        }));
+        let constrained = kernel.store().inspect_initiative_for_queues_at(
+            &initiative.id,
+            "2026-01-01T00:00:00Z",
+            &std::collections::BTreeSet::from(["company".to_owned()]),
+        );
+        assert!(constrained.is_err(), "a cross-queue member must not leak");
+        let snapshot = kernel
+            .store()
+            .inspect_initiative_for_queues_at(
+                &initiative.id,
+                "2026-01-01T00:00:00Z",
+                &std::collections::BTreeSet::from(["company".to_owned(), "product".to_owned()]),
+            )
+            .expect("authorized inspection");
+        assert_eq!(snapshot.members.len(), 1);
+        assert_eq!(snapshot.members[0].item.id, task.id);
+        let inspection = json!({
+            "initiative": initiative_address,
+            "resources": ["company", "product"],
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "inspect-eff",
+            input_json: &inspection,
+            idempotency_key: "rule=start;effect=inspect-eff",
+            ..queued("tracker.inspect", "{}")
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-b",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-inspection"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit inspection");
+        let claimable = kernel.claimable_effects("instance-b").expect("claimable");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-b",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("inspection settles");
+        let events = kernel.store().list_events("instance-b").expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "fact.derived"
+                && event.payload_json.contains("tracker.inspect.completed")
+                && event.payload_json.contains(&task.id)
+        }));
+
+        let removal = json!({
+            "task": task_address,
+            "initiative": initiative_address,
+            "change": "remove",
+            "resources": ["company", "product"],
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "remove-eff",
+            input_json: &removal,
+            idempotency_key: "rule=start;effect=remove-eff",
+            ..queued("tracker.membership", "{}")
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-c",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-removal"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit removal");
+        let claimable = kernel.claimable_effects("instance-c").expect("claimable");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-c",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("removal settles");
+        let events = kernel.store().list_events("instance-c").expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "fact.derived"
+                && event.payload_json.contains("tracker.membership.completed")
+                && event.payload_json.contains("\"outcome\":\"removed\"")
+        }));
+        let snapshot = kernel
+            .store()
+            .inspect_initiative_for_queues_at(
+                &initiative.id,
+                "2026-01-01T00:00:00Z",
+                &std::collections::BTreeSet::from(["company".to_owned(), "product".to_owned()]),
+            )
+            .expect("empty initiative");
+        assert!(snapshot.members.is_empty());
+        let effects = [NewEffect {
+            effect_id: "remove-again-eff",
+            input_json: &removal,
+            idempotency_key: "rule=start;effect=remove-again-eff",
+            ..queued("tracker.membership", "{}")
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-d",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-removal-again"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit repeated removal");
+        let claimable = kernel.claimable_effects("instance-d").expect("claimable");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-d",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("repeated removal settles");
+        let events = kernel.store().list_events("instance-d").expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "fact.derived"
+                && event
+                    .payload_json
+                    .contains("\"outcome\":\"already_absent\"")
+        }));
+        let wrong_address = json!({
+            "initiative":{"id":initiative.id,"queue":"product","title":initiative.title},
+            "resources":["company","product"],
+        })
+        .to_string();
+        let effects = [NewEffect {
+            effect_id: "wrong-inspection-eff",
+            input_json: &wrong_address,
+            idempotency_key: "rule=start;effect=wrong-inspection-eff",
+            ..queued("tracker.inspect", "{}")
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-e",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-wrong-inspection"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit mismatched inspection");
+        let claimable = kernel.claimable_effects("instance-e").expect("claimable");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-e",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("mismatched inspection settles as a failure");
+        let events = kernel.store().list_events("instance-e").expect("events");
+        assert!(events.iter().any(|event| {
+            event
+                .payload_json
+                .contains("inspection initiative differs from its checked address")
+        }));
+    }
+
+    #[test]
     fn initiative_finish_effect_requires_a_summary_and_an_initiative_target() {
         let missing_summary = run_and_collect(
             "tracker.finish",
@@ -5250,6 +5663,30 @@ mod queue_effect_refusal_tests {
             wrong_target.contains("finish initiative requires an initiative target"),
             "{wrong_target}"
         );
+    }
+
+    #[test]
+    fn initiative_effects_refuse_invalid_changes_and_unchecked_tracker_addresses() {
+        let invalid_change = run_and_collect(
+            "tracker.membership",
+            r#"{"task":{"id":"WS-1","queue":"jobs"},"initiative":{"id":"WS-2","queue":"company"},"change":"replace","resources":["jobs","company"]}"#,
+        );
+        assert!(invalid_change.contains("membership has no valid change"));
+        let unchecked_task = run_and_collect(
+            "tracker.membership",
+            r#"{"task":{"id":"WS-1","queue":"secret"},"initiative":{"id":"WS-2","queue":"company"},"change":"add","resources":["company"]}"#,
+        );
+        assert!(
+            unchecked_task.contains("membership address is outside its checked tracker resources")
+        );
+        let unchecked_inspection = run_and_collect(
+            "tracker.inspect",
+            r#"{"initiative":{"id":"WS-2","queue":"company"},"resources":["jobs"]}"#,
+        );
+        assert!(unchecked_inspection
+            .contains("inspection initiative is outside its checked tracker resources"));
+        let unknown = run_and_collect("tracker.unknown", "{}");
+        assert!(unknown.contains("unknown queue effect kind"));
     }
 
     #[test]

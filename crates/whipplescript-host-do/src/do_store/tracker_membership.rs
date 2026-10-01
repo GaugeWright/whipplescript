@@ -198,6 +198,76 @@ mod tests {
     }
 
     #[test]
+    fn hosted_inspection_refuses_an_unreadable_member_before_loading_its_record() {
+        let mut store = DoSqliteStore::new(RusqliteDoSql::with_runtime_schema());
+        let initiative = store
+            .file_item(
+                "company",
+                "group",
+                "outcome",
+                &[],
+                &serde_json::json!({"kind":"initiative"}),
+                None,
+                None,
+            )
+            .expect("initiative");
+        let task = store
+            .file_item(
+                "product",
+                "task",
+                "work",
+                &[],
+                &serde_json::json!({}),
+                None,
+                None,
+            )
+            .expect("task");
+        store
+            .add_relation(&task.id, &initiative.id, "belongs-to", None)
+            .expect("membership");
+        store
+            .sql
+            .execute(
+                "UPDATE tracker_issues SET metadata_json = 'not-json' WHERE issue_id = ?1",
+                &[text(&task.id)],
+            )
+            .expect("corrupt member record");
+        let allowed = std::collections::BTreeSet::from(["company".to_owned()]);
+        let error = store
+            .inspect_initiative_for_queues_at(&initiative.id, "2030-01-01T00:00:00Z", &allowed)
+            .expect_err("unreadable member");
+        assert!(format!("{error:?}").contains("outside the readable tracker set"));
+    }
+
+    #[test]
+    fn hosted_inspection_refuses_an_unreadable_initiative_before_loading_its_record() {
+        let mut store = DoSqliteStore::new(RusqliteDoSql::with_runtime_schema());
+        let initiative = store
+            .file_item(
+                "company",
+                "group",
+                "outcome",
+                &[],
+                &serde_json::json!({"kind":"initiative"}),
+                None,
+                None,
+            )
+            .expect("initiative");
+        store
+            .sql
+            .execute(
+                "UPDATE tracker_issues SET metadata_json = 'not-json' WHERE issue_id = ?1",
+                &[text(&initiative.id)],
+            )
+            .expect("corrupt initiative record");
+        let allowed = std::collections::BTreeSet::from(["product".to_owned()]);
+        let error = store
+            .inspect_initiative_for_queues_at(&initiative.id, "2030-01-01T00:00:00Z", &allowed)
+            .expect_err("unreadable initiative");
+        assert!(format!("{error:?}").contains("outside the readable tracker set"));
+    }
+
+    #[test]
     fn hosted_membership_sql_failures_leave_no_partial_event_edge_or_receipt() {
         let mut reached_success = false;
         for fail_at in 1..=60 {

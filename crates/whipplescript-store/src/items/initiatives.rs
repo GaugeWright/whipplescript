@@ -312,27 +312,79 @@ impl super::WorkItemStore {
     /// A read transaction pins the group, relation set, member overlays and
     /// readiness explanations to the same SQLite snapshot.
     pub fn inspect_initiative_at(&self, id: &str, at: &str) -> StoreResult<InitiativeInspection> {
+        self.inspect_initiative_inner(id, at, None)
+    }
+
+    pub fn inspect_initiative_for_queues_at(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<InitiativeInspection> {
+        self.inspect_initiative_inner(id, at, Some(allowed_queues))
+    }
+
+    fn inspect_initiative_inner(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: Option<&std::collections::BTreeSet<String>>,
+    ) -> StoreResult<InitiativeInspection> {
         let at = super::readiness::canonical_instant(at).ok_or_else(|| {
             StoreError::Conflict("initiative inspection needs a UTC instant".into())
         })?;
         let tx = self.connection.unchecked_transaction()?;
+        if let Some(allowed) = allowed_queues {
+            let queue: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT queue FROM tracker_issues WHERE issue_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if queue.as_ref().is_some_and(|queue| !allowed.contains(queue)) {
+                return Err(StoreError::Conflict(format!(
+                    "initiative {id} is outside the readable tracker set"
+                )));
+            }
+        }
         let initiative = self
             .get_item(id)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown initiative {id}")))?;
         if issue_kind(&initiative.metadata)? != "initiative" {
             return Err(StoreError::Conflict(format!("{id} is not an initiative")));
         }
-        let members = self
-            .initiative_members(id)?
-            .into_iter()
-            .map(|item| {
-                let unready_reasons = self.unready_reasons_at(&item.id, &at)?;
-                Ok(InitiativeMember {
-                    item,
-                    unready_reasons,
-                })
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
+        let addresses = self
+            .connection
+            .prepare(
+                "SELECT r.from_issue, i.queue FROM tracker_relations r \
+                 LEFT JOIN tracker_issues i ON i.issue_id = r.from_issue \
+                 WHERE r.to_issue = ?1 AND r.kind = 'belongs-to' ORDER BY r.from_issue",
+            )?
+            .query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut members = Vec::with_capacity(addresses.len());
+        for (member_id, queue) in addresses {
+            let queue = queue.ok_or_else(|| {
+                StoreError::Conflict(format!("initiative member {member_id} is unavailable"))
+            })?;
+            if allowed_queues.is_some_and(|allowed| !allowed.contains(&queue)) {
+                return Err(StoreError::Conflict(format!(
+                    "initiative member {member_id} is outside the readable tracker set"
+                )));
+            }
+            let item = self
+                .get_item(&member_id)?
+                .expect("member queue row exists in this transaction snapshot");
+            let unready_reasons = self.unready_reasons_at(&item.id, &at)?;
+            members.push(InitiativeMember {
+                item,
+                unready_reasons,
+            });
+        }
         tx.commit()?;
         Ok(inspection(initiative, members, at))
     }
@@ -703,6 +755,46 @@ mod tests {
                 .title,
             "later task"
         );
+    }
+
+    #[test]
+    fn inspection_refuses_an_unreadable_member_before_loading_its_record() {
+        let mut store = WorkItemStore::open_in_memory().expect("store");
+        let initiative = file(&mut store, "company", "A", "initiative");
+        let task = file(&mut store, "product", "task", "task");
+        store
+            .add_relation(&task.id, &initiative.id, "belongs-to", None)
+            .expect("membership");
+        store
+            .connection
+            .execute(
+                "UPDATE tracker_issues SET metadata_json = 'not-json' WHERE issue_id = ?1",
+                [&task.id],
+            )
+            .expect("corrupt member record");
+        let allowed = std::collections::BTreeSet::from(["company".to_owned()]);
+        let error = store
+            .inspect_initiative_for_queues_at(&initiative.id, "2030-01-01T00:00:00Z", &allowed)
+            .expect_err("unreadable member");
+        assert!(format!("{error:?}").contains("outside the readable tracker set"));
+    }
+
+    #[test]
+    fn inspection_refuses_an_unreadable_initiative_before_loading_its_record() {
+        let mut store = WorkItemStore::open_in_memory().expect("store");
+        let initiative = file(&mut store, "company", "A", "initiative");
+        store
+            .connection
+            .execute(
+                "UPDATE tracker_issues SET metadata_json = 'not-json' WHERE issue_id = ?1",
+                [&initiative.id],
+            )
+            .expect("corrupt initiative record");
+        let allowed = std::collections::BTreeSet::from(["product".to_owned()]);
+        let error = store
+            .inspect_initiative_for_queues_at(&initiative.id, "2030-01-01T00:00:00Z", &allowed)
+            .expect_err("unreadable initiative");
+        assert!(format!("{error:?}").contains("outside the readable tracker set"));
     }
 
     #[test]

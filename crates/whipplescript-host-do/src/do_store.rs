@@ -9530,17 +9530,37 @@ fn do_file_item_on(
     Ok((item_id, content_id))
 }
 
-impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
-    fn inspect_initiative_at(
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn inspect_initiative_inner(
         &self,
         id: &str,
         at: &str,
+        allowed_queues: Option<&std::collections::BTreeSet<String>>,
     ) -> StoreResult<whipplescript_store::items::initiatives::InitiativeInspection> {
         use whipplescript_store::items::initiatives::{inspection, InitiativeMember};
         let at = whipplescript_store::items::readiness::canonical_instant(at).ok_or_else(|| {
             StoreError::Conflict("initiative inspection needs a UTC instant".into())
         })?;
         recovery::atomic_result(&self.sql, false, &mut || {
+            if let Some(allowed) = allowed_queues {
+                let rows = self
+                    .sql
+                    .query(
+                        "SELECT queue FROM tracker_issues WHERE issue_id = ?1",
+                        &[text(id)],
+                    )
+                    .map_err(sql_err)?;
+                if let Some(row) = rows.first() {
+                    // The schema makes queue non-null; a row here fixes the
+                    // same transaction snapshot used by get_item below.
+                    let queue = as_text(&row[0]);
+                    if !allowed.contains(&queue) {
+                        return Err(StoreError::Conflict(format!(
+                            "initiative {id} is outside the readable tracker set"
+                        )));
+                    }
+                }
+            }
             let initiative = self
                 .get_item(id)?
                 .ok_or_else(|| StoreError::Conflict(format!("unknown initiative {id}")))?;
@@ -9549,20 +9569,33 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             {
                 return Err(StoreError::Conflict(format!("{id} is not an initiative")));
             }
-            let rows = self.sql.query(
-                "SELECT from_issue FROM tracker_relations WHERE to_issue = ?1 AND kind = 'belongs-to' ORDER BY from_issue",
-                &[text(id)],
-            ).map_err(sql_err)?;
+            let rows = self
+                .sql
+                .query(
+                    "SELECT r.from_issue, i.queue FROM tracker_relations r \
+                 LEFT JOIN tracker_issues i ON i.issue_id = r.from_issue \
+                 WHERE r.to_issue = ?1 AND r.kind = 'belongs-to' ORDER BY r.from_issue",
+                    &[text(id)],
+                )
+                .map_err(sql_err)?;
             let source = readiness::DoReadiness(&self.sql);
             let members = rows
                 .iter()
                 .map(|row| {
                     let member_id = as_text(&row[0]);
-                    let item = self.get_item(&member_id)?.ok_or_else(|| {
+                    let queue = as_opt_text(&row[1]).ok_or_else(|| {
                         StoreError::Conflict(format!(
                             "initiative member {member_id} is unavailable"
                         ))
                     })?;
+                    if allowed_queues.is_some_and(|allowed| !allowed.contains(&queue)) {
+                        return Err(StoreError::Conflict(format!(
+                            "initiative member {member_id} is outside the readable tracker set"
+                        )));
+                    }
+                    let item = self
+                        .get_item(&member_id)?
+                        .expect("member queue row exists in this transaction snapshot");
                     let unready_reasons = whipplescript_store::items::readiness::unready_reasons(
                         &source, &member_id, &at,
                     )?;
@@ -9574,6 +9607,24 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 .collect::<StoreResult<Vec<_>>>()?;
             Ok(inspection(initiative, members, at.clone()))
         })
+    }
+}
+
+impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn inspect_initiative_at(
+        &self,
+        id: &str,
+        at: &str,
+    ) -> StoreResult<whipplescript_store::items::initiatives::InitiativeInspection> {
+        self.inspect_initiative_inner(id, at, None)
+    }
+    fn inspect_initiative_for_queues_at(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<whipplescript_store::items::initiatives::InitiativeInspection> {
+        self.inspect_initiative_inner(id, at, Some(allowed_queues))
     }
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         do_content_id(&self.sql, id)

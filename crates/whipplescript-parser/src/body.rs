@@ -469,6 +469,8 @@ impl BodyEffectKind {
                 | Self::TrackerClaim { .. }
                 | Self::TrackerRelease { .. }
                 | Self::TrackerFinish { .. }
+                | Self::TrackerMembership { .. }
+                | Self::TrackerInspect { .. }
                 | Self::LedgerAppend { .. }
                 | Self::CounterConsume { .. }
                 | Self::Exec {
@@ -502,6 +504,9 @@ impl BodyEffectKind {
             Self::TrackerClaim { .. } => "claim",
             Self::TrackerRelease { .. } => "release",
             Self::TrackerFinish { .. } => "finish",
+            Self::TrackerMembership { remove: false, .. } => "add",
+            Self::TrackerMembership { remove: true, .. } => "remove",
+            Self::TrackerInspect { .. } => "inspect initiative",
             Self::LeaseAcquire { .. } => "acquire",
             Self::LeaseRenew { .. } => "renew",
             Self::LedgerAppend { .. } => "append",
@@ -727,6 +732,14 @@ pub enum BodyEffectKind {
         fields: Vec<FieldAssign>,
         #[serde(default)]
         initiative: bool,
+    },
+    TrackerMembership {
+        task: String,
+        initiative: String,
+        remove: bool,
+    },
+    TrackerInspect {
+        initiative: String,
     },
     /// Coordination verbs (spec/coordination.md): one atomic attempt each,
     /// with branchable sum-typed outcomes.
@@ -2123,6 +2136,9 @@ impl<'a> BodyParser<'a> {
             "claim" => self.parse_tracker_claim(),
             "release" => self.parse_tracker_release(),
             "finish" => self.parse_tracker_finish(),
+            "add" => self.parse_tracker_membership(false),
+            "remove" => self.parse_tracker_membership(true),
+            "inspect" => self.parse_tracker_inspect(),
             "acquire" => self.parse_lease_acquire(),
             "renew" => self.parse_lease_renew(),
             "append" => self.parse_ledger_append(),
@@ -5228,6 +5244,81 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
+    fn parse_tracker_membership(&mut self, remove: bool) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // add or remove
+        let task = self.ident_text("task binding")?;
+        let connective = if remove { "from" } else { "to" };
+        if !self.consume_ident(connective) || !self.consume_ident("initiative") {
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                self.span_here(),
+                format!("expected `{connective} initiative` after the task binding"),
+                None,
+            );
+            return None;
+        }
+        let initiative = self.ident_text("initiative binding")?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::TrackerMembership {
+                task,
+                initiative,
+                remove,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    fn parse_tracker_inspect(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // inspect
+        if !self.consume_ident("initiative") {
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                self.span_here(),
+                "expected `initiative` after `inspect`".to_owned(),
+                None,
+            );
+            return None;
+        }
+        let initiative = self.ident_text("initiative binding")?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        if binding.is_none() {
+            // Keep the effect for `then snapshot <- inspect …`, which supplies
+            // the binding during expansion. Ordinary source still receives
+            // this diagnostic from the unexpanded parse.
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                self.span_here(),
+                "inspection requires `as <snapshot>`".to_owned(),
+                None,
+            );
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::TrackerInspect { initiative },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
     // -- blocks --------------------------------------------------------------
 
     /// `during <cond> { … } on lapse [as x] { … }` / `until <cond> { … }`
@@ -5699,6 +5790,9 @@ pub(crate) const RULE_BODY_STATEMENT_KEYWORDS: &[&str] = &[
     "claim",
     "release",
     "finish",
+    "add",
+    "remove",
+    "inspect",
     "acquire",
     "renew",
     "append",

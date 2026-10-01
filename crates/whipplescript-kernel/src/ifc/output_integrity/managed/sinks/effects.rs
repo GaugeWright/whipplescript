@@ -95,6 +95,13 @@ pub(super) fn resource_payload(
             ExecTarget::Capability { stdin_binding, .. } => expression(stdin_binding)?,
         },
         BodyEffectKind::LeaseAcquire { key_expr, .. } => expression(key_expr)?,
+        BodyEffectKind::TrackerMembership {
+            task, initiative, ..
+        } => {
+            let mut payload = expression(task)?;
+            payload.extend(expression(initiative)?);
+            payload
+        }
         BodyEffectKind::CounterConsume {
             key_expr,
             amount_expr,
@@ -108,6 +115,7 @@ pub(super) fn resource_payload(
         | BodyEffectKind::RevokeCredential { .. }
         | BodyEffectKind::TrackerClaim { .. }
         | BodyEffectKind::TrackerRelease { .. }
+        | BodyEffectKind::TrackerInspect { .. }
         | BodyEffectKind::LeaseRenew { .. }
         | BodyEffectKind::Timer { .. } => Vec::new(),
         // These need provider/package, collection, signal, ingestion or

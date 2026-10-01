@@ -2476,7 +2476,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 return Ok(EffectStep::NeedsHttp(request));
             }
             "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
-            | "tracker.finish" => {
+            | "tracker.finish" | "tracker.membership" | "tracker.inspect" => {
                 // The host's own instant (DR-0126 RV-3): the claim guard decides
                 // readiness at it, and a claim `ttl` deadline is anchored to it,
                 // so a timed claim is timed here as it is natively.

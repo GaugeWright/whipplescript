@@ -3811,6 +3811,14 @@ pub trait WorkItems {
         at: &str,
     ) -> StoreResult<initiatives::InitiativeInspection>;
 
+    /// Refuse an out-of-ceiling member before loading its record or readiness.
+    fn inspect_initiative_for_queues_at(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<initiatives::InitiativeInspection>;
+
     /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
     /// Advisory: it records who *should* act and never restricts who may claim.
     /// Default: no-op, for a store with no assignment plane.
@@ -3942,6 +3950,14 @@ impl WorkItems for WorkItemStore {
         at: &str,
     ) -> StoreResult<initiatives::InitiativeInspection> {
         WorkItemStore::inspect_initiative_at(self, id, at)
+    }
+    fn inspect_initiative_for_queues_at(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<initiatives::InitiativeInspection> {
+        WorkItemStore::inspect_initiative_for_queues_at(self, id, at, allowed_queues)
     }
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         WorkItemStore::subject_content_id(self, id)

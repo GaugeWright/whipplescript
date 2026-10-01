@@ -3007,6 +3007,8 @@ pub enum IrEffectKind {
     TrackerRenew,
     TrackerRelease,
     TrackerFinish,
+    TrackerMembership,
+    TrackerInspect,
     LeaseAcquire,
     LeaseRenew,
     LedgerAppend,
@@ -5783,6 +5785,26 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
+        IrEffectKind::TrackerMembership => (
+            "std.tracker",
+            strings(&["add", "remove"]),
+            Some("tracker.membership.input"),
+            Some("TrackerMembership"),
+            strings(&["tracker.membership"]),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
+        IrEffectKind::TrackerInspect => (
+            "std.tracker",
+            strings(&["inspect"]),
+            Some("tracker.inspect.input"),
+            Some("TrackerInspection"),
+            strings(&["tracker.inspect"]),
+            Vec::new(),
+            strings(&["effect.output"]),
+            TypedOutputValidation::None,
+        ),
         IrEffectKind::LeaseAcquire => (
             "std.coord",
             strings(&["acquire"]),
@@ -5917,6 +5939,8 @@ impl IrEffectKind {
             Self::TrackerRenew => "tracker.renew",
             Self::TrackerRelease => "tracker.release",
             Self::TrackerFinish => "tracker.finish",
+            Self::TrackerMembership => "tracker.membership",
+            Self::TrackerInspect => "tracker.inspect",
             Self::LeaseAcquire => "lease.acquire",
             Self::LeaseRenew => "lease.renew",
             Self::LedgerAppend => "ledger.append",
@@ -5952,6 +5976,8 @@ impl IrEffectKind {
         Self::TrackerRenew,
         Self::TrackerRelease,
         Self::TrackerFinish,
+        Self::TrackerMembership,
+        Self::TrackerInspect,
         Self::LeaseAcquire,
         Self::LeaseRenew,
         Self::LedgerAppend,
@@ -5993,6 +6019,8 @@ impl IrEffectKind {
             | Self::TrackerRenew
             | Self::TrackerRelease
             | Self::TrackerFinish
+            | Self::TrackerMembership
+            | Self::TrackerInspect
             | Self::LeaseAcquire
             | Self::LeaseRenew
             | Self::LedgerAppend
@@ -14814,6 +14842,8 @@ fn terminal_completed_payload_type(
         | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
+        | IrEffectKind::TrackerMembership
+        | IrEffectKind::TrackerInspect
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
@@ -15543,6 +15573,8 @@ pub fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGra
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15578,6 +15610,8 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::TrackerClaim { .. } => IrEffectKind::TrackerClaim,
         body::BodyEffectKind::TrackerRelease { .. } => IrEffectKind::TrackerRelease,
         body::BodyEffectKind::TrackerFinish { .. } => IrEffectKind::TrackerFinish,
+        body::BodyEffectKind::TrackerMembership { .. } => IrEffectKind::TrackerMembership,
+        body::BodyEffectKind::TrackerInspect { .. } => IrEffectKind::TrackerInspect,
         body::BodyEffectKind::LeaseAcquire { .. } => IrEffectKind::LeaseAcquire,
         body::BodyEffectKind::LeaseRenew { .. } => IrEffectKind::LeaseRenew,
         body::BodyEffectKind::LedgerAppend { .. } => IrEffectKind::LedgerAppend,
@@ -15612,6 +15646,8 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15660,6 +15696,8 @@ fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15720,6 +15758,8 @@ fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15753,6 +15793,8 @@ fn on_stream_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15792,6 +15834,8 @@ fn vcs_selective_for_body(kind: &body::BodyEffectKind) -> (Option<String>, Optio
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -15835,6 +15879,8 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -16383,6 +16429,8 @@ fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredent
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -16447,6 +16495,8 @@ fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -16484,6 +16534,8 @@ fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -16555,6 +16607,10 @@ fn resource_for_body(
         body::BodyEffectKind::TrackerClaim { item, .. }
         | body::BodyEffectKind::TrackerRelease { item }
         | body::BodyEffectKind::TrackerFinish { item, .. } => binding_resources.get(item).cloned(),
+        body::BodyEffectKind::TrackerMembership { initiative, .. }
+        | body::BodyEffectKind::TrackerInspect { initiative } => {
+            binding_resources.get(initiative).cloned()
+        }
         // `renew` is one body kind serving two effect kinds: it is a tracker
         // renew when its binding names a claim and a lease renew otherwise, and
         // the binding map already carries whichever it is, because a claim
@@ -16663,6 +16719,8 @@ fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse>
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
         | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseAcquire { .. }
         | body::BodyEffectKind::LeaseRenew { .. }
         | body::BodyEffectKind::LedgerAppend { .. }
@@ -16945,6 +17003,12 @@ fn collect_effects_from_ast(
     let mut aliases = BTreeMap::new();
     collect_provenance_metadata(statements, &mut BTreeMap::new(), &mut aliases);
     for effect in &mut effects {
+        if matches!(
+            effect.kind,
+            IrEffectKind::TrackerMembership | IrEffectKind::TrackerInspect
+        ) {
+            effect.resources = trackers.iter().cloned().collect();
+        }
         if let Some(call) = &mut effect.package_call {
             let resolved = call.argument.as_deref().and_then(|argument| {
                 let binding = aliases
@@ -17019,6 +17083,19 @@ fn walk_effects(
                 }
                 let idempotency_key =
                     effect_idempotency_key(rule_name, &id, &kind, &effect.binding);
+                let resources = match &effect.kind {
+                    body::BodyEffectKind::TrackerMembership {
+                        task, initiative, ..
+                    } => [task, initiative]
+                        .iter()
+                        .filter_map(|binding| binding_resources.get(*binding).cloned())
+                        .collect(),
+                    _ => contract
+                        .resource
+                        .legacy_name(binding_resources)
+                        .into_iter()
+                        .collect(),
+                };
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -17038,11 +17115,7 @@ fn walk_effects(
                     on_stream: contract.on_stream,
                     selection_source: contract.selection_source,
                     transport_onto: contract.transport_onto,
-                    resources: contract
-                        .resource
-                        .legacy_name(binding_resources)
-                        .into_iter()
-                        .collect(),
+                    resources,
                     agent: contract.agent,
                     coerce_target: contract.coerce_target,
                     prompt_provider: contract.prompt_provider,
@@ -21130,6 +21203,8 @@ fn effect_binding_schema(
         | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
+        | IrEffectKind::TrackerMembership
+        | IrEffectKind::TrackerInspect
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend
@@ -21651,6 +21726,92 @@ pub fn tracker_finish_output_type(span: SourceSpan) -> IrType {
         },
     ]);
     IrType::Object(fields)
+}
+
+/// The settled relation result names both original addresses and the change.
+pub fn tracker_membership_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(vec![
+        IrClassField {
+            name: "task".into(),
+            ty: tracker_file_output_type(span),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "initiative".into(),
+            ty: tracker_file_output_type(span),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "outcome".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ])
+}
+
+/// The one-instant, bounded view exposed to a workflow by inspection.
+pub fn tracker_inspection_output_type(span: SourceSpan) -> IrType {
+    let mut initiative_fields = tracker_address_fields(span);
+    initiative_fields.push(IrClassField {
+        name: "status".into(),
+        ty: IrType::Primitive(IrPrimitiveType::String),
+        is_key: false,
+        presence_condition: None,
+        span,
+    });
+    let mut member_fields = tracker_address_fields(span);
+    for (name, ty) in [
+        ("status", IrType::Primitive(IrPrimitiveType::String)),
+        ("ready", IrType::Primitive(IrPrimitiveType::Bool)),
+        (
+            "unready_reasons",
+            IrType::Array(Box::new(IrType::Primitive(IrPrimitiveType::String))),
+        ),
+    ] {
+        member_fields.push(IrClassField {
+            name: name.into(),
+            ty,
+            is_key: false,
+            presence_condition: None,
+            span,
+        });
+    }
+    IrType::Object(vec![
+        IrClassField {
+            name: "initiative".into(),
+            ty: IrType::Object(initiative_fields),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "members".into(),
+            ty: IrType::Array(Box::new(IrType::Object(member_fields))),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "state_counts".into(),
+            ty: IrType::Map(Box::new(IrType::Primitive(IrPrimitiveType::Int))),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "at".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ])
 }
 
 /// The stable sum-shaped value produced by one counter consume. `Over` is a
@@ -22545,6 +22706,13 @@ fn collect_effect_expression_sources(kind: &body::BodyEffectKind, out: &mut Vec<
             source(item, out);
             fields(f, out);
         }
+        body::BodyEffectKind::TrackerMembership {
+            task, initiative, ..
+        } => {
+            source(task, out);
+            source(initiative, out);
+        }
+        body::BodyEffectKind::TrackerInspect { initiative } => source(initiative, out),
         body::BodyEffectKind::LeaseAcquire { key_expr, .. } => source(key_expr, out),
         body::BodyEffectKind::LeaseRenew {
             acquire_binding, ..
@@ -24459,6 +24627,8 @@ fn check_conditioned_effect_reads(
         | body::BodyEffectKind::Call { .. }
         | body::BodyEffectKind::TrackerClaim { .. }
         | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerMembership { .. }
+        | body::BodyEffectKind::TrackerInspect { .. }
         | body::BodyEffectKind::LeaseRenew { .. } => {}
     }
 }

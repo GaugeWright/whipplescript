@@ -2915,6 +2915,13 @@ impl EffectFlow {
         writes_resource: true,
         ..Self::NONE
     };
+    /// A mutation whose result depends on current tracker state.
+    const BOTH_ATTRIBUTED: Self = Self {
+        reads_resource: true,
+        writes_resource: true,
+        resource_is_output_provenance: true,
+        ..Self::NONE
+    };
     /// Outbound to the broadcast `stream` sink instead of to a resource.
     const STREAM: Self = Self {
         emits_stream: true,
@@ -2949,6 +2956,8 @@ fn effect_flow(kind: &IrEffectKind) -> EffectFlow {
         // that other actors and humans read, so it is a data sink like
         // `file issue`.
         IrEffectKind::TrackerFinish => EffectFlow::WRITE,
+        IrEffectKind::TrackerMembership => EffectFlow::BOTH_ATTRIBUTED,
+        IrEffectKind::TrackerInspect => EffectFlow::READ_ATTRIBUTED,
         // Claim, release and renew carry no rule data: what they write is the
         // HOLDER and a TTL, not anything the rule read. Treating them as data
         // sinks over-reports, and not in a harmless direction — it refuses
@@ -3173,6 +3182,8 @@ fn endpoint_doors_for_effect(ir: &IrProgram, effect: &IrEffectNode) -> Vec<Strin
         | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
+        | IrEffectKind::TrackerMembership
+        | IrEffectKind::TrackerInspect
         | IrEffectKind::LeaseAcquire
         | IrEffectKind::LeaseRenew
         | IrEffectKind::LedgerAppend

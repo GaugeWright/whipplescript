@@ -563,6 +563,31 @@ pub(crate) fn print_effect(
                 return;
             }
         }
+        BodyEffectKind::TrackerMembership {
+            task,
+            initiative,
+            remove,
+        } => {
+            if *remove {
+                format!(
+                    "remove {} from initiative {}{requires}{binding}{timeout}",
+                    rn(task),
+                    rn(initiative)
+                )
+            } else {
+                format!(
+                    "add {} to initiative {}{requires}{binding}{timeout}",
+                    rn(task),
+                    rn(initiative)
+                )
+            }
+        }
+        BodyEffectKind::TrackerInspect { initiative } => {
+            format!(
+                "inspect initiative {}{requires}{binding}{timeout}",
+                rn(initiative)
+            )
+        }
         BodyEffectKind::FileRead {
             format,
             store,

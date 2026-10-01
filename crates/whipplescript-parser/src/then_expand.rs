@@ -424,6 +424,10 @@ mod tests {
                 "recall project_memory for ticket.title",
                 "recall project_memory for ticket.title as __then_v",
             ),
+            (
+                "inspect initiative discovery",
+                "inspect initiative discovery as __then_v",
+            ),
         ] {
             let (out, diagnostics) = expand(&format!(
                 "  then v <- {chained}\n  complete result {{ note \"ok\" }}"

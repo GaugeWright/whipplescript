@@ -1096,6 +1096,15 @@ impl WorkItems for NativeStores {
     ) -> StoreResult<items::initiatives::InitiativeInspection> {
         self.items.inspect_initiative_at(id, at)
     }
+    fn inspect_initiative_for_queues_at(
+        &self,
+        id: &str,
+        at: &str,
+        allowed_queues: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<items::initiatives::InitiativeInspection> {
+        self.items
+            .inspect_initiative_for_queues_at(id, at, allowed_queues)
+    }
     fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
         self.items.set_event_effect_id(effect_id);
     }

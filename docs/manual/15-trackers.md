@@ -663,7 +663,9 @@ closes its tasks, and later task or membership changes do not silently reopen
 it. The existing `link`, `unlink`, `show` and `finish` commands manage this
 without another work store.
 
-Workflows can file and finish an initiative using the existing tracker effects:
+Workflows can file, inspect, update membership and finish an initiative. Each
+tracker referenced by a task or initiative address must be declared in the
+workflow. Inspection reads the current set under those declared tracker reads:
 
 <!-- check: fragment -->
 ```whip
@@ -672,10 +674,17 @@ then discovery <- file initiative into work {
   body "Agents can discover current work through ordinary repository search."
 }
 
+then linked <- add task to initiative discovery
+then snapshot <- inspect initiative discovery
+then unlinked <- remove task from initiative discovery
 then closed <- finish initiative discovery { summary "Outcome verified" }
 ```
 
 `file initiative` supplies the immutable kind and does not accept an assignee.
-`finish initiative` requires a summary and refuses a task target. Workflow
-membership and inspection verbs are still pending; use the `whip issue` CLI
-for those operations.
+`task` above is a task address returned by a tracker effect or trigger. A task
+may belong to more than one initiative, even across declared tracker queues.
+Membership results report `added`, `already_member`, `removed`, or
+`already_absent`, so repeated set changes remain visible as no-ops.
+`snapshot.members` contains each task's status, readiness and reasons, and
+`snapshot.state_counts` summarizes the states at the inspection instant.
+`finish initiative` requires a summary and refuses a task target.

@@ -1402,6 +1402,12 @@ impl Checker<'_> {
                 BodyEffectKind::TrackerFinish { .. } => {
                     Some(crate::tracker_finish_output_type(effect.span))
                 }
+                BodyEffectKind::TrackerMembership { .. } => {
+                    Some(crate::tracker_membership_output_type(effect.span))
+                }
+                BodyEffectKind::TrackerInspect { .. } => {
+                    Some(crate::tracker_inspection_output_type(effect.span))
+                }
                 BodyEffectKind::LedgerAppend { .. } => {
                     Some(crate::ledger_append_output_type(effect.span))
                 }
@@ -2288,6 +2294,54 @@ impl Checker<'_> {
                                 );
                             }
                         }
+                    }
+                }
+                BodyEffectKind::TrackerMembership {
+                    task, initiative, ..
+                } => {
+                    for item in [task, initiative] {
+                        let known = environment.get(item).is_some();
+                        let valid = known
+                            && ["queue", "id", "title"].into_iter().all(|field| {
+                                environment
+                                    .path_type(&[item.clone(), field.into()], self.semantic)
+                                    .is_some_and(|actual| {
+                                        assignable(
+                                            &actual,
+                                            &primitive(IrPrimitiveType::String),
+                                            self.semantic,
+                                        )
+                                    })
+                            });
+                        if known && !valid {
+                            self.scope_error(
+                                effect.span,
+                                format!("tracker address `{item}` must provide string fields `queue`, `id`, and `title`"),
+                                owner,
+                            );
+                        }
+                    }
+                }
+                BodyEffectKind::TrackerInspect { initiative } => {
+                    let known = environment.get(initiative).is_some();
+                    let valid = known
+                        && ["queue", "id", "title"].into_iter().all(|field| {
+                            environment
+                                .path_type(&[initiative.clone(), field.into()], self.semantic)
+                                .is_some_and(|actual| {
+                                    assignable(
+                                        &actual,
+                                        &primitive(IrPrimitiveType::String),
+                                        self.semantic,
+                                    )
+                                })
+                        });
+                    if known && !valid {
+                        self.scope_error(
+                            effect.span,
+                            format!("tracker address `{initiative}` must provide string fields `queue`, `id`, and `title`"),
+                            owner,
+                        );
                     }
                 }
                 BodyEffectKind::LedgerAppend {
