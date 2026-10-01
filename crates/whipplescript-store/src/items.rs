@@ -2401,7 +2401,7 @@ fn tx_file_item(
     effect_id: Option<&str>,
     filing_fingerprint: Option<&str>,
 ) -> StoreResult<(String, String)> {
-    initiatives::issue_kind(metadata)?;
+    initiatives::validate_assignment(initiatives::issue_kind(metadata)?, assigned_to)?;
     let now = tx_now(tx)?;
     let next: i64 = tx.query_row(
             "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
@@ -3711,6 +3711,11 @@ fn fold_set_status(
 /// never a durable status write. Only durable-`open` issues can be overlaid.
 /// Shared by the native and durable-object backends so the overlay is identical.
 pub fn apply_overlay(mut item: WorkItem, holder: Option<String>) -> WorkItem {
+    // Old event streams may contain assignments from before initiatives were
+    // collective. Keep those events, but never present an initiative owner.
+    if initiatives::issue_kind(&item.metadata).ok() == Some("initiative") {
+        item.assigned_to = None;
+    }
     if item.status == "open" {
         if let Some(holder) = holder {
             item.status = "in_progress".to_owned();

@@ -30,13 +30,19 @@ pub struct Context<'a> {
 struct Contract<'a> {
     tracker: &'a IrTracker,
     fields: &'a [FieldAssign],
+    initiative: bool,
 }
 
 fn contract<'a>(
     ir: &'a IrProgram,
     effect: &'a whipplescript_parser::body::EffectStmt,
 ) -> Result<Contract<'a>, String> {
-    let BodyEffectKind::TrackerFile { queue, fields } = &effect.kind else {
+    let BodyEffectKind::TrackerFile {
+        queue,
+        fields,
+        initiative,
+    } = &effect.kind
+    else {
         return Err("tracker-file projector requires a file statement".into());
     };
     let tracker = ir
@@ -46,6 +52,9 @@ fn contract<'a>(
         .ok_or("managed tracker filing has no declared tracker")?;
     let mut names: BTreeSet<&str> = BTreeSet::new();
     for field in fields {
+        if *initiative && field.name == "metadata" {
+            return Err("initiative kind is supplied by `file initiative`".into());
+        }
         if !matches!(
             field.name.as_str(),
             "title" | "body" | "labels" | "metadata"
@@ -59,7 +68,11 @@ fn contract<'a>(
     if !names.contains("title") {
         return Err("managed tracker item has no title".into());
     }
-    Ok(Contract { tracker, fields })
+    Ok(Contract {
+        tracker,
+        fields,
+        initiative: *initiative,
+    })
 }
 
 fn item(fields: &[FieldAssign], statement: &Statement<'_>) -> Evaluation {
@@ -156,7 +169,8 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
             .map_err(|_| "recorded tracker filing has no valid item argument")?;
         super::journal::validate_argument(&item, context.frontier).map_err(|issue| issue.0)?;
         validate_item(&item.value)?;
-        if input["queue"] != contract.tracker.name
+        if input["initiative"].as_bool().unwrap_or(false) != contract.initiative
+            || input["queue"] != contract.tracker.name
             || input["provider"] != contract.tracker.provider
             || input["fields"]
                 != serde_json::to_value(contract.fields)
@@ -176,10 +190,14 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
     }
 
     let item = item(contract.fields, &statement);
-    let State::Ready(item_value) = &item.state else {
+    let State::Ready(raw_item) = &item.state else {
         return Ok(Leaf::Waiting(item));
     };
-    validate_item(item_value)?;
+    let mut item_value = raw_item.clone();
+    if contract.initiative {
+        item_value["metadata"] = json!({"kind":"initiative"});
+    }
+    validate_item(&item_value)?;
     let item_argument = Argument {
         value: item_value.clone(),
         sources: item.sources,
@@ -206,7 +224,7 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
         after: None,
         timeout_seconds,
     };
-    let input = json!({
+    let mut input = json!({
         "queue": contract.tracker.name,
         "provider": contract.tracker.provider,
         "fields": contract.fields,
@@ -214,6 +232,9 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
         "rule": context.frame.rule,
         "item_argument": item_argument,
     });
+    if contract.initiative {
+        input["initiative"] = json!(true);
+    }
     Ok(leaf(
         OwnedLowering {
             effects: vec![OwnedEffect {

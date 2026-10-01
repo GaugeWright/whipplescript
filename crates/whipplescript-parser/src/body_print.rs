@@ -458,8 +458,13 @@ pub(crate) fn print_effect(
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::TrackerFile { queue, fields } => {
-            push_stmt_line(out, indent, &format!("file issue into {queue} {{"));
+        BodyEffectKind::TrackerFile {
+            queue,
+            fields,
+            initiative,
+        } => {
+            let noun = if *initiative { "initiative" } else { "issue" };
+            push_stmt_line(out, indent, &format!("file {noun} into {queue} {{"));
             print_fields(fields, indent + 1, &rn, out);
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
@@ -539,11 +544,16 @@ pub(crate) fn print_effect(
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::TrackerFinish { item, fields } => {
+        BodyEffectKind::TrackerFinish {
+            item,
+            fields,
+            initiative,
+        } => {
+            let noun = if *initiative { "initiative " } else { "" };
             if fields.is_empty() {
-                format!("finish {}", rn(item))
+                format!("finish {noun}{}", rn(item))
             } else {
-                push_stmt_line(out, indent, &format!("finish {} {{", rn(item)));
+                push_stmt_line(out, indent, &format!("finish {noun}{} {{", rn(item)));
                 print_fields(fields, indent + 1, &rn, out);
                 // The binding must survive the round-trip: `then x <- finish
                 // item { … }` re-serializes through here with the synthetic

@@ -9451,7 +9451,10 @@ fn do_file_item_on(
     effect_id: Option<&str>,
     filing_fingerprint: Option<&str>,
 ) -> StoreResult<(String, String)> {
-    whipplescript_store::items::initiatives::issue_kind(metadata)?;
+    whipplescript_store::items::initiatives::validate_assignment(
+        whipplescript_store::items::initiatives::issue_kind(metadata)?,
+        assigned_to,
+    )?;
     let now = do_now(sql)?;
     // The caller owns the transaction spanning counter, event and projection.
     let bumped = sql

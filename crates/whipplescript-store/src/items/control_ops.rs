@@ -154,6 +154,10 @@ pub(super) fn assign_item(
     if status.as_deref() != Some("open") {
         return Ok(false);
     }
+    super::initiatives::validate_assignment(
+        super::initiatives::native_kind(tx, item_id)?.unwrap_or("task"),
+        assignee,
+    )?;
     let payload = json!({ "assigned_to": assignee });
     tx_append_event(
         tx,

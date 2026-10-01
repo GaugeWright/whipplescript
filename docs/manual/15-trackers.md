@@ -639,7 +639,8 @@ of a workflow to systems that are not whip.
 
 An initiative names a set of related tasks and describes its outcome and
 completion criteria. It uses the same issue identity, history, comments,
-evidence and assignment, with immutable kind `initiative`.
+evidence, with immutable kind `initiative`. It has no assignee; assign its
+member tasks individually. `filed_by` records who filed it, not an owner.
 
 ```sh
 whip issue new --tracker company --kind initiative --title "Release the tracker"
@@ -653,7 +654,7 @@ A task may belong to several initiatives, including ones in another repository
 tracker. Membership is a set: adding the same membership again does nothing.
 It is independent of `parent-of` decomposition, task assignment, dependencies
 and execution claims. Initiatives cannot belong to other initiatives, become
-ready or be claimed; their assignment names the outcome owner.
+ready, claimed, or assigned.
 
 Inspection derives current member states and blockers. Finish an initiative
 explicitly after verifying the outcome. With unfinished members, supply a
@@ -661,3 +662,20 @@ summary explaining what remains and its disposition. Closing a group never
 closes its tasks, and later task or membership changes do not silently reopen
 it. The existing `link`, `unlink`, `show` and `finish` commands manage this
 without another work store.
+
+Workflows can file and finish an initiative using the existing tracker effects:
+
+<!-- check: fragment -->
+```whip
+then discovery <- file initiative into work {
+  title "Make tracker work visible to agents"
+  body "Agents can discover current work through ordinary repository search."
+}
+
+then closed <- finish initiative discovery { summary "Outcome verified" }
+```
+
+`file initiative` supplies the immutable kind and does not accept an assignee.
+`finish initiative` requires a summary and refuses a task target. Workflow
+membership and inspection verbs are still pending; use the `whip issue` CLI
+for those operations.

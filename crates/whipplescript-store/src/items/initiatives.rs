@@ -17,6 +17,16 @@ pub fn issue_kind(metadata: &Value) -> StoreResult<&'static str> {
     }
 }
 
+/// Initiatives coordinate several parties; assignment belongs to member tasks.
+pub fn validate_assignment(kind: &str, assignee: Option<&str>) -> StoreResult<()> {
+    if kind == "initiative" && assignee.is_some() {
+        return Err(StoreError::Conflict(
+            "initiatives have no assignee; assign their member tasks".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the grouping boundary, independently of backend and queue.
 pub fn validate_relation(kind: &str, from: Option<&str>, to: Option<&str>) -> StoreResult<()> {
     if kind == "belongs-to" && (from != Some("task") || to != Some("initiative")) {
@@ -117,6 +127,73 @@ mod tests {
                 None,
             )
             .expect("test operation succeeds")
+    }
+
+    #[test]
+    fn initiatives_refuse_assignment_while_tasks_keep_it() {
+        let mut store = WorkItemStore::open_in_memory().expect("store");
+        let metadata = json!({"kind":"initiative"});
+        let refusal = store
+            .file_item("q", "group", "outcome", &[], &metadata, None, Some("alice"))
+            .expect_err("assigned initiative");
+        assert!(format!("{refusal:?}").contains("initiatives have no assignee"));
+        assert!(store.list_items(None, None).expect("list").is_empty());
+
+        let initiative = file(&mut store, "q", "group", "initiative");
+        let refusal = store
+            .assign_item(&initiative.id, Some("alice"))
+            .expect_err("initiative assignment");
+        assert!(format!("{refusal:?}").contains("initiatives have no assignee"));
+        assert_eq!(
+            store
+                .get_item(&initiative.id)
+                .expect("read")
+                .unwrap()
+                .assigned_to,
+            None
+        );
+        // An earlier writer could have recorded an assignee before this
+        // contract. Keep its event, but never present a sole owner now.
+        store
+            .connection
+            .execute(
+                "UPDATE tracker_issues SET assigned_to = 'legacy' WHERE issue_id = ?1",
+                [&initiative.id],
+            )
+            .expect("legacy projection");
+        assert_eq!(
+            store
+                .get_item(&initiative.id)
+                .expect("read")
+                .unwrap()
+                .assigned_to,
+            None
+        );
+
+        let task = store
+            .file_item(
+                "q",
+                "task",
+                "work",
+                &[],
+                &json!({"kind":"task"}),
+                None,
+                Some("alice"),
+            )
+            .expect("assigned task");
+        assert_eq!(task.assigned_to.as_deref(), Some("alice"));
+        assert!(store
+            .assign_item(&task.id, Some("bob"))
+            .expect("reassign task"));
+        assert_eq!(
+            store
+                .get_item(&task.id)
+                .expect("read")
+                .unwrap()
+                .assigned_to
+                .as_deref(),
+            Some("bob")
+        );
     }
 
     #[test]

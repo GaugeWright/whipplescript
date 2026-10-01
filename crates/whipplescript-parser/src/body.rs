@@ -702,6 +702,8 @@ pub enum BodyEffectKind {
     TrackerFile {
         queue: String,
         fields: Vec<FieldAssign>,
+        #[serde(default)]
+        initiative: bool,
     },
     TrackerClaim {
         item: String,
@@ -723,6 +725,8 @@ pub enum BodyEffectKind {
     TrackerFinish {
         item: String,
         fields: Vec<FieldAssign>,
+        #[serde(default)]
+        initiative: bool,
     },
     /// Coordination verbs (spec/coordination.md): one atomic attempt each,
     /// with branchable sum-typed outcomes.
@@ -5058,16 +5062,20 @@ impl<'a> BodyParser<'a> {
     fn parse_tracker_file(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // file
-        if !self.consume_ident("issue") {
+        let initiative = if self.consume_ident("initiative") {
+            true
+        } else if self.consume_ident("issue") {
+            false
+        } else {
             let span = self.span_here();
             self.error(
                 diagnostic_code!("parse.unexpected_token"),
                 span,
-                "expected `issue` after `file`",
-                Some("write `file issue into <tracker> { ... }`".to_owned()),
+                "expected `issue` or `initiative` after `file`",
+                Some("write `file initiative into <tracker> { ... }`".to_owned()),
             );
             return None;
-        }
+        };
         if !self.consume_ident("into") {
             let span = self.span_here();
             self.error(
@@ -5087,7 +5095,11 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::TrackerFile { queue, fields },
+            kind: BodyEffectKind::TrackerFile {
+                queue,
+                fields,
+                initiative,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -5186,6 +5198,7 @@ impl<'a> BodyParser<'a> {
     fn parse_tracker_finish(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // finish
+        let initiative = self.consume_ident("initiative");
         let item = self.ident_text("issue binding after `finish`")?;
         let fields = if self.at_sym('{') {
             self.parse_field_block(false)?
@@ -5202,7 +5215,11 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::TrackerFinish { item, fields },
+            kind: BodyEffectKind::TrackerFinish {
+                item,
+                fields,
+                initiative,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -6553,6 +6570,21 @@ mod tests {
         assert!(matches!(
             &ast.statements[1],
             BodyStmt::Effect(EffectStmt { kind: BodyEffectKind::TrackerClaim { .. }, binding: Some(b), .. }) if b == "lease"
+        ));
+    }
+
+    #[test]
+    fn parses_initiative_filing_as_tracker_filing() {
+        let ast = parse_ok(
+            "file initiative into backlog { title \"Release tracker\" body \"Outcome\" } as effort",
+        );
+        assert!(matches!(
+            &ast.statements[0],
+            BodyStmt::Effect(EffectStmt {
+                kind: BodyEffectKind::TrackerFile { queue, initiative: true, .. },
+                binding: Some(binding),
+                ..
+            }) if queue == "backlog" && binding == "effort"
         ));
     }
 

@@ -2131,7 +2131,11 @@ impl Checker<'_> {
                         }
                     }
                 }
-                BodyEffectKind::TrackerFile { queue, fields } => {
+                BodyEffectKind::TrackerFile {
+                    queue,
+                    fields,
+                    initiative,
+                } => {
                     if !self.semantic.trackers.contains(queue) {
                         self.scope_error(
                             effect.span,
@@ -2141,6 +2145,14 @@ impl Checker<'_> {
                     }
                     let mut names = BTreeSet::new();
                     for field in fields {
+                        if *initiative && field.name == "metadata" {
+                            self.scope_error(
+                                effect.span,
+                                "initiative kind is supplied by `file initiative`; remove `metadata`".into(),
+                                owner,
+                            );
+                            continue;
+                        }
                         if !names.insert(field.name.as_str()) {
                             self.scope_error(
                                 effect.span,

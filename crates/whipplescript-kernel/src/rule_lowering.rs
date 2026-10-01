@@ -3665,8 +3665,10 @@ pub fn parse_effect_statements(
         } else if let Some(rest) = trimmed.strip_prefix("file ") {
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let initiative = rest.starts_with("initiative into ");
             let queue = rest
                 .strip_prefix("issue into ")
+                .or_else(|| rest.strip_prefix("initiative into "))
                 .and_then(|tail| tail.split_whitespace().next())
                 .unwrap_or_default()
                 .trim_end_matches('{')
@@ -3678,7 +3680,11 @@ pub fn parse_effect_statements(
                 target: Some(queue),
                 name: None,
                 binding: binding_after_as(&statement),
-                args: vec![body],
+                args: if initiative {
+                    vec![body, "initiative".into()]
+                } else {
+                    vec![body]
+                },
                 prompt: None,
                 prompt_content_type: None,
                 prompt_template: None,
@@ -3775,7 +3781,10 @@ pub fn parse_effect_statements(
             } else {
                 (trimmed.to_owned(), index)
             };
+            let initiative = rest.starts_with("initiative ");
             let item = rest
+                .strip_prefix("initiative ")
+                .unwrap_or(rest)
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
@@ -3787,7 +3796,11 @@ pub fn parse_effect_statements(
                 target: None,
                 name: None,
                 binding: binding_after_as(&statement),
-                args: vec![item, body],
+                args: if initiative {
+                    vec![item, body, "initiative".into()]
+                } else {
+                    vec![item, body]
+                },
                 prompt: None,
                 prompt_content_type: None,
                 prompt_template: None,
@@ -4811,16 +4824,28 @@ pub fn parsed_effect_input_json(
             input
         }
         "tracker.file" => {
-            let fields = parse_record_fields(
+            let mut fields = parse_record_fields(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
                 errors,
             );
+            let initiative = effect.args.get(1).is_some_and(|arg| arg == "initiative");
+            if initiative {
+                if fields.contains_key("metadata") || fields.contains_key("assigned_to") {
+                    let refusal: String =
+                        "initiative filing cannot supply metadata or an assignee".into();
+                    errors.push(refusal);
+                }
+                fields.insert("metadata".into(), json!({"kind":"initiative"}));
+            }
             let mut input = json!({
                 "queue": effect.target,
                 "item": Value::Object(fields),
                 "rule": rule.name,
             });
+            if initiative {
+                insert_json_field(&mut input, "initiative", json!(true));
+            }
             // DR-0053 §11: an `obtain credential` carries the credential it is
             // escalating for. Its presence is what tells the handler to derive
             // `credential.requested` beside the item — a `file issue` never
@@ -4853,6 +4878,9 @@ pub fn parsed_effect_input_json(
                 }
             }
             if effect.kind == "tracker.finish" {
+                if effect.args.get(2).is_some_and(|arg| arg == "initiative") {
+                    insert_json_field(&mut input, "initiative", json!(true));
+                }
                 let fields = parse_record_fields(
                     effect.args.get(1).map(String::as_str).unwrap_or_default(),
                     context,
@@ -8555,6 +8583,63 @@ rule r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_initiative_filing_refuses_authored_metadata_or_assignment() {
+        let source = r#"
+workflow Groups
+tracker backlog
+class Result { note string }
+class Task { title string }
+output result Result
+rule make when Task as task => { complete result { note "done" } }
+"#;
+        let compiled = whipplescript_parser::compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("compiled program");
+        let rule = ir.rules.iter().find(|rule| rule.name == "make").unwrap();
+        let facts = vec![fact("Task", "Task:t1", r#"{"title":"task"}"#)];
+        let ready = ready_contexts(&ir, rule, &facts, &[], None);
+        let context = ready.contexts.first().expect("started context");
+        for authored in [
+            r#"{ title "Group" metadata { kind "task" } }"#,
+            r#"{ title "Group" assigned_to "alice" }"#,
+        ] {
+            let effect = ParsedEffect {
+                kind: "tracker.file".into(),
+                target: Some("backlog".into()),
+                name: None,
+                binding: None,
+                args: vec![authored.into(), "initiative".into()],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: Vec::new(),
+                after: None,
+                timeout_seconds: None,
+            };
+            let mut errors = Vec::new();
+            let _ = parsed_effect_input_json(
+                &ir,
+                rule,
+                &effect,
+                context,
+                &std::collections::BTreeMap::new(),
+                &mut errors,
+                &facts,
+                &[],
+            );
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("initiative filing cannot supply metadata or an assignee")),
+                "{errors:?}"
+            );
+        }
+    }
 
     /// DR-0090: the arm the SNAPSHOT records must be the arm the effect KEY is
     /// built from. This is the check that lets a reader holding only a stored

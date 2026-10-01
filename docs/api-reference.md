@@ -1266,7 +1266,7 @@ Membership can cross trackers. Initiatives cannot themselves be members.
 and readiness reasons; `--json` exposes them under `progress`. This is derived
 from current tasks. Initiatives are never ready or claimable, even with a claim
 override, and membership does not affect task readiness or ownership. Dependencies
-connect tasks. Assignment on an initiative names its outcome owner.
+connect tasks. Initiatives have no assignee; assign their member tasks.
 
 Finish an initiative explicitly after verifying its outcome. If any members
 are not closed, `finish --summary` must explain their disposition. A status-only

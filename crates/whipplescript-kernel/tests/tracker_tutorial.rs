@@ -68,11 +68,88 @@ fn drive(kernel: &mut RuntimeKernel<NativeStores>, ir: &IrProgram, id: &str) {
         if tracker_wait::is_tracker_wait(&effect) {
             tracker_wait::run(kernel, id, &effect, &config).unwrap();
         } else {
-            assert_eq!(effect.kind, "tracker.file");
+            assert!(matches!(
+                effect.kind.as_str(),
+                "tracker.file" | "tracker.finish"
+            ));
             run_queue_effect_generic(kernel, id, &effect, "2026-09-10T12:00:00Z", &config).unwrap();
         }
     }
     panic!("tutorial did not reach a fixpoint");
+}
+
+#[test]
+fn initiative_source_files_an_unassigned_group_in_the_existing_tracker() {
+    let source = SOURCE
+        .replacen("then chat <- file issue", "then chat <- file initiative", 1)
+        .replacen("    assigned_to learner.authority\n", "", 1);
+    let stores = NativeStores::open_in_memory().expect("stores");
+    let (mut kernel, ir, id) = start(stores, &source);
+    drive(&mut kernel, &ir, &id);
+    let items = kernel
+        .store()
+        .items
+        .list_items(Some("tutorials"), None)
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].metadata["kind"], "initiative");
+    assert_eq!(items[0].assigned_to, None);
+}
+
+#[test]
+fn initiative_source_finishes_the_group_with_a_summary() {
+    let source = r#"
+use std.tracker
+workflow Initiative(learner: Learner) -> bool
+class Learner { authority string }
+tracker tutorials
+rule begin
+  when Learner as learner
+=> {
+  then group <- file initiative into tutorials {
+    title "Release the tracker"
+    body "Make current work visible to agents."
+  }
+  then closed <- finish initiative group { summary "Outcome verified" }
+  complete result true
+}
+"#;
+    let (mut kernel, ir, id) = start(NativeStores::open_in_memory().unwrap(), source);
+    drive(&mut kernel, &ir, &id);
+    let items = kernel
+        .store()
+        .items
+        .list_items(Some("tutorials"), None)
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].metadata["kind"], "initiative");
+    assert_eq!(items[0].status, "closed");
+}
+
+#[test]
+fn finish_initiative_refuses_a_task_without_closing_it() {
+    let source = r#"
+use std.tracker
+workflow Initiative(learner: Learner) -> bool
+class Learner { authority string }
+tracker tutorials
+rule begin
+  when Learner as learner
+=> {
+  then task <- file issue into tutorials { title "Task" body "Work" }
+  then closed <- finish initiative task { summary "Wrong kind" }
+  complete result true
+}
+"#;
+    let (mut kernel, ir, id) = start(NativeStores::open_in_memory().unwrap(), source);
+    drive(&mut kernel, &ir, &id);
+    let items = kernel
+        .store()
+        .items
+        .list_items(Some("tutorials"), None)
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, "open");
 }
 
 #[test]

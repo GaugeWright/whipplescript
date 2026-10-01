@@ -107,6 +107,10 @@ fn execute(
             if status != "open" {
                 return Ok(Outcome::NotOpen);
             }
+            whipplescript_store::items::initiatives::validate_assignment(
+                super::readiness::issue_kind(sql, id)?.unwrap_or("task"),
+                assignee.as_deref(),
+            )?;
             let rows = sql
                 .query(
                     "SELECT assigned_to FROM tracker_issues WHERE issue_id = ?1",
@@ -223,6 +227,45 @@ mod tests {
                 case,
             );
         }
+    }
+
+    #[test]
+    fn hosted_assignment_refuses_an_initiative() {
+        let mut store = DoSqliteStore::new(RusqliteDoSql::with_runtime_schema());
+        let group = store
+            .file_item(
+                "q",
+                "group",
+                "outcome",
+                &[],
+                &serde_json::json!({"kind":"initiative"}),
+                None,
+                None,
+            )
+            .expect("file group");
+        let request = TrackerControl {
+            operation_id: "assign-group".into(),
+            instance_id: "instance".into(),
+            effect_id: "effect".into(),
+            actor: "alice".into(),
+            queue: group.queue.clone(),
+            item_id: group.id.clone(),
+            subject_id: store.subject_content_id(&group.id).unwrap().unwrap(),
+            action: Action::Assign {
+                expected_assignee: None,
+                assignee: Some("alice".into()),
+            },
+        };
+        let before = store.event_position().unwrap();
+        let refusal = store
+            .control_issue_once(&request)
+            .expect_err("assign initiative");
+        assert!(format!("{refusal:?}").contains("initiatives have no assignee"));
+        assert_eq!(store.event_position().unwrap(), before);
+        assert_eq!(
+            store.get_item(&group.id).unwrap().unwrap().assigned_to,
+            None
+        );
     }
     #[test]
     fn every_hosted_tracker_control_sql_failure_rolls_back_before_retry() {

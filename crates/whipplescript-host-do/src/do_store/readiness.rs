@@ -404,6 +404,37 @@ mod tests {
     }
 
     #[test]
+    fn hosted_initiative_filing_has_no_assignee() {
+        let mut hosted = store();
+        let metadata = json!({"kind":"initiative"});
+        let refusal = WorkItems::file_item(
+            &mut hosted,
+            "q",
+            "group",
+            "outcome",
+            &[],
+            &metadata,
+            None,
+            Some("alice"),
+        )
+        .expect_err("assigned initiative");
+        assert!(format!("{refusal:?}").contains("initiatives have no assignee"));
+        assert!(hosted.list_items(None, None).unwrap().is_empty());
+        let task = WorkItems::file_item(
+            &mut hosted,
+            "q",
+            "task",
+            "work",
+            &[],
+            &json!({}),
+            None,
+            Some("alice"),
+        )
+        .expect("assigned task");
+        assert_eq!(task.assigned_to.as_deref(), Some("alice"));
+    }
+
+    #[test]
     fn initiative_hosted_import_refuses_invalid_membership_without_exposing_it() {
         let mut native = WorkItemStore::open_in_memory().expect("store");
         native

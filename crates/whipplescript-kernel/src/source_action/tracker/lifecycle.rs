@@ -68,6 +68,7 @@ impl Operation<'_> {
 struct Contract<'a> {
     operation: Operation<'a>,
     item: &'a str,
+    initiative: bool,
 }
 
 fn validate_finish_fields(fields: &[FieldAssign]) -> Result<(), String> {
@@ -84,7 +85,7 @@ fn validate_finish_fields(fields: &[FieldAssign]) -> Result<(), String> {
 }
 
 fn contract(effect: &EffectStmt) -> Result<Contract<'_>, String> {
-    let (operation, item) = match &effect.kind {
+    let (operation, item, initiative) = match &effect.kind {
         BodyEffectKind::TrackerClaim {
             item,
             ttl_seconds,
@@ -95,15 +96,27 @@ fn contract(effect: &EffectStmt) -> Result<Contract<'_>, String> {
                 endorsed: *endorsed,
             },
             item.as_str(),
+            false,
         ),
-        BodyEffectKind::TrackerRelease { item } => (Operation::Release, item.as_str()),
-        BodyEffectKind::TrackerFinish { item, fields } => {
+        BodyEffectKind::TrackerRelease { item } => (Operation::Release, item.as_str(), false),
+        BodyEffectKind::TrackerFinish {
+            item,
+            fields,
+            initiative,
+        } => {
             validate_finish_fields(fields)?;
-            (Operation::Finish { fields }, item.as_str())
+            if *initiative && !fields.iter().any(|field| field.name == "summary") {
+                return Err("finishing an initiative requires a summary".into());
+            }
+            (Operation::Finish { fields }, item.as_str(), *initiative)
         }
         _ => return Err("tracker lifecycle projector requires claim, release or finish".into()),
     };
-    Ok(Contract { operation, item })
+    Ok(Contract {
+        operation,
+        item,
+        initiative,
+    })
 }
 
 fn address(statement: &Statement<'_>, item: &str) -> Evaluation {
@@ -305,6 +318,7 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
             || input["result_binding"] != json!(effect.binding)
             || input["item"] != item.value
             || input["resources"] != json!(resources)
+            || input["initiative"].as_bool().unwrap_or(false) != contract.initiative
             || input["queue"] != queue
             || input["id"] != id
             || input["title"] != title
@@ -405,7 +419,7 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
         after: None,
         timeout_seconds,
     };
-    let input = json!({
+    let mut input = json!({
         "operation": contract.operation.kind(),
         "item_binding": contract.item,
         "result_binding": effect.binding,
@@ -425,6 +439,9 @@ pub fn project(statement: Statement<'_>, context: Context<'_>) -> Result<Leaf, S
         "payload_argument": payload_argument,
         "rule": context.frame.rule,
     });
+    if contract.initiative {
+        input["initiative"] = json!(true);
+    }
     Ok(leaf(
         OwnedLowering {
             effects: vec![OwnedEffect {

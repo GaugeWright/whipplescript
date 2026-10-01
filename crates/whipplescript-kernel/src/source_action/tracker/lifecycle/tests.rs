@@ -224,6 +224,28 @@ fn draft(statement: &str) -> (String, Value) {
 }
 
 #[test]
+fn initiative_finish_carries_a_kind_guard_and_summary() {
+    let (kind, input) =
+        draft("finish initiative item { summary \"Outcome verified\" } as operation");
+    assert_eq!(kind, "tracker.finish");
+    assert_eq!(input["initiative"], true);
+    assert_eq!(input["payload"]["summary"], "Outcome verified");
+}
+
+#[test]
+fn initiative_finish_requires_a_summary_before_admission() {
+    let error = run(
+        "finish initiative item as operation",
+        Slot::Ready(item()),
+        &[],
+        &[],
+        |body| body,
+    )
+    .expect_err("summary required");
+    assert!(error.contains("finishing an initiative requires a summary"));
+}
+
+#[test]
 fn managed_tracker_lifecycle_captures_and_projects_each_typed_receipt() {
     let cases = [
         (

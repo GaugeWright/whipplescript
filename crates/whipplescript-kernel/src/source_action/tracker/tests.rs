@@ -183,6 +183,43 @@ fn managed_tracker_file_captures_one_checked_item_and_tracker_contract() {
 }
 
 #[test]
+fn initiative_filing_uses_the_same_effect_with_an_immutable_kind() {
+    let (lowering, _, _) = ready(
+        run(
+            "file initiative into backlog { title \"Release tracker\" body \"Outcome\" } as effort",
+            Some("file"),
+            &Bindings::new(),
+            &[],
+            &[],
+            |body| body,
+        )
+        .unwrap(),
+    );
+    let input: Value = serde_json::from_str(&lowering.effects[0].input_json).unwrap();
+    assert_eq!(lowering.effects[0].kind, "tracker.file");
+    assert_eq!(input["initiative"], true);
+    assert_eq!(input["item"]["metadata"]["kind"], "initiative");
+    assert_eq!(input["item_argument"]["value"], input["item"]);
+}
+
+#[test]
+fn initiative_filing_refuses_authored_kind_metadata() {
+    let refusal = run(
+        "file initiative into backlog { title \"Group\" metadata { kind \"task\" } } as effort",
+        Some("file"),
+        &Bindings::new(),
+        &[],
+        &[],
+        |body| body,
+    )
+    .expect_err("initiative kind is supplied by the verb");
+    assert!(
+        refusal.contains("initiative kind is supplied by `file initiative`"),
+        "{refusal}"
+    );
+}
+
+#[test]
 fn managed_tracker_file_projects_its_stable_receipt() {
     let (draft, _, _) = ready(run(FILE, Some("file"), &bindings(), &[], &[], |body| body).unwrap());
     let input: Value = serde_json::from_str(&draft.effects[0].input_json).unwrap();

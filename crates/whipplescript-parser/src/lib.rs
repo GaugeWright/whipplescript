@@ -12208,7 +12208,7 @@ fn collect_statement_roots(statements: &[body::BodyStmt], out: &mut BTreeSet<Str
                             roots_in_expr(arg, out);
                         }
                     }
-                    body::BodyEffectKind::TrackerFinish { item, fields } => {
+                    body::BodyEffectKind::TrackerFinish { item, fields, .. } => {
                         out.insert(item.clone());
                         roots_in_fields(fields, out);
                     }
@@ -14488,7 +14488,7 @@ fn collect_egress_payload_reads(
                 // same durable row `file issue` does, so what it reads is
                 // recorded against the same sink. The queue comes from the
                 // binding map, since the statement names an item.
-                body::BodyEffectKind::TrackerFinish { item, fields } => {
+                body::BodyEffectKind::TrackerFinish { item, fields, .. } => {
                     let Some(queue) = binding_resources.get(item) else {
                         continue;
                     };
@@ -14496,7 +14496,7 @@ fn collect_egress_payload_reads(
                     collect_payload_field_roots(fields, None, &mut roots);
                     out.push((queue.clone(), roots));
                 }
-                body::BodyEffectKind::TrackerFile { queue, fields } => {
+                body::BodyEffectKind::TrackerFile { queue, fields, .. } => {
                     let mut roots = BTreeSet::new();
                     collect_payload_field_roots(fields, None, &mut roots);
                     out.push((queue.clone(), roots));
@@ -14588,7 +14588,7 @@ fn collect_tracker_file_field_reads(
     for statement in statements {
         match statement {
             body::BodyStmt::Effect(body::EffectStmt {
-                kind: body::BodyEffectKind::TrackerFile { queue, fields },
+                kind: body::BodyEffectKind::TrackerFile { queue, fields, .. },
                 ..
             }) => {
                 let per_field = out.entry(queue.clone()).or_default();
@@ -22539,7 +22539,9 @@ fn collect_effect_expression_sources(kind: &body::BodyEffectKind, out: &mut Vec<
         body::BodyEffectKind::ObtainCredential { fields: f, .. } => fields(f, out),
         body::BodyEffectKind::TrackerClaim { item, .. }
         | body::BodyEffectKind::TrackerRelease { item } => source(item, out),
-        body::BodyEffectKind::TrackerFinish { item, fields: f } => {
+        body::BodyEffectKind::TrackerFinish {
+            item, fields: f, ..
+        } => {
             source(item, out);
             fields(f, out);
         }
@@ -27411,7 +27413,7 @@ fn validate_effect_field_roots(
                         diagnostics,
                     );
                 }
-                body::BodyEffectKind::TrackerFile { queue, fields } => {
+                body::BodyEffectKind::TrackerFile { queue, fields, .. } => {
                     check_field_value_roots(
                         rule,
                         &format!("file into `{queue}`"),
@@ -27431,7 +27433,7 @@ fn validate_effect_field_roots(
                         diagnostics,
                     );
                 }
-                body::BodyEffectKind::TrackerFinish { item, fields } => {
+                body::BodyEffectKind::TrackerFinish { item, fields, .. } => {
                     check_operand_root(
                         rule,
                         effect.span,

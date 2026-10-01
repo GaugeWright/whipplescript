@@ -2467,10 +2467,35 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
                 .pointer("/payload/summary")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let result = kernel
-                .store_mut()
-                .finish_item(id, summary.as_deref(), None)
-                .map_err(|error| format!("{error:?}"));
+            let target_check = if input.get("initiative").and_then(Value::as_bool) == Some(true) {
+                if summary.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                    Err("finish initiative requires a summary".into())
+                } else {
+                    kernel
+                        .store_mut()
+                        .get_item(id)
+                        .map_err(|error| format!("initiative lookup failed: {error:?}"))
+                        .and_then(|target| {
+                            if target.as_ref().and_then(|item| {
+                                whipplescript_store::items::initiatives::issue_kind(&item.metadata)
+                                    .ok()
+                            }) == Some("initiative")
+                            {
+                                Ok(())
+                            } else {
+                                Err("finish initiative requires an initiative target".into())
+                            }
+                        })
+                }
+            } else {
+                Ok(())
+            };
+            let result = target_check.and_then(|()| {
+                kernel
+                    .store_mut()
+                    .finish_item(id, summary.as_deref(), None)
+                    .map_err(|error| format!("{error:?}"))
+            });
             if matches!(result, Ok(FinishOutcome::Finished)) {
                 // DR-0086 F3: the effect door mints the same cut-trail
                 // evidence the CLI and agent doors do (advisory).
@@ -5205,6 +5230,26 @@ mod queue_effect_refusal_tests {
             .map(|event| event.payload_json.clone())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn initiative_finish_effect_requires_a_summary_and_an_initiative_target() {
+        let missing_summary = run_and_collect(
+            "tracker.finish",
+            r#"{"id":"WS-404","initiative":true,"payload":{}}"#,
+        );
+        assert!(
+            missing_summary.contains("finish initiative requires a summary"),
+            "{missing_summary}"
+        );
+        let wrong_target = run_and_collect(
+            "tracker.finish",
+            r#"{"id":"WS-404","initiative":true,"payload":{"summary":"checked"}}"#,
+        );
+        assert!(
+            wrong_target.contains("finish initiative requires an initiative target"),
+            "{wrong_target}"
+        );
     }
 
     #[test]
