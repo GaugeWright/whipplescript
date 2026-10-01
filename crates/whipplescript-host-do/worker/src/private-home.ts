@@ -90,37 +90,25 @@ function packageBindingError(
 function routeIdentity(url: URL): {
   homeId: string;
   tenantId: string;
-  subject: { kind: "project"; projectId: string } | {
-    kind: "agent_authoring"; agentId: string; targetId: string;
-  };
+  projectId: string;
   commandId: string;
   epoch: number;
   innerPath: string;
 } | undefined {
-  const project = url.pathname.match(
+  const match = url.pathname.match(
     /^\/v1\/homes\/([^/]+)\/tenants\/([^/]+)\/projects\/([^/]+)\/commands\/([^/]+)\/attempts\/([1-9][0-9]*)(\/host\/.*)$/,
   );
-  const authoring = url.pathname.match(
-    /^\/v1\/homes\/([^/]+)\/tenants\/([^/]+)\/agents\/([^/]+)\/authoring-targets\/([^/]+)\/commands\/([^/]+)\/attempts\/([1-9][0-9]*)(\/host\/.*)$/,
-  );
-  const match = project ?? authoring;
   if (!match) return undefined;
-  const epoch = Number(match[project ? 5 : 6]);
+  const epoch = Number(match[5]);
   if (!Number.isSafeInteger(epoch)) return undefined;
   try {
     return {
       homeId: decodeURIComponent(match[1]),
       tenantId: decodeURIComponent(match[2]),
-      subject: project
-        ? { kind: "project", projectId: decodeURIComponent(match[3]) }
-        : {
-          kind: "agent_authoring",
-          agentId: decodeURIComponent(match[3]),
-          targetId: decodeURIComponent(match[4]),
-        },
-      commandId: decodeURIComponent(match[project ? 4 : 5]),
+      projectId: decodeURIComponent(match[3]),
+      commandId: decodeURIComponent(match[4]),
       epoch,
-      innerPath: match[project ? 6 : 7],
+      innerPath: match[6],
     };
   } catch {
     return undefined;
@@ -154,11 +142,7 @@ async function verifyGrantEnvelope(
   if (
     grant.home_id !== route.homeId ||
     grant.tenant_id !== route.tenantId ||
-    (route.subject.kind === "project"
-      ? grant.agent_authoring !== undefined || grant.project_id !== route.subject.projectId
-      : !grant.agent_authoring ||
-        grant.agent_authoring.agent_id !== route.subject.agentId ||
-        grant.agent_authoring.target_id !== route.subject.targetId) ||
+    grant.project_id !== route.projectId ||
     grant.command_id !== route.commandId ||
     grant.epoch !== route.epoch ||
     grant.request_method !== request.method ||

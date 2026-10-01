@@ -210,27 +210,6 @@
       ]
     },
     {
-      "id": "private-agent-authoring-command",
-      "state": "runner-needed",
-      "runner": null,
-      "executionBoundary": "managed-private-home",
-      "contracts": [
-        "runtime.private-home.agent.forward.get",
-        "runtime.private-home.agent.forward.post",
-        "runtime.private-home.agent.object.place",
-        "runtime.private-home.agent.retire"
-      ],
-      "requiredInfrastructure": [
-        "Disposable synthetic Agent, exact authoring target, and pinned Main cut owned by a dedicated Home",
-        "Terminal Home ledger receipt and separate Agent-authoring execution grant with private retirement authorization",
-        "Dedicated command-scoped private object store and isolated synthetic provider capability"
-      ],
-      "cleanup": "Run only the disposable synthetic Agent-authoring command, wait for its terminal Home receipt, and retry command-scoped object retirement until its keys are absent. Preserve the Agent Main cut and never infer a project identity or remove another command's objects.",
-      "surfaces": [
-        "whip-runtime"
-      ]
-    },
-    {
       "id": "private-command-retirement",
       "state": "ready-awaiting-identity",
       "runner": "scripts/production-wiring-canary.mjs#private-command-retirement",

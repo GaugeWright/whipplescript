@@ -104,7 +104,6 @@ function privateAttemptBasis(grant: DurableWorkflowGrant): string {
     tenant_id: grant.tenant_id,
     project_id: grant.project_id,
     work_target_basis: grant.work_target_basis,
-    agent_authoring: grant.agent_authoring ?? null,
     command_id: grant.command_id,
     attempt_id: grant.attempt_id,
     payload_digest: grant.payload_digest,
@@ -4790,7 +4789,6 @@ export class WorkflowInstance implements DurableObject {
         incoming.home_id !== previous.home_id ||
         incoming.tenant_id !== previous.tenant_id ||
         incoming.project_id !== previous.project_id ||
-        canonicalJson(incoming.agent_authoring ?? null) !== canonicalJson(previous.agent_authoring ?? null) ||
         incoming.command_id !== previous.command_id
       ) {
         return Response.json(

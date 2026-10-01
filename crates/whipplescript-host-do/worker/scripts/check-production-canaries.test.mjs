@@ -20,7 +20,7 @@ const journeys = Object.keys(runners);
 test("every WhippleScript deployed gap has one cleanup-bounded suite", () => {
   assert.deepEqual(
     validateProductionCanaries(manifest, canaries, journeys),
-    { gaps: 27, covered: 32, ready: 23, pending: 9, suites: 10 },
+    { gaps: 23, covered: 28, ready: 23, pending: 5, suites: 9 },
   );
 });
 
@@ -31,7 +31,7 @@ test("recorded deployed evidence does not unschedule its continuous canary", () 
   firstGap.evidence.deployed.push("production:identified-canary-run");
   assert.deepEqual(
     validateProductionCanaries(changed, canaries, journeys),
-    { gaps: 26, covered: 32, ready: 23, pending: 9, suites: 10 },
+    { gaps: 22, covered: 28, ready: 23, pending: 5, suites: 9 },
   );
 });
 
