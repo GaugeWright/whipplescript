@@ -44,9 +44,14 @@ host="$(printf '%s\n' "$toolchain" | sed -n 's/^host: //p')"
 # target, whose Linux siblings the read sandbox holds to it (GaugeWright
 # FLEET.md stage 0). Keep the two together.
 inputs=(Cargo.toml Cargo.lock rust-toolchain.toml dist-workspace.toml
-        crates std examples models spec skills scripts/check-windows-compile.sh scripts/windows-cargo-timings.mjs)
+        crates std examples models spec skills scripts/check-windows-compile.sh scripts/windows-cargo-timings.mjs scripts/windows-buck2-readiness.mjs)
 
 if [ "$host" = "$target" ]; then
+    # Fresh launch metadata, including when Cargo is served from its pass record.
+    # A blocked Buck2 launch never changes the existing full Cargo gate result.
+    node scripts/windows-buck2-readiness.mjs 2>/dev/null || \
+        printf 'CI_WINDOWS_BUCK2_READINESS: {"version":1,"scope":"pinned-binary-launch","status":"unknown","reason":"diagnostic-unavailable","nativeCompileProven":false}\n'
+
     # A tree whose inputs this host has already compiled is answered from that
     # compile rather than compiled again. Most pull requests are answered on a
     # test merge that differs from the last one only outside these paths — a

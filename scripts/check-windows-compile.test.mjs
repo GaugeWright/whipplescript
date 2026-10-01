@@ -14,6 +14,7 @@ for (const shell of shells) test(`Windows cache decisions and failure exits unde
     mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'));
     copyFileSync(source, join(root, 'scripts/check-windows-compile.sh'));
     copyFileSync(resolve('scripts/windows-cargo-timings.mjs'), join(root, 'scripts/windows-cargo-timings.mjs'));
+    copyFileSync(resolve('scripts/windows-buck2-readiness.mjs'), join(root, 'scripts/windows-buck2-readiness.mjs'));
     writeFileSync(join(root, 'Cargo.toml'), '[workspace]\n');
     writeFileSync(join(root, '.gitignore'), 'target/\nbin/\n');
     writeFileSync(join(root, 'bin/rustc'), '#!/usr/bin/env bash\nprintf "host: %s\\nrelease: %s\\n" "${FAKE_HOST:-x86_64-pc-windows-msvc}" "${FAKE_RUSTC:-test}"\n', { mode: 0o755 });
@@ -28,9 +29,11 @@ for (const shell of shells) test(`Windows cache decisions and failure exits unde
     const noHead = result(firstRun); assert.equal(noHead.reason, 'no-head'); assert.equal(noHead.key, ''); assert.ok(!existsSync(join(root, 'target/windows-compile-passed')));
     git('add', '.'); git('commit', '-qm', 'fixture');
     const first = result(run()); assert.equal(first.reason, 'no-pass-record'); assert.equal(first.decision, 'build'); assert.ok(Number.isInteger(first.cargoSeconds) && first.cargoSeconds >= 0); assert.match(first.key, /^[a-f0-9]{40}$/);
-    const legacyKey = execFileSync('git', ['hash-object', '--stdin'], { cwd: root, input: Buffer.concat([Buffer.from('host: x86_64-pc-windows-msvc\nrelease: test\n'), execFileSync('git', ['ls-tree', '-r', 'HEAD', '--', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'dist-workspace.toml', 'crates', 'std', 'examples', 'models', 'spec', 'skills', 'scripts/check-windows-compile.sh', 'scripts/windows-cargo-timings.mjs'], { cwd: root })]) }).toString().trim();
+    const legacyKey = execFileSync('git', ['hash-object', '--stdin'], { cwd: root, input: Buffer.concat([Buffer.from('host: x86_64-pc-windows-msvc\nrelease: test\n'), execFileSync('git', ['ls-tree', '-r', 'HEAD', '--', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'dist-workspace.toml', 'crates', 'std', 'examples', 'models', 'spec', 'skills', 'scripts/check-windows-compile.sh', 'scripts/windows-cargo-timings.mjs', 'scripts/windows-buck2-readiness.mjs'], { cwd: root })]) }).toString().trim();
     assert.equal(first.key, legacyKey, 'the existing pass-key algorithm is unchanged');
     const servedRun = run(); assert.doesNotMatch(servedRun.stdout, /CI_WINDOWS_CARGO_TIMING:/);
+    assert.match(servedRun.stdout, /CI_WINDOWS_BUCK2_READINESS:/);
+    assert.ok(servedRun.stdout.indexOf('CI_WINDOWS_BUCK2_READINESS:') < servedRun.stdout.indexOf('CI_WINDOWS_COMPILE:'));
     const served = result(servedRun); assert.equal(served.decision, 'served'); assert.equal(served.reason, 'matching-pass'); assert.equal(served.cargoSeconds, null);
     writeFileSync(join(root, 'README.md'), 'documentation\n'); git('add', '.'); git('commit', '-qm', 'docs'); assert.equal(result(run()).key, first.key);
     mkdirSync(join(root, 'crates')); writeFileSync(join(root, 'crates/untracked.rs'), '// untracked\n'); assert.equal(result(run()).reason, 'dirty-inputs'); rmSync(join(root, 'crates'), { recursive: true });
