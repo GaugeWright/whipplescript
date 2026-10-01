@@ -161,6 +161,9 @@ impl RuntimeStore for NativeStores {
     fn schema_version(&self) -> StoreResult<i64> {
         self.runtime.schema_version()
     }
+    fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        self.runtime.store_incarnation()
+    }
 
     fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
         self.runtime.append_event(event)

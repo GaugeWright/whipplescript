@@ -1777,6 +1777,9 @@ fn hosted_tables(sql: &RusqliteDoSql) -> BTreeMap<String, Value> {
         if table.starts_with("tracker_")
             || table.starts_with("sqlite_")
             || table == "schema_migrations"
+            // This vector seeds another Durable Object, which mints its own
+            // target-store incarnation before any fixture rows arrive.
+            || table == "runtime_store_incarnation"
         {
             continue;
         }

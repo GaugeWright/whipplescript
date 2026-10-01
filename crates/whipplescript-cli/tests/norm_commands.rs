@@ -1906,7 +1906,9 @@ fn norm_hosted_enqueue_fixture(
         })
         .expect("enqueue observer");
     let mut runtime_rows = Vec::new();
-    for table in kernel.store().sql.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations', 'tracker_assertion_counter', 'tracker_counter') ORDER BY CASE name WHEN 'programs' THEN 0 WHEN 'program_versions' THEN 1 WHEN 'instances' THEN 2 ELSE 3 END, name", &[]).expect("tables") {
+    // These rows seed a DIFFERENT Durable Object. Its target-store identity
+    // belongs to that object and cannot be copied from the native fixture.
+    for table in kernel.store().sql.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_migrations', 'tracker_assertion_counter', 'tracker_counter', 'runtime_store_incarnation') ORDER BY CASE name WHEN 'programs' THEN 0 WHEN 'program_versions' THEN 1 WHEN 'instances' THEN 2 ELSE 3 END, name", &[]).expect("tables") {
         let SqlValue::Text(table) = &table[0] else { panic!("table name") };
         let columns: Vec<String> = kernel.store().sql.query(&format!("PRAGMA table_info(\"{table}\")"), &[]).expect("columns").into_iter().map(|row| match &row[1] { SqlValue::Text(name) => name.clone(), _ => panic!("column name") }).collect();
         let rows: Vec<Value> = kernel.store().sql.query(&format!("SELECT * FROM \"{table}\""), &[]).expect("fixture rows").iter().map(|row| json!(row.iter().map(|value| match value {

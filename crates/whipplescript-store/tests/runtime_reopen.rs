@@ -2,7 +2,9 @@
 #![cfg(feature = "native")]
 #[path = "support/scratch.rs"]
 mod scratch;
-use whipplescript_store::{NewInstance, SqliteStore, StoreError, SUPPORTED_SCHEMA_VERSION};
+use whipplescript_store::{
+    NewInstance, RuntimeStore, SqliteStore, StoreError, SUPPORTED_SCHEMA_VERSION,
+};
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -18,6 +20,61 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+#[test]
+fn runtime_store_identity_survives_reopen_but_not_replacement_at_the_same_path() {
+    let fixture = Fixture::new();
+    let first = SqliteStore::open(fixture.path()).expect("first store");
+    let identity = first
+        .store_incarnation()
+        .expect("identity")
+        .expect("minted");
+    assert_eq!(identity.len(), 32);
+    assert_eq!(
+        RuntimeStore::store_incarnation(&first).expect("trait identity"),
+        Some(identity.clone())
+    );
+    drop(first);
+
+    let reopened = SqliteStore::open_initialized(fixture.path()).expect("reopen");
+    assert_eq!(
+        reopened.store_incarnation().expect("identity"),
+        Some(identity.clone())
+    );
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(fixture.path()).expect("fixture");
+    assert!(connection.execute(
+        "UPDATE runtime_store_incarnation SET incarnation_id = '00000000000000000000000000000000' WHERE id = 1",
+        [],
+    ).is_err(), "an in-place rewrite must be refused");
+    assert!(connection
+        .execute("DELETE FROM runtime_store_incarnation WHERE id = 1", [])
+        .is_err());
+    connection
+        .execute_batch("DROP TRIGGER runtime_store_incarnation_no_update")
+        .expect("simulate corrupt store");
+    connection
+        .execute(
+            "UPDATE runtime_store_incarnation SET incarnation_id = 'gggggggggggggggggggggggggggggggg' WHERE id = 1",
+            [],
+        )
+        .expect("corrupt identity");
+    let corrupted = SqliteStore::open_initialized(fixture.path()).expect("read corrupt store");
+    let error = corrupted
+        .store_incarnation()
+        .expect_err("corrupt identity must not bind to a Home");
+    assert!(format!("{error:?}").contains("malformed runtime store incarnation"));
+    drop(corrupted);
+    drop(connection);
+
+    std::fs::remove_dir_all(&fixture.0).expect("replace store directory");
+    std::fs::create_dir_all(&fixture.0).expect("recreate directory");
+    let replacement = SqliteStore::open(fixture.path()).expect("replacement store");
+    assert_ne!(
+        replacement.store_incarnation().expect("identity"),
+        Some(identity)
+    );
 }
 #[test]
 fn initialized_connection_opens_under_a_writer_lock_and_keeps_write_constraints() {

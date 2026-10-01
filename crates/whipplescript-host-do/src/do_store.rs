@@ -678,6 +678,33 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         }
     }
 
+    /// Exact identity of this Durable Object runtime database. The Worker
+    /// seeds it when creating or upgrading the object's SQLite schema.
+    pub fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT incarnation_id FROM runtime_store_incarnation WHERE id = 1",
+                &[],
+            )
+            .map_err(sql_err)?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] if row.len() == 1 => match &row[0] {
+                SqlValue::Text(value) => {
+                    whipplescript_store::store_incarnation::validate(value)?;
+                    Ok(Some(value.clone()))
+                }
+                _ => Err(StoreError::Conflict(
+                    "malformed runtime store incarnation identity".into(),
+                )),
+            },
+            _ => Err(StoreError::Conflict(
+                "runtime store has multiple incarnation identities".into(),
+            )),
+        }
+    }
+
     /// DR-0067 §2: this instance's high-water mark, `(sequence, head_digest)`.
     /// Native parity: `SqliteStore::chain_head`.
     pub fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
@@ -5526,6 +5553,9 @@ fn do_new_import_operation_id<Sql: DoSql>(sql: &Sql) -> StoreResult<String> {
 }
 
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
+    fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        self.store_incarnation()
+    }
     fn admit_host_action(
         &mut self,
         action: whipplescript_store::host_actions::HostActionStart<'_>,
@@ -11869,6 +11899,8 @@ pub mod test_support {
             .expect("program import admission schema");
         conn.execute_batch(whipplescript_store::program_imports::OPERATIONS_SCHEMA)
             .expect("program import operation schema");
+        conn.execute_batch(whipplescript_store::store_incarnation::SCHEMA)
+            .expect("runtime store incarnation schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -12435,6 +12467,90 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn do_store_identity_is_stable_and_immutable() {
+        let store = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+        let identity = store
+            .store_incarnation()
+            .expect("identity")
+            .expect("minted");
+        assert_eq!(
+            RuntimeStore::store_incarnation(&store).expect("trait identity"),
+            Some(identity.clone())
+        );
+        assert_eq!(
+            store.store_incarnation().expect("repeat read"),
+            Some(identity.clone())
+        );
+        assert!(store.sql.execute(
+            "UPDATE runtime_store_incarnation SET incarnation_id = '00000000000000000000000000000000' WHERE id = 1",
+            &[],
+        ).is_err());
+        assert!(store
+            .sql
+            .execute("DELETE FROM runtime_store_incarnation WHERE id = 1", &[])
+            .is_err());
+        store
+            .sql
+            .execute("DROP TRIGGER runtime_store_incarnation_no_update", &[])
+            .expect("simulate corrupt store");
+        store
+            .sql
+            .execute(
+                "UPDATE runtime_store_incarnation SET incarnation_id = 'gggggggggggggggggggggggggggggggg' WHERE id = 1",
+                &[],
+            )
+            .expect("corrupt identity");
+        let error = store
+            .store_incarnation()
+            .expect_err("corrupt identity must not bind to a Home");
+        assert!(format!("{error:?}").contains("malformed runtime store incarnation"));
+        let another = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+        assert_ne!(
+            another.store_incarnation().expect("identity"),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn do_store_refuses_a_malformed_or_ambiguous_identity_table() {
+        let store = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+        store
+            .sql
+            .execute("DROP TABLE runtime_store_incarnation", &[])
+            .expect("simulate damaged schema");
+        store
+            .sql
+            .execute(
+                "CREATE TABLE runtime_store_incarnation (id INTEGER, incarnation_id INTEGER)",
+                &[],
+            )
+            .expect("damaged schema");
+        store
+            .sql
+            .execute(
+                "INSERT INTO runtime_store_incarnation (id, incarnation_id) VALUES (1, 42)",
+                &[],
+            )
+            .expect("malformed identity row");
+        let error = store
+            .store_incarnation()
+            .expect_err("non-text identity must refuse");
+        assert!(format!("{error:?}").contains("malformed runtime store incarnation identity"));
+
+        store
+            .sql
+            .execute(
+                "INSERT INTO runtime_store_incarnation (id, incarnation_id) VALUES (1, 43)",
+                &[],
+            )
+            .expect("duplicate identity row");
+        let error = store
+            .store_incarnation()
+            .expect_err("ambiguous identity must refuse");
+        assert!(format!("{error:?}").contains("runtime store has multiple incarnation identities"));
+    }
 
     #[test]
     fn do_tracker_recovery_preserves_historical_run_timestamps() {

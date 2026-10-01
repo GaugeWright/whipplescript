@@ -9,6 +9,19 @@
             INSERT INTO schema_migrations (version, name) VALUES (8, 'program-import-admission');
             INSERT INTO schema_migrations (version, name) VALUES (9, 'program-import-operation-population');
             INSERT INTO schema_migrations (version, name) VALUES (10, 'settled-agent-source-identities');
+            INSERT INTO schema_migrations (version, name) VALUES (11, 'runtime-store-incarnation');
+            CREATE TABLE runtime_store_incarnation (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                incarnation_id TEXT NOT NULL CHECK (length(incarnation_id) = 32)
+            );
+            INSERT INTO runtime_store_incarnation (id, incarnation_id)
+                VALUES (1, lower(hex(randomblob(16))));
+            CREATE TRIGGER runtime_store_incarnation_no_update
+                BEFORE UPDATE ON runtime_store_incarnation
+                BEGIN SELECT RAISE(ABORT, 'runtime store incarnation is immutable'); END;
+            CREATE TRIGGER runtime_store_incarnation_no_delete
+                BEFORE DELETE ON runtime_store_incarnation
+                BEGIN SELECT RAISE(ABORT, 'runtime store incarnation is immutable'); END;
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,

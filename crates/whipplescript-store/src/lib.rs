@@ -67,6 +67,7 @@ pub mod ref_authority;
 #[cfg(feature = "native")]
 mod runtime_protection;
 pub mod runtime_registry_basis;
+pub mod store_incarnation;
 #[cfg(feature = "native")]
 pub use runtime_protection::RuntimeEventMetadata;
 pub mod tracker_closure;
@@ -134,7 +135,7 @@ pub fn run_block_event_key(legacy: &str, payload: &str, original: Option<&str>) 
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 6;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 7;
 
 /// Stamp a satellite store's schema generation, and refuse one stamped beyond
 /// what this build understands.
@@ -1706,6 +1707,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "program-import-operation-population",
         sql: include_str!("../migrations/0006_program_import_operations.sql"),
     },
+    Migration {
+        version: 7,
+        name: "runtime-store-incarnation",
+        sql: store_incarnation::SCHEMA,
+    },
 ];
 
 /// The schema owner an existing runtime store must carry: the name of its
@@ -1842,6 +1848,27 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Durable identity of this runtime database. A deleted and recreated
+    /// database at the same path gets a new value; reopening or restoring a
+    /// complete database retains the old one. `None` is legacy/unknown to a
+    /// Home coverage issuer, never evidence of the same target store.
+    pub fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT incarnation_id FROM runtime_store_incarnation WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                store_incarnation::validate(&value)?;
+                Ok(value)
+            })
+            .transpose()
     }
 
     pub fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
@@ -8814,6 +8841,10 @@ pub trait RuntimeStore {
         action: host_actions::HostActionStart<'_>,
     ) -> StoreResult<host_actions::HostActionAdmission>;
     fn schema_version(&self) -> StoreResult<i64>;
+    /// `None` is an unbound/legacy target, not a reusable store identity.
+    fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
     fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent>;
     fn create_program_version(
         &mut self,
@@ -9309,6 +9340,9 @@ impl RuntimeStore for SqliteStore {
     }
     fn schema_version(&self) -> StoreResult<i64> {
         self.schema_version()
+    }
+    fn store_incarnation(&self) -> StoreResult<Option<String>> {
+        self.store_incarnation()
     }
     fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
         self.append_event(event)

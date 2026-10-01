@@ -2129,7 +2129,7 @@ describe("real WorkflowInstance hibernation", () => {
     expect(response.status).toBe(200);
     await runInDurableObject(stub, async (_instance, state) => {
       const stamp = state.storage.sql.exec("SELECT MAX(version) AS version FROM schema_migrations").toArray() as { version: number }[];
-      expect(stamp[0].version).toBe(10);
+      expect(stamp[0].version).toBe(11);
       expect(state.storage.sql.exec("SELECT effect_id FROM agent_turn_source_identities").toArray()).toEqual([]);
       expect(state.storage.sql.exec("SELECT operation_id FROM tracker_filing_receipts").toArray()).toEqual([]);
       expect(state.storage.sql.exec("SELECT operation_id FROM tracker_closure_receipts").toArray()).toEqual([]);
@@ -2142,6 +2142,52 @@ describe("real WorkflowInstance hibernation", () => {
       ).toArray();
       expect(gaps.length).toBeGreaterThan(0);
       expect(JSON.stringify(state.storage.sql.exec("SELECT event_id, payload_json FROM events ORDER BY sequence").toArray())).toBe(history);
+    });
+  });
+
+  it("mints one durable store identity on old-object upgrade and keeps it after eviction", async () => {
+    const sessionId = "session-store-incarnation-upgrade";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE runtime_store_incarnation");
+      state.storage.sql.exec("DELETE FROM schema_migrations WHERE version = 11");
+    });
+
+    const upgraded = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(upgraded.status, await upgraded.clone().text()).toBe(200);
+    let identity = "";
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql.exec(
+        "SELECT incarnation_id FROM runtime_store_incarnation WHERE id = 1",
+      ).toArray() as { incarnation_id: string }[];
+      expect(rows).toHaveLength(1);
+      identity = rows[0].incarnation_id;
+      expect(identity).toMatch(/^[0-9a-f]{32}$/);
+      expect(() => state.storage.sql.exec(
+        "UPDATE runtime_store_incarnation SET incarnation_id = '00000000000000000000000000000000' WHERE id = 1",
+      )).toThrow();
+      expect(() => state.storage.sql.exec(
+        "DELETE FROM runtime_store_incarnation WHERE id = 1",
+      )).toThrow();
+      expect(state.storage.sql.exec(
+        "SELECT version FROM schema_migrations WHERE version = 11",
+      ).toArray()).toHaveLength(1);
+    });
+
+    await evictDurableObject(stub);
+    const reopened = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(reopened.status, await reopened.clone().text()).toBe(200);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql.exec(
+        "SELECT incarnation_id FROM runtime_store_incarnation WHERE id = 1",
+      ).toArray() as { incarnation_id: string }[];
+      expect(rows).toEqual([{ incarnation_id: identity }]);
     });
   });
 

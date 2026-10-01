@@ -488,7 +488,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 10;
+const SUPPORTED_DO_SCHEMA_VERSION = 11;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer
@@ -852,6 +852,23 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
   sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
     VALUES (10, 'settled-agent-source-identities')`);
+  // A Home must distinguish a recovered store from a replacement at the same
+  // Durable Object name. The target identity is immutable within the store;
+  // the Home binds it to its own project authority separately.
+  sql.exec(`CREATE TABLE IF NOT EXISTS runtime_store_incarnation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    incarnation_id TEXT NOT NULL CHECK (length(incarnation_id) = 32)
+  )`);
+  sql.exec(`INSERT OR IGNORE INTO runtime_store_incarnation (id, incarnation_id)
+    VALUES (1, lower(hex(randomblob(16))))`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS runtime_store_incarnation_no_update
+    BEFORE UPDATE ON runtime_store_incarnation
+    BEGIN SELECT RAISE(ABORT, 'runtime store incarnation is immutable'); END`);
+  sql.exec(`CREATE TRIGGER IF NOT EXISTS runtime_store_incarnation_no_delete
+    BEFORE DELETE ON runtime_store_incarnation
+    BEGIN SELECT RAISE(ABORT, 'runtime store incarnation is immutable'); END`);
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (11, 'runtime-store-incarnation')`);
   // Live text is a repairable operational projection. Terminal transcript and
   // receipt events remain authority; these rows only let an SSE consumer catch
   // up after a transient disconnect during the active turn.
@@ -4573,6 +4590,9 @@ export class WorkflowInstance implements DurableObject {
         sql.exec("PRAGMA defer_foreign_keys = ON");
         const retained = new Set([
           "private_governance_root", "private_retirement", "private_retirement_debt",
+          // Retirement erases the command payload, not the identity of this
+          // runtime store. A Home must still recognize it as the same target.
+          "runtime_store_incarnation",
         ]);
         const tables = sql.exec(
           `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
