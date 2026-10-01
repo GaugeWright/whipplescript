@@ -663,6 +663,7 @@ fn the_gate_admits_only_a_fully_supported_plan_and_names_what_is_lacking() {
         after_frontier: view.frontier.clone(),
         plan,
         method_gaps,
+        method_installation: Default::default(),
         conformance: Vec::new(),
         reservation_conflicts: Vec::new(),
         investigations: Vec::new(),

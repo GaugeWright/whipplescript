@@ -60,6 +60,9 @@ pub struct Planned {
     pub after_frontier: std::collections::BTreeSet<String>,
     pub plan: crate::norm_impact::ImpactPlan,
     pub method_gaps: BTreeMap<String, Vec<MethodGap>>,
+    /// Fingerprints of the installations actually read for automatic discovery,
+    /// with private capture retained for an embedding's final recapture.
+    pub method_installation: crate::norm_discovery::MethodInstallationCapture,
     /// Each witnessed record's derived current conformance at the candidate.
     pub conformance: Vec<Conformance>,
     /// Conflicts among live claims at the after frontier (norm-plane §7).
@@ -155,6 +158,7 @@ impl Planned {
             "after_frontier": self.after_frontier,
             "plan": self.plan,
             "method_gaps": self.method_gaps,
+            "method_installation": self.method_installation,
             "conformance": self.conformance,
             "reservation_conflicts": self.reservation_conflicts,
             "investigations": self.investigations,
@@ -305,9 +309,6 @@ pub fn plan<S: RuntimeStore>(
         .map_err(|error| format!("{error:?}"))?;
     let before_artifact = artifacts(before_cut).map_err(|error| format!("{error:?}"))?;
     let candidate = artifacts(after_cut).map_err(|error| format!("{error:?}"))?;
-    let installed = runtime
-        .get_script_capability(&configuration.capability)
-        .map_err(|error| format!("{error:?}"))?;
     let projection = EvidenceProjection::capture(
         history,
         &configuration.roles,
@@ -331,6 +332,7 @@ pub fn plan<S: RuntimeStore>(
         },
     )?;
     let method_gaps = std::cell::RefCell::new(BTreeMap::<String, Vec<MethodGap>>::new());
+    let discovery = crate::norm_discovery::DiscoveryReads::default();
     let runs_buck2 = policy.runs_buck2_tests();
     let plan = plan_projected(
         ProjectedImpactInput {
@@ -353,17 +355,13 @@ pub fn plan<S: RuntimeStore>(
                     crate::norm_buck2_execution::requirement_support(requirement)
                         .map(|support| support.method())
                 }
-                _ => installed
-                    .as_ref()
-                    .ok_or_else(|| "norm observer capability is not registered".to_owned())
-                    .and_then(|installed| {
-                        crate::norm_discovery::discover(
-                            requirement,
-                            artifact,
-                            installed,
-                            &verify_runtime,
-                        )
-                    }),
+                _ => discovery.discover(
+                    runtime,
+                    &configuration.capability,
+                    requirement,
+                    artifact,
+                    &verify_runtime,
+                ),
             };
             match found {
                 Ok(method) => Some(method),
@@ -444,12 +442,15 @@ pub fn plan<S: RuntimeStore>(
                 diagnosed: !judgment.diagnostics.is_empty(),
             }
         }));
+    let method_installation = discovery.finish()?;
+    method_installation.revalidate(runtime, &verify_runtime)?;
     Ok(Planned {
         anchor: history.anchor(),
         before_frontier: before.frontier,
         after_frontier: after.frontier,
         plan,
         method_gaps: method_gaps.into_inner(),
+        method_installation,
         conformance,
         reservation_conflicts,
         investigations,

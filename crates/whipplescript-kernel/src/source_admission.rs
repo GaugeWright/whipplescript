@@ -455,6 +455,7 @@ fn derive<
     };
     let mut blockers = BTreeSet::new();
     let mut process_installation = None;
+    let mut norm_binding = None;
     let dependencies = match authority {
         None => {
             blockers.insert(LocatedBlocker {
@@ -495,16 +496,18 @@ fn derive<
                             .into(),
                     });
                 }
-                if let Err(reason) = authority.verify_norm_basis(
+                let binding = authority.verify_norm_basis(
                     &impact.basis,
                     &planned.anchor,
                     &planned.plan.policy,
-                ) {
+                );
+                if let Err(reason) = &binding {
                     blockers.insert(LocatedBlocker {
                         scope: "home/norm-basis".into(),
-                        reason,
+                        reason: reason.clone(),
                     });
                 }
+                norm_binding = Some(binding);
                 for class in &references.required_classes {
                     let scope = ReferenceScope {
                         class: class.contract.clone(),
@@ -659,10 +662,18 @@ fn derive<
         {
             return Err("Home process installation changed during derivation".into());
         }
+        if Some(authority.verify_norm_basis(&impact.basis, &planned.anchor, &planned.plan.policy))
+            != norm_binding
+        {
+            return Err("Home norm authority binding changed during derivation".into());
+        }
         if authority.basis(witness_digest)? != impact.basis {
             return Err("Home source-admission basis changed during derivation".into());
         }
     }
+    planned
+        .method_installation
+        .revalidate(host.runtime, host.verify_runtime)?;
     Ok(SourceAdmissionPlan {
         identity: identity(&judgment)?,
         judgment,
