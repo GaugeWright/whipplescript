@@ -226,6 +226,18 @@ pub enum FlowingBatchTargetEffectsOutcome {
     Refused(FlowingTargetEffectsOutcome),
 }
 
+/// Source-order evidence for a mixed cut drawn from one complete twig prefix.
+/// Cross-source ordering still needs an explicit dependency contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingBatchSourceOrderOutcome {
+    Verified,
+    SourceUnproven,
+    CrossSourceUnproven,
+    IncompletePrefix,
+    UnprovenBasis { unit_id: String },
+    MissingContent { content_id: String },
+}
+
 /// A content-derived, complete direct-twig prefix at an unchanged trunk base.
 /// The recorded cut is a GC root, but this is preparation, not a gate verdict
 /// or permission to advance the trunk ref.
@@ -1593,6 +1605,206 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             target_after_manifest_hash: target_cut.manifest_hash,
             units,
         }))
+    }
+
+    /// Prove the declared read and dependency basis of a complete, ordered
+    /// prefix from one twig. A later tail is harmless, but an omitted earlier
+    /// unit, reused cut, rewrite, changed read snapshot, or changed predecessor
+    /// refuses. This proof is deliberately separate from the mixed-content
+    /// comparison: both must hold before a batch handoff can move a ref.
+    pub fn verify_private_batch_source_order(
+        &self,
+        witness: &FlowingBatchTargetEffects,
+    ) -> StoreResult<FlowingBatchSourceOrderOutcome> {
+        use FlowingBatchSourceOrderOutcome as R;
+        let Some(first) = witness.units().first() else {
+            return Ok(R::IncompletePrefix);
+        };
+        let source_id = first.source_branch_id();
+        let cross_source = witness
+            .units()
+            .iter()
+            .any(|unit| unit.source_branch_id() != source_id);
+        // REFUSAL: separate twigs have no shared declared dependency order
+        if cross_source {
+            return Ok(R::CrossSourceUnproven);
+        }
+        let Some(source) = self.branches.get_branch(source_id)? else {
+            return Ok(R::SourceUnproven);
+        };
+        let wrong_source = source.status != BranchStatus::Active
+            || source.name.is_some()
+            || source.parent_branch_id.as_deref() != Some(witness.target_branch_id())
+            || source.branch_point_cut_id.as_deref() != witness.target_before_cut_id();
+        // REFUSAL: a changed branch point cannot satisfy the declared reads
+        if wrong_source {
+            return Ok(R::SourceUnproven);
+        }
+        let target_before_manifest = match witness.target_before_cut_id() {
+            Some(id) => {
+                let Some(cut) = self.branches.get_cut(id)? else {
+                    return Ok(R::SourceUnproven);
+                };
+                if cut.branch_id != witness.target_branch_id() {
+                    return Ok(R::SourceUnproven);
+                }
+                Some(cut.manifest_hash)
+            }
+            None => None,
+        };
+        if target_before_manifest != source.branch_point_manifest_hash {
+            return Ok(R::SourceUnproven);
+        }
+
+        let selected_cut_id = witness.units().last().expect("nonempty").source_cut_id();
+        let mut cursor = source.head_cut_id.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = cursor {
+            if !seen.insert(id.clone()) {
+                return Ok(R::SourceUnproven);
+            }
+            let Some(cut) = self.branches.get_cut(&id)? else {
+                return Ok(R::SourceUnproven);
+            };
+            if cut.branch_id != source_id
+                || !cut
+                    .origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.starts_with("write:"))
+            {
+                return Ok(R::SourceUnproven);
+            }
+            if id == selected_cut_id {
+                break;
+            }
+            cursor = cut.parent_cut_id;
+        }
+        if !seen.contains(selected_cut_id) {
+            return Ok(R::SourceUnproven);
+        }
+        let mut cuts = Vec::new();
+        let mut cursor = Some(selected_cut_id.to_owned());
+        let mut prefix_ids = BTreeSet::new();
+        while cursor != source.branch_point_cut_id {
+            let Some(id) = cursor else {
+                return Ok(R::SourceUnproven);
+            };
+            if !prefix_ids.insert(id.clone()) {
+                return Ok(R::SourceUnproven);
+            }
+            let Some(cut) = self.branches.get_cut(&id)? else {
+                return Ok(R::SourceUnproven);
+            };
+            if cut.branch_id != source_id
+                || !cut
+                    .origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.starts_with("write:"))
+            {
+                return Ok(R::SourceUnproven);
+            }
+            if self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none() {
+                return Ok(R::MissingContent {
+                    content_id: cut.manifest_hash,
+                });
+            }
+            cursor = cut.parent_cut_id.clone();
+            cuts.push(cut);
+        }
+        cuts.reverse();
+        if cuts.is_empty() {
+            return Ok(R::IncompletePrefix);
+        }
+        let declared_ids: BTreeSet<String> = self
+            .branches
+            .source_contributions(source_id)?
+            .into_iter()
+            .filter(|unit| prefix_ids.contains(&unit.source_cut_id))
+            .map(|unit| unit.unit_id)
+            .collect();
+        let selected_ids: BTreeSet<&str> = witness
+            .units()
+            .iter()
+            .map(FlowingBatchUnitEffect::unit_id)
+            .collect();
+        let incomplete_roster = selected_ids.len() != witness.units().len()
+            || declared_ids != selected_ids.iter().map(|id| (*id).to_owned()).collect();
+        // REFUSAL: an omitted declaration leaves its obligation on the twig
+        if incomplete_roster {
+            return Ok(R::IncompletePrefix);
+        }
+
+        let mut next_cut = 0;
+        let mut prior_cut_id = source.branch_point_cut_id.clone();
+        let mut prior_manifest_hash = source.branch_point_manifest_hash.clone();
+        let mut predecessors: Vec<(String, String)> = Vec::new();
+        for selected in witness.units() {
+            let Some(unit) = self.branches.contribution_declaration(selected.unit_id())? else {
+                return Ok(R::IncompletePrefix);
+            };
+            let Some(basis) = self.branches.contribution_basis(selected.unit_id())? else {
+                return Ok(R::IncompletePrefix);
+            };
+            let Some(pin) = self.branches.private_cut_pin(&unit.pin_id)? else {
+                return Ok(R::IncompletePrefix);
+            };
+            if unit.source_branch_id != source_id
+                || unit.source_cut_id != selected.source_cut_id()
+                || unit.source_manifest_hash != pin.manifest_hash
+                || pin.twig_branch_id != source_id
+                || pin.cut_id != unit.source_cut_id
+                || pin.released_at.is_some()
+                || basis.basis_digest != selected.basis_digest()
+                || self
+                    .branches
+                    .contribution_handoff(selected.unit_id())?
+                    .is_some()
+            {
+                return Ok(R::IncompletePrefix);
+            }
+            let read =
+                native_read_basis_digest(prior_cut_id.as_deref(), prior_manifest_hash.as_deref());
+            let deps = native_dependency_basis_digest(&predecessors);
+            // REFUSAL: the dependent must name the exact predecessor snapshot
+            if unit.read_basis_digest != read || unit.dependency_basis_digest != deps {
+                return Ok(R::UnprovenBasis {
+                    unit_id: selected.unit_id().to_owned(),
+                });
+            }
+            let mut actual_atoms = Vec::new();
+            loop {
+                let Some(cut) = cuts.get(next_cut) else {
+                    return Ok(R::IncompletePrefix);
+                };
+                let mut changes = Vec::new();
+                self.push_units_for_cut(cut, &mut changes)?;
+                actual_atoms.extend(changes.into_iter().map(|change| FlowingSourceAtom {
+                    cut_id: change.cut_id,
+                    change_id: change.change_id,
+                    path: change.path,
+                    before: change.before,
+                    after: change.after,
+                }));
+                next_cut += 1;
+                if cut.cut_id == selected.source_cut_id() {
+                    prior_cut_id = Some(cut.cut_id.clone());
+                    prior_manifest_hash = Some(cut.manifest_hash.clone());
+                    if unit.source_manifest_hash != cut.manifest_hash {
+                        return Ok(R::IncompletePrefix);
+                    }
+                    break;
+                }
+            }
+            // REFUSAL: an unclaimed write cannot disappear between selected units
+            if actual_atoms != basis.atoms {
+                return Ok(R::IncompletePrefix);
+            }
+            predecessors.push((selected.unit_id().to_owned(), basis.basis_digest));
+        }
+        if next_cut != cuts.len() {
+            return Ok(R::IncompletePrefix);
+        }
+        Ok(R::Verified)
     }
 
     /// Publish the mixed content witness and its content closure before a
@@ -4523,6 +4735,131 @@ mod tests {
                     path: "extra.txt".into()
                 }
             )
+        );
+    }
+
+    #[test]
+    fn mixed_source_order_requires_the_complete_declared_prefix_and_read_basis() {
+        fn fixture(
+            second_read_override: Option<&str>,
+            unclaimed_middle: bool,
+        ) -> (
+            WorkspaceVcs<BranchStore, ContentStore>,
+            FlowingBatchTargetEffects,
+        ) {
+            let mut vcs = workspace();
+            vcs.init("t0").unwrap();
+            vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+                .unwrap();
+            vcs.create_branch("twig", None, "branch", "t1").unwrap();
+            vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+                .unwrap();
+            pin(&mut vcs, "twig-a", "pin-a");
+            declare_native(&mut vcs, "unit-a", "pin-a", None, &[], None);
+            let FlowingSelectionOutcome::Selected(first) = vcs
+                .select_private_changes("pin-a", &selection::parse("change(twig-a)").unwrap())
+                .unwrap()
+            else {
+                panic!("first source selection")
+            };
+            assert_eq!(
+                vcs.bind_private_selection("unit-a", &first, "t3").unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            if unclaimed_middle {
+                vcs.write("twig", "gap.txt", Some("unclaimed"), "twig-gap", "t3b")
+                    .unwrap();
+            }
+            vcs.write("twig", "a.txt", Some("B"), "twig-b", "t4")
+                .unwrap();
+            pin(&mut vcs, "twig-b", "pin-b");
+            declare_native(
+                &mut vcs,
+                "unit-b",
+                "pin-b",
+                Some("twig-a"),
+                &[("unit-a".into(), first.digest().into())],
+                second_read_override,
+            );
+            let FlowingSelectionOutcome::Selected(second) = vcs
+                .select_private_changes("pin-b", &selection::parse("change(twig-b)").unwrap())
+                .unwrap()
+            else {
+                panic!("second source selection")
+            };
+            assert_eq!(
+                vcs.bind_private_selection("unit-b", &second, "t5").unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            vcs.write("branch", "a.txt", Some("B"), "target-b", "t6")
+                .unwrap();
+            let FlowingBatchTargetEffectsOutcome::Verified(witness) = vcs
+                .verify_private_batch_target_effects(&["unit-a", "unit-b"], "target-b")
+                .unwrap()
+            else {
+                panic!("mixed content remains valid independently of read basis")
+            };
+            (vcs, witness)
+        }
+
+        let (mut vcs, witness) = fixture(None, false);
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&witness).unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        vcs.write("twig", "tail.txt", Some("later"), "twig-tail", "t7")
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&witness).unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        let mut omitted = witness.clone();
+        omitted.units.remove(0);
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&omitted).unwrap(),
+            FlowingBatchSourceOrderOutcome::IncompletePrefix
+        );
+        let mut reversed = witness.clone();
+        reversed.units.swap(0, 1);
+        assert_ne!(
+            vcs.verify_private_batch_source_order(&reversed).unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        let mut moved_base = witness.clone();
+        moved_base.target_before_cut_id = Some("other-base".into());
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&moved_base).unwrap(),
+            FlowingBatchSourceOrderOutcome::SourceUnproven
+        );
+        let mut wrong_parent = witness.clone();
+        wrong_parent.target_branch_id = "another-branch".into();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&wrong_parent)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::SourceUnproven
+        );
+        let mut cross_source = witness.clone();
+        cross_source.units[1].source_branch_id = "other-twig".into();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&cross_source)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::CrossSourceUnproven
+        );
+        let (bad_vcs, bad_witness) = fixture(Some("stale-read"), false);
+        assert_eq!(
+            bad_vcs
+                .verify_private_batch_source_order(&bad_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::UnprovenBasis {
+                unit_id: "unit-b".into()
+            }
+        );
+        let (gapped_vcs, gapped_witness) = fixture(None, true);
+        assert_eq!(
+            gapped_vcs
+                .verify_private_batch_source_order(&gapped_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::IncompletePrefix
         );
     }
 
