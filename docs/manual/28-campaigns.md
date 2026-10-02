@@ -120,6 +120,14 @@ one generalizing revision; both the finding and the revision remain in the
 campaign record. An unavailable critic is recorded as unassessed, not clean.
 Neither the proposer nor the critic receives sealed scenario contents.
 
+A broad native draft may receive one scope refinement before scoring. For a
+resource-focused deletion, a passing narrower revision does not automatically
+discard a draft that removes more declarations: the loop can evaluate both on
+open cases, charge the extra evaluation to the campaign, and keep the original
+only if it also clears the baseline gates and dominates the revision. The
+campaign record shows that comparison. Only the selected source reaches the
+sealed promotion check.
+
 For a useful campaign, pin cases that exercise the behavior you want and its
 important guards, run `whip improve`, then inspect `whip campaign <id>` and
 the candidate cards before adopting. Keep different cases outside the

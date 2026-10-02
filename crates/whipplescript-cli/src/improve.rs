@@ -3405,6 +3405,61 @@ fn needs_scope_refinement(observation: &EditObservation) -> bool {
                     .is_some_and(|account| account.expected_gauges.len() >= 2)))
 }
 
+fn removed_declarations(observation: &EditObservation) -> usize {
+    observation.changes.as_ref().map_or(0, |changes| {
+        changes
+            .iter()
+            .filter(|change| change["change"] == "removed")
+            .count()
+    })
+}
+
+/// Deletion can make a program smaller even when the diff is larger. In a
+/// resource campaign, prove that a draft with more deletions earns the extra
+/// edited surface instead of discarding it solely on declaration count.
+fn compare_original_deletion(
+    specs: &[GaugeSpec],
+    campaign: &CampaignSpec,
+    original_edit: &EditObservation,
+    refined_edit: &EditObservation,
+) -> bool {
+    campaign
+        .ascend
+        .iter()
+        .any(|(name, _)| specs.iter().any(|spec| spec.name == *name && spec.builtin))
+        && removed_declarations(original_edit) > removed_declarations(refined_edit)
+}
+
+fn original_dominates_refinement(
+    specs: &[GaugeSpec],
+    campaign: &CampaignSpec,
+    baseline: &[RunObservation],
+    refined: &[RunObservation],
+    original: &[RunObservation],
+) -> Option<(CandidateVerdict, CandidateVerdict)> {
+    let (base_for_original, original_for_base, baseline_dropped) =
+        comparable_pairs(baseline, original);
+    let (refined_for_original, original_for_refined, refined_dropped) =
+        comparable_pairs(refined, original);
+    if baseline_dropped > 0
+        || refined_dropped > 0
+        || base_for_original.is_empty()
+        || base_for_original.len() != baseline.len()
+        || refined_for_original.len() != refined.len()
+    {
+        return None;
+    }
+    let against_baseline =
+        dominance_verdict(specs, campaign, &base_for_original, &original_for_base);
+    let against_refinement = dominance_verdict(
+        specs,
+        campaign,
+        &refined_for_original,
+        &original_for_refined,
+    );
+    Some((against_baseline, against_refinement))
+}
+
 /// A semantic judgment is evidence for the human adoption review, never a
 /// source veto. The exact quote is checked against the new source before it
 /// can route one generalizing revision (DR-0147).
@@ -3903,7 +3958,7 @@ fn campaign_search_memory(
             "candidate.refinement" => {
                 if matches!(
                     event.payload["status"].as_str(),
-                    Some("selected" | "open-refused" | "no-comparable-pairs")
+                    Some("selected" | "retained-original" | "open-refused" | "no-comparable-pairs")
                 ) {
                     if let Some(hash) = event.payload["hash"].as_str() {
                         seen_hashes.insert(hash.to_owned());
@@ -4883,6 +4938,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 let mut shortcut_mitigated = false;
                 let mut selected_shortcut = shortcut.clone();
                 let mut prefetched_open = None;
+                let mut original_retained_after_comparison = false;
                 if proposer.name() == "native"
                     && (needs_scope_refinement(&edit) || clear_quote.is_some())
                     && spec_active
@@ -5104,18 +5160,97 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                                                         &refined_edit,
                                                     );
                                                     if open_verdict.proposable {
-                                                        refinement_event["status"] =
-                                                            json!("selected");
-                                                        proposal = refinement;
-                                                        edit = refined_edit;
-                                                        candidate_hash = refined_hash;
-                                                        candidate_path_str = refined_path_str;
-                                                        candidate_ir = refined_ir;
-                                                        candidate_context = refined_context;
-                                                        prefetched_open =
-                                                            Some(refined_observations);
-                                                        shortcut_mitigated = clear_quote.is_some();
-                                                        selected_shortcut = refined_shortcut;
+                                                        let mut original_kept = None;
+                                                        if clear_quote.is_none()
+                                                            && compare_original_deletion(
+                                                                &specs,
+                                                                &spec_active,
+                                                                &edit,
+                                                                &refined_edit,
+                                                            )
+                                                        {
+                                                            if spec_active
+                                                                .spend_cap_micros
+                                                                .is_some_and(|cap| {
+                                                                    spent_micros >= cap
+                                                                })
+                                                            {
+                                                                refinement_event["comparison"] = json!({"status": "skipped-cap"});
+                                                            } else {
+                                                                match evaluate_all(
+                                                                    &candidate_path_str,
+                                                                    &candidate_ir,
+                                                                    candidate_context.as_ref(),
+                                                                    &open,
+                                                                    &mut seq,
+                                                                ) {
+                                                                    Err(reason) => {
+                                                                        refinement_event
+                                                                            ["comparison"] = json!({"status": "open-evaluation-failed", "reason": reason});
+                                                                    }
+                                                                    Ok(original_observations) => {
+                                                                        judge_spend(
+                                                                            store,
+                                                                            &original_observations,
+                                                                            &format!("judge turns ({candidate_id}, original comparison)"),
+                                                                            &mut spent_micros,
+                                                                        )?;
+                                                                        workflow_spend(
+                                                                            store,
+                                                                            &original_observations,
+                                                                            &format!("workflow turns ({candidate_id}, original comparison)"),
+                                                                            &mut spent_micros,
+                                                                        )?;
+                                                                        if let Some((against_baseline, against_refinement)) = original_dominates_refinement(
+                                                                            &specs,
+                                                                            &spec_active,
+                                                                            &baseline_open,
+                                                                            &refined_observations,
+                                                                            &original_observations,
+                                                                        ) {
+                                                                            let keep = against_baseline.proposable && against_refinement.proposable;
+                                                                            refinement_event["comparison"] = json!({
+                                                                                "status": if keep { "retained-original" } else { "selected-refinement" },
+                                                                                "original_against_baseline": evidence_card(
+                                                                                    &campaign_id, &candidate_id, &proposal.rationale,
+                                                                                    &against_baseline, &[], unheld_out, &edit,
+                                                                                ),
+                                                                                "original_against_refinement": evidence_card(
+                                                                                    &campaign_id, &candidate_id, &proposal.rationale,
+                                                                                    &against_refinement, &[], unheld_out, &edit,
+                                                                                ),
+                                                                            });
+                                                                            if keep {
+                                                                                original_kept = Some(original_observations);
+                                                                            }
+                                                                        } else {
+                                                                            refinement_event["comparison"] = json!({"status": "no-comparable-pairs"});
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(observations) = original_kept {
+                                                            refinement_event["status"] =
+                                                                json!("retained-original");
+                                                            prefetched_open = Some(observations);
+                                                            original_retained_after_comparison =
+                                                                true;
+                                                        } else {
+                                                            refinement_event["status"] =
+                                                                json!("selected");
+                                                            proposal = refinement;
+                                                            edit = refined_edit;
+                                                            candidate_hash = refined_hash;
+                                                            candidate_path_str = refined_path_str;
+                                                            candidate_ir = refined_ir;
+                                                            candidate_context = refined_context;
+                                                            prefetched_open =
+                                                                Some(refined_observations);
+                                                            shortcut_mitigated =
+                                                                clear_quote.is_some();
+                                                            selected_shortcut = refined_shortcut;
+                                                        }
                                                     } else {
                                                         refinement_event["status"] =
                                                             json!("open-refused");
@@ -5246,6 +5381,9 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 }
                 if shortcut_mitigated {
                     gate_tags.push("shortcut-revised".to_owned());
+                }
+                if original_retained_after_comparison {
+                    gate_tags.push("scope-refinement-outperformed".to_owned());
                 }
                 if dropped_pairs > 0 {
                     gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
@@ -7375,6 +7513,17 @@ mod tests {
         }
     }
 
+    fn spec_resource(name: &str) -> GaugeSpec {
+        GaugeSpec {
+            name: name.to_owned(),
+            judge: JudgeSpec::Builtin,
+            bar: None,
+            inputs: Vec::new(),
+            direction_up: name == "std.cache_hit",
+            builtin: true,
+        }
+    }
+
     fn observations(gauge: &str, passes: &[bool]) -> Vec<RunObservation> {
         passes
             .iter()
@@ -7386,6 +7535,26 @@ mod tests {
                     GaugeReading {
                         score: if *passed { 1.0 } else { 0.0 },
                         passed: Some(*passed),
+                        tags: Vec::new(),
+                    },
+                )]),
+                skipped: Vec::new(),
+                judge_usage: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn resource_observations(gauge: &str, scores: &[f64]) -> Vec<RunObservation> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(index, score)| RunObservation {
+                scenario: Some(format!("s{index}")),
+                readings: BTreeMap::from([(
+                    gauge.to_owned(),
+                    GaugeReading {
+                        score: *score,
+                        passed: None,
                         tags: Vec::new(),
                     },
                 )]),
@@ -7527,6 +7696,91 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("std.cache_hit")));
+    }
+
+    #[test]
+    fn resource_deletion_comparison_retains_only_a_dominating_original() {
+        let specs = vec![
+            spec_resource("std.tokens"),
+            spec_resource("std.cache_hit"),
+            spec_quality("quality"),
+        ];
+        let campaign = CampaignSpec {
+            ascend: vec![("std.tokens".to_owned(), None)],
+            ..Default::default()
+        };
+        let baseline = merge(
+            merge(
+                resource_observations("std.tokens", &[200.0; 6]),
+                resource_observations("std.cache_hit", &[0.0; 6]),
+            ),
+            observations("quality", &[true; 6]),
+        );
+        let refined = merge(
+            merge(
+                resource_observations("std.tokens", &[100.0; 6]),
+                resource_observations("std.cache_hit", &[0.0; 6]),
+            ),
+            observations("quality", &[true; 6]),
+        );
+        let original = merge(
+            resource_observations("std.tokens", &[0.0; 6]),
+            observations("quality", &[true; 6]),
+        );
+        let (baseline_verdict, relative_verdict) =
+            original_dominates_refinement(&specs, &campaign, &baseline, &refined, &original)
+                .expect("all open cases comparable");
+        assert!(
+            baseline_verdict.proposable,
+            "{:?}",
+            baseline_verdict.reasons
+        );
+        assert!(
+            relative_verdict.proposable,
+            "{:?}",
+            relative_verdict.reasons
+        );
+
+        let broken_original = merge(
+            resource_observations("std.tokens", &[0.0; 6]),
+            observations("quality", &[false; 6]),
+        );
+        let (baseline_verdict, relative_verdict) =
+            original_dominates_refinement(&specs, &campaign, &baseline, &refined, &broken_original)
+                .expect("all open cases comparable");
+        assert!(!baseline_verdict.proposable);
+        assert!(!relative_verdict.proposable);
+
+        let edit = |removed: usize| EditObservation {
+            account: None,
+            changes: Some(vec![json!({"change": "removed"}); removed]),
+            unaccounted: Vec::new(),
+            resource_changes: Vec::new(),
+            unaccounted_resources: Vec::new(),
+            tags: Vec::new(),
+        };
+        assert!(compare_original_deletion(
+            &specs,
+            &campaign,
+            &edit(3),
+            &edit(1)
+        ));
+        assert!(!compare_original_deletion(
+            &specs,
+            &campaign,
+            &edit(1),
+            &edit(1)
+        ));
+        let quality_campaign = CampaignSpec {
+            ascend: vec![("quality".to_owned(), None)],
+            ..Default::default()
+        };
+        assert!(!compare_original_deletion(
+            &specs,
+            &quality_campaign,
+            &edit(3),
+            &edit(1)
+        ));
     }
 
     #[test]

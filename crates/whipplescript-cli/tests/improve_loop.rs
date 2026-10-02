@@ -364,6 +364,200 @@ fn native_shortcut_critic_generalizes_a_planted_case_answer() {
 }
 
 #[test]
+fn native_resource_refinement_keeps_a_dominating_deletion_draft() {
+    let env = Env::new("resource-deletion-refinement");
+    let judge = env.dir.join("judge_copy.py");
+    fs::write(
+        &judge,
+        r#"import json, sys
+record = json.load(sys.stdin)
+expected = record["input"]["item"]["code"]
+actual = [fact["value"]["code"] for fact in record["facts"] if fact["name"] == "Reply"]
+print(json.dumps({"ok": bool(actual) and actual[-1] == expected}))
+"#,
+    )
+    .expect("judge");
+    let baseline = r#"use std.coercion
+
+workflow CopyCode
+
+input item Item
+output result Reply
+
+class Item {
+  code string
+}
+
+class Reply {
+  code string
+}
+
+class AuditResult {
+  checked bool
+}
+
+coerce Copy(value string) -> Reply {
+  prompt """markdown
+  Copy {{ value }} into code.
+  {{ ctx.output_format }}
+  """
+}
+
+coerce Audit(value string) -> AuditResult {
+  prompt """markdown
+  Return checked true for {{ value }}.
+  {{ ctx.output_format }}
+  """
+}
+
+gauge copy_correct {
+  judge via exec "python3 __JUDGE__"
+  expect P(ok) at least 0.9
+}
+
+rule copy
+  when Item as item
+=> {
+  then first <- coerce Copy(item.code)
+  then redundant <- coerce Audit(item.code)
+  record Reply { code first.code }
+  complete result { code first.code }
+}
+"#
+    .replace("__JUDGE__", &judge.to_string_lossy());
+    let narrow = baseline
+        .replace("class AuditResult {\n  checked bool\n}\n\n", "")
+        .replace(
+            "coerce Audit(value string) -> AuditResult {\n  prompt \"\"\"markdown\n  Return checked true for {{ value }}.\n  {{ ctx.output_format }}\n  \"\"\"\n}\n\n",
+            "",
+        )
+        .replace("  then redundant <- coerce Audit(item.code)\n", "");
+    let broad = narrow
+        .replace("use std.coercion\n\n", "")
+        .replace(
+            "coerce Copy(value string) -> Reply {\n  prompt \"\"\"markdown\n  Copy {{ value }} into code.\n  {{ ctx.output_format }}\n  \"\"\"\n}\n\n",
+            "",
+        )
+        .replace("  then first <- coerce Copy(item.code)\n", "")
+        .replace("first.code", "item.code");
+    assert!(!broad.contains("coerce"), "broad draft removes both calls");
+    let program_path = env.dir.join("copy.whip");
+    fs::write(&program_path, &baseline).expect("baseline program");
+    let program_str = program_path.to_string_lossy().into_owned();
+    let proposal = serde_json::json!({
+        "rationale": "copy the already available input without model calls",
+        "source": broad,
+        "edit_account": {"mechanism": "remove redundant model work",
+            "declarations": ["use std.coercion", "class AuditResult", "coerce Copy(value string) -> Reply", "coerce Audit(value string) -> AuditResult", "rule copy"],
+            "resources": [], "expected_gauges": ["std.tokens"]},
+        "context_edits": []
+    });
+    let refinement = serde_json::json!({
+        "rationale": "remove only the unused audit",
+        "source": narrow,
+        "edit_account": {"mechanism": "remove redundant audit",
+            "declarations": ["class AuditResult", "coerce Audit(value string) -> AuditResult", "rule copy"],
+            "resources": [], "expected_gauges": ["std.tokens"]},
+        "context_edits": []
+    });
+    let no_shortcut = serde_json::json!({
+        "classification": "none", "source_path": "program", "source_quote": "", "reason": ""
+    });
+    let replies = vec![
+        r#"{"code":"CODE"}"#.to_owned(),
+        r#"{"checked":true}"#.to_owned(),
+        r#"{"code":"CODE"}"#.to_owned(),
+        r#"{"checked":true}"#.to_owned(),
+        proposal.to_string(),
+        no_shortcut.to_string(),
+        refinement.to_string(),
+        no_shortcut.to_string(),
+        r#"{"code":"CODE"}"#.to_owned(),
+    ];
+    let (base_url, bodies) = mock_coerce_sequence_endpoint(replies);
+    let provider_env = [
+        ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+        ("OPENAI_API_KEY", "test-key"),
+        ("WHIPPLESCRIPT_COERCE_BASE_URL", base_url.as_str()),
+        ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+    ];
+    let dev = env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "--input",
+            r#"{"item":{"code":"CODE"}}"#,
+            "run",
+            &program_str,
+            "--provider",
+            "owned",
+        ],
+        &provider_env,
+    );
+    env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "pin",
+            dev["instance_id"].as_str().unwrap(),
+            "--as",
+            "copy-case",
+        ],
+        &[],
+    );
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "std.tokens",
+            "--program",
+            &program_str,
+            "--provider",
+            "owned",
+            "--proposer",
+            "native",
+        ],
+        &provider_env,
+    );
+    assert_eq!(report["proposed"], true, "{report}");
+    let card = &report["cards"][0];
+    assert!(card["tags"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("scope-refinement-outperformed")));
+    assert_eq!(
+        card["gauges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gauge| gauge["gauge"] == "std.tokens")
+            .unwrap()["candidate"],
+        0.0
+    );
+    let campaign = env.run_json(
+        &["--json", "campaign", report["campaign"].as_str().unwrap()],
+        &[],
+    );
+    let events = campaign["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "candidate.refinement"
+            && event["payload"]["status"] == "retained-original"
+            && event["payload"]["comparison"]["status"] == "retained-original"));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "candidate.recorded"
+            && event["payload"]["source"] == proposal["source"]));
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        9,
+        "two baseline calls twice, three model turns, a refinement critic, and one refined call"
+    );
+}
+
+#[test]
 fn ambiguous_shortcut_finding_remains_reviewable_and_testable() {
     let env = Env::new("shortcut-ambiguous");
     write_judges(&env.dir);
