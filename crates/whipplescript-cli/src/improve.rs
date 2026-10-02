@@ -4874,25 +4874,27 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 ) {
                     Ok((_, candidate_ir)) => candidate_ir,
                     Err(error) => {
+                        let reason =
+                            format!("does not compile: {}", compile_failure_summary(&error));
                         store
-                    .append_campaign_event(
-                        &campaign_id,
-                        "candidate.rejected",
-                        &json!({
-                            "candidate": candidate_id,
-                            "reason": format!("does not compile: {}", compile_failure_summary(&error)),
-                            "rationale": proposal.rationale,
-                            "edit": edit.payload(),
-                            "tags": edit.tags,
-                        }),
-                    )
-                    .map_err(|error| format!("failed to record rejection: {error:?}"))?;
+                            .append_campaign_event(
+                                &campaign_id,
+                                "candidate.rejected",
+                                &json!({
+                                    "candidate": candidate_id,
+                                    "reason": reason,
+                                    "rationale": proposal.rationale,
+                                    "edit": edit.payload(),
+                                    "tags": edit.tags,
+                                }),
+                            )
+                            .map_err(|error| format!("failed to record rejection: {error:?}"))?;
                         store
                             .append_campaign_event(
                                 &campaign_id,
                                 "candidate.open_assessed",
                                 &json!({"candidate": candidate_id, "proposable": false,
-                                "tradeoff": false, "reasons": ["does not compile"]}),
+                                "tradeoff": false, "reasons": [reason]}),
                             )
                             .map_err(|error| format!("failed to record open refusal: {error:?}"))?;
                         continue;
@@ -5280,13 +5282,51 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 let candidate_open = if let Some(observations) = prefetched_open {
                     observations
                 } else {
-                    let observations = evaluate_all(
+                    let observations = match evaluate_all(
                         &candidate_path_str,
                         &candidate_ir,
                         candidate_context.as_ref(),
                         &open,
                         &mut seq,
-                    )?;
+                    ) {
+                        Ok(observations) => observations,
+                        Err(reason) => {
+                            // A candidate can pass the source checker yet fail
+                            // when a ready rule is lowered against a concrete
+                            // turn (for example, an unknown turn projection).
+                            // Keep provider and infrastructure failures fatal.
+                            if !reason.contains("lowering failed:") {
+                                return Err(reason);
+                            }
+                            let reason = format!("open evaluation failed: {reason}");
+                            store
+                                .append_campaign_event(
+                                    &campaign_id,
+                                    "candidate.rejected",
+                                    &json!({
+                                        "candidate": candidate_id,
+                                        "reason": reason,
+                                        "rationale": proposal.rationale,
+                                        "edit": edit.payload(),
+                                        "tags": edit.tags,
+                                    }),
+                                )
+                                .map_err(|error| {
+                                    format!("failed to record rejection: {error:?}")
+                                })?;
+                            store
+                                .append_campaign_event(
+                                    &campaign_id,
+                                    "candidate.open_assessed",
+                                    &json!({"candidate": candidate_id, "proposable": false,
+                                    "tradeoff": false, "reasons": [reason]}),
+                                )
+                                .map_err(|error| {
+                                    format!("failed to record open refusal: {error:?}")
+                                })?;
+                            continue;
+                        }
+                    };
                     judge_spend(
                         store,
                         &observations,

@@ -1757,6 +1757,13 @@ command then repeats these steps: propose a candidate, apply the static gate,
 evaluate the candidate, give a verdict on the dominance, and apply the sealed
 gate for a promotion.
 
+A draft that passes source checking but fails when one of its rules is lowered
+against an open scenario is recorded as a rejected candidate, and the campaign
+continues its search. The open-case compiler or lowering diagnostic appears
+in the next proposer turn's search history. Provider and evaluation
+infrastructure failures still fail the campaign. A rejected draft is never
+eligible for adoption.
+
 The command proposes a candidate only when the candidate improves a gauge in the
 ascend set, causes no regression in a guarded gauge, and meets each bar. The
 command surfaces a true trade as a decision. The command never accepts a trade

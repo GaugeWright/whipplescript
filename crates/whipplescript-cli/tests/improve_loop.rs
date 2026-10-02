@@ -193,6 +193,125 @@ fn dev_and_pin(env: &Env, program_path: &str) -> String {
 }
 
 #[test]
+fn candidate_that_fails_runtime_lowering_is_recorded_and_next_proposal_runs() {
+    let env = Env::new("candidate-lowering");
+    let judge = env.dir.join("judge.py");
+    fs::write(
+        &judge,
+        "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({'ok': any(f.get('name') == 'Reply' and f.get('value', {}).get('route') == 'owned completed' for f in r.get('facts', []))}))\n",
+    )
+    .expect("judge");
+    let baseline = format!(
+        r#"use std.agent
+workflow Route
+input ticket Ticket
+class Ticket {{ id string }}
+class Reply {{ route string }}
+gauge route_correct {{
+  judge via exec "python3 {}"
+  expect P(ok) at least 0.5
+}}
+agent router {{ provider owned profile "repo-reader" capacity 1 }}
+rule route
+  when Ticket as ticket
+  when router is available
+=> {{
+  tell router as turn """markdown
+  Route {{{{ ticket.id }}}}.
+  """
+  after turn succeeds {{
+    record Reply {{ route "GENERAL" }}
+  }}
+}}
+"#,
+        judge.display()
+    );
+    let program_path = env.dir.join("route.whip");
+    fs::write(&program_path, &baseline).expect("baseline");
+    let program_str = program_path.to_string_lossy().into_owned();
+    let input = r#"{"ticket":{"id":"T-1"}}"#;
+    let run = env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "--input",
+            input,
+            "run",
+            &program_str,
+            "--provider",
+            "fixture",
+        ],
+        &[],
+    );
+    env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "pin",
+            run["instance_id"].as_str().unwrap(),
+            "--as",
+            "route-1",
+        ],
+        &[],
+    );
+    let bad = env.dir.join("bad.whip");
+    fs::write(
+        &bad,
+        baseline.replace("route \"GENERAL\"", "route turn.text"),
+    )
+    .expect("bad candidate");
+    let good = env.dir.join("good.whip");
+    fs::write(
+        &good,
+        baseline.replace("route \"GENERAL\"", "route turn.summary"),
+    )
+    .expect("good candidate");
+    let proposals = format!("{}:{}", bad.display(), good.display());
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "route_correct",
+            "--program",
+            &program_str,
+            "--provider",
+            "fixture",
+            "--proposer",
+            "fixture",
+        ],
+        &[("WHIPPLESCRIPT_IMPROVE_PROPOSALS", &proposals)],
+    );
+    assert_eq!(report["proposed"], true, "{report}");
+    let campaign = env.run_json(
+        &["--json", "campaign", report["campaign"].as_str().unwrap()],
+        &[],
+    );
+    assert!(
+        campaign["events"].as_array().unwrap().iter().any(|event| {
+            event["type"] == "candidate.rejected"
+                && event["payload"]["candidate"] == "K-1"
+                && event["payload"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("lowering failed:"))
+        }),
+        "{campaign}"
+    );
+    assert!(
+        campaign["events"].as_array().unwrap().iter().any(|event| {
+            event["type"] == "candidate.open_assessed"
+                && event["payload"]["candidate"] == "K-1"
+                && event["payload"]["reasons"][0]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("could not resolve `turn.text`"))
+        }),
+        "the next proposer must receive the actionable open-case diagnostic: {campaign}"
+    );
+    assert_eq!(report["cards"][0]["candidate"], "K-2", "{report}");
+}
+
+#[test]
 fn improve_skips_repeated_canonical_candidate_before_regeneration() {
     let env = Env::new("repeat-guard");
     write_judges(&env.dir);
