@@ -335,11 +335,32 @@ fn native_shortcut_critic_generalizes_a_planted_case_answer() {
             .count(),
         2,
     );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 4, "proposal, critic, revision, critic");
+    let proposal_request: Value = serde_json::from_str(&bodies[0]).expect("proposal request");
     assert_eq!(
-        bodies.lock().unwrap().len(),
-        4,
-        "proposal, critic, revision, critic"
+        proposal_request["response_format"]["json_schema"]["strict"],
+        true
     );
+    let proposal_schema = &proposal_request["response_format"]["json_schema"]["schema"];
+    assert!(proposal_schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("context_edits")));
+    assert!(proposal_schema["properties"]["edit_account"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("resources")));
+    let critic_request: Value = serde_json::from_str(&bodies[1]).expect("critic request");
+    assert_eq!(
+        critic_request["response_format"]["json_schema"]["strict"],
+        true
+    );
+    let critic_schema = &critic_request["response_format"]["json_schema"]["schema"];
+    assert!(critic_schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("source_path")));
 }
 
 #[test]
