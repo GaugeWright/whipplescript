@@ -19,6 +19,8 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Workspace edit and grep semantics now share pure helpers across native and Durable Object hosts. The native workspace resolver rejects overlapping edits while preserving leading BOMs; hosted grep keeps the same parameter behavior and 500-character line cap.
+
 - Embeddings can fence a native imported diff with their original current
   authority. A final refusal rolls back the branch head, cut and operation
   receipt; exact recovery also requires current authority under retention.

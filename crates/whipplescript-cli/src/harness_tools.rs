@@ -1896,66 +1896,10 @@ impl FileToolExecutor {
             .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
         let full = self.root.join(path);
-        let mut content =
+        let content =
             std::fs::read_to_string(&full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
-        // A UTF-8 BOM is invisible in the model's view of the file (read strips
-        // nothing, but the model never types one): strip it before matching so an
-        // edit anchored at the file start applies, and restore it on write so the
-        // file keeps its encoding marker (pi-conformance §1).
-        const BOM: &str = "\u{feff}";
-        let had_bom = content.starts_with(BOM);
-        if had_bom {
-            content = content[BOM.len()..].to_string();
-        }
-        // Regions already rewritten, in current-content coordinates (with the edit
-        // index that produced them). A later edit whose match intersects one is
-        // editing an earlier edit's output — almost always a model mistake.
-        let mut replaced: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
-        let mut applied = 0usize;
-        for (index, edit) in edits.iter().enumerate() {
-            let old = str_arg(edit, "oldText")?;
-            let new = str_arg(edit, "newText")?;
-            if old.is_empty() {
-                return Err(format!("edit {index}: oldText must not be empty"));
-            }
-            let matches = content.matches(old).count();
-            if matches == 0 {
-                return Err(format!("edit {index}: oldText not found in `{path}`"));
-            }
-            if matches > 1 {
-                return Err(format!(
-                    "edit {index}: oldText matches {matches} times in `{path}`; make it unique"
-                ));
-            }
-            let start = content
-                .find(old)
-                .ok_or_else(|| format!("edit {index}: oldText not found in `{path}`"))?;
-            let end = start + old.len();
-            for (earlier, region) in &replaced {
-                if start < region.end && region.start < end {
-                    return Err(format!(
-                        "edit {earlier} and edit {index} overlap in `{path}`; merge them \
-                         into one edit or target disjoint regions"
-                    ));
-                }
-            }
-            content.replace_range(start..end, new);
-            // Shift the recorded regions that sit after the splice point.
-            let delta = new.len() as isize - old.len() as isize;
-            for (_, region) in replaced.iter_mut() {
-                if region.start >= end {
-                    region.start = (region.start as isize + delta) as usize;
-                    region.end = (region.end as isize + delta) as usize;
-                }
-            }
-            replaced.push((index, start..start + new.len()));
-            applied += 1;
-        }
-        let output = if had_bom {
-            format!("{BOM}{content}")
-        } else {
-            content
-        };
+        let (output, applied) =
+            whipplescript_kernel::workspace_edit::apply_edits(content, path, edits)?;
         std::fs::write(&full, &output).map_err(|e| format!("write of `{path}` failed: {e}"))?;
         Ok(format!("applied {applied} edit(s) to {path}"))
     }
@@ -6995,6 +6939,38 @@ mod tests {
         let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
         assert_eq!(read.content, "xyz");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ws331_edit_preserves_bom_refuses_overlap_and_shifts_disjoint_regions() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let original = "\u{feff}α beta gamma";
+        std::fs::write(root.join("e.txt"), original).unwrap();
+        let bom = exec.execute(&call(
+            "edit",
+            json!({"path":"e.txt", "edits":[{"oldText":"α beta gamma", "newText":"δ"}]}),
+        ));
+        assert_eq!(bom.status, ToolStatus::Ok);
+        assert_eq!(
+            std::fs::read_to_string(root.join("e.txt")).unwrap(),
+            "\u{feff}δ"
+        );
+        std::fs::write(root.join("e.txt"), original).unwrap();
+        let overlap = exec.execute(&call("edit", json!({"path":"e.txt", "edits":[{"oldText":"α beta", "newText":"α beta"}, {"oldText":"beta gamma", "newText":"BETA gamma"}]})));
+        assert_eq!(overlap.status, ToolStatus::Error);
+        assert!(overlap.content.contains("overlap"), "{}", overlap.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("e.txt")).unwrap(),
+            original
+        );
+        let shifted = exec.execute(&call("edit", json!({"path":"e.txt", "edits":[{"oldText":"gamma", "newText":"ΓΓΓ"}, {"oldText":"α", "newText":"longer-α"}, {"oldText":"beta", "newText":"β"}]})));
+        assert_eq!(shifted.status, ToolStatus::Ok);
+        assert_eq!(
+            std::fs::read_to_string(root.join("e.txt")).unwrap(),
+            "\u{feff}longer-α β ΓΓΓ"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

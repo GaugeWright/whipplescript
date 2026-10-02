@@ -1,5 +1,10 @@
 //! Deterministic runtime kernel scaffold.
 
+/// Placement-neutral workspace edits; hosts own admission and I/O.
+pub mod workspace_edit;
+/// Placement-neutral workspace grep; hosts own admitted traversal and witnesses.
+pub mod workspace_grep;
+
 mod action_execution;
 mod action_result;
 pub mod agent_profile;

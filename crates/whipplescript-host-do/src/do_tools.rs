@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
+use whipplescript_kernel::workspace_grep::GrepMatcher;
 
 use serde_json::{json, Value};
 use whipplescript_kernel::effect_handlers::glob_match;
@@ -66,8 +67,6 @@ const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on `files` rows visited by `find`/`grep` so a huge workspace cannot
 /// stall a turn (mirrors native's tree-walk bound, applied to the flat table).
 const MAX_FILES_WALKED: usize = 5_000;
-/// Cap on a single emitted `grep` line.
-const GREP_MAX_LINE_CHARS: usize = 500;
 /// Leading bytes sniffed for a NUL byte to refuse reading binary content as text.
 const BINARY_SNIFF_BYTES: usize = 8_192;
 
@@ -724,63 +723,11 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         let edits = edits_value
             .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
-        let mut content = self
+        let content = self
             .file_content(&key)?
             .ok_or_else(|| format!("no such file: {path}"))?;
-        // A UTF-8 BOM is invisible in the model's view: strip it before matching
-        // so an edit anchored at the file start applies, restore it on write.
-        const BOM: &str = "\u{feff}";
-        let had_bom = content.starts_with(BOM);
-        if had_bom {
-            content = content[BOM.len()..].to_string();
-        }
-        // Regions already rewritten, in current-content coordinates. A later edit
-        // whose match intersects one is editing an earlier edit's output.
-        let mut replaced: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
-        let mut applied = 0usize;
-        for (index, edit) in edits.iter().enumerate() {
-            let old = str_arg(edit, "oldText")?;
-            let new = str_arg(edit, "newText")?;
-            if old.is_empty() {
-                return Err(format!("edit {index}: oldText must not be empty"));
-            }
-            let matches = content.matches(old).count();
-            if matches == 0 {
-                return Err(format!("edit {index}: oldText not found in `{path}`"));
-            }
-            if matches > 1 {
-                return Err(format!(
-                    "edit {index}: oldText matches {matches} times in `{path}`; make it unique"
-                ));
-            }
-            let start = content
-                .find(old)
-                .ok_or_else(|| format!("edit {index}: oldText not found in `{path}`"))?;
-            let end = start + old.len();
-            for (earlier, region) in &replaced {
-                if start < region.end && region.start < end {
-                    return Err(format!(
-                        "edit {earlier} and edit {index} overlap in `{path}`; merge them \
-                         into one edit or target disjoint regions"
-                    ));
-                }
-            }
-            content.replace_range(start..end, new);
-            let delta = new.len() as isize - old.len() as isize;
-            for (_, region) in replaced.iter_mut() {
-                if region.start >= end {
-                    region.start = (region.start as isize + delta) as usize;
-                    region.end = (region.end as isize + delta) as usize;
-                }
-            }
-            replaced.push((index, start..start + new.len()));
-            applied += 1;
-        }
-        let output = if had_bom {
-            format!("{BOM}{content}")
-        } else {
-            content
-        };
+        let (output, applied) =
+            whipplescript_kernel::workspace_edit::apply_edits(content, &path, edits)?;
         self.store_file(&key, &output)?;
         Ok(format!("applied {applied} edit(s) to {path}"))
     }
@@ -992,31 +939,15 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             } else {
                 scan_complete = false;
             }
-            let lines: Vec<&str> = content.lines().collect();
-            let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
-            // The match limit counts matches; context lines ride along free.
-            // Overlapping context windows are merged (each line emitted once).
-            let mut emit: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            for (index, &hit) in matched.iter().enumerate() {
-                if !hit {
-                    continue;
-                }
-                if matches_found >= limit {
-                    break;
-                }
-                matches_found += 1;
-                let from = index.saturating_sub(context);
-                let to = (index + context).min(lines.len().saturating_sub(1));
-                emit.extend(from..=to);
-            }
-            for index in emit {
-                let line = cap_grep_line(lines[index]);
-                if matched[index] {
-                    hits.push(format!("{presented}:{}:{line}", index + 1));
-                } else {
-                    hits.push(format!("{presented}-{}-{line}", index + 1));
-                }
-            }
+            whipplescript_kernel::workspace_grep::grep_file_into(
+                presented,
+                &content,
+                &matcher,
+                context,
+                limit,
+                &mut matches_found,
+                &mut hits,
+            );
         }
         if let Some((admitted, _)) = searched.witness {
             if scan_complete && !searched_files.is_empty() {
@@ -1377,58 +1308,6 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-}
-
-/// Native and DO grep share the same forgiving contract: compile a real regex
-/// when possible and treat invalid regex syntax as the literal text users often
-/// paste from source files.
-enum GrepMatcher {
-    Regex(regex::Regex),
-    Literal { needle: String, ignore_case: bool },
-}
-
-impl GrepMatcher {
-    fn new(pattern: &str, ignore_case: bool) -> Self {
-        match regex::RegexBuilder::new(pattern)
-            .case_insensitive(ignore_case)
-            .build()
-        {
-            Ok(regex) => Self::Regex(regex),
-            Err(_) => Self::Literal {
-                needle: if ignore_case {
-                    pattern.to_lowercase()
-                } else {
-                    pattern.to_owned()
-                },
-                ignore_case,
-            },
-        }
-    }
-
-    fn is_match(&self, line: &str) -> bool {
-        match self {
-            Self::Regex(regex) => regex.is_match(line),
-            Self::Literal {
-                needle,
-                ignore_case,
-            } => {
-                if *ignore_case {
-                    line.to_lowercase().contains(needle)
-                } else {
-                    line.contains(needle)
-                }
-            }
-        }
-    }
-}
-
-/// Cap a single grep output line at [`GREP_MAX_LINE_CHARS`] characters
-/// (char-boundary safe), marking the cut.
-fn cap_grep_line(line: &str) -> String {
-    match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
-        Some((byte_index, _)) => format!("{}... [truncated]", &line[..byte_index]),
-        None => line.to_string(),
-    }
 }
 
 /// Map a TodoWrite-style status to the builtin tracker's item status.
@@ -2253,6 +2132,36 @@ mod tests {
     }
 
     #[test]
+    fn ws331_edit_preserves_bom_refuses_overlap_and_shifts_disjoint_regions() {
+        let exec = executor();
+        let original = "\u{feff}α beta gamma";
+        exec.execute(&call("write", json!({"path":"e.txt","content":original})));
+        let bom = exec.execute(&call(
+            "edit",
+            json!({"path":"e.txt", "edits":[{"oldText":"α beta gamma", "newText":"δ"}]}),
+        ));
+        assert_eq!(bom.status, ToolStatus::Ok);
+        assert_eq!(
+            exec.execute(&call("read", json!({"path":"e.txt"}))).content,
+            "\u{feff}δ"
+        );
+        exec.execute(&call("write", json!({"path":"e.txt","content":original})));
+        let overlap = exec.execute(&call("edit", json!({"path":"e.txt", "edits":[{"oldText":"α beta", "newText":"α beta"}, {"oldText":"beta gamma", "newText":"BETA gamma"}]})));
+        assert_eq!(overlap.status, ToolStatus::Error);
+        assert!(overlap.content.contains("overlap"), "{}", overlap.content);
+        assert_eq!(
+            exec.execute(&call("read", json!({"path":"e.txt"}))).content,
+            original
+        );
+        let shifted = exec.execute(&call("edit", json!({"path":"e.txt", "edits":[{"oldText":"gamma", "newText":"ΓΓΓ"}, {"oldText":"α", "newText":"longer-α"}, {"oldText":"beta", "newText":"β"}]})));
+        assert_eq!(shifted.status, ToolStatus::Ok);
+        assert_eq!(
+            exec.execute(&call("read", json!({"path":"e.txt"}))).content,
+            "\u{feff}longer-α β ΓΓΓ"
+        );
+    }
+
+    #[test]
     fn edit_unique_match_replaces() {
         let exec = executor();
         exec.execute(&call(
@@ -2347,6 +2256,30 @@ mod tests {
         assert_eq!(hits.content, "src/a.rs\nsrc/b.rs");
         let none = exec.execute(&call("find", json!({ "pattern": "*.toml" })));
         assert_eq!(none.content, "No files found");
+    }
+
+    #[test]
+    fn ws331_grep_shares_literal_fallback_context_limit_and_500_character_cap() {
+        let exec = executor();
+        exec.execute(&call(
+            "write",
+            json!({"path":"e.txt", "content":"before\nFOO(\nafter\nfoo(\n"}),
+        ));
+        let grep = exec.execute(&call(
+            "grep",
+            json!({"pattern":"foo(","ignoreCase":true,"context":1,"limit":1}),
+        ));
+        assert_eq!(grep.status, ToolStatus::Ok);
+        assert_eq!(grep.content, "e.txt-1-before\ne.txt:2:FOO(\ne.txt-3-after");
+        exec.execute(&call(
+            "write",
+            json!({"path":"e.txt", "content":"界".repeat(501)}),
+        ));
+        let cap = exec.execute(&call("grep", json!({"pattern":"界"})));
+        assert_eq!(
+            cap.content,
+            format!("e.txt:1:{}... [truncated]", "界".repeat(500))
+        );
     }
 
     #[test]

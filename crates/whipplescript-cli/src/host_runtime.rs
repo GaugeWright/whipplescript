@@ -834,23 +834,13 @@ impl NativeWorkspaceResolver {
     fn edit(&self, arguments: &Value, view: &FileView) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
         let (resolved, stored) = self.resolve_admitted(path, true, view)?;
-        let mut text = fs::read_to_string(&resolved)
+        let text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
         let edits = arguments
             .get("edits")
             .and_then(Value::as_array)
             .ok_or_else(|| "`edits` must be an array".to_owned())?;
-        for edit in edits {
-            let old = string_argument(edit, "oldText")?;
-            let new = string_argument(edit, "newText")?;
-            if old.is_empty() {
-                return Err("edit oldText must not be empty".to_owned());
-            }
-            if text.matches(old).count() != 1 {
-                return Err("edit oldText must match exactly once".to_owned());
-            }
-            text = text.replacen(old, new, 1);
-        }
+        let (text, applied) = whipplescript_kernel::workspace_edit::apply_edits(text, path, edits)?;
         fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
         self.witness_write(
@@ -858,7 +848,7 @@ impl NativeWorkspaceResolver {
             true,
             text.as_bytes(),
         );
-        Ok(format!("applied {} edit(s) to {path}", edits.len()))
+        Ok(format!("applied {applied} edit(s) to {path}"))
     }
 
     fn list(&self, call_id: &str, arguments: &Value, view: &FileView) -> Result<String, String> {
@@ -8786,6 +8776,58 @@ workflow UnsafeHostChat {
             "a refused result writes nothing"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ws331_edit_preserves_bom_refuses_overlap_and_shifts_disjoint_regions() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-ws331-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let resolver = NativeWorkspaceResolver::new(&root).unwrap();
+        let admitted = [ResourceRef {
+            handle: "project".into(),
+            kind: "file_store".into(),
+            selector: None,
+            writable: None,
+            presented_as: None,
+        }];
+        let edit = |arguments| {
+            resolver.execute_tool(
+                &admitted,
+                &ToolCall {
+                    id: "edit-one".into(),
+                    name: "edit".into(),
+                    arguments,
+                },
+            )
+        };
+        let original = "\u{feff}α beta gamma";
+        fs::write(root.join("e.txt"), original).unwrap();
+        let bom =
+            edit(json!({"path":"e.txt", "edits":[{"oldText":"α beta gamma", "newText":"δ"}]}));
+        assert!(bom.is_ok(), "{bom:?}");
+        assert_eq!(fs::read_to_string(root.join("e.txt")).unwrap(), "\u{feff}δ");
+        fs::write(root.join("e.txt"), original).unwrap();
+        let overlap = edit(
+            json!({"path":"e.txt", "edits":[{"oldText":"α beta", "newText":"α beta"}, {"oldText":"beta gamma", "newText":"BETA gamma"}]}),
+        );
+        assert!(overlap.unwrap_err().contains("overlap"));
+        assert_eq!(fs::read_to_string(root.join("e.txt")).unwrap(), original);
+        let shifted = edit(
+            json!({"path":"e.txt", "edits":[{"oldText":"gamma", "newText":"ΓΓΓ"}, {"oldText":"α", "newText":"longer-α"}, {"oldText":"beta", "newText":"β"}]}),
+        );
+        assert!(shifted.is_ok(), "{shifted:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("e.txt")).unwrap(),
+            "\u{feff}longer-α β ΓΓΓ"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

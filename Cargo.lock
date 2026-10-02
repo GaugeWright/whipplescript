@@ -4740,6 +4740,7 @@ dependencies = [
  "office_oxide",
  "p256",
  "pdf-extract",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
