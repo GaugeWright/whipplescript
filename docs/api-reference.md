@@ -1762,10 +1762,12 @@ ascend set, causes no regression in a guarded gauge, and meets each bar. The
 command surfaces a true trade as a decision. The command never accepts a trade
 automatically.
 
-The proposer never sees the content of a sealed scenario, and the proposer sees
-the aggregates only. The `--redacted-view` flag, or a declared
-`proposer redacted` clause, extends this limit to the content of EACH scenario.
-The evidence of the campaign then has the `proposer:redacted-view` tag.
+The proposer never sees the content of a sealed scenario; it may see only
+aggregate baseline readings from that set. By default it can see names and
+inputs from open scenarios. The `--redacted-view` flag, or a declared
+`proposer redacted` clause, withholds open scenario names, inputs, and traces
+as well. The evidence of the campaign then has the
+`proposer:redacted-view` tag.
 
 The command checks each candidate for fragments of the payload of a scenario
 that are new in its source and that are identical to the original. A match puts
@@ -1784,6 +1786,20 @@ evaluation or change the proposal and adoption rules. The fixture proposer can
 supply an account through
 `WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT` as JSON with `mechanism`, `declarations`,
 and `expected_gauges`.
+
+For a native proposal, a semantic shortcut critic reviews the new source and
+changed context against only the open scenario inputs before regeneration. A
+redacted campaign withholds those inputs and scenario names from the critic;
+sealed contents are never shown. The critic may report one explained `none`,
+`ambiguous`, or `clear` finding. The engine accepts a cited excerpt only when
+it is newly present in the named program or context file. A verified `clear`
+finding may spend the candidate's single revision turn on generalization; the
+revision must compile, remove the excerpt, and clear the ordinary open gauge
+gate before it replaces the original for evaluation. A finding is advisory and
+does not veto adoption. A failed or unavailable critic is recorded as
+unassessed, not as a clean review. The campaign card retains the original and
+selected assessments, revision lineage, and critic spend. Fixture proposals
+do not run a native critic turn.
 
 The terminal state is one card of evidence for each candidate. The command
 proposes. The command does not apply.
@@ -1843,14 +1859,14 @@ granted.
 
 ```sh
 whip auth status
-whip auth set <openai|anthropic> <key>
+whip auth set <openai|anthropic|xai> <key>
 ```
 
 The command manages the credentials of the native coerce providers. The `status`
 subcommand reports, for each provider, the source of a credential and a preview
 that the command redacts. With the `--json` flag, the output has the
 `whipplescript.auth_status.v0` schema and a `configured` flag. The `set`
-subcommand stores a key for `openai` or for `anthropic`. There is no `login`
+subcommand stores a key for `openai`, `anthropic`, or `xai`. There is no `login`
 subcommand. Whip runs no OAuth procedure.
 
 Every credential this resolver finds is one whip holds itself, so `status` also

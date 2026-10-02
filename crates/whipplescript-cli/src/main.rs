@@ -24217,6 +24217,7 @@ fn coerce_provider_by_name(
     match name {
         "openai" => Some(whipplescript_kernel::coerce_native::CoerceProvider::OpenAi),
         "anthropic" => Some(whipplescript_kernel::coerce_native::CoerceProvider::Anthropic),
+        "xai" => Some(whipplescript_kernel::coerce_native::CoerceProvider::Xai),
         _ => None,
     }
 }
@@ -24302,7 +24303,7 @@ fn auth_status(options: &CliOptions) -> ExitCode {
 
 fn auth_set(args: &[&str]) -> ExitCode {
     let [provider, key] = args else {
-        eprintln!("usage: whip auth set <openai|anthropic> <key>");
+        eprintln!("usage: whip auth set <openai|anthropic|xai> <key>");
         return ExitCode::from(2);
     };
     if !auth::KNOWN_PROVIDERS.contains(provider) {

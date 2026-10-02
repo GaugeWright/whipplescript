@@ -7164,6 +7164,10 @@ workflow UnsafeHostChat {
             .to_string();
         assert!(serialized.contains("source answer"));
         assert!(serialized.contains("turn 2"));
+        // The carried thread answers under the target package's persona, not
+        // the one it was seeded with.
+        assert!(serialized.contains("Help through the governed resource tools (v2)."));
+        assert!(!serialized.contains("Help through the governed resource tools."));
 
         drop(target);
         drop(source);

@@ -141,6 +141,12 @@ export function boundManagedProviderBody(
 }
 
 const MANAGED_BYOK_ALIAS = "primary";
+/** Every managed round asks the shared gateway not to log its request and
+ * response bodies, so a visitor's turn is metered without its content being
+ * kept in the gateway's logs (gaugewright-cloud #189, SOC 2 3.4). The hosted
+ * Pi plugin's provider registration once set this and was removed; nothing in
+ * the runtime did. */
+const MANAGED_GATEWAY_NO_PAYLOAD_LOG: [string, string] = ["cf-aig-collect-log-payload", "false"];
 const MANAGED_GATEWAY_RETRYABLE_STATUSES = new Set([401, 403, 408, 425, 429]);
 
 /** Which upstream surface of the gateway a managed turn is admitted against.
@@ -563,6 +569,7 @@ export async function performManagedGatewayFetch(
         // lets the REST retry below use Cloudflare Unified Billing instead of
         // selecting the same broken provider key again.
         headers.set("cf-aig-byok-alias", MANAGED_BYOK_ALIAS);
+        headers.set(...MANAGED_GATEWAY_NO_PAYLOAD_LOG);
         return fetcher(url, { ...init, headers });
       },
       (delta) => {
@@ -623,6 +630,7 @@ export async function performManagedGatewayFetch(
       // No BYOK alias is sent here and the gateway must have no `default` key;
       // Cloudflare's credential precedence therefore reaches Unified Billing.
       headers.delete("cf-aig-byok-alias");
+      headers.set(...MANAGED_GATEWAY_NO_PAYLOAD_LOG);
       return fetcher(url, { ...init, headers });
     },
     onTextDelta,

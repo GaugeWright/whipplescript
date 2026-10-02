@@ -656,7 +656,9 @@ where
         // Resume-from-projection: continue from the persisted transcript, dropping
         // a dangling final tool-call (a crash between request and result) so the
         // model re-decides rather than the loop deadlocking on an unanswered call.
-        sanitize_resume_messages(input.resume_from.clone())
+        let mut resumed = sanitize_resume_messages(input.resume_from.clone());
+        rebase_leading_context(&mut resumed, None, input);
+        resumed
     };
     // Persist the (possibly resumed) starting context so a crash before the first
     // model call still leaves a transcript to resume from.
@@ -1468,12 +1470,17 @@ where
                     .push(self.input.model_provenance.user.clone());
                 messages
             } else {
-                let resumed = sanitize_resume_messages(self.input.resume_from.clone());
+                let mut resumed = sanitize_resume_messages(self.input.resume_from.clone());
                 self.message_provenance = if self.resume_provenance.len() == resumed.len() {
                     std::mem::take(&mut self.resume_provenance)
                 } else {
                     vec![ModelContentProvenance::default(); resumed.len()]
                 };
+                rebase_leading_context(
+                    &mut resumed,
+                    Some(&mut self.message_provenance),
+                    self.input,
+                );
                 resumed
             };
             (self.checkpoint)(&self.messages);
@@ -2768,6 +2775,57 @@ fn chat_message_from_json(value: &Value) -> Option<ChatMessage> {
 /// re-decides on resume instead of the loop waiting on an unanswered call.
 /// Anti-idempotence makes this safe: a re-issued edit that already applied is
 /// just an informative error.
+/// A resumed thread runs under the package resolving THIS turn, not the one
+/// it began under (agent-harness.md "Program identity across toolchains"), so
+/// its leading system message, and the developer message after it, are this
+/// turn's. They are the only messages a package authors; everything after
+/// them is the conversation and the worlds it saw, and is kept as recorded.
+///
+/// For a thread that continues under the same package this rewrites nothing.
+/// After a fork or adoption into another package it is what makes the target
+/// answer under its own persona instead of the source's, which was otherwise
+/// pinned into the thread at its first turn and carried by every seed.
+fn rebase_leading_context(
+    messages: &mut Vec<ChatMessage>,
+    mut provenance: Option<&mut Vec<ModelContentProvenance>>,
+    input: &BrokeredTurnInput,
+) {
+    let system_provenance = &input.model_provenance.system;
+    if matches!(messages.first(), Some(ChatMessage::System(_))) {
+        messages[0] = ChatMessage::System(input.system.clone());
+        if let Some(labels) = provenance.as_deref_mut() {
+            labels[0] = system_provenance.clone();
+        }
+    } else {
+        messages.insert(0, ChatMessage::System(input.system.clone()));
+        if let Some(labels) = provenance.as_deref_mut() {
+            labels.insert(0, system_provenance.clone());
+        }
+    }
+    let has_developer = matches!(messages.get(1), Some(ChatMessage::Developer(_)));
+    match (input.developer.is_empty(), has_developer) {
+        (false, true) => {
+            messages[1] = ChatMessage::Developer(input.developer.clone());
+            if let Some(labels) = provenance {
+                labels[1] = system_provenance.clone();
+            }
+        }
+        (false, false) => {
+            messages.insert(1, ChatMessage::Developer(input.developer.clone()));
+            if let Some(labels) = provenance {
+                labels.insert(1, system_provenance.clone());
+            }
+        }
+        (true, true) => {
+            messages.remove(1);
+            if let Some(labels) = provenance {
+                labels.remove(1);
+            }
+        }
+        (true, false) => {}
+    }
+}
+
 fn sanitize_resume_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     if let Some(ChatMessage::Assistant { tool_calls, .. }) = messages.last() {
         if !tool_calls.is_empty() {
@@ -3199,6 +3257,7 @@ mod tests {
             complete: true,
         };
         let mut turn = input(1);
+        turn.model_provenance.system = known("package:current");
         turn.resume_from = vec![
             ChatMessage::System("old system".to_owned()),
             ChatMessage::user_text("old input"),
@@ -3214,7 +3273,16 @@ mod tests {
         let Outcome::NeedsIo(IoRequest::Http(first)) = first else {
             panic!("first call");
         };
-        assert_eq!(first.model_provenance.unwrap().messages, labels);
+        // The leading system message is this turn's, so it carries this turn's
+        // label; the conversation keeps the labels it was recorded with.
+        assert_eq!(
+            first.model_provenance.unwrap().messages,
+            vec![
+                known("package:current"),
+                known("chat:old"),
+                known("chat:new")
+            ]
+        );
 
         let mut checkpoint = no_checkpoint();
         let mismatch =
@@ -3224,12 +3292,66 @@ mod tests {
         let Outcome::NeedsIo(IoRequest::Http(mismatch)) = mismatch else {
             panic!("first call with mismatched labels");
         };
-        assert!(mismatch
-            .model_provenance
-            .unwrap()
-            .messages
-            .iter()
-            .all(|source| !source.complete));
+        let messages = mismatch.model_provenance.unwrap().messages;
+        assert_eq!(messages[0], known("package:current"));
+        assert!(messages[1..].iter().all(|source| !source.complete));
+    }
+
+    /// A thread carried into another package answers under that package's
+    /// persona: its leading system and developer messages are the resuming
+    /// turn's, and the conversation after them is kept as recorded.
+    #[test]
+    fn a_resumed_thread_runs_under_the_resuming_packages_system_and_developer() {
+        let thread = |developer: Option<&str>| {
+            let mut messages = vec![ChatMessage::System("old persona".to_owned())];
+            if let Some(text) = developer {
+                messages.push(ChatMessage::Developer(text.to_owned()));
+            }
+            messages.extend([
+                ChatMessage::System("<whip_world/>".to_owned()),
+                ChatMessage::user_text("earlier request"),
+                ChatMessage::Assistant {
+                    text: "earlier reply".to_owned(),
+                    tool_calls: Vec::new(),
+                },
+                ChatMessage::user_text("new request"),
+            ]);
+            messages
+        };
+        let tail = thread(None)[1..].to_vec();
+        let cases = [
+            (Some("old guide"), "new guide", true),
+            (None, "new guide", true),
+            (Some("old guide"), "", false),
+            (None, "", false),
+        ];
+        for (recorded, current, expect_developer) in cases {
+            let mut turn = input(1);
+            turn.system = "new persona".to_owned();
+            turn.developer = current.to_owned();
+            let mut messages = thread(recorded);
+            let mut labels = vec![ModelContentProvenance::default(); messages.len()];
+            rebase_leading_context(&mut messages, Some(&mut labels), &turn);
+            assert_eq!(labels.len(), messages.len());
+            assert!(matches!(&messages[0], ChatMessage::System(text) if text == "new persona"));
+            let rest = if expect_developer {
+                assert!(
+                    matches!(&messages[1], ChatMessage::Developer(text) if text == "new guide")
+                );
+                &messages[2..]
+            } else {
+                &messages[1..]
+            };
+            assert_eq!(rest, &tail[..], "{recorded:?} -> {current:?}");
+        }
+
+        // A recorded thread with no system message of its own gains one.
+        let mut turn = input(1);
+        turn.system = "new persona".to_owned();
+        let mut bare = vec![ChatMessage::user_text("only a request")];
+        rebase_leading_context(&mut bare, None, &turn);
+        assert!(matches!(&bare[0], ChatMessage::System(text) if text == "new persona"));
+        assert_eq!(bare.len(), 2);
     }
 
     /// Transient provider errors auto-retry (bounded); a persistent one still

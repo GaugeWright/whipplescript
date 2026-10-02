@@ -706,12 +706,14 @@ function gatewayRound(
 test("a managed round spends the gateway token and no customer credential", async () => {
   let capturedAuthorization = "";
   let capturedByokAlias = "";
+  let capturedNoPayloadLog = "";
   let capturedUrl = "";
   await gatewayRound(async (url, init) => {
     capturedUrl = url;
     const headers = new Headers(init.headers);
     capturedAuthorization = headers.get("authorization") ?? "";
     capturedByokAlias = headers.get("cf-aig-byok-alias") ?? "";
+    capturedNoPayloadLog = headers.get("cf-aig-collect-log-payload") ?? "";
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -723,6 +725,8 @@ test("a managed round spends the gateway token and no customer credential", asyn
   // And the sentinel never survives to the wire.
   assert.ok(!capturedAuthorization.includes(MODEL_AUTH_SENTINEL));
   assert.equal(capturedUrl, `${gatewayBinding.base_url}/chat/completions`);
+  // The shared gateway meters the round without keeping its bodies.
+  assert.equal(capturedNoPayloadLog, "false");
   assert.equal(capturedByokAlias, "primary");
 });
 
@@ -807,6 +811,10 @@ for (const retryableStatus of [401, 403, 408, 425, 429, 500, 503]) {
     assert.equal(calls[1]!.headers.get("cf-aig-gateway-id"), "gaugewright-panels");
     assert.equal(calls[1]!.headers.get("cf-aig-byok-alias"), null);
     assert.equal(calls[1]!.headers.get("authorization"), "Bearer cf-gateway-token");
+    // Neither the metered round nor its fallback lets the gateway log bodies.
+    for (const call of calls) {
+      assert.equal(call.headers.get("cf-aig-collect-log-payload"), "false");
+    }
     assert.equal(JSON.parse(result).status, 200);
   });
 }

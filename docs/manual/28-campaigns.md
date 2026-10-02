@@ -63,10 +63,11 @@ Two mechanisms for honesty go with each campaign:
 
 - **The holdout set.** With sufficient pinned scenarios, the command seals a
   fraction of the scenarios from the proposer. The command uses the sealed
-  scenarios only for the final score. Thus the optimizer cannot overfit to the
-  corpus that it saw. With too few scenarios, the command *tags* the campaign
-  as `unheld-out`. The command does not continue silently. The example above
-  shows this tag. Thus the record contains the weakness.
+  scenarios only for the promotion check. This limits one route for fitting to
+  visible cases; it does not prove that a change will generalize. Repeated
+  promotion checks also wear out a seal. With too few scenarios, the command
+  *tags* the campaign as `unheld-out`. The command does not continue silently.
+  The example above shows this tag. Thus the record contains the weakness.
 - **The redacted view.** A `proposer redacted` clause limits the data that the
   model of the proposer sees. The `--redacted-view` flag does the same. The
   model then sees aggregate statistics only. The model never sees the input of
@@ -80,20 +81,68 @@ A bare `whip improve` command with no campaign is **repair mode**. In this
 mode, the command restores a bar that the workflow violated and changes nothing
 else. This mode is the conservative default after a regression.
 
-## A person adopts a candidate
+## Improve the whole admitted harness
 
-The optimizer proposes a candidate. The optimizer never ships a candidate. A
-person adopts a candidate that survives, and the adoption is explicit:
+The native proposer can change more than prompt text in a `.whip` file. It may
+change rules, agent instructions, tool use, and control flow, subject to the
+program's gauges and compiler checks. To include project instructions, skills,
+or documents an Agent reads through file tools, put the `.whip` file outside a
+dedicated context directory and admit that directory explicitly:
 
 ```sh
-whip answer C-1:candidate-2 --accept --by jack
-whip adopt …
+whip improve release_tuning --program agent.whip --context-root ./agent-context --provider owned
 ```
 
-An accepted answer becomes a durable decision that you can attribute. Chapter
-29 gives these decisions as precedents. A rejected answer is equally in the
-record. The division of authority is the same as in chapter 24. The machinery
-collects evidence and holds the constraints. A person owns the change.
+Every regular UTF-8 file under that root becomes part of the versioned
+candidate. The current limit is 64 files, 64 KiB per file, and 256 KiB in
+total; symbolic links are refused. The proposer may add, replace, or delete
+files. Baseline and candidate evaluations use separate materialized copies, so
+an unadopted proposal does not edit the live directory. The program and all
+admitted files must still match the campaign's baseline when you adopt. A
+campaign evaluating an Agent should use its actual provider binding; `owned`
+is the local Managed provider in this example. A fixture provider is useful for
+contained tests but cannot establish how the deployed Agent will respond. A
+marked scenario uses input replay on both sides of a context campaign, because
+its frozen prefix might already have read the old context; the evidence says
+`context-input-replay`. A global context directory is not captured by this
+flag. See the [`improve` reference](../api-reference.md#improve) for the exact
+limits and refusals.
+
+Each native proposal states one testable mechanism, the declarations and
+resource paths it expects to change, and the gauges it expects to improve.
+The campaign card shows the actual changed declarations and files beside that
+account. An `edit-account-mismatch` warns that the account omitted a change;
+it does not prove that the proposal contains independent mechanisms. Before
+open-case evaluation, a semantic shortcut critic looks for case-specific
+dependencies in the new source or context. A finding must cite a newly added
+excerpt, and its judgment is advisory. A verified clear finding may trigger
+one generalizing revision; both the finding and the revision remain in the
+campaign record. An unavailable critic is recorded as unassessed, not clean.
+Neither the proposer nor the critic receives sealed scenario contents.
+
+For a useful campaign, pin cases that exercise the behavior you want and its
+important guards, run `whip improve`, then inspect `whip campaign <id>` and
+the candidate cards before adopting. Keep different cases outside the
+campaign for a later transfer check. An open-case gain, a sealed promotion,
+and an `unheld-out` tag make different evidence claims. None substitutes for
+checking the adopted behavior on later work.
+
+## A person adopts a candidate
+
+The optimizer proposes a candidate. It does not apply it. A person reviews the
+card and explicitly adopts a proposed candidate:
+
+```sh
+whip campaign C-1
+whip adopt C-1:K-2 --program agent.whip
+```
+
+If the system instead surfaces a **tradeoff**, a person can accept or reject
+that tradeoff with `whip answer C-1:K-2 --accept|--reject --by jack`. An
+accepted tradeoff then becomes adoptable and sets a revocable precedent; an
+ordinary proposed candidate does not need an `answer`. Chapter 29 explains
+precedents. The division of authority is the same as in chapter 24. The
+machinery collects evidence and holds the constraints. A person owns the change.
 
 ## Where next
 
