@@ -3,16 +3,13 @@
 //! `local` provider's `MemoryStore` seam over `DoSql`, so memory pools work on
 //! the durable object the same way they do natively.
 //!
-//! Same table shape as `whipplescript_store::memory::SqliteMemoryStore`, but the
-//! lexical match is `LIKE`-based rather than FTS5: the DO's platform SQLite is
-//! not guaranteed to bundle FTS5, and the native store's inverted index would
-//! not port to the Worker's `state.storage.sql` anyway. Retrieval stays "boring"
-//! (per std-memory.md): case-insensitive per-token substring match, pool
-//! scoping, recency ordering, `context_limit` cap.
+//! Same content table and FTS5 lexical contract as the native store. SQLite-backed
+//! Durable Objects support FTS5; the derived index is initialized atomically and
+//! backfilled once for an existing pool, without changing content or provenance.
 
 use whipplescript_store::memory::{
-    CurateStrategy, CurationReport, MemoryEntryRow, MemoryPoolRow, MemoryStore, NewMemoryEntry,
-    DEFAULT_CONTEXT_LIMIT,
+    fts_match_expression, CurateStrategy, CurationReport, MemoryEntryRow, MemoryPoolRow,
+    MemoryStore, NewMemoryEntry, DEFAULT_CONTEXT_LIMIT,
 };
 use whipplescript_store::StoreResult;
 
@@ -57,6 +54,29 @@ impl<Sql: DoSql> DoMemoryStore<Sql> {
             &[],
         )
         .map_err(sql_err)?;
+        // The table is the initialization marker: creation, triggers and legacy
+        // backfill commit together. A failed first touch leaves no partial index
+        // and may be retried. Backfill costs scale with existing entries once;
+        // neither reopening a healthy store nor querying rebuilds the index.
+        let indexed = sql
+            .query(
+                "SELECT name FROM sqlite_master WHERE name = 'memory_entries_fts'",
+                &[],
+            )
+            .map_err(sql_err)?;
+        if indexed.is_empty() {
+            sql.atomic(&mut || {
+                for statement in [
+                    "CREATE VIRTUAL TABLE memory_entries_fts USING fts5(text, content='memory_entries', content_rowid='memory_id')",
+                    "CREATE TRIGGER memory_entries_fts_insert AFTER INSERT ON memory_entries BEGIN INSERT INTO memory_entries_fts(rowid, text) VALUES (new.memory_id, new.text); END",
+                    "CREATE TRIGGER memory_entries_fts_delete AFTER DELETE ON memory_entries BEGIN INSERT INTO memory_entries_fts(memory_entries_fts, rowid, text) VALUES ('delete', old.memory_id, old.text); END",
+                    "INSERT INTO memory_entries_fts(memory_entries_fts) VALUES ('rebuild')",
+                ] {
+                    sql.execute(statement, &[]).map_err(sql_err)?;
+                }
+                Ok(())
+            })?;
+        }
         Ok(Self { sql })
     }
 
@@ -84,23 +104,6 @@ fn entry_from_row(row: &[SqlValue]) -> MemoryEntryRow {
         author_actor: as_opt_text(&row[7]),
         source: as_opt_text(&row[8]),
         note: as_opt_text(&row[9]),
-    }
-}
-
-/// Alphanumeric tokens of the query text — the same tokenization the native
-/// store feeds FTS, here turned into case-insensitive `LIKE` substrings.
-/// `None` when the text has no indexable tokens (recall then falls back to
-/// pure recency).
-fn like_tokens(query_text: &str) -> Option<Vec<String>> {
-    let tokens: Vec<String> = query_text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(|token| format!("%{}%", token.to_lowercase()))
-        .collect();
-    if tokens.is_empty() {
-        None
-    } else {
-        Some(tokens)
     }
 }
 
@@ -139,28 +142,22 @@ impl<Sql: DoSql> MemoryStore for DoMemoryStore<Sql> {
         context_limit: Option<usize>,
     ) -> StoreResult<Vec<MemoryEntryRow>> {
         let limit = context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT);
-        let Some(tokens) = like_tokens(query_text) else {
+        let Some(expression) = fts_match_expression(query_text) else {
             return self.entries(pool, Some(limit));
         };
-        // pool is ?1; each token binds ?2.. ; the limit binds last.
-        let mut params: Vec<SqlValue> = vec![text(pool)];
-        let ors: Vec<String> = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, token)| {
-                params.push(text(token));
-                format!("LOWER(text) LIKE ?{}", index + 2)
-            })
-            .collect();
-        params.push(SqlValue::Int(limit as i64));
-        let limit_placeholder = params.len();
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM memory_entries \
-             WHERE pool = ?1 AND ({}) \
-             ORDER BY created_at DESC, memory_id DESC LIMIT ?{limit_placeholder}",
-            ors.join(" OR ")
+             WHERE pool = ?1 AND memory_id IN \
+             (SELECT rowid FROM memory_entries_fts WHERE memory_entries_fts MATCH ?2) \
+             ORDER BY created_at DESC, memory_id DESC LIMIT ?3"
         );
-        let rows = self.sql.query(&sql, &params).map_err(sql_err)?;
+        let rows = self
+            .sql
+            .query(
+                &sql,
+                &[text(pool), text(&expression), SqlValue::Int(limit as i64)],
+            )
+            .map_err(sql_err)?;
         Ok(rows.iter().map(|row| entry_from_row(row)).collect())
     }
 
@@ -291,6 +288,167 @@ mod tests {
     }
 
     #[test]
+    fn native_and_hosted_lexical_retrieval_have_identical_results() {
+        use whipplescript_store::memory::SqliteMemoryStore;
+        let mut native = SqliteMemoryStore::open_in_memory().unwrap();
+        let mut hosted = store();
+        for (pool, value) in [
+            ("p", "concatenate"),
+            ("p", "CAT café running"),
+            ("p", "cat dog"),
+            ("p", "cat dog"),
+            ("other", "cat café"),
+            ("p", "punctuation hyphen-word"),
+            ("p", "東京 café"),
+        ] {
+            let mut entry = learn(pool, value, "effect");
+            entry.author_actor = Some("author");
+            entry.source = Some("source");
+            native.write(&entry).unwrap();
+            hosted.write(&entry).unwrap();
+        }
+        for query in [
+            "cat",
+            "CAT",
+            "cafe",
+            "café",
+            "東京",
+            "run",
+            "running",
+            "cat OR dog",
+            "hyphen-word",
+            r#""cat" + dog"#,
+            "!!!",
+            "missing",
+        ] {
+            for limit in [None, Some(0), Some(1), Some(8)] {
+                assert_eq!(
+                    native.query("p", query, limit).unwrap(),
+                    hosted.query("p", query, limit).unwrap(),
+                    "query={query}, limit={limit:?}"
+                );
+            }
+        }
+        for strategy in [
+            CurateStrategy::DedupeByText,
+            CurateStrategy::Prune { capacity: 1 },
+            CurateStrategy::Prune { capacity: 0 },
+        ] {
+            assert_eq!(
+                native.curate("p", strategy).unwrap(),
+                hosted.curate("p", strategy).unwrap()
+            );
+            assert_eq!(
+                native.query("p", "cat café", None).unwrap(),
+                hosted.query("p", "cat café", None).unwrap()
+            );
+            assert_eq!(
+                native.query("other", "cat", None).unwrap(),
+                hosted.query("other", "cat", None).unwrap()
+            );
+        }
+    }
+
+    struct InitializationSql {
+        inner: TestSql,
+        fail_rebuild: std::cell::Cell<bool>,
+        rebuilds: std::cell::Cell<usize>,
+    }
+
+    impl DoSql for &InitializationSql {
+        fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            self.inner.atomic(body)
+        }
+        fn execute(&self, query: &str, params: &[SqlValue]) -> Result<u64, String> {
+            if query.contains("VALUES ('rebuild')") {
+                self.rebuilds.set(self.rebuilds.get() + 1);
+                if self.fail_rebuild.get() {
+                    return Err("injected backfill failure".into());
+                }
+            }
+            self.inner.execute(query, params)
+        }
+        fn query(&self, query: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.inner.query(query, params)
+        }
+    }
+
+    #[test]
+    fn legacy_backfill_is_atomic_retryable_and_runs_once() {
+        let sql = InitializationSql {
+            inner: TestSql::in_memory(),
+            fail_rebuild: std::cell::Cell::new(true),
+            rebuilds: std::cell::Cell::new(0),
+        };
+        // Open's content schema remains readable even if index initialization fails.
+        assert!(DoMemoryStore::open(&sql).is_err());
+        sql.inner.execute("INSERT INTO memory_entries (pool, text, created_at, source_instance_id, source_effect_id, source_run_id, author_actor, source, note) VALUES ('p', 'legacy cat', '2026-10-02', 'instance', 'effect', 'run', 'owner', 'source', 'note')", &[]).unwrap();
+        let original = sql
+            .inner
+            .query("SELECT * FROM memory_entries", &[])
+            .unwrap();
+        assert!(DoMemoryStore::open(&sql).is_err());
+        assert_eq!(
+            sql.inner
+                .query("SELECT * FROM memory_entries", &[])
+                .unwrap(),
+            original
+        );
+        let artifacts = sql
+            .inner
+            .query(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'memory_entries_fts%'",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            artifacts.is_empty(),
+            "failed initialization must roll back index and triggers"
+        );
+        assert_eq!(
+            sql.inner
+                .query("SELECT COUNT(*) FROM memory_entries", &[])
+                .unwrap()[0][0],
+            SqlValue::Int(1)
+        );
+        sql.fail_rebuild.set(false);
+        let mut first = DoMemoryStore::open(&sql).unwrap();
+        let hits = first.query("p", "cat", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].author_actor.as_deref(), Some("owner"));
+        let mut native = whipplescript_store::memory::SqliteMemoryStore::open_in_memory().unwrap();
+        let mut legacy = learn("p", "legacy cat", "unused");
+        legacy.created_at = "2026-10-02";
+        legacy.source_instance_id = Some("instance");
+        legacy.source_effect_id = Some("effect");
+        legacy.source_run_id = Some("run");
+        legacy.author_actor = Some("owner");
+        legacy.source = Some("source");
+        legacy.note = Some("note");
+        native.write(&legacy).unwrap();
+        assert_eq!(hits, native.query("p", "cat", None).unwrap());
+        let rebuilds = sql.rebuilds.get();
+        let mut new = learn("p", "new cat", "e1");
+        new.created_at = "2026-10-03";
+        first.write(&new).unwrap();
+        new.source_effect_id = Some("e2");
+        first.write(&new).unwrap();
+        first.curate("p", CurateStrategy::DedupeByText).unwrap();
+        assert_eq!(first.query("p", "cat", None).unwrap().len(), 2);
+        first
+            .curate("p", CurateStrategy::Prune { capacity: 1 })
+            .unwrap();
+        let reopened = DoMemoryStore::open(&sql).unwrap();
+        assert_eq!(reopened.query("p", "legacy", None).unwrap().len(), 0);
+        assert_eq!(reopened.query("p", "new", None).unwrap().len(), 1);
+        assert_eq!(
+            sql.rebuilds.get(),
+            rebuilds,
+            "healthy reopen/query must not rebuild"
+        );
+    }
+
+    #[test]
     fn write_query_round_trip_scopes_to_pool_and_matches_lexically() {
         let mut store = store();
         store
@@ -301,7 +459,7 @@ mod tests {
             .unwrap();
         store.write(&learn("other", "deploy notes", "e3")).unwrap();
 
-        // Lexical LIKE match, scoped to the pool: only the deploy entry in
+        // Lexical FTS5 match, scoped to the pool: only the deploy entry in
         // `project` qualifies (the `other`-pool deploy entry is out of scope).
         let hits = store.query("project", "deploy", None).unwrap();
         assert_eq!(hits.len(), 1);

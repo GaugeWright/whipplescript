@@ -3972,8 +3972,7 @@ pub fn memory_item_json(row: &whipplescript_store::memory::MemoryEntryRow) -> Va
 /// The `std.memory` capability provider's outcome, host-agnostic over any
 /// [`MemoryStore`](whipplescript_store::memory::MemoryStore) backend: native's
 /// file-backed `SqliteMemoryStore` and the DO's `DoMemoryStore` both call this,
-/// so recall/learn/curate behave identically on either host (the only
-/// difference is FTS5 vs LIKE lexical match inside the store). `memory.write`
+/// so recall/learn/curate share the same FTS5 lexical contract on either host. `memory.write`
 /// stores one entry (effect-plane determinism: empty `created_at`, provenance
 /// from the effect id); `memory.query` returns a MemoryContext; `memory.curate`
 /// dedupes the pool by content identity.

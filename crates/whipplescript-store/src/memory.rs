@@ -260,8 +260,7 @@ fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEntryRow> {
 /// Raw query text as a safe FTS5 expression: alphanumeric tokens, each quoted
 /// (never parsed as FTS syntax), joined with OR so any-token match qualifies.
 /// `None` when the text has no indexable tokens.
-#[cfg(feature = "native")]
-fn fts_match_expression(query_text: &str) -> Option<String> {
+pub fn fts_match_expression(query_text: &str) -> Option<String> {
     let tokens: Vec<String> = query_text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|token| !token.is_empty())
