@@ -29,6 +29,10 @@ pub struct GaugeEvidence {
     pub bar: Option<Bar>,
     pub baseline: Vec<Reading>,
     pub candidate: Vec<Reading>,
+    /// The host proved that the candidate has no denominator for this metric.
+    /// It stays unmeasured on the card, but an unnamed guard does not fail
+    /// closed merely because a ratio stopped applying.
+    pub candidate_not_applicable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -301,7 +305,11 @@ pub fn select(gauges: &[GaugeEvidence], campaign: &Campaign) -> Verdict {
                     gauge.name
                 ));
             }
-            if movement == Delta::Unmeasured && baseline.n() > 0 && candidate.n() == 0 {
+            if movement == Delta::Unmeasured
+                && baseline.n() > 0
+                && candidate.n() == 0
+                && !gauge.candidate_not_applicable
+            {
                 guard_broken = true;
                 reasons.push(format!(
                     "`{}` became unmeasurable on the candidate (guarded gauges fail closed)",
@@ -356,6 +364,7 @@ mod tests {
             bar: None,
             baseline: readings(before),
             candidate: readings(after),
+            candidate_not_applicable: false,
         }
     }
 
@@ -477,5 +486,23 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("unmeasurable")));
+    }
+
+    #[test]
+    fn proven_zero_denominator_does_not_block_an_independent_resource_gain() {
+        let mut tokens = gauge("std.tokens", &[200.0, 200.0], &[0.0, 0.0]);
+        tokens.direction_up = false;
+        tokens.resource = true;
+        let mut cache = gauge("std.cache_hit", &[0.5, 0.5], &[]);
+        cache.resource = true;
+        cache.candidate_not_applicable = true;
+        let campaign = Campaign {
+            ascend: BTreeMap::from([("std.tokens".to_owned(), None)]),
+            ..Default::default()
+        };
+        let result = select(&[tokens, cache], &campaign);
+        assert!(result.proposable, "{:?}", result.reasons);
+        assert_eq!(result.lines[1].delta, Delta::Unmeasured);
+        assert_eq!(result.lines[1].candidate, None);
     }
 }

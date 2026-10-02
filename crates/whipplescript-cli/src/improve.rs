@@ -1157,10 +1157,15 @@ struct RunObservation {
 /// fabricated) — if ANY usage-bearing run cannot price (no table entry,
 /// no recorded model, no input/output split), the reading is skipped with
 /// the reason rather than reported as a partial total wearing a full one.
+/// An empty run ledger is an observed zero, distinct from a nonempty ledger
+/// with missing usage.
 fn total_spend_usd(
     runs: &[whipplescript_store::RunView],
     prices: &PriceTable,
 ) -> Result<Option<f64>, String> {
+    if runs.is_empty() {
+        return Ok(Some(0.0));
+    }
     let mut total_micros: i64 = 0;
     let mut any = false;
     for run in runs {
@@ -1427,6 +1432,9 @@ fn parse_store_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
 }
 
 fn total_latency_ms(runs: &[whipplescript_store::RunView]) -> Option<f64> {
+    if runs.is_empty() {
+        return Some(0.0);
+    }
     let mut total = 0.0;
     let mut any = false;
     for run in runs {
@@ -1443,6 +1451,9 @@ fn total_latency_ms(runs: &[whipplescript_store::RunView]) -> Option<f64> {
 }
 
 fn total_tokens(runs: &[whipplescript_store::RunView]) -> Option<f64> {
+    if runs.is_empty() {
+        return Some(0.0);
+    }
     let mut total = 0.0;
     let mut any = false;
     for run in runs {
@@ -2756,6 +2767,16 @@ fn dominance_verdict(
                     passed: reading.passed,
                 })
                 .collect(),
+            candidate_not_applicable: spec.name == "std.cache_hit"
+                && !cand.is_empty()
+                && !campaign.floors.contains_key("std.cache_hit")
+                && cand.iter().all(|observation| {
+                    observation
+                        .readings
+                        .get("std.tokens")
+                        .is_some_and(|reading| reading.score == 0.0)
+                        && !observation.readings.contains_key("std.cache_hit")
+                }),
         })
         .collect::<Vec<_>>();
     let selection = shared::select(
@@ -7443,6 +7464,72 @@ mod tests {
     }
 
     #[test]
+    fn zero_token_candidate_keeps_undefined_cache_ratio_without_hiding_missing_usage() {
+        let specs = ["std.tokens", "std.cache_hit"]
+            .iter()
+            .map(|name| GaugeSpec {
+                name: (*name).to_owned(),
+                judge: JudgeSpec::Builtin,
+                bar: None,
+                inputs: Vec::new(),
+                direction_up: *name == "std.cache_hit",
+                builtin: true,
+            })
+            .collect::<Vec<_>>();
+        let campaign = CampaignSpec {
+            ascend: vec![("std.tokens".to_owned(), None)],
+            ..Default::default()
+        };
+        let observation = |tokens: f64, cache: Option<f64>| RunObservation {
+            scenario: None,
+            readings: [
+                Some(("std.tokens", tokens)),
+                cache.map(|rate| ("std.cache_hit", rate)),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(name, score)| {
+                (
+                    name.to_owned(),
+                    GaugeReading {
+                        score,
+                        passed: None,
+                        tags: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+            skipped: Vec::new(),
+            judge_usage: Vec::new(),
+        };
+        let base = vec![observation(200.0, Some(0.0)); 6];
+        let zero = vec![observation(0.0, None); 6];
+        let result = dominance_verdict(&specs, &campaign, &base, &zero);
+        assert!(result.proposable, "{:?}", result.reasons);
+        assert_eq!(result.lines[1].delta, Delta::Unmeasured);
+        assert_eq!(result.lines[1].candidate, None);
+
+        let missing_cache = vec![observation(10.0, None); 6];
+        let result = dominance_verdict(&specs, &campaign, &base, &missing_cache);
+        assert!(!result.proposable);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("std.cache_hit")));
+
+        let floor = CampaignSpec {
+            floors: BTreeMap::from([("std.cache_hit".to_owned(), (true, 0.0))]),
+            ..campaign
+        };
+        let result = dominance_verdict(&specs, &floor, &base, &zero);
+        assert!(!result.proposable);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("std.cache_hit")));
+    }
+
+    #[test]
     fn dominance_refuses_guard_regression() {
         let specs = vec![spec_quality("focus"), spec_quality_no_bar("guarded")];
         let campaign = CampaignSpec {
@@ -8288,6 +8375,19 @@ mod tests {
             json!({"usage": {"input_tokens": 5, "output_tokens": 5}}),
         );
         assert!(total_spend_usd(&[priced, unpriceable], &table).is_err());
+    }
+
+    #[test]
+    fn a_workflow_without_provider_runs_has_measured_zero_resource_use() {
+        let runs = [];
+        assert_eq!(total_tokens(&runs), Some(0.0));
+        assert_eq!(total_latency_ms(&runs), Some(0.0));
+        assert_eq!(
+            total_spend_usd(&runs, &PriceTable::default()),
+            Ok(Some(0.0))
+        );
+        // Cache-hit rate has no denominator when the workflow uses no tokens.
+        assert_eq!(total_cache_hit_rate(&runs), None);
     }
 
     #[test]

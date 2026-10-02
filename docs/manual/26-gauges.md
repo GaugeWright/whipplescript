@@ -67,6 +67,14 @@ gauges deterministically from the ledger of the run. The gauges are
 `std.spend`, `std.latency`, and `std.tokens`. Each of these three descends: a
 smaller value is better. The fourth gauge is `std.cache_hit`, which ascends.
 This gauge exists where the provider reports the use of its cache.
+When a completed workflow makes no provider runs, spend, provider-run latency,
+and tokens read as zero. Cache-hit rate is absent because there is no input
+traffic to divide by. A provider run that omits usage or price data is still
+unscored for the affected gauge; absence is not treated as zero.
+In an improvement campaign, a proven zero-token candidate does not fail the
+unnamed cache-hit guard solely because that rate stopped applying. The card
+keeps the rate unmeasured. Missing cache reporting for a candidate that used
+provider tokens still fails a previously measured guard closed.
 
 ## Ambient scores: each run is evidence
 
