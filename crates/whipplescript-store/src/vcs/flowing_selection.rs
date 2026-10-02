@@ -164,7 +164,7 @@ pub enum FlowingTargetEffectsOutcome {
 
 /// Ordered per-unit effects of one mixed target cut. This is a content
 /// comparison only; no holder transfers until an atomic batch receipt exists.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FlowingBatchUnitEffect {
     unit_id: String,
     source_branch_id: String,
@@ -191,7 +191,7 @@ impl FlowingBatchUnitEffect {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FlowingBatchTargetEffects {
     target_branch_id: String,
     target_before_cut_id: Option<String>,
@@ -1593,6 +1593,90 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             target_after_manifest_hash: target_cut.manifest_hash,
             units,
         }))
+    }
+
+    /// Publish the mixed content witness and its content closure before a
+    /// handoff can try to move a branch ref. This record does not prove the
+    /// source-unit dependency order or transfer a holder: every unit remains
+    /// owed until a later atomic head-and-receipt transaction consumes it.
+    pub fn record_private_batch_derivation(
+        &mut self,
+        derivation_id: &str,
+        witness: &FlowingBatchTargetEffects,
+        actor: &str,
+        recorded_at: &str,
+    ) -> StoreResult<crate::branches::flowing_sources::RecordFlowingDerivedCutOutcome> {
+        use crate::branches::flowing_sources::{
+            RecordFlowingDerivedCut, RecordFlowingDerivedCutOutcome as R,
+        };
+        let request = RecordFlowingDerivedCut::new(derivation_id, witness, actor, recorded_at);
+        if self.branches.flowing_derived_cut(derivation_id)?.is_some() {
+            return self.branches.record_flowing_derived_cut(request);
+        }
+        let unit_ids: Vec<&str> = witness
+            .units()
+            .iter()
+            .map(FlowingBatchUnitEffect::unit_id)
+            .collect();
+        use FlowingBatchTargetEffectsOutcome as B;
+        use FlowingTargetEffectsOutcome as E;
+        let observed =
+            self.verify_private_batch_target_effects(&unit_ids, witness.target_after_cut_id())?;
+        let missing_content = match &observed {
+            B::Refused(E::MissingContent { content_id }) => Some(content_id.clone()),
+            _ => None,
+        };
+        let missing_content_id = missing_content.unwrap_or_default();
+        // REFUSAL: missing constituent content cannot be published as derivation
+        if !missing_content_id.is_empty() {
+            return Ok(R::MissingContent {
+                content_id: missing_content_id,
+            });
+        }
+        if observed != B::Verified(witness.clone()) {
+            return Ok(R::WitnessMismatch);
+        }
+        let mut ids = BTreeSet::new();
+        let mut roots = vec![witness.target_after_manifest_hash().to_owned()];
+        if let Some(before_cut_id) = witness.target_before_cut_id() {
+            let Some(before_cut) = self.branches.get_cut(before_cut_id)? else {
+                return Ok(R::WitnessMismatch);
+            };
+            roots.push(before_cut.manifest_hash);
+        }
+        for unit in witness.units() {
+            let Some(declaration) = self.branches.contribution_declaration(unit.unit_id())? else {
+                return Ok(R::UnitMissing {
+                    unit_id: unit.unit_id().into(),
+                });
+            };
+            let Some(basis) = self.branches.contribution_basis(unit.unit_id())? else {
+                return Ok(R::BasisMissing {
+                    unit_id: unit.unit_id().into(),
+                });
+            };
+            roots.push(declaration.source_manifest_hash);
+            for atom in basis.atoms {
+                ids.extend(atom.before);
+                ids.extend(atom.after);
+            }
+        }
+        for root in roots {
+            let Some(manifest) = self.load_manifest_opt_raw(&root)? else {
+                return Ok(R::MissingContent { content_id: root });
+            };
+            ids.insert(root.clone());
+            match manifest {
+                RawManifest::Tree(_) => {
+                    ids.extend(crate::manifest_tree::reachable_ids(&self.content, &root)?)
+                }
+                RawManifest::Flat(files) => ids.extend(files.into_values()),
+            }
+        }
+        let ids: Vec<String> = ids.into_iter().collect();
+        let branches = &mut self.branches;
+        self.content
+            .publish_retained(&ids, || branches.record_flowing_derived_cut(request))
     }
 
     /// Check one bound unit against a recorded trunk candidate. This is a
@@ -4440,6 +4524,151 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn mixed_derivation_is_durable_before_any_holder_moves() {
+        use crate::branches::flowing_sources::RecordFlowingDerivedCutOutcome as R;
+        let mut vcs = bound_unit();
+        vcs.write("twig", "a.txt", Some("B"), "twig-b", "t7")
+            .unwrap();
+        pin(&mut vcs, "twig-b", "pin-b");
+        declare(&mut vcs, "unit-b", "pin-b");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-b", &selection::parse("change(twig-b)").unwrap())
+            .unwrap()
+        else {
+            panic!("second source change")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-b", &selection, "t8")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let b = vcs.content.put_text("B").unwrap();
+        let manifest_hash = vcs
+            .store_manifest(&BTreeMap::from([("a.txt".to_owned(), b)]))
+            .unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "batch-cut",
+                change_id: "batch-change",
+                branch_id: "branch",
+                manifest_hash: &manifest_hash,
+                parent_cut_id: None,
+                origin: Some("transport-batch:derive-1"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t9",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_batch_target_effects(&["unit-a", "unit-b"], "batch-cut")
+            .unwrap()
+        else {
+            panic!("complete mixed witness")
+        };
+        let mut forged_json = serde_json::to_value(&witness).unwrap();
+        forged_json["units"][0]["basis_digest"] = "wrong".into();
+        let forged = serde_json::from_value(forged_json).unwrap();
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-forged", &forged, "mediator", "t9")
+                .unwrap(),
+            R::WitnessMismatch
+        );
+        assert!(vcs
+            .branches
+            .flowing_derived_cut("derive-forged")
+            .unwrap()
+            .is_none());
+        let R::Recorded(record) = vcs
+            .record_private_batch_derivation("derive-1", &witness, "mediator", "t9")
+            .unwrap()
+        else {
+            panic!("durable derivation")
+        };
+        assert_eq!(record.witness, witness);
+        assert_eq!(
+            vcs.branches.flowing_derived_cut("derive-1").unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-1", &witness, "mediator", "t9")
+                .unwrap(),
+            R::Existing(record)
+        );
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-1", &witness, "someone-else", "t9")
+                .unwrap(),
+            R::IdentityMismatch
+        );
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-2", &witness, "mediator", "t9")
+                .unwrap(),
+            R::CutAlreadyDerived
+        );
+        assert_eq!(
+            vcs.branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id,
+            None
+        );
+        for unit in ["unit-a", "unit-b"] {
+            assert!(vcs.branches.contribution_handoff(unit).unwrap().is_none());
+        }
+        let second_body = vcs
+            .branches
+            .contribution_basis("unit-b")
+            .unwrap()
+            .unwrap()
+            .atoms[0]
+            .after
+            .clone()
+            .unwrap();
+        assert!(matches!(
+            vcs.content.erase(&second_body, "t10").unwrap(),
+            crate::content::EraseOutcome::Erased { .. }
+        ));
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-2", &witness, "mediator", "t9")
+                .unwrap(),
+            R::MissingContent {
+                content_id: second_body
+            }
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "whip-flowing-derived-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        vcs.branches
+            .test_connection()
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reopened = BranchStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .flowing_derived_cut("derive-1")
+                .unwrap()
+                .unwrap()
+                .witness,
+            witness
+        );
+        reopened
+            .test_connection()
+            .execute(
+                "UPDATE flowing_derived_cuts SET witness_digest = 'wrong' WHERE derivation_id = 'derive-1'",
+                [],
+            )
+            .unwrap();
+        assert!(reopened.flowing_derived_cut("derive-1").is_err());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

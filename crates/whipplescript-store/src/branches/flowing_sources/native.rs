@@ -1,14 +1,88 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    missing_basis_field, missing_declaration_field, missing_handoff_field, missing_pin_field,
-    missing_release_field, BindContributionBasis, BindContributionBasisOutcome, ContributionBasis,
-    ContributionDeclaration, DeclareContribution, DeclareContributionOutcome, FlowingSources,
-    HandoffContribution, HandoffContributionOutcome, HandoffReceipt, PinPrivateCut,
-    PinPrivateCutOutcome, PrivateCutPin, ReleasePrivateCut, ReleasePrivateCutOutcome,
+    derived_cut_digest, missing_basis_field, missing_declaration_field, missing_derived_cut_field,
+    missing_handoff_field, missing_pin_field, missing_release_field, BindContributionBasis,
+    BindContributionBasisOutcome, ContributionBasis, ContributionDeclaration, DeclareContribution,
+    DeclareContributionOutcome, FlowingDerivedCut, FlowingSources, HandoffContribution,
+    HandoffContributionOutcome, HandoffReceipt, PinPrivateCut, PinPrivateCutOutcome, PrivateCutPin,
+    RecordFlowingDerivedCut, RecordFlowingDerivedCutOutcome, ReleasePrivateCut,
+    ReleasePrivateCutOutcome,
 };
 use crate::branches::{BranchStatus, BranchStore, MAINLINE_BRANCH_ID};
-use crate::StoreResult;
+use crate::{StoreError, StoreResult};
+
+fn read_derived_cut(
+    connection: &Connection,
+    derivation_id: &str,
+) -> StoreResult<Option<FlowingDerivedCut>> {
+    type DerivedRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    let row: Option<DerivedRow> = connection
+        .query_row(
+            "SELECT derivation_id, target_branch_id, target_before_cut_id, \
+                    target_after_cut_id, target_after_manifest_hash, witness_json, \
+                    witness_digest, actor, recorded_at \
+             FROM flowing_derived_cuts WHERE derivation_id = ?1",
+            [derivation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            derivation_id,
+            target_branch_id,
+            target_before_cut_id,
+            target_after_cut_id,
+            target_after_manifest_hash,
+            witness_json,
+            witness_digest,
+            actor,
+            recorded_at,
+        )| {
+            let witness = serde_json::from_str(&witness_json)?;
+            if derived_cut_digest(&witness) != witness_digest
+                || witness.target_branch_id() != target_branch_id
+                || witness.target_before_cut_id() != target_before_cut_id.as_deref()
+                || witness.target_after_cut_id() != target_after_cut_id
+                || witness.target_after_manifest_hash() != target_after_manifest_hash
+            {
+                return Err(StoreError::Conflict(
+                    "flowing derived-cut witness differs from its digest".into(),
+                ));
+            }
+            Ok(FlowingDerivedCut {
+                derivation_id,
+                witness,
+                witness_digest,
+                actor,
+                recorded_at,
+            })
+        },
+    )
+    .transpose()
+}
 
 fn read_pin(connection: &Connection, pin_id: &str) -> StoreResult<Option<PrivateCutPin>> {
     connection
@@ -606,6 +680,141 @@ impl FlowingSources for BranchStore {
             .map(|row| decode_handoff(row?))
             .collect();
         receipts
+    }
+
+    fn record_flowing_derived_cut(
+        &mut self,
+        request: RecordFlowingDerivedCut<'_>,
+    ) -> StoreResult<RecordFlowingDerivedCutOutcome> {
+        use RecordFlowingDerivedCutOutcome as R;
+        if let Some(field) = missing_derived_cut_field(request) {
+            return Ok(R::Invalid { field });
+        }
+        let witness = request.witness();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = read_derived_cut(&tx, request.derivation_id())? {
+            return Ok(
+                if existing.witness == *witness
+                    && existing.actor == request.actor()
+                    && existing.recorded_at == request.recorded_at()
+                {
+                    R::Existing(existing)
+                } else {
+                    R::IdentityMismatch
+                },
+            );
+        }
+        let already_derived: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM flowing_derived_cuts WHERE target_after_cut_id = ?1)",
+            [witness.target_after_cut_id()],
+            |row| row.get(0),
+        )?;
+        if already_derived {
+            return Ok(R::CutAlreadyDerived);
+        }
+        if witness.target_branch_id() == MAINLINE_BRANCH_ID {
+            return Ok(R::TrunkRequiresGate);
+        }
+        let Some(target) = BranchStore::row_by_id(&tx, witness.target_branch_id())? else {
+            return Ok(R::TargetMissing);
+        };
+        if target.status != BranchStatus::Active {
+            return Ok(R::TargetNotActive);
+        }
+        let Some(cut) = BranchStore::cut_by_id(&tx, witness.target_after_cut_id())? else {
+            return Ok(R::CutMissing);
+        };
+        if cut.branch_id != witness.target_branch_id()
+            || cut.parent_cut_id.as_deref() != witness.target_before_cut_id()
+            || cut.manifest_hash != witness.target_after_manifest_hash()
+        {
+            return Ok(R::CutMismatch);
+        }
+        if cut.origin.as_deref()
+            != Some(format!("transport-batch:{}", request.derivation_id()).as_str())
+            || cut.actor.as_deref() != Some(request.actor())
+            || cut.recorded_at != request.recorded_at()
+        {
+            return Ok(R::CutAuthorshipMismatch);
+        }
+        for selected in witness.units() {
+            let unit_id = selected.unit_id();
+            let Some(unit) = read_declaration(&tx, unit_id)? else {
+                return Ok(R::UnitMissing {
+                    unit_id: unit_id.into(),
+                });
+            };
+            let Some(basis) = read_basis(&tx, unit_id)? else {
+                return Ok(R::BasisMissing {
+                    unit_id: unit_id.into(),
+                });
+            };
+            if unit.source_branch_id != selected.source_branch_id()
+                || unit.source_cut_id != selected.source_cut_id()
+                || basis.basis_digest != selected.basis_digest()
+            {
+                return Ok(R::BasisMismatch {
+                    unit_id: unit_id.into(),
+                });
+            }
+            let Some(pin) = read_pin(&tx, &unit.pin_id)? else {
+                return Ok(R::PinMissing {
+                    unit_id: unit_id.into(),
+                });
+            };
+            if pin.released_at.is_some() {
+                return Ok(R::PinReleased {
+                    unit_id: unit_id.into(),
+                });
+            }
+            let Some(source) = BranchStore::row_by_id(&tx, &unit.source_branch_id)? else {
+                return Ok(R::SourceNotActive {
+                    unit_id: unit_id.into(),
+                });
+            };
+            if source.status != BranchStatus::Active {
+                return Ok(R::SourceNotActive {
+                    unit_id: unit_id.into(),
+                });
+            }
+            if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
+                return Ok(R::SourceNotParent {
+                    unit_id: unit_id.into(),
+                });
+            }
+        }
+        let record = FlowingDerivedCut {
+            derivation_id: request.derivation_id().into(),
+            witness: witness.clone(),
+            witness_digest: derived_cut_digest(witness),
+            actor: request.actor().into(),
+            recorded_at: request.recorded_at().into(),
+        };
+        tx.execute(
+            "INSERT INTO flowing_derived_cuts \
+             (derivation_id, target_after_cut_id, target_branch_id, target_before_cut_id, \
+              target_after_manifest_hash, witness_json, witness_digest, actor, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.derivation_id,
+                witness.target_after_cut_id(),
+                witness.target_branch_id(),
+                witness.target_before_cut_id(),
+                witness.target_after_manifest_hash(),
+                serde_json::to_string(witness)?,
+                record.witness_digest,
+                record.actor,
+                record.recorded_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(R::Recorded(record))
+    }
+
+    fn flowing_derived_cut(&self, derivation_id: &str) -> StoreResult<Option<FlowingDerivedCut>> {
+        read_derived_cut(&self.connection, derivation_id)
     }
 
     fn release_private_cut(

@@ -1,11 +1,13 @@
 use super::DoBranches;
 use crate::do_store::{as_opt_text, as_text, sql_err, text, DoSql, SqlValue};
 use whipplescript_store::branches::flowing_sources::{
-    missing_basis_field, missing_declaration_field, missing_handoff_field, missing_pin_field,
-    missing_release_field, BindContributionBasis, BindContributionBasisOutcome, ContributionBasis,
-    ContributionDeclaration, DeclareContribution, DeclareContributionOutcome, FlowingSources,
-    HandoffContribution, HandoffContributionOutcome, HandoffReceipt, PinPrivateCut,
-    PinPrivateCutOutcome, PrivateCutPin, ReleasePrivateCut, ReleasePrivateCutOutcome,
+    derived_cut_digest, missing_basis_field, missing_declaration_field, missing_derived_cut_field,
+    missing_handoff_field, missing_pin_field, missing_release_field, BindContributionBasis,
+    BindContributionBasisOutcome, ContributionBasis, ContributionDeclaration, DeclareContribution,
+    DeclareContributionOutcome, FlowingDerivedCut, FlowingSources, HandoffContribution,
+    HandoffContributionOutcome, HandoffReceipt, PinPrivateCut, PinPrivateCutOutcome, PrivateCutPin,
+    RecordFlowingDerivedCut, RecordFlowingDerivedCutOutcome, ReleasePrivateCut,
+    ReleasePrivateCutOutcome,
 };
 use whipplescript_store::branches::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
 use whipplescript_store::{StoreError, StoreResult};
@@ -26,6 +28,44 @@ pub(super) fn exact_atomic<S: DoSql, T>(
         Ok(())
     })?;
     result.ok_or_else(|| StoreError::fault(subject, "SQL host skipped atomic body"))
+}
+
+fn read_derived_cut<S: DoSql>(
+    sql: &S,
+    derivation_id: &str,
+) -> StoreResult<Option<FlowingDerivedCut>> {
+    let rows = sql
+        .query(
+            "SELECT derivation_id, target_branch_id, target_before_cut_id, \
+                target_after_cut_id, target_after_manifest_hash, witness_json, \
+                witness_digest, actor, recorded_at \
+         FROM flowing_derived_cuts WHERE derivation_id = ?1",
+            &[text(derivation_id)],
+        )
+        .map_err(sql_err)?;
+    rows.first()
+        .map(|row| {
+            let witness = serde_json::from_str(&as_text(&row[5]))?;
+            let witness_digest = as_text(&row[6]);
+            if derived_cut_digest(&witness) != witness_digest
+                || witness.target_branch_id() != as_text(&row[1])
+                || witness.target_before_cut_id() != as_opt_text(&row[2]).as_deref()
+                || witness.target_after_cut_id() != as_text(&row[3])
+                || witness.target_after_manifest_hash() != as_text(&row[4])
+            {
+                return Err(StoreError::Conflict(
+                    "flowing derived-cut witness differs from its digest or row".into(),
+                ));
+            }
+            Ok(FlowingDerivedCut {
+                derivation_id: as_text(&row[0]),
+                witness,
+                witness_digest,
+                actor: as_text(&row[7]),
+                recorded_at: as_text(&row[8]),
+            })
+        })
+        .transpose()
 }
 
 fn read_pin<S: DoSql>(sql: &S, pin_id: &str) -> StoreResult<Option<PrivateCutPin>> {
@@ -597,6 +637,144 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
         rows.iter().map(|row| decode_handoff(row)).collect()
     }
 
+    fn record_flowing_derived_cut(
+        &mut self,
+        request: RecordFlowingDerivedCut<'_>,
+    ) -> StoreResult<RecordFlowingDerivedCutOutcome> {
+        use RecordFlowingDerivedCutOutcome as R;
+        if let Some(field) = missing_derived_cut_field(request) {
+            return Ok(R::Invalid { field });
+        }
+        let witness = request.witness();
+        exact_atomic(&self.sql, "flowing derived cut", || {
+            if let Some(existing) = read_derived_cut(&self.sql, request.derivation_id())? {
+                return Ok(
+                    if existing.witness == *witness
+                        && existing.actor == request.actor()
+                        && existing.recorded_at == request.recorded_at()
+                    {
+                        R::Existing(existing)
+                    } else {
+                        R::IdentityMismatch
+                    },
+                );
+            }
+            if !self
+                .sql
+                .query(
+                    "SELECT 1 FROM flowing_derived_cuts WHERE target_after_cut_id = ?1",
+                    &[text(witness.target_after_cut_id())],
+                )
+                .map_err(sql_err)?
+                .is_empty()
+            {
+                return Ok(R::CutAlreadyDerived);
+            }
+            if witness.target_branch_id() == MAINLINE_BRANCH_ID {
+                return Ok(R::TrunkRequiresGate);
+            }
+            let Some(target) = self.row_by_id(witness.target_branch_id())? else {
+                return Ok(R::TargetMissing);
+            };
+            if target.status != BranchStatus::Active {
+                return Ok(R::TargetNotActive);
+            }
+            let Some(cut) = self.get_cut(witness.target_after_cut_id())? else {
+                return Ok(R::CutMissing);
+            };
+            if cut.branch_id != witness.target_branch_id()
+                || cut.parent_cut_id.as_deref() != witness.target_before_cut_id()
+                || cut.manifest_hash != witness.target_after_manifest_hash()
+            {
+                return Ok(R::CutMismatch);
+            }
+            if cut.origin.as_deref()
+                != Some(format!("transport-batch:{}", request.derivation_id()).as_str())
+                || cut.actor.as_deref() != Some(request.actor())
+                || cut.recorded_at != request.recorded_at()
+            {
+                return Ok(R::CutAuthorshipMismatch);
+            }
+            for selected in witness.units() {
+                let unit_id = selected.unit_id();
+                let Some(unit) = read_declaration(&self.sql, unit_id)? else {
+                    return Ok(R::UnitMissing {
+                        unit_id: unit_id.into(),
+                    });
+                };
+                let Some(basis) = read_basis(&self.sql, unit_id)? else {
+                    return Ok(R::BasisMissing {
+                        unit_id: unit_id.into(),
+                    });
+                };
+                if unit.source_branch_id != selected.source_branch_id()
+                    || unit.source_cut_id != selected.source_cut_id()
+                    || basis.basis_digest != selected.basis_digest()
+                {
+                    return Ok(R::BasisMismatch {
+                        unit_id: unit_id.into(),
+                    });
+                }
+                let Some(pin) = read_pin(&self.sql, &unit.pin_id)? else {
+                    return Ok(R::PinMissing {
+                        unit_id: unit_id.into(),
+                    });
+                };
+                if pin.released_at.is_some() {
+                    return Ok(R::PinReleased {
+                        unit_id: unit_id.into(),
+                    });
+                }
+                let Some(source) = self.row_by_id(&unit.source_branch_id)? else {
+                    return Ok(R::SourceNotActive {
+                        unit_id: unit_id.into(),
+                    });
+                };
+                if source.status != BranchStatus::Active {
+                    return Ok(R::SourceNotActive {
+                        unit_id: unit_id.into(),
+                    });
+                }
+                if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
+                    return Ok(R::SourceNotParent {
+                        unit_id: unit_id.into(),
+                    });
+                }
+            }
+            let record = FlowingDerivedCut {
+                derivation_id: request.derivation_id().into(),
+                witness: witness.clone(),
+                witness_digest: derived_cut_digest(witness),
+                actor: request.actor().into(),
+                recorded_at: request.recorded_at().into(),
+            };
+            self.sql
+                .execute(
+                    "INSERT INTO flowing_derived_cuts \
+                 (derivation_id, target_after_cut_id, target_branch_id, target_before_cut_id, \
+                  target_after_manifest_hash, witness_json, witness_digest, actor, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    &[
+                        text(&record.derivation_id),
+                        text(witness.target_after_cut_id()),
+                        text(witness.target_branch_id()),
+                        witness.target_before_cut_id().map_or(SqlValue::Null, text),
+                        text(witness.target_after_manifest_hash()),
+                        text(&serde_json::to_string(witness)?),
+                        text(&record.witness_digest),
+                        text(&record.actor),
+                        text(&record.recorded_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(R::Recorded(record))
+        })
+    }
+
+    fn flowing_derived_cut(&self, derivation_id: &str) -> StoreResult<Option<FlowingDerivedCut>> {
+        read_derived_cut(&self.sql, derivation_id)
+    }
+
     fn release_private_cut(
         &mut self,
         request: ReleasePrivateCut<'_>,
@@ -646,6 +824,156 @@ mod tests {
     use crate::do_store::test_support::RusqliteDoSql;
     use crate::do_store::SqlValue;
     use whipplescript_store::branches::{CreateBranch, CutRecord, MAINLINE_BRANCH_ID};
+
+    #[test]
+    fn hosted_mixed_derivation_retains_both_units_without_a_head_move() {
+        use std::rc::Rc;
+
+        use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::branches::flowing_sources::RecordFlowingDerivedCutOutcome as R;
+        use whipplescript_store::content::ContentBlobs;
+        use whipplescript_store::selection::parse;
+        use whipplescript_store::vcs::{
+            FlowingBatchTargetEffectsOutcome, FlowingSelectionOutcome, WorkspaceVcs,
+        };
+
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).unwrap(),
+            DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+        );
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        vcs.write("twig", "b.txt", Some("B"), "twig-b", "t3")
+            .unwrap();
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        let mut selected_ids = Vec::new();
+        for (unit_id, pin_id, cut_id, path) in [
+            ("unit-a", "pin-a", "twig-a", "a.txt"),
+            ("unit-b", "pin-b", "twig-b", "b.txt"),
+        ] {
+            let cut = branches.get_cut(cut_id).unwrap().unwrap();
+            assert_eq!(
+                branches
+                    .pin_private_cut(PinPrivateCut {
+                        pin_id,
+                        twig_branch_id: "twig",
+                        cut_id,
+                        manifest_hash: &cut.manifest_hash,
+                        principal: "s:author",
+                        retained_at: "t4",
+                    })
+                    .unwrap(),
+                PinPrivateCutOutcome::Pinned
+            );
+            assert_eq!(
+                branches
+                    .declare_contribution(DeclareContribution {
+                        unit_id,
+                        pin_id,
+                        principal: "s:author",
+                        intent: "mixed change",
+                        read_basis_digest: "read",
+                        dependency_basis_digest: "deps",
+                        scope_digest: "scope",
+                        declared_at: "t4",
+                    })
+                    .unwrap(),
+                DeclareContributionOutcome::Declared
+            );
+            let FlowingSelectionOutcome::Selected(selection) = vcs
+                .select_private_changes(pin_id, &parse(&format!("path({path})")).unwrap())
+                .unwrap()
+            else {
+                panic!("source selection")
+            };
+            selected_ids.push((
+                path.to_owned(),
+                selection.changes()[0].after.clone().unwrap(),
+            ));
+            assert_eq!(
+                vcs.bind_private_selection(unit_id, &selection, "t5")
+                    .unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+        }
+        let content = DoContentBlobs::new(Rc::clone(&sql)).unwrap();
+        let manifest_hash = content
+            .put_text(
+                &serde_json::to_string(
+                    &selected_ids
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        branches
+            .record_cut(CutRecord {
+                cut_id: "batch-cut",
+                change_id: "mixed-output",
+                branch_id: "branch",
+                manifest_hash: &manifest_hash,
+                parent_cut_id: None,
+                origin: Some("transport-batch:derive-1"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t6",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_batch_target_effects(&["unit-a", "unit-b"], "batch-cut")
+            .unwrap()
+        else {
+            panic!("real mixed target")
+        };
+        let mut forged_json = serde_json::to_value(&witness).unwrap();
+        forged_json["units"][1]["basis_digest"] = "wrong".into();
+        let forged = serde_json::from_value(forged_json).unwrap();
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-forged", &forged, "mediator", "t6")
+                .unwrap(),
+            R::WitnessMismatch
+        );
+        assert!(branches
+            .flowing_derived_cut("derive-forged")
+            .unwrap()
+            .is_none());
+        let R::Recorded(record) = vcs
+            .record_private_batch_derivation("derive-1", &witness, "mediator", "t6")
+            .unwrap()
+        else {
+            panic!("hosted derivation")
+        };
+        assert_eq!(
+            branches.flowing_derived_cut("derive-1").unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            vcs.record_private_batch_derivation("derive-1", &witness, "mediator", "t6")
+                .unwrap(),
+            R::Existing(record)
+        );
+        assert!(branches
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+        for unit_id in ["unit-a", "unit-b"] {
+            assert!(branches.contribution_handoff(unit_id).unwrap().is_none());
+        }
+        sql.execute(
+            "UPDATE flowing_derived_cuts SET witness_digest = 'wrong' WHERE derivation_id = ?1",
+            &[text("derive-1")],
+        )
+        .unwrap();
+        assert!(branches.flowing_derived_cut("derive-1").is_err());
+    }
 
     #[test]
     fn hosted_flowing_writes_refuse_a_repeated_or_skipped_atomic_body() {

@@ -6,7 +6,9 @@
 //! content-derived source atoms and makes duplicate atom ownership impossible.
 //! An unbound declaration remains owed on its twig. A content-verified handoff
 //! moves one bound unit to its parent branch with the target ref and receipt in
-//! one transaction. Trunk accounting still needs a separate future receipt.
+//! one transaction. A mixed cut can prepublish a content derivation while
+//! every unit remains owed; source-order proof and an atomic batch handoff
+//! remain open. Trunk accounting still needs a separate future receipt.
 //! The calling host authenticates and authorizes the principal on pin,
 //! declaration and release; the store binds those claims and prevents their
 //! later reinterpretation.
@@ -14,7 +16,7 @@
 #[cfg(feature = "native")]
 mod native;
 
-pub const SCHEMA: [&str; 8] = [
+pub const SCHEMA: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS flowing_private_pins (
         pin_id TEXT PRIMARY KEY,
         twig_branch_id TEXT NOT NULL,
@@ -74,6 +76,19 @@ pub const SCHEMA: [&str; 8] = [
     )",
     "CREATE INDEX IF NOT EXISTS flowing_handoffs_target_idx
         ON flowing_handoffs(target_branch_id, recorded_at)",
+    "CREATE TABLE IF NOT EXISTS flowing_derived_cuts (
+        derivation_id TEXT PRIMARY KEY,
+        target_after_cut_id TEXT NOT NULL UNIQUE,
+        target_branch_id TEXT NOT NULL,
+        target_before_cut_id TEXT,
+        target_after_manifest_hash TEXT NOT NULL,
+        witness_json TEXT NOT NULL,
+        witness_digest TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS flowing_derived_cuts_branch_idx
+        ON flowing_derived_cuts(target_branch_id, target_after_cut_id)",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +286,80 @@ pub struct HandoffReceipt {
     pub recorded_at: String,
 }
 
+/// Immutable mixed-content derivation prepared before any target ref move.
+/// This does not establish source-order or dependent read-basis compatibility.
+/// Recording it leaves every unit owed on its source line; a later atomic
+/// handoff must check this exact row and transfer every unit together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingDerivedCut {
+    pub derivation_id: String,
+    pub witness: crate::vcs::FlowingBatchTargetEffects,
+    pub witness_digest: String,
+    pub actor: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RecordFlowingDerivedCut<'a> {
+    derivation_id: &'a str,
+    witness: &'a crate::vcs::FlowingBatchTargetEffects,
+    actor: &'a str,
+    recorded_at: &'a str,
+}
+
+impl<'a> RecordFlowingDerivedCut<'a> {
+    pub(crate) fn new(
+        derivation_id: &'a str,
+        witness: &'a crate::vcs::FlowingBatchTargetEffects,
+        actor: &'a str,
+        recorded_at: &'a str,
+    ) -> Self {
+        Self {
+            derivation_id,
+            witness,
+            actor,
+            recorded_at,
+        }
+    }
+
+    pub fn derivation_id(self) -> &'a str {
+        self.derivation_id
+    }
+    pub fn witness(self) -> &'a crate::vcs::FlowingBatchTargetEffects {
+        self.witness
+    }
+    pub fn actor(self) -> &'a str {
+        self.actor
+    }
+    pub fn recorded_at(self) -> &'a str {
+        self.recorded_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecordFlowingDerivedCutOutcome {
+    Recorded(FlowingDerivedCut),
+    Existing(FlowingDerivedCut),
+    IdentityMismatch,
+    WitnessMismatch,
+    MissingContent { content_id: String },
+    CutAlreadyDerived,
+    CutMissing,
+    CutMismatch,
+    CutAuthorshipMismatch,
+    UnitMissing { unit_id: String },
+    BasisMissing { unit_id: String },
+    BasisMismatch { unit_id: String },
+    PinMissing { unit_id: String },
+    PinReleased { unit_id: String },
+    SourceNotActive { unit_id: String },
+    SourceNotParent { unit_id: String },
+    TargetMissing,
+    TargetNotActive,
+    TrunkRequiresGate,
+    Invalid { field: &'static str },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HandoffContributionOutcome {
     Transferred(HandoffReceipt),
@@ -350,6 +439,14 @@ pub trait FlowingSources {
     /// compare this roster with the branch's actual cut lineage before using
     /// it as a source-unit frontier; a receipt alone does not prove content.
     fn target_handoffs(&self, target_branch_id: &str) -> crate::StoreResult<Vec<HandoffReceipt>>;
+    fn record_flowing_derived_cut(
+        &mut self,
+        request: RecordFlowingDerivedCut<'_>,
+    ) -> crate::StoreResult<RecordFlowingDerivedCutOutcome>;
+    fn flowing_derived_cut(
+        &self,
+        derivation_id: &str,
+    ) -> crate::StoreResult<Option<FlowingDerivedCut>>;
     /// Only an explicit release can end an undeclared pin. A declared unit
     /// keeps the pin until an exact handoff or admission receipt transfers
     /// responsibility under a later operation.
@@ -433,4 +530,27 @@ pub fn missing_handoff_field(request: HandoffContribution<'_>) -> Option<&'stati
             .then_some("target_before_cut_id")
     })
     .or_else(|| request.witness.effects().is_empty().then_some("effects"))
+}
+
+pub fn missing_derived_cut_field(request: RecordFlowingDerivedCut<'_>) -> Option<&'static str> {
+    [
+        ("derivation_id", request.derivation_id),
+        ("target_branch_id", request.witness.target_branch_id()),
+        ("target_after_cut_id", request.witness.target_after_cut_id()),
+        (
+            "target_after_manifest_hash",
+            request.witness.target_after_manifest_hash(),
+        ),
+        ("actor", request.actor),
+        ("recorded_at", request.recorded_at),
+    ]
+    .into_iter()
+    .find_map(|(field, value)| value.trim().is_empty().then_some(field))
+    .or_else(|| (request.witness.units().len() < 2).then_some("units"))
+}
+
+pub fn derived_cut_digest(witness: &crate::vcs::FlowingBatchTargetEffects) -> String {
+    let bytes = serde_json::to_vec(&("flowing-derived-cut-v1", witness))
+        .expect("derived-cut witness serializes");
+    format!("sha256:{}", crate::chunking::content_hash_hex(&bytes))
 }
