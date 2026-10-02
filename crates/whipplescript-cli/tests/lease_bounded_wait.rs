@@ -99,8 +99,21 @@ fn seed_foreign_holder(coordination: &std::path::Path) {
     );
 }
 
+// These tests exercise leases, not the workspace tracker. Every child must
+// override the bar's shared items store, including later step/worker rounds.
+fn isolated_command(mut command: Command, coordination: &std::path::Path) -> Command {
+    command
+        .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination)
+        .env(
+            "WHIPPLESCRIPT_ITEMS_STORE",
+            coordination.with_extension("items.sqlite"),
+        )
+        .env("WHIPPLESCRIPT_MISUSE_LOG", "off");
+    command
+}
+
 fn dev(bin: &str, store: &str, source: &str, coordination: &str) -> Value {
-    let output = Command::new(bin)
+    let output = isolated_command(Command::new(bin), std::path::Path::new(coordination))
         .args([
             "--store",
             store,
@@ -112,7 +125,6 @@ fn dev(bin: &str, store: &str, source: &str, coordination: &str) -> Value {
             "--until",
             "idle",
         ])
-        .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination)
         .output()
         .expect("dev runs");
     assert!(
@@ -142,9 +154,8 @@ fn drive_round(bin: &str, store: &str, instance: &str, source: &str, coordinatio
             "fixture",
         ],
     ] {
-        let output = Command::new(bin)
+        let output = isolated_command(Command::new(bin), std::path::Path::new(coordination))
             .args(&command)
-            .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination)
             .output()
             .expect("command runs");
         assert!(
@@ -197,6 +208,7 @@ fn plain_acquire_contends_immediately() {
 
     let _ = fs::remove_file(&store);
     let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(coordination.with_extension("items.sqlite"));
     let _ = fs::remove_file(&coordination);
 }
 
@@ -263,6 +275,7 @@ fn wait_defers_then_acquires_on_release() {
 
     let _ = fs::remove_file(&store);
     let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(coordination.with_extension("items.sqlite"));
     let _ = fs::remove_file(&coordination);
 }
 
@@ -293,12 +306,8 @@ test "wait elapses then gives up" {
     );
     fs::write(&source, program).expect("write source");
 
-    let output = Command::new(bin)
+    let output = isolated_command(Command::new(bin), &coordination)
         .args(["--json", "test", source.to_str().expect("utf-8")])
-        .env(
-            "WHIPPLESCRIPT_COORDINATION_STORE",
-            coordination.to_str().expect("utf-8"),
-        )
         .output()
         .expect("whip test runs");
     let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
@@ -314,5 +323,61 @@ test "wait elapses then gives up" {
     );
 
     let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(coordination.with_extension("items.sqlite"));
     let _ = fs::remove_file(&coordination);
+}
+
+/// An unrelated writer in the bar's shared items store must not influence a
+/// lease test. Set the inherited path on the child only: changing the parent
+/// environment would itself race other Rust tests.
+#[test]
+fn lease_child_isolates_locked_workspace_items_store() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let root = tempfile::tempdir().expect("isolated fixture");
+    let ambient_items = root.path().join("ambient-items.sqlite");
+    whipplescript_store::items::WorkItemStore::open(&ambient_items).expect("seed ambient items");
+    let mut writer = rusqlite::Connection::open(&ambient_items).expect("open ambient writer");
+    let _write_lock = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("hold unrelated write lock");
+    let source = root.path().join("plain.whip");
+    let store = root.path().join("runtime.sqlite");
+    let coordination = root.path().join("coordination.sqlite");
+    fs::write(&source, source_with("acquire deploy_slot for t.id as slot")).expect("source");
+    seed_foreign_holder(&coordination);
+    let mut inherited = Command::new(bin);
+    inherited.env("WHIPPLESCRIPT_ITEMS_STORE", &ambient_items);
+    let output = isolated_command(inherited, &coordination)
+        .args([
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("isolated child");
+    assert!(
+        output.status.success(),
+        "unrelated tracker lock reached lease child: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+    assert_eq!(
+        instance_status(
+            bin,
+            store.to_str().expect("utf-8"),
+            result["instance_id"].as_str().expect("instance")
+        ),
+        "failed",
+        "the foreign lease holder still routes the plain acquire to contended"
+    );
+    assert!(
+        coordination.with_extension("items.sqlite").is_file(),
+        "the child must use its declared private tracker"
+    );
 }
