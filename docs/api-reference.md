@@ -1764,6 +1764,12 @@ in the next proposer turn's search history. Provider and evaluation
 infrastructure failures still fail the campaign. A rejected draft is never
 eligible for adoption.
 
+An exec judge receives `whipplescript.judge_input.v0` with the scenario,
+instance status and input, all produced facts including consumed facts, and
+`terminal`: the final workflow completion or failure payload, or `null` if no
+terminal event exists. This is the same record shape for baseline and candidate
+evaluations.
+
 The command proposes a candidate only when the candidate improves a gauge in the
 ascend set, causes no regression in a guarded gauge, and meets each bar. The
 command surfaces a true trade as a decision. The command never accepts a trade

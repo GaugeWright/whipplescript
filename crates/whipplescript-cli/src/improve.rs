@@ -1226,6 +1226,19 @@ fn score_instance(
         .list_facts_including_consumed(instance_id)
         .unwrap_or_default();
     let runs = store.list_runs(instance_id).unwrap_or_default();
+    let terminal = store.list_events(instance_id).ok().and_then(|events| {
+        events
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "workflow.completed" || event.event_type == "workflow.failed"
+            })
+            .and_then(|event| {
+                serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| payload.get("payload").cloned())
+            })
+    });
     let facts_json: Vec<Value> = facts
         .iter()
         .map(|fact| {
@@ -1246,6 +1259,7 @@ fn score_instance(
             .and_then(|i| serde_json::from_str::<Value>(&i.input_json).ok())
             .unwrap_or(Value::Null),
         "facts": facts_json,
+        "terminal": terminal,
     });
 
     // Builtins first (they may feed derived gauges).

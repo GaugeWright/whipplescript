@@ -24,6 +24,10 @@ truth. The list below goes from the most rigorous to the least rigorous:
   JSON with the context of the run on stdin. The command writes a JSON decision
   on stdout, such as `{"ok": true, "score": 1.0}`. The same
   `WHIPPLESCRIPT_EXEC_ALLOW` gate from chapter 6 governs the command.
+  The `whipplescript.judge_input.v0` record contains `scenario`, `status`,
+  `input`, all produced `facts` (including consumed facts), and `terminal`.
+  `terminal` is the payload of the final `workflow.completed` or
+  `workflow.failed` event, or `null` when the workflow has no terminal event.
 - `judge via labels "<source>"` — ground truth from a file of labels that a
   user owns. The key is the scenario.
 - `judge via coerce <Name>(<args>)` — a judge that is a model, with an explicit
