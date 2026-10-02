@@ -3292,6 +3292,8 @@ impl NativeProposer {
             "You are refining a proposed WhippleScript harness change before evaluation. \
              Keep ONE independently testable mechanism that targets the stated gauges. \
              Remove separable edits; preserve coupled declarations when needed. \
+             If the same behavior is expressed in both program source and context, \
+             keep only the surface needed for the agent to perform the task. \
              Return the COMPLETE source, rationale, and edit_account. Do not use \
              benchmark-specific branches or invent evidence. If the source cannot be \
              usefully narrowed, return the original source unchanged.\n\n\
@@ -3370,14 +3372,16 @@ fn append_revision_context(
 }
 
 fn needs_scope_refinement(observation: &EditObservation) -> bool {
-    let changed =
-        observation.changes.as_ref().map_or(0, Vec::len) + observation.resource_changes.len();
+    let declarations = observation.changes.as_ref().map_or(0, Vec::len);
+    let resources = observation.resource_changes.len();
+    let changed = declarations + resources;
     changed >= 3
         || (changed >= 2
-            && observation
-                .account
-                .as_ref()
-                .is_some_and(|account| account.expected_gauges.len() >= 2))
+            && ((declarations > 0 && resources > 0)
+                || observation
+                    .account
+                    .as_ref()
+                    .is_some_and(|account| account.expected_gauges.len() >= 2)))
 }
 
 /// A semantic judgment is evidence for the human adoption review, never a
