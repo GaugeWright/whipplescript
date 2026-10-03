@@ -28,11 +28,12 @@ pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
 pub use flowing_selection::{
-    native_dependency_basis_digest, native_read_basis_digest, FlowingBatchTargetEffects,
-    FlowingBatchTargetEffectsOutcome, FlowingBatchUnitEffect, FlowingBranchLineage,
-    FlowingBranchLineageOutcome, FlowingBranchPrefix, FlowingEffectDisposition, FlowingSelection,
-    FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect, FlowingTargetEffects,
-    FlowingTargetEffectsOutcome, NativeCandidate, NativeCandidateOutcome,
+    native_dependency_basis_digest, native_read_basis_digest, FlowingBatchSourceOrderOutcome,
+    FlowingBatchTargetEffects, FlowingBatchTargetEffectsOutcome, FlowingBatchUnitEffect,
+    FlowingBranchLineage, FlowingBranchLineageOutcome, FlowingBranchPrefix,
+    FlowingEffectDisposition, FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom,
+    FlowingTargetEffect, FlowingTargetEffects, FlowingTargetEffectsOutcome, NativeCandidate,
+    NativeCandidateOutcome,
 };
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 

@@ -1,13 +1,16 @@
+use std::collections::BTreeSet;
+
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    derived_cut_digest, missing_basis_field, missing_declaration_field, missing_derived_cut_field,
-    missing_handoff_field, missing_pin_field, missing_release_field, BindContributionBasis,
-    BindContributionBasisOutcome, ContributionBasis, ContributionDeclaration, DeclareContribution,
-    DeclareContributionOutcome, FlowingDerivedCut, FlowingSources, HandoffContribution,
-    HandoffContributionOutcome, HandoffReceipt, PinPrivateCut, PinPrivateCutOutcome, PrivateCutPin,
-    RecordFlowingDerivedCut, RecordFlowingDerivedCutOutcome, ReleasePrivateCut,
-    ReleasePrivateCutOutcome,
+    batch_handoff_digest, derived_cut_digest, missing_basis_field, missing_batch_handoff_field,
+    missing_declaration_field, missing_derived_cut_field, missing_handoff_field, missing_pin_field,
+    missing_release_field, BindContributionBasis, BindContributionBasisOutcome, ContributionBasis,
+    ContributionDeclaration, DeclareContribution, DeclareContributionOutcome,
+    FlowingBatchHandoffReceipt, FlowingDerivedCut, FlowingSources, HandoffBatchContribution,
+    HandoffBatchContributionOutcome, HandoffContribution, HandoffContributionOutcome,
+    HandoffReceipt, PinPrivateCut, PinPrivateCutOutcome, PrivateCutPin, RecordFlowingDerivedCut,
+    RecordFlowingDerivedCutOutcome, ReleasePrivateCut, ReleasePrivateCutOutcome,
 };
 use crate::branches::{BranchStatus, BranchStore, MAINLINE_BRANCH_ID};
 use crate::{StoreError, StoreResult};
@@ -220,6 +223,131 @@ fn decode_handoff(
 ) -> StoreResult<HandoffReceipt> {
     receipt.effects = serde_json::from_str(&effects_json)?;
     Ok(receipt)
+}
+
+fn read_batch(
+    connection: &Connection,
+    predicate: &str,
+    value: &str,
+) -> StoreResult<Option<FlowingBatchHandoffReceipt>> {
+    let row: Option<(String, String, String, String)> = connection
+        .query_row(
+            &format!(
+                "SELECT derivation_id, target_after_cut_id, receipt_json, receipt_digest \
+                 FROM flowing_handoff_batches WHERE {predicate} = ?1"
+            ),
+            [value],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((derivation_id, target_after_cut_id, receipt_json, digest)) = row else {
+        return Ok(None);
+    };
+    let receipt: FlowingBatchHandoffReceipt = serde_json::from_str(&receipt_json)?;
+    let Some(derived) = read_derived_cut(connection, &derivation_id)? else {
+        return Err(StoreError::Conflict(
+            "batch handoff has no derivation".into(),
+        ));
+    };
+    if batch_handoff_digest(&receipt) != digest
+        || receipt.derivation_id != derivation_id
+        || receipt.target_after_cut_id != target_after_cut_id
+        || receipt.witness_digest != derived.witness_digest
+        || receipt.target_branch_id != derived.witness.target_branch_id()
+        || receipt.target_before_cut_id.as_deref() != derived.witness.target_before_cut_id()
+        || receipt.target_after_cut_id != derived.witness.target_after_cut_id()
+        || receipt.target_after_manifest_hash != derived.witness.target_after_manifest_hash()
+        || receipt.actor != derived.actor
+        || receipt.units.len() != derived.witness.units().len()
+    {
+        return Err(StoreError::Conflict(
+            "batch handoff differs from derivation".into(),
+        ));
+    }
+    let Some(cut) = BranchStore::cut_by_id(connection, &target_after_cut_id)? else {
+        return Err(StoreError::Conflict(
+            "batch handoff target cut is missing".into(),
+        ));
+    };
+    if cut.branch_id != receipt.target_branch_id
+        || cut.parent_cut_id != receipt.target_before_cut_id
+        || cut.manifest_hash != receipt.target_after_manifest_hash
+        || cut.origin.as_deref() != Some(format!("transport-batch:{derivation_id}").as_str())
+        || cut.actor.as_deref() != Some(receipt.actor.as_str())
+        || cut.recorded_at != derived.recorded_at
+    {
+        return Err(StoreError::Conflict(
+            "batch handoff target cut differs".into(),
+        ));
+    }
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM flowing_handoffs WHERE target_after_cut_id = ?1",
+        [&target_after_cut_id],
+        |row| row.get(0),
+    )?;
+    if count != receipt.units.len() as i64 {
+        return Err(StoreError::Conflict(
+            "batch handoff receipt roster is incomplete".into(),
+        ));
+    }
+    for (index, (unit, selected)) in receipt
+        .units
+        .iter()
+        .zip(derived.witness.units())
+        .enumerate()
+    {
+        if unit.op_id != format!("batch:{derivation_id}:{index}")
+            || unit.unit_id != selected.unit_id()
+            || unit.source_branch_id != selected.source_branch_id()
+            || unit.source_cut_id != selected.source_cut_id()
+            || unit.source_basis_digest != selected.basis_digest()
+            || unit.effects != selected.effects()
+            || unit.target_branch_id != receipt.target_branch_id
+            || unit.target_before_cut_id != receipt.target_before_cut_id
+            || unit.target_after_cut_id != receipt.target_after_cut_id
+            || unit.target_after_manifest_hash != receipt.target_after_manifest_hash
+            || unit.actor != receipt.actor
+            || unit.recorded_at != receipt.recorded_at
+            || read_handoff(connection, HandoffLookup::Operation, &unit.op_id)?.as_ref()
+                != Some(unit)
+        {
+            return Err(StoreError::Conflict(
+                "batch handoff unit receipt differs".into(),
+            ));
+        }
+    }
+    Ok(Some(receipt))
+}
+
+fn source_cut_reachable(
+    connection: &Connection,
+    source_branch_id: &str,
+    head_cut_id: Option<&str>,
+    selected_cut_id: &str,
+) -> StoreResult<bool> {
+    let mut cursor = head_cut_id.map(str::to_owned);
+    let mut seen = BTreeSet::new();
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            return Ok(false);
+        }
+        let Some(cut) = BranchStore::cut_by_id(connection, &id)? else {
+            return Ok(false);
+        };
+        if cut.branch_id != source_branch_id
+            || !cut
+                .origin
+                .as_deref()
+                .is_some_and(|origin| origin.starts_with("write:"))
+        {
+            return Ok(false);
+        }
+        if id == selected_cut_id {
+            return Ok(true);
+        }
+        cursor = cut.parent_cut_id;
+    }
+    Ok(false)
 }
 
 impl FlowingSources for BranchStore {
@@ -815,6 +943,249 @@ impl FlowingSources for BranchStore {
 
     fn flowing_derived_cut(&self, derivation_id: &str) -> StoreResult<Option<FlowingDerivedCut>> {
         read_derived_cut(&self.connection, derivation_id)
+    }
+
+    fn handoff_batch_contribution(
+        &mut self,
+        request: HandoffBatchContribution<'_>,
+    ) -> StoreResult<HandoffBatchContributionOutcome> {
+        use HandoffBatchContributionOutcome as R;
+        if let Some(field) = missing_batch_handoff_field(request) {
+            return Ok(R::Invalid { field });
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = read_batch(&tx, "derivation_id", request.derivation_id())? {
+            return Ok(
+                if existing.witness_digest == request.expected_witness_digest()
+                    && existing.actor == request.actor()
+                    && existing.recorded_at == request.recorded_at()
+                {
+                    R::Existing(existing)
+                } else {
+                    R::IdentityMismatch
+                },
+            );
+        }
+        let Some(derived) = read_derived_cut(&tx, request.derivation_id())? else {
+            return Ok(R::DerivationMissing);
+        };
+        let witness = &derived.witness;
+        if derived.witness_digest != request.expected_witness_digest()
+            || derived.actor != request.actor()
+        {
+            return Ok(R::DerivationMismatch);
+        }
+        if witness.target_branch_id() == MAINLINE_BRANCH_ID {
+            return Ok(R::TrunkRequiresGate);
+        }
+        let Some(target) = BranchStore::row_by_id(&tx, witness.target_branch_id())? else {
+            return Ok(R::TargetMissing);
+        };
+        if target.status != BranchStatus::Active {
+            return Ok(R::TargetNotActive);
+        }
+        let reservation: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                [witness.target_branch_id()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(holder) = reservation {
+            return Ok(R::TargetReserved { holder });
+        }
+        if target.head_cut_id.as_deref() != witness.target_before_cut_id() {
+            return Ok(R::TargetStale {
+                current_head_cut_id: target.head_cut_id,
+            });
+        }
+        let Some(target_cut) = BranchStore::cut_by_id(&tx, witness.target_after_cut_id())? else {
+            return Ok(R::TargetCutMissing);
+        };
+        if target_cut.branch_id != witness.target_branch_id()
+            || target_cut.parent_cut_id.as_deref() != witness.target_before_cut_id()
+            || target_cut.manifest_hash != witness.target_after_manifest_hash()
+        {
+            return Ok(R::TargetCutMismatch);
+        }
+        if target_cut.origin.as_deref()
+            != Some(format!("transport-batch:{}", request.derivation_id()).as_str())
+            || target_cut.actor.as_deref() != Some(derived.actor.as_str())
+            || target_cut.recorded_at != derived.recorded_at
+        {
+            return Ok(R::TargetCutAuthorshipMismatch);
+        }
+        if let Some(state) =
+            crate::branches::flowing_fence::native::read_state(&tx, witness.target_branch_id())?
+        {
+            if crate::branches::flowing_fence::require_head_move(
+                &state,
+                witness.target_before_cut_id(),
+                witness.target_after_cut_id(),
+                witness.target_after_manifest_hash(),
+                Some(&target_cut),
+            )
+            .is_err()
+            {
+                return Ok(R::TargetFenceRefused);
+            }
+        }
+        let mut units = Vec::with_capacity(witness.units().len());
+        for (index, selected) in witness.units().iter().enumerate() {
+            let unit_id = selected.unit_id().to_owned();
+            let op_id = format!("batch:{}:{index}", request.derivation_id());
+            if read_handoff(&tx, HandoffLookup::Operation, &op_id)?.is_some() {
+                return Ok(R::IdentityMismatch);
+            }
+            if read_handoff(&tx, HandoffLookup::Unit, &unit_id)?.is_some() {
+                return Ok(R::UnitAlreadyTransferred { unit_id });
+            }
+            let Some(unit) = read_declaration(&tx, &unit_id)? else {
+                return Ok(R::UnitMissing { unit_id });
+            };
+            let Some(basis) = read_basis(&tx, &unit_id)? else {
+                return Ok(R::BasisMissing { unit_id });
+            };
+            if unit.source_branch_id != selected.source_branch_id()
+                || unit.source_cut_id != selected.source_cut_id()
+                || basis.basis_digest != selected.basis_digest()
+            {
+                return Ok(R::BasisMismatch { unit_id });
+            }
+            let Some(pin) = read_pin(&tx, &unit.pin_id)? else {
+                return Ok(R::PinMissing { unit_id });
+            };
+            if pin.released_at.is_some() {
+                return Ok(R::PinReleased { unit_id });
+            }
+            if pin.twig_branch_id != unit.source_branch_id
+                || pin.cut_id != unit.source_cut_id
+                || pin.manifest_hash != unit.source_manifest_hash
+                || pin.principal != unit.principal
+            {
+                return Ok(R::BasisMismatch { unit_id });
+            }
+            let Some(source_cut) = BranchStore::cut_by_id(&tx, &unit.source_cut_id)? else {
+                return Ok(R::BasisMismatch { unit_id });
+            };
+            if source_cut.branch_id != unit.source_branch_id
+                || source_cut.manifest_hash != unit.source_manifest_hash
+            {
+                return Ok(R::BasisMismatch { unit_id });
+            }
+            let Some(source) = BranchStore::row_by_id(&tx, &unit.source_branch_id)? else {
+                return Ok(R::SourceNotActive { unit_id });
+            };
+            if source.status != BranchStatus::Active
+                || !source_cut_reachable(
+                    &tx,
+                    &unit.source_branch_id,
+                    source.head_cut_id.as_deref(),
+                    &unit.source_cut_id,
+                )?
+            {
+                return Ok(R::SourceNotActive { unit_id });
+            }
+            if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
+                return Ok(R::SourceNotParent { unit_id });
+            }
+            if source.branch_point_cut_id.as_deref() != witness.target_before_cut_id()
+                || source.branch_point_manifest_hash != target.head_manifest_hash
+            {
+                return Ok(R::SourceOrderUnproven);
+            }
+            units.push(HandoffReceipt {
+                op_id,
+                unit_id,
+                source_branch_id: unit.source_branch_id,
+                source_cut_id: unit.source_cut_id,
+                source_manifest_hash: unit.source_manifest_hash,
+                source_basis_digest: basis.basis_digest,
+                target_branch_id: witness.target_branch_id().to_owned(),
+                target_before_cut_id: witness.target_before_cut_id().map(str::to_owned),
+                target_after_cut_id: witness.target_after_cut_id().to_owned(),
+                target_after_manifest_hash: witness.target_after_manifest_hash().to_owned(),
+                effects: selected.effects().to_vec(),
+                original_principal: unit.principal,
+                actor: request.actor().to_owned(),
+                recorded_at: request.recorded_at().to_owned(),
+            });
+        }
+        let receipt = FlowingBatchHandoffReceipt {
+            derivation_id: request.derivation_id().to_owned(),
+            witness_digest: derived.witness_digest,
+            target_branch_id: witness.target_branch_id().to_owned(),
+            target_before_cut_id: witness.target_before_cut_id().map(str::to_owned),
+            target_after_cut_id: witness.target_after_cut_id().to_owned(),
+            target_after_manifest_hash: witness.target_after_manifest_hash().to_owned(),
+            units,
+            actor: request.actor().to_owned(),
+            recorded_at: request.recorded_at().to_owned(),
+        };
+        for unit in &receipt.units {
+            tx.execute(
+                "INSERT INTO flowing_handoffs \
+                 (op_id, unit_id, source_branch_id, source_cut_id, source_manifest_hash, \
+                  source_basis_digest, target_branch_id, target_before_cut_id, target_after_cut_id, \
+                  target_after_manifest_hash, effects_json, original_principal, actor, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    unit.op_id,
+                    unit.unit_id,
+                    unit.source_branch_id,
+                    unit.source_cut_id,
+                    unit.source_manifest_hash,
+                    unit.source_basis_digest,
+                    unit.target_branch_id,
+                    unit.target_before_cut_id,
+                    unit.target_after_cut_id,
+                    unit.target_after_manifest_hash,
+                    serde_json::to_string(&unit.effects)?,
+                    unit.original_principal,
+                    unit.actor,
+                    unit.recorded_at,
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO flowing_handoff_batches \
+             (derivation_id, target_after_cut_id, receipt_json, receipt_digest) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.derivation_id,
+                receipt.target_after_cut_id,
+                serde_json::to_string(&receipt)?,
+                batch_handoff_digest(&receipt),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, updated_at = ?4 \
+             WHERE branch_id = ?1",
+            params![
+                receipt.target_branch_id,
+                receipt.target_after_cut_id,
+                receipt.target_after_manifest_hash,
+                request.recorded_at(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(R::Transferred(receipt))
+    }
+
+    fn handoff_batch_receipt(
+        &self,
+        derivation_id: &str,
+    ) -> StoreResult<Option<FlowingBatchHandoffReceipt>> {
+        read_batch(&self.connection, "derivation_id", derivation_id)
+    }
+
+    fn target_handoff_batch(
+        &self,
+        target_after_cut_id: &str,
+    ) -> StoreResult<Option<FlowingBatchHandoffReceipt>> {
+        read_batch(&self.connection, "target_after_cut_id", target_after_cut_id)
     }
 
     fn release_private_cut(

@@ -82,6 +82,16 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         {
             return Ok(R::IncompletePrefix);
         }
+        // One mixed target cut carries several ordered receipts. The simple
+        // candidate constructor below advances its predecessor once per cut,
+        // so it must wait for a batch-aware realized-basis proof.
+        if prefix
+            .selected_handoffs()
+            .windows(2)
+            .any(|pair| pair[0].target_after_cut_id == pair[1].target_after_cut_id)
+        {
+            return Ok(R::IncompletePrefix);
+        }
         let mut prior = Vec::new();
         let mut predecessor_cut_id = expected_trunk_cut_id.map(str::to_owned);
         let mut predecessor_manifest_hash = trunk.head_manifest_hash.clone();

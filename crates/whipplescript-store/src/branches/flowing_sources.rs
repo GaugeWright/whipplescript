@@ -7,8 +7,9 @@
 //! An unbound declaration remains owed on its twig. A content-verified handoff
 //! moves one bound unit to its parent branch with the target ref and receipt in
 //! one transaction. A mixed cut can prepublish a content derivation while
-//! every unit remains owed; source-order proof and an atomic batch handoff
-//! remain open. Trunk accounting still needs a separate future receipt.
+//! every unit remains owed. A complete same-twig prefix can then prove source
+//! order and move the head with every unit receipt in one transaction. Mixed
+//! source dependencies and branch-to-trunk accounting remain open.
 //! The calling host authenticates and authorizes the principal on pin,
 //! declaration and release; the store binds those claims and prevents their
 //! later reinterpretation.
@@ -16,7 +17,7 @@
 #[cfg(feature = "native")]
 mod native;
 
-pub const SCHEMA: [&str; 10] = [
+pub const SCHEMA: [&str; 11] = [
     "CREATE TABLE IF NOT EXISTS flowing_private_pins (
         pin_id TEXT PRIMARY KEY,
         twig_branch_id TEXT NOT NULL,
@@ -89,6 +90,12 @@ pub const SCHEMA: [&str; 10] = [
     )",
     "CREATE INDEX IF NOT EXISTS flowing_derived_cuts_branch_idx
         ON flowing_derived_cuts(target_branch_id, target_after_cut_id)",
+    "CREATE TABLE IF NOT EXISTS flowing_handoff_batches (
+        derivation_id TEXT PRIMARY KEY,
+        target_after_cut_id TEXT NOT NULL UNIQUE,
+        receipt_json TEXT NOT NULL,
+        receipt_digest TEXT NOT NULL
+    )",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,7 +275,7 @@ impl<'a> HandoffContribution<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HandoffReceipt {
     pub op_id: String,
     pub unit_id: String,
@@ -284,6 +291,88 @@ pub struct HandoffReceipt {
     pub original_principal: String,
     pub actor: String,
     pub recorded_at: String,
+}
+
+/// One indivisible head move and complete per-unit receipt roster. The stored
+/// batch receipt is checked against every individual row on read, so an
+/// interrupted or corrupted partial transfer cannot look complete.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FlowingBatchHandoffReceipt {
+    pub derivation_id: String,
+    pub witness_digest: String,
+    pub target_branch_id: String,
+    pub target_before_cut_id: Option<String>,
+    pub target_after_cut_id: String,
+    pub target_after_manifest_hash: String,
+    pub units: Vec<HandoffReceipt>,
+    pub actor: String,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HandoffBatchContribution<'a> {
+    derivation_id: &'a str,
+    expected_witness_digest: &'a str,
+    actor: &'a str,
+    recorded_at: &'a str,
+}
+
+impl<'a> HandoffBatchContribution<'a> {
+    pub(crate) fn new(
+        derivation_id: &'a str,
+        expected_witness_digest: &'a str,
+        actor: &'a str,
+        recorded_at: &'a str,
+    ) -> Self {
+        Self {
+            derivation_id,
+            expected_witness_digest,
+            actor,
+            recorded_at,
+        }
+    }
+    pub fn derivation_id(self) -> &'a str {
+        self.derivation_id
+    }
+    pub fn expected_witness_digest(self) -> &'a str {
+        self.expected_witness_digest
+    }
+    pub fn actor(self) -> &'a str {
+        self.actor
+    }
+    pub fn recorded_at(self) -> &'a str {
+        self.recorded_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HandoffBatchContributionOutcome {
+    Transferred(FlowingBatchHandoffReceipt),
+    Existing(FlowingBatchHandoffReceipt),
+    IdentityMismatch,
+    DerivationMissing,
+    DerivationMismatch,
+    WitnessMismatch,
+    SourceOrderUnproven,
+    MissingContent { content_id: String },
+    UnitAlreadyTransferred { unit_id: String },
+    UnitMissing { unit_id: String },
+    BasisMissing { unit_id: String },
+    BasisMismatch { unit_id: String },
+    PinMissing { unit_id: String },
+    PinReleased { unit_id: String },
+    SourceNotActive { unit_id: String },
+    SourceNotParent { unit_id: String },
+    TargetMissing,
+    TargetNotActive,
+    TargetReserved { holder: String },
+    TargetStale { current_head_cut_id: Option<String> },
+    TargetFenceRefused,
+    TargetCutMissing,
+    TargetCutMismatch,
+    TargetCutAuthorshipMismatch,
+    TrunkRequiresGate,
+    Invalid { field: &'static str },
 }
 
 /// Immutable mixed-content derivation prepared before any target ref move.
@@ -447,6 +536,18 @@ pub trait FlowingSources {
         &self,
         derivation_id: &str,
     ) -> crate::StoreResult<Option<FlowingDerivedCut>>;
+    fn handoff_batch_contribution(
+        &mut self,
+        request: HandoffBatchContribution<'_>,
+    ) -> crate::StoreResult<HandoffBatchContributionOutcome>;
+    fn handoff_batch_receipt(
+        &self,
+        derivation_id: &str,
+    ) -> crate::StoreResult<Option<FlowingBatchHandoffReceipt>>;
+    fn target_handoff_batch(
+        &self,
+        target_after_cut_id: &str,
+    ) -> crate::StoreResult<Option<FlowingBatchHandoffReceipt>>;
     /// Only an explicit release can end an undeclared pin. A declared unit
     /// keeps the pin until an exact handoff or admission receipt transfers
     /// responsibility under a later operation.
@@ -553,4 +654,21 @@ pub fn derived_cut_digest(witness: &crate::vcs::FlowingBatchTargetEffects) -> St
     let bytes = serde_json::to_vec(&("flowing-derived-cut-v1", witness))
         .expect("derived-cut witness serializes");
     format!("sha256:{}", crate::chunking::content_hash_hex(&bytes))
+}
+
+pub fn batch_handoff_digest(receipt: &FlowingBatchHandoffReceipt) -> String {
+    let bytes = serde_json::to_vec(&("flowing-batch-handoff-v1", receipt))
+        .expect("batch handoff receipt serializes");
+    format!("sha256:{}", crate::chunking::content_hash_hex(&bytes))
+}
+
+pub fn missing_batch_handoff_field(request: HandoffBatchContribution<'_>) -> Option<&'static str> {
+    [
+        ("derivation_id", request.derivation_id),
+        ("expected_witness_digest", request.expected_witness_digest),
+        ("actor", request.actor),
+        ("recorded_at", request.recorded_at),
+    ]
+    .into_iter()
+    .find_map(|(field, value)| value.trim().is_empty().then_some(field))
 }

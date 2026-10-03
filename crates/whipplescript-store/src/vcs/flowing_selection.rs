@@ -324,7 +324,7 @@ impl FlowingBranchLineage {
         let position = self
             .handoffs
             .iter()
-            .position(|receipt| receipt.target_after_cut_id == selected_cut_id)?;
+            .rposition(|receipt| receipt.target_after_cut_id == selected_cut_id)?;
         let (selected, later) = self.handoffs.split_at(position + 1);
         let (selected_sources, _) = self.sources.split_at(position + 1);
         Some(FlowingBranchPrefix {
@@ -412,7 +412,8 @@ type NetSourceResult<'a> = StoreResult<Result<NetSourcePaths<'a>, FlowingTargetE
 
 impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Match every cut reachable from a named branch's head to its branch
-    /// point with one immutable handoff receipt, and rederive each receipt's
+    /// point with an immutable handoff receipt or complete batch, and rederive
+    /// each receipt's
     /// effects from the bound source atoms and actual target content. Any
     /// local edit, rewrite, orphan receipt or omitted target cut refuses until
     /// constituent transport lineage can account for it explicitly.
@@ -456,16 +457,12 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             None => {}
         }
-        let mut by_cut = BTreeMap::new();
+        let mut by_cut: BTreeMap<String, Vec<HandoffReceipt>> = BTreeMap::new();
         for receipt in self.branches.target_handoffs(branch_id)? {
-            if by_cut
-                .insert(receipt.target_after_cut_id.clone(), receipt.clone())
-                .is_some()
-            {
-                return Ok(R::ReceiptMismatch {
-                    op_id: receipt.op_id,
-                });
-            }
+            by_cut
+                .entry(receipt.target_after_cut_id.clone())
+                .or_default()
+                .push(receipt);
         }
         let mut reverse = Vec::new();
         let mut reverse_sources = Vec::new();
@@ -489,54 +486,142 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             {
                 return Ok(R::CutMismatch { cut_id });
             }
-            let Some(receipt) = by_cut.remove(&cut_id) else {
+            let Some(receipts) = by_cut.remove(&cut_id) else {
                 return Ok(R::MissingReceipt { cut_id });
             };
-            if receipt.target_branch_id != branch_id
-                || receipt.target_before_cut_id != cut.parent_cut_id
-                || receipt.target_after_manifest_hash != cut.manifest_hash
-                || cut.origin.as_deref()
-                    != Some(format!("transport:{}", receipt.source_branch_id).as_str())
-                || cut.actor.as_deref() != Some(receipt.actor.as_str())
-            {
-                return Ok(R::ReceiptMismatch {
-                    op_id: receipt.op_id,
+            if let Some(batch) = self.branches.target_handoff_batch(&cut_id)? {
+                let group: BTreeSet<&str> = receipts
+                    .iter()
+                    .map(|receipt| receipt.op_id.as_str())
+                    .collect();
+                let recorded: BTreeSet<&str> = batch
+                    .units
+                    .iter()
+                    .map(|receipt| receipt.op_id.as_str())
+                    .collect();
+                if receipts.len() != batch.units.len()
+                    || group != recorded
+                    || batch.target_branch_id != branch_id
+                    || batch.target_before_cut_id != cut.parent_cut_id
+                    || batch.target_after_manifest_hash != cut.manifest_hash
+                    || cut.origin.as_deref()
+                        != Some(format!("transport-batch:{}", batch.derivation_id).as_str())
+                    || cut.actor.as_deref() != Some(batch.actor.as_str())
+                {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: batch.derivation_id,
+                    });
+                }
+                let Some(derived) = self.branches.flowing_derived_cut(&batch.derivation_id)? else {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: batch.derivation_id,
+                    });
+                };
+                let unit_ids = batch
+                    .units
+                    .iter()
+                    .map(|receipt| receipt.unit_id.as_str())
+                    .collect::<Vec<_>>();
+                if self.verify_private_batch_target_effects(&unit_ids, &cut_id)?
+                    != FlowingBatchTargetEffectsOutcome::Verified(derived.witness)
+                {
+                    return Ok(R::EffectsUnproved {
+                        unit_id: batch.units[0].unit_id.clone(),
+                    });
+                }
+                for receipt in batch.units.into_iter().rev() {
+                    let Some(unit) = self.branches.contribution_declaration(&receipt.unit_id)?
+                    else {
+                        return Ok(R::ReceiptMismatch {
+                            op_id: receipt.op_id,
+                        });
+                    };
+                    let Some(basis) = self.branches.contribution_basis(&receipt.unit_id)? else {
+                        return Ok(R::EffectsUnproved {
+                            unit_id: receipt.unit_id,
+                        });
+                    };
+                    if receipt.source_branch_id != unit.source_branch_id
+                        || receipt.source_cut_id != unit.source_cut_id
+                        || receipt.source_manifest_hash != unit.source_manifest_hash
+                        || receipt.source_basis_digest != basis.basis_digest
+                        || receipt.original_principal != unit.principal
+                    {
+                        return Ok(R::ReceiptMismatch {
+                            op_id: receipt.op_id,
+                        });
+                    }
+                    reverse_sources.push(FlowingHandoffSource {
+                        unit_id: receipt.unit_id.clone(),
+                        source_cut_id: unit.source_cut_id,
+                        pin_id: unit.pin_id,
+                        basis_digest: basis.basis_digest,
+                        principal: unit.principal,
+                        intent: unit.intent,
+                    });
+                    reverse.push(receipt);
+                }
+            } else {
+                let [receipt] = receipts.as_slice() else {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: receipts[0].op_id.clone(),
+                    });
+                };
+                if receipt.target_branch_id != branch_id
+                    || receipt.target_before_cut_id != cut.parent_cut_id
+                    || receipt.target_after_manifest_hash != cut.manifest_hash
+                    || cut.origin.as_deref()
+                        != Some(format!("transport:{}", receipt.source_branch_id).as_str())
+                    || cut.actor.as_deref() != Some(receipt.actor.as_str())
+                {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: receipt.op_id.clone(),
+                    });
+                }
+                let Some(unit) = self.branches.contribution_declaration(&receipt.unit_id)? else {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: receipt.op_id.clone(),
+                    });
+                };
+                let Some(basis) = self.branches.contribution_basis(&receipt.unit_id)? else {
+                    return Ok(R::EffectsUnproved {
+                        unit_id: receipt.unit_id.clone(),
+                    });
+                };
+                if receipt.source_branch_id != unit.source_branch_id
+                    || receipt.source_cut_id != unit.source_cut_id
+                    || receipt.source_manifest_hash != unit.source_manifest_hash
+                    || receipt.source_basis_digest != basis.basis_digest
+                    || receipt.original_principal != unit.principal
+                {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: receipt.op_id.clone(),
+                    });
+                }
+                let FlowingTargetEffectsOutcome::Verified(effects) =
+                    self.verify_private_target_effects(&receipt.unit_id, &cut_id)?
+                else {
+                    return Ok(R::EffectsUnproved {
+                        unit_id: receipt.unit_id.clone(),
+                    });
+                };
+                if effects.effects() != receipt.effects
+                    || effects.target_before_cut_id() != receipt.target_before_cut_id.as_deref()
+                    || effects.target_after_manifest_hash() != receipt.target_after_manifest_hash
+                {
+                    return Ok(R::ReceiptMismatch {
+                        op_id: receipt.op_id.clone(),
+                    });
+                }
+                reverse_sources.push(FlowingHandoffSource {
+                    unit_id: receipt.unit_id.clone(),
+                    source_cut_id: unit.source_cut_id,
+                    pin_id: unit.pin_id,
+                    basis_digest: basis.basis_digest,
+                    principal: unit.principal,
+                    intent: unit.intent,
                 });
-            }
-            let Some(unit) = self.branches.contribution_declaration(&receipt.unit_id)? else {
-                return Ok(R::ReceiptMismatch {
-                    op_id: receipt.op_id,
-                });
-            };
-            let Some(basis) = self.branches.contribution_basis(&receipt.unit_id)? else {
-                return Ok(R::EffectsUnproved {
-                    unit_id: receipt.unit_id,
-                });
-            };
-            if receipt.source_branch_id != unit.source_branch_id
-                || receipt.source_cut_id != unit.source_cut_id
-                || receipt.source_manifest_hash != unit.source_manifest_hash
-                || receipt.source_basis_digest != basis.basis_digest
-                || receipt.original_principal != unit.principal
-            {
-                return Ok(R::ReceiptMismatch {
-                    op_id: receipt.op_id,
-                });
-            }
-            let FlowingTargetEffectsOutcome::Verified(effects) =
-                self.verify_private_target_effects(&receipt.unit_id, &cut_id)?
-            else {
-                return Ok(R::EffectsUnproved {
-                    unit_id: receipt.unit_id,
-                });
-            };
-            if effects.effects() != receipt.effects
-                || effects.target_before_cut_id() != receipt.target_before_cut_id.as_deref()
-                || effects.target_after_manifest_hash() != receipt.target_after_manifest_hash
-            {
-                return Ok(R::ReceiptMismatch {
-                    op_id: receipt.op_id,
-                });
+                reverse.push(receipt.clone());
             }
             expected_manifest = match cut.parent_cut_id.as_deref() {
                 Some(parent_id) => self
@@ -546,18 +631,11 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 None => None,
             };
             cursor = cut.parent_cut_id;
-            reverse_sources.push(FlowingHandoffSource {
-                unit_id: receipt.unit_id.clone(),
-                source_cut_id: unit.source_cut_id,
-                pin_id: unit.pin_id,
-                basis_digest: basis.basis_digest,
-                principal: unit.principal,
-                intent: unit.intent,
-            });
-            reverse.push(receipt);
         }
         if let Some((_, extra)) = by_cut.into_iter().next() {
-            return Ok(R::UnreachableReceipt { op_id: extra.op_id });
+            return Ok(R::UnreachableReceipt {
+                op_id: extra[0].op_id.clone(),
+            });
         }
         if expected_manifest != branch.branch_point_manifest_hash {
             return Ok(R::CutMismatch {
@@ -1889,6 +1967,98 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let branches = &mut self.branches;
         self.content
             .publish_retained(&ids, || branches.record_flowing_derived_cut(request))
+    }
+
+    /// Transfer a stored mixed derivation only after both its current content
+    /// and complete same-twig predecessor basis have been re-proved. The
+    /// branch store recaptures mutable source, target and fence premises in
+    /// one transaction with the head and complete receipt roster.
+    pub fn handoff_private_batch_derivation(
+        &mut self,
+        derivation_id: &str,
+        expected_witness_digest: &str,
+        actor: &str,
+        recorded_at: &str,
+    ) -> StoreResult<crate::branches::flowing_sources::HandoffBatchContributionOutcome> {
+        use crate::branches::flowing_sources::{
+            HandoffBatchContribution, HandoffBatchContributionOutcome as R,
+        };
+        let request = HandoffBatchContribution::new(
+            derivation_id,
+            expected_witness_digest,
+            actor,
+            recorded_at,
+        );
+        if self
+            .branches
+            .handoff_batch_receipt(derivation_id)?
+            .is_some()
+        {
+            return self.branches.handoff_batch_contribution(request);
+        }
+        let Some(derived) = self.branches.flowing_derived_cut(derivation_id)? else {
+            return Ok(R::DerivationMissing);
+        };
+        if derived.witness_digest != expected_witness_digest || derived.actor != actor {
+            return Ok(R::DerivationMismatch);
+        }
+        let witness = &derived.witness;
+        if self.verify_private_batch_source_order(witness)?
+            != FlowingBatchSourceOrderOutcome::Verified
+        {
+            return Ok(R::SourceOrderUnproven);
+        }
+        let unit_ids = witness
+            .units()
+            .iter()
+            .map(FlowingBatchUnitEffect::unit_id)
+            .collect::<Vec<_>>();
+        let observed =
+            self.verify_private_batch_target_effects(&unit_ids, witness.target_after_cut_id())?;
+        if observed != FlowingBatchTargetEffectsOutcome::Verified(witness.clone()) {
+            return Ok(R::WitnessMismatch);
+        }
+        let mut ids = BTreeSet::new();
+        let mut roots = vec![witness.target_after_manifest_hash().to_owned()];
+        if let Some(before_cut_id) = witness.target_before_cut_id() {
+            let Some(before_cut) = self.branches.get_cut(before_cut_id)? else {
+                return Ok(R::WitnessMismatch);
+            };
+            roots.push(before_cut.manifest_hash);
+        }
+        for selected in witness.units() {
+            let Some(unit) = self.branches.contribution_declaration(selected.unit_id())? else {
+                return Ok(R::UnitMissing {
+                    unit_id: selected.unit_id().into(),
+                });
+            };
+            let Some(basis) = self.branches.contribution_basis(selected.unit_id())? else {
+                return Ok(R::BasisMissing {
+                    unit_id: selected.unit_id().into(),
+                });
+            };
+            roots.push(unit.source_manifest_hash);
+            for atom in basis.atoms {
+                ids.extend(atom.before);
+                ids.extend(atom.after);
+            }
+        }
+        for root in roots {
+            let Some(manifest) = self.load_manifest_opt_raw(&root)? else {
+                return Ok(R::MissingContent { content_id: root });
+            };
+            ids.insert(root.clone());
+            match manifest {
+                RawManifest::Tree(_) => {
+                    ids.extend(crate::manifest_tree::reachable_ids(&self.content, &root)?)
+                }
+                RawManifest::Flat(files) => ids.extend(files.into_values()),
+            }
+        }
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        let branches = &mut self.branches;
+        self.content
+            .publish_retained(&ids, || branches.handoff_batch_contribution(request))
     }
 
     /// Check one bound unit against a recorded trunk candidate. This is a
@@ -5006,6 +5176,319 @@ mod tests {
         assert!(reopened.flowing_derived_cut("derive-1").is_err());
         drop(reopened);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_mixed_batch_handoff_moves_head_and_both_units_or_neither() {
+        use crate::branches::flowing_sources::{
+            HandoffBatchContributionOutcome as H, RecordFlowingDerivedCutOutcome as D,
+        };
+        let mut vcs = workspace();
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-batch-inc".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "twig-batch-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        let mut previous = None;
+        let mut predecessors = Vec::new();
+        for (unit_id, pin_id, cut_id, body) in [
+            ("unit-a", "pin-a", "twig-a", "A"),
+            ("unit-b", "pin-b", "twig-b", "B"),
+        ] {
+            vcs.write("twig", "a.txt", Some(body), cut_id, "t2")
+                .unwrap();
+            pin(&mut vcs, cut_id, pin_id);
+            declare_native(&mut vcs, unit_id, pin_id, previous, &predecessors, None);
+            let FlowingSelectionOutcome::Selected(selection) = vcs
+                .select_private_changes(
+                    pin_id,
+                    &selection::parse(&format!("change({cut_id})")).unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("bound source cut")
+            };
+            assert_eq!(
+                vcs.bind_private_selection(unit_id, &selection, "t3")
+                    .unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            predecessors.push((unit_id.to_owned(), selection.digest().to_owned()));
+            previous = Some(cut_id);
+        }
+        let manifest_hash = vcs
+            .branches
+            .get_cut("twig-b")
+            .unwrap()
+            .unwrap()
+            .manifest_hash;
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "batch-cut",
+                change_id: "batch-change",
+                branch_id: "branch",
+                manifest_hash: &manifest_hash,
+                parent_cut_id: None,
+                origin: Some("transport-batch:derive-1"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t9",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_batch_target_effects(&["unit-a", "unit-b"], "batch-cut")
+            .unwrap()
+        else {
+            panic!("mixed target content")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&witness).unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        let D::Recorded(derived) = vcs
+            .record_private_batch_derivation("derive-1", &witness, "mediator", "t9")
+            .unwrap()
+        else {
+            panic!("prepublished derivation")
+        };
+
+        vcs.branches
+            .test_connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_second_batch_unit BEFORE INSERT ON flowing_handoffs \
+                 WHEN NEW.unit_id = 'unit-b' BEGIN SELECT RAISE(ABORT, 'fail second unit'); END;",
+            )
+            .unwrap();
+        assert!(vcs
+            .handoff_private_batch_derivation(
+                "derive-1",
+                &derived.witness_digest,
+                "mediator",
+                "t10",
+            )
+            .is_err());
+        assert!(vcs
+            .branches
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+        assert!(vcs
+            .branches
+            .handoff_batch_receipt("derive-1")
+            .unwrap()
+            .is_none());
+        for unit_id in ["unit-a", "unit-b"] {
+            assert!(vcs
+                .branches
+                .contribution_handoff(unit_id)
+                .unwrap()
+                .is_none());
+        }
+        vcs.branches
+            .test_connection()
+            .execute_batch("DROP TRIGGER fail_second_batch_unit")
+            .unwrap();
+        let H::Transferred(receipt) = vcs
+            .handoff_private_batch_derivation(
+                "derive-1",
+                &derived.witness_digest,
+                "mediator",
+                "t10",
+            )
+            .unwrap()
+        else {
+            panic!("atomic batch transfer")
+        };
+        assert_eq!(receipt.units.len(), 2);
+        assert_eq!(
+            vcs.branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("batch-cut")
+        );
+        assert_eq!(
+            vcs.branches.handoff_batch_receipt("derive-1").unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            vcs.branches.target_handoff_batch("batch-cut").unwrap(),
+            Some(receipt.clone())
+        );
+        for (index, unit_id) in ["unit-a", "unit-b"].iter().enumerate() {
+            assert_eq!(
+                vcs.branches.contribution_handoff(unit_id).unwrap(),
+                Some(receipt.units[index].clone())
+            );
+        }
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("complete mixed handoff lineage")
+        };
+        assert_eq!(lineage.handoffs(), receipt.units);
+        let prefix = lineage.prefix_through("batch-cut").unwrap();
+        assert_eq!(prefix.selected_handoffs().len(), 2);
+        assert!(prefix.later_handoffs().is_empty());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "whip-flowing-batch-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        vcs.branches
+            .test_connection()
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reopened = BranchStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.handoff_batch_receipt("derive-1").unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            reopened
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("batch-cut")
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_derived_cuts SET derivation_id = 'missing' WHERE derivation_id = 'derive-1'",
+                [],
+            )
+            .unwrap();
+        let error = vcs.branches.handoff_batch_receipt("derive-1").unwrap_err();
+        assert!(format!("{error:?}").contains("batch handoff has no derivation"));
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_derived_cuts SET derivation_id = 'derive-1' WHERE derivation_id = 'missing'",
+                [],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET cut_id = 'missing' WHERE cut_id = 'batch-cut'",
+                [],
+            )
+            .unwrap();
+        let error = vcs.branches.handoff_batch_receipt("derive-1").unwrap_err();
+        assert!(format!("{error:?}").contains("batch handoff target cut is missing"));
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET cut_id = 'batch-cut' WHERE cut_id = 'missing'",
+                [],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = 'wrong' WHERE cut_id = 'batch-cut'",
+                [],
+            )
+            .unwrap();
+        assert!(vcs.branches.handoff_batch_receipt("derive-1").is_err());
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = ?1 WHERE cut_id = 'batch-cut'",
+                [&manifest_hash],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoff_batches SET receipt_digest = 'wrong' WHERE derivation_id = 'derive-1'",
+                [],
+            )
+            .unwrap();
+        assert!(vcs.branches.handoff_batch_receipt("derive-1").is_err());
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoff_batches SET receipt_digest = ?1 WHERE derivation_id = 'derive-1'",
+                [crate::branches::flowing_sources::batch_handoff_digest(&receipt)],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoffs SET actor = 'other' WHERE unit_id = 'unit-b'",
+                [],
+            )
+            .unwrap();
+        let error = vcs.branches.handoff_batch_receipt("derive-1").unwrap_err();
+        assert!(format!("{error:?}").contains("batch handoff unit receipt differs"));
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoffs SET actor = 'mediator' WHERE unit_id = 'unit-b'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.handoff_private_batch_derivation(
+                "derive-1",
+                &derived.witness_digest,
+                "mediator",
+                "t10"
+            )
+            .unwrap(),
+            H::Existing(receipt.clone())
+        );
+        assert_eq!(
+            vcs.handoff_private_batch_derivation(
+                "derive-1",
+                &derived.witness_digest,
+                "mediator",
+                "t11"
+            )
+            .unwrap(),
+            H::IdentityMismatch
+        );
+        vcs.branches
+            .test_connection()
+            .execute("DELETE FROM flowing_handoffs WHERE unit_id = 'unit-b'", [])
+            .unwrap();
+        let error = vcs.branches.handoff_batch_receipt("derive-1").unwrap_err();
+        assert!(format!("{error:?}").contains("batch handoff receipt roster is incomplete"));
     }
 
     #[test]
