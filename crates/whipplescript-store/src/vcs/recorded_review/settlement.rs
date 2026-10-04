@@ -34,6 +34,20 @@ impl AppliedRecordedSettlement {
     }
 }
 
+/// Historical evidence only: never a current-head or projection authority.
+#[derive(Clone)]
+pub struct HistoricalRecordedSettlement {
+    receipt: AppliedRecordedSettlement,
+}
+impl HistoricalRecordedSettlement {
+    pub fn cut(&self) -> &CutRow {
+        &self.receipt.cut
+    }
+    pub fn operation(&self) -> &OpRow {
+        &self.receipt.op
+    }
+}
+
 pub enum RecordedSettlementOutcome {
     Applied(Box<AppliedRecordedSettlement>),
     GateRefused(GateRefusal),
@@ -290,6 +304,56 @@ impl NativeWorkspaceVcs {
         intent: &str,
         check: &mut dyn FnMut() -> StoreResult<()>,
     ) -> StoreResult<AppliedRecordedSettlement> {
+        self.recover_original_recorded_settlement(
+            branch_id,
+            original_head,
+            original_evidence,
+            cut_id,
+            actor,
+            intent,
+            check,
+            false,
+        )
+    }
+
+    /// Recover original immutable history after later collaboration. Never
+    /// advances a head or supplies current applied/projection authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_historical_recorded_settlement(
+        &self,
+        branch_id: &str,
+        original_head: &str,
+        original_evidence: &[String],
+        cut_id: &str,
+        actor: &str,
+        intent: &str,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<HistoricalRecordedSettlement> {
+        self.recover_original_recorded_settlement(
+            branch_id,
+            original_head,
+            original_evidence,
+            cut_id,
+            actor,
+            intent,
+            check,
+            true,
+        )
+        .map(|receipt| HistoricalRecordedSettlement { receipt })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_original_recorded_settlement(
+        &self,
+        branch_id: &str,
+        original_head: &str,
+        original_evidence: &[String],
+        cut_id: &str,
+        actor: &str,
+        intent: &str,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+        historical: bool,
+    ) -> StoreResult<AppliedRecordedSettlement> {
         check()?;
         let unavailable = || {
             StoreError::Conflict(
@@ -322,12 +386,13 @@ impl NativeWorkspaceVcs {
             || op.deltas.len() != 2
             || source.status != BranchStatus::Active
             || target.status != BranchStatus::Active
-            || source.head_cut_id.as_deref() != Some(cut_id)
-            || source.branch_point_cut_id.as_deref() != Some(cut_id)
-            || source.head_manifest_hash.as_deref() != Some(&cut.manifest_hash)
-            || source.branch_point_manifest_hash.as_deref() != Some(&cut.manifest_hash)
-            || target.head_cut_id.as_deref() != Some(cut_id)
-            || target.head_manifest_hash.as_deref() != Some(&cut.manifest_hash)
+            || (!historical
+                && (source.head_cut_id.as_deref() != Some(cut_id)
+                    || source.branch_point_cut_id.as_deref() != Some(cut_id)
+                    || source.head_manifest_hash.as_deref() != Some(&cut.manifest_hash)
+                    || source.branch_point_manifest_hash.as_deref() != Some(&cut.manifest_hash)
+                    || target.head_cut_id.as_deref() != Some(cut_id)
+                    || target.head_manifest_hash.as_deref() != Some(&cut.manifest_hash)))
         {
             return Err(StoreError::Conflict(
                 "original recorded settlement recovery meaning differs".into(),
@@ -337,10 +402,21 @@ impl NativeWorkspaceVcs {
         let target_delta = &op.deltas[0];
         let before_source = source_delta.before.as_ref().ok_or_else(unavailable)?;
         let before_target = target_delta.before.as_ref().ok_or_else(unavailable)?;
+        let mut expected_source = before_source.clone();
+        expected_source.head_cut_id = Some(cut_id.into());
+        expected_source.head_manifest_hash = Some(cut.manifest_hash.clone());
+        expected_source.branch_point_cut_id = expected_source.head_cut_id.clone();
+        expected_source.branch_point_manifest_hash = expected_source.head_manifest_hash.clone();
+        let mut expected_target = before_target.clone();
+        expected_target.head_cut_id = Some(cut_id.into());
+        expected_target.head_manifest_hash = Some(cut.manifest_hash.clone());
         if source_delta.branch_id != branch_id
             || target_delta.branch_id != target.branch_id
-            || source_delta.after != OpBranchState::of(&source)
-            || target_delta.after != OpBranchState::of(&target)
+            || source_delta.after != expected_source
+            || target_delta.after != expected_target
+            || (!historical
+                && (source_delta.after != OpBranchState::of(&source)
+                    || target_delta.after != OpBranchState::of(&target)))
             || before_source.head_cut_id.as_deref() != Some(original_head)
             || before_target.head_cut_id != cut.parent_cut_id
             || before_source.status != BranchStatus::Active
@@ -398,11 +474,71 @@ impl NativeWorkspaceVcs {
             inputs,
             retained,
         };
-        self.publish_recorded_settlement(&receipt, |receipt, _| {
-            self.require_legacy_source(&receipt.source.branch_id, "recorded settlement recovery")?;
-            self.require_legacy_source(&receipt.target.branch_id, "recorded settlement recovery")?;
-            check()?;
-            Ok(receipt.clone())
+        if historical {
+            let history = HistoricalRecordedSettlement { receipt };
+            self.publish_historical_recorded_settlement(&history, |history, _| {
+                check()?;
+                Ok(history.receipt.clone())
+            })
+        } else {
+            self.publish_recorded_settlement(&receipt, |receipt, _| {
+                self.require_legacy_source(
+                    &receipt.source.branch_id,
+                    "recorded settlement recovery",
+                )?;
+                self.require_legacy_source(
+                    &receipt.target.branch_id,
+                    "recorded settlement recovery",
+                )?;
+                check()?;
+                Ok(receipt.clone())
+            })
+        }
+    }
+
+    /// Retain historical cut/operation/payloads and current active custody
+    /// under both writers. The callback consumes the same original embedding
+    /// writer, including its final authorization check. No native mutation.
+    pub fn publish_historical_recorded_settlement<T>(
+        &self,
+        history: &HistoricalRecordedSettlement,
+        publish: impl FnOnce(&HistoricalRecordedSettlement, &Self) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let applied = &history.receipt;
+        self.content.publish_retained(&applied.retained, || {
+            self.branches.with_fenced_observation(|| {
+                let source = self.branches.get_branch(&applied.source.branch_id)?;
+                let target = self.branches.get_branch(&applied.target.branch_id)?;
+                if !source.as_ref().is_some_and(|row| {
+                    row.status == BranchStatus::Active
+                        && row.created_at == applied.source.created_at
+                        && row.parent_branch_id == applied.source.parent_branch_id
+                        && row.parent_branch_id.as_deref()
+                            == Some(applied.target.branch_id.as_str())
+                }) || !target.as_ref().is_some_and(|row| {
+                    row.status == BranchStatus::Active
+                        && row.created_at == applied.target.created_at
+                        && row.parent_branch_id == applied.target.parent_branch_id
+                }) || self.branches.get_cut(&applied.cut.cut_id)?.as_ref() != Some(&applied.cut)
+                    || self.branches.get_op(&applied.op.op_id)?.as_ref() != Some(&applied.op)
+                    || applied.inputs.iter().any(|cut| {
+                        self.branches.get_cut(&cut.cut_id).ok().flatten().as_ref() != Some(cut)
+                    })
+                {
+                    return Err(StoreError::Conflict(
+                        "historical recorded settlement evidence or custody changed".into(),
+                    ));
+                }
+                self.require_legacy_source(
+                    &applied.source.branch_id,
+                    "historical settlement publication",
+                )?;
+                self.require_legacy_source(
+                    &applied.target.branch_id,
+                    "historical settlement publication",
+                )?;
+                publish(history, self)
+            })
         })
     }
 

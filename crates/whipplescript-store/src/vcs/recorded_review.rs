@@ -3,7 +3,8 @@
 use super::*;
 mod settlement;
 pub use settlement::{
-    AppliedRecordedSettlement, PreparedRecordedSettlement, RecordedSettlementOutcome,
+    AppliedRecordedSettlement, HistoricalRecordedSettlement, PreparedRecordedSettlement,
+    RecordedSettlementOutcome,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

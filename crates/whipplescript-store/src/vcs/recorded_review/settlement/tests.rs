@@ -762,3 +762,328 @@ fn recorded_settlement_recovery_requires_complete_original_cut_coordinates() {
         );
     }
 }
+
+fn history(vcs: &NativeWorkspaceVcs) -> HistoricalRecordedSettlement {
+    vcs.recover_historical_recorded_settlement(
+        "office",
+        "office-1",
+        &[],
+        "settlement",
+        "staff:alice",
+        "original-http-command",
+        &mut || Ok(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn historical_recorded_settlement_recovers_after_both_heads_advance_without_moving_them() {
+    let mut vcs = setup();
+    let prepared = prepare(&vcs);
+    let RecordedSettlementOutcome::Applied(applied) = vcs
+        .apply_prepared_recorded_settlement(&prepared, &mut || Ok(()), &mut gate(&vcs, "admit"))
+        .unwrap()
+    else {
+        panic!("not applied")
+    };
+    vcs.write(
+        "office",
+        "later.txt",
+        Some("later staff work"),
+        "office-2",
+        "t6",
+    )
+    .unwrap();
+    vcs.write(
+        MAINLINE_BRANCH_ID,
+        "later-main.txt",
+        Some("later shared work"),
+        "main-3",
+        "t7",
+    )
+    .unwrap();
+    let before = vcs.branches.list_branches(None).unwrap();
+    assert!(vcs
+        .recover_recorded_settlement(
+            "office",
+            "office-1",
+            &[],
+            "settlement",
+            "staff:alice",
+            "original-http-command",
+            &mut || Ok(())
+        )
+        .is_err());
+    assert!(vcs
+        .publish_recorded_settlement(&applied, |_, _| Ok(()))
+        .is_err());
+    let recovered = history(&vcs);
+    assert_eq!(recovered.cut(), applied.cut());
+    assert_eq!(recovered.operation(), applied.operation());
+    assert_eq!(vcs.branches.list_branches(None).unwrap(), before);
+    // A historical value remains historical when more work occurs before
+    // publication. The receipt is not a captured current-head projection.
+    vcs.write("office", "newer.txt", Some("newer"), "office-3", "t8")
+        .unwrap();
+    let before = vcs.branches.list_branches(None).unwrap();
+    vcs.publish_historical_recorded_settlement(&recovered, |receipt, _| {
+        assert_eq!(receipt.cut(), applied.cut());
+        for name in ["branches.sqlite", "content.sqlite"] {
+            let db = rusqlite::Connection::open(vcs.dir.join(name)).unwrap();
+            db.busy_timeout(std::time::Duration::ZERO).unwrap();
+            assert!(
+                db.execute_batch("BEGIN IMMEDIATE").is_err(),
+                "historical publisher lost {name} writer"
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(vcs.branches.list_branches(None).unwrap(), before);
+}
+
+#[test]
+fn historical_recorded_settlement_refuses_changed_evidence_custody_and_lost_payloads() {
+    for change in [
+        "source-status",
+        "target-status",
+        "source-parent",
+        "source-created",
+        "target-parent",
+        "target-created",
+        "op",
+        "cut",
+        "input",
+        "payload",
+    ] {
+        let vcs = setup();
+        let prepared = prepare(&vcs);
+        assert!(matches!(
+            vcs.apply_prepared_recorded_settlement(
+                &prepared,
+                &mut || Ok(()),
+                &mut gate(&vcs, "admit")
+            )
+            .unwrap(),
+            RecordedSettlementOutcome::Applied(_)
+        ));
+        let receipt = history(&vcs);
+        let db = rusqlite::Connection::open(vcs.dir.join("branches.sqlite")).unwrap();
+        match change {
+            "source-status" => {
+                db.execute(
+                    "UPDATE branches SET status='discarded' WHERE branch_id='office'",
+                    [],
+                )
+                .unwrap();
+            }
+            "target-status" => {
+                db.execute(
+                    "UPDATE branches SET status='discarded' WHERE branch_id=?1",
+                    [MAINLINE_BRANCH_ID],
+                )
+                .unwrap();
+            }
+            "source-parent" => {
+                db.execute(
+                    "UPDATE branches SET parent_branch_id=NULL WHERE branch_id='office'",
+                    [],
+                )
+                .unwrap();
+            }
+            "source-created" => {
+                db.execute(
+                    "UPDATE branches SET created_at='recreated' WHERE branch_id='office'",
+                    [],
+                )
+                .unwrap();
+            }
+            "target-parent" => {
+                db.execute(
+                    "UPDATE branches SET parent_branch_id='substituted' WHERE branch_id=?1",
+                    [MAINLINE_BRANCH_ID],
+                )
+                .unwrap();
+            }
+            "target-created" => {
+                db.execute(
+                    "UPDATE branches SET created_at='recreated' WHERE branch_id=?1",
+                    [MAINLINE_BRANCH_ID],
+                )
+                .unwrap();
+            }
+            "op" => {
+                db.execute("DELETE FROM ops WHERE op_id='op-settlement'", [])
+                    .unwrap();
+            }
+            "cut" => {
+                db.execute("DELETE FROM cuts WHERE cut_id='settlement'", [])
+                    .unwrap();
+            }
+            "input" => {
+                db.execute("DELETE FROM cuts WHERE cut_id='office-1'", [])
+                    .unwrap();
+            }
+            "payload" => {
+                vcs.content
+                    .erase(&receipt.cut().manifest_hash, "t6")
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let mut published = false;
+        let result = vcs.publish_historical_recorded_settlement(&receipt, |_, _| {
+            published = true;
+            Ok(())
+        });
+        if change == "payload" {
+            assert!(result.is_err());
+        } else {
+            assert!(
+                matches!(result, Err(StoreError::Conflict(reason))
+                if reason == "historical recorded settlement evidence or custody changed"),
+                "{change}"
+            );
+        }
+        assert!(!published, "{change}");
+    }
+}
+
+#[test]
+fn historical_recorded_settlement_requires_original_meaning_complete_coordinates_and_access() {
+    for change in [
+        "actor",
+        "intent",
+        "head",
+        "source-after",
+        "target-after",
+        "source-before",
+        "input-cut",
+        "initial-access",
+        "final-access",
+    ] {
+        let mut vcs = setup();
+        let prepared = prepare(&vcs);
+        assert!(matches!(
+            vcs.apply_prepared_recorded_settlement(
+                &prepared,
+                &mut || Ok(()),
+                &mut gate(&vcs, "admit")
+            )
+            .unwrap(),
+            RecordedSettlementOutcome::Applied(_)
+        ));
+        vcs.write("office", "later.txt", Some("later"), "office-2", "t6")
+            .unwrap();
+        let db = rusqlite::Connection::open(vcs.dir.join("branches.sqlite")).unwrap();
+        if matches!(change, "source-after" | "target-after" | "source-before") {
+            let mut op = vcs.get_op("op-settlement").unwrap().unwrap();
+            match change {
+                "source-after" => op.deltas[1].after.branch_point_manifest_hash = None,
+                "target-after" => op.deltas[0].after.head_cut_id = Some("substituted".into()),
+                _ => op.deltas[1].before.as_mut().unwrap().head_manifest_hash = None,
+            }
+            db.execute(
+                "UPDATE ops SET deltas=?1 WHERE op_id='op-settlement'",
+                [serde_json::to_string(&op.deltas).unwrap()],
+            )
+            .unwrap();
+        }
+        if change == "input-cut" {
+            db.execute(
+                "UPDATE cuts SET change_id='substituted' WHERE cut_id='office-1'",
+                [],
+            )
+            .unwrap();
+        }
+        let calls = Cell::new(0);
+        let mut check = || {
+            calls.set(calls.get() + 1);
+            if (change == "initial-access" && calls.get() == 1)
+                || (change == "final-access" && calls.get() == 2)
+            {
+                Err(StoreError::Conflict("original access ended".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let result = vcs.recover_historical_recorded_settlement(
+            "office",
+            if change == "head" {
+                "main-1"
+            } else {
+                "office-1"
+            },
+            &[],
+            "settlement",
+            if change == "actor" {
+                "another-staff"
+            } else {
+                "staff:alice"
+            },
+            if change == "intent" {
+                "new-command"
+            } else {
+                "original-http-command"
+            },
+            &mut check,
+        );
+        assert!(result.is_err(), "{change}");
+    }
+}
+
+#[test]
+fn historical_recorded_settlement_never_reopens_controlled_source_or_target() {
+    use crate::branches::flowing_fence::{FlowingFenceState, FlowingSourceKind};
+    for branch in ["office", MAINLINE_BRANCH_ID] {
+        let vcs = setup();
+        let prepared = prepare(&vcs);
+        assert!(matches!(
+            vcs.apply_prepared_recorded_settlement(
+                &prepared,
+                &mut || Ok(()),
+                &mut gate(&vcs, "admit")
+            )
+            .unwrap(),
+            RecordedSettlementOutcome::Applied(_)
+        ));
+        let receipt = history(&vcs);
+        // Opening a moved legacy branch is itself refused by the native API.
+        // Inject inconsistent custody to prove recovery does not bypass that
+        // continuing owner fence when inspecting damaged/restored state.
+        let state = FlowingFenceState {
+            source_branch_id: branch.into(),
+            incarnation_id: format!("inc-{branch}"),
+            kind: FlowingSourceKind::Branch,
+            owner: "coordinator".into(),
+            owner_epoch: 1,
+            eligibility_epoch: 1,
+            held: false,
+            revision: None,
+            admission_enabled: true,
+            opened_at: "t6".into(),
+        };
+        let db = rusqlite::Connection::open(vcs.dir.join("branches.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO flowing_source_fences(source_branch_id,state_json) VALUES (?1,?2)",
+            rusqlite::params![branch, serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+        let result = vcs.publish_historical_recorded_settlement(&receipt, |_, _| Ok(()));
+        assert!(
+            matches!(result, Err(StoreError::Conflict(reason)) if reason.contains("controlled lifecycle operation")),
+            "{branch}"
+        );
+        assert!(vcs
+            .recover_historical_recorded_settlement(
+                "office",
+                "office-1",
+                &[],
+                "settlement",
+                "staff:alice",
+                "original-http-command",
+                &mut || Ok(())
+            )
+            .is_err());
+    }
+}
