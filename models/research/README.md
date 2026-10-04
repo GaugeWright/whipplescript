@@ -218,6 +218,22 @@ disposition for the old unit. It does not prove real reconciliation, SQL
 transaction scope, content publication or lock composition, and does not
 decide whether an already checked prefix remains eligible across the rewrite.
 
+`flowing_read_revalidation.py` isolates the semantic proof the content rewrite
+does not supply:
+
+```sh
+python3 models/research/flowing_read_revalidation.py
+```
+
+It admits a rewritten two-unit prefix after checking exact positive and
+negative reads, declared predecessor units and external pins against the new
+predecessor, then rechecks parent, source, policy and external epochs at the
+ref entry. An unbound later write does not invalidate that earlier prefix.
+Nine deliberate bypasses show why disjoint write paths or the old opaque
+snapshot digest cannot establish read compatibility. The model assumes a
+truthful, complete read witness and an atomic ref entry; production must still
+capture those observations and bind them to the durable unit identity.
+
 `revision_lineage.py` probes the other half of that boundary: every
 acknowledged mutation of a selected unit's meaning must advance the ref-owned
 source epoch before the topology head changes. It models eight mutation
