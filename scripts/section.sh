@@ -216,7 +216,13 @@ case "${1:-}" in
 
   hosted_install="cargo install wasm-bindgen-cli --locked, and npm --prefix $worker ci"
   if [ -z "$missing_hosted" ]; then
-      [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
+      # A directory can survive a changed lockfile or an interrupted install.
+      # The gate reused one with wrangler but without the declared ws package,
+      # so directory existence alone reported a ready worker that could not run.
+      if [ ! -d "$worker/node_modules" ] || \
+          ! npm --prefix "$worker" ls --depth=0 --silent >/dev/null 2>&1; then
+          npm --prefix "$worker" ci
+      fi
       npm --prefix "$worker" test
       (cd "$worker" && npx tsc --noEmit)
       # Cosmetic requests must not hold the gate open after the dry-run.

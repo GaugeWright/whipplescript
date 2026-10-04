@@ -6,10 +6,14 @@
 //! root edge, revalidate affected read/dependency bases, and atomically
 //! recapture both refs and the source revision before making the head visible.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::branches::flowing_admission::FlowingAdmissions;
 use crate::branches::flowing_fence::FlowingSourceKind;
+use crate::branches::flowing_rewrite::{
+    CommitFlowingRewrite, FlowingRewriteOutcome, FlowingRewrites,
+};
 use crate::branches::flowing_sources::FlowingSources;
 use crate::branches::{BranchStatus, Branches};
 use crate::content::ContentBlobs;
@@ -18,7 +22,8 @@ use crate::StoreResult;
 use super::flowing_selection::FlowingSourceAtom;
 use super::WorkspaceVcs;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowingRewriteRoot {
     unit_id: String,
     basis_digest: String,
@@ -57,6 +62,39 @@ pub struct FlowingDisjointRebase {
 }
 
 impl FlowingDisjointRebase {
+    pub fn source_branch_id(&self) -> &str {
+        &self.source_branch_id
+    }
+    pub fn source_incarnation_id(&self) -> &str {
+        &self.source_incarnation_id
+    }
+    pub fn source_eligibility_epoch(&self) -> i64 {
+        self.source_eligibility_epoch
+    }
+    pub fn source_owner_epoch(&self) -> i64 {
+        self.source_owner_epoch
+    }
+    pub fn old_head_cut_id(&self) -> &str {
+        &self.old_head_cut_id
+    }
+    pub fn old_head_manifest_hash(&self) -> &str {
+        &self.old_head_manifest_hash
+    }
+    pub fn old_point_cut_id(&self) -> Option<&str> {
+        self.old_point_cut_id.as_deref()
+    }
+    pub fn old_point_manifest_hash(&self) -> Option<&str> {
+        self.old_point_manifest_hash.as_deref()
+    }
+    pub fn parent_branch_id(&self) -> &str {
+        &self.parent_branch_id
+    }
+    pub fn parent_head_cut_id(&self) -> Option<&str> {
+        self.parent_head_cut_id.as_deref()
+    }
+    pub fn parent_head_manifest_hash(&self) -> Option<&str> {
+        self.parent_head_manifest_hash.as_deref()
+    }
     pub fn roots(&self) -> &[FlowingRewriteRoot] {
         &self.roots
     }
@@ -386,12 +424,66 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
     }
 }
 
+impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Publish a prepared replay under retained content and one ref-owned
+    /// transaction. The caller must have taken the matching BeginRevision and
+    /// must hold the Home/norm exclusion needed by `check` to prove that each
+    /// source unit's read, dependency and policy basis still applies to the
+    /// new parent. The callback runs inside the branch transaction just
+    /// before its first write; an embedding without that proof must refuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_prepared_disjoint_flowing_rebase(
+        &mut self,
+        plan: &FlowingDisjointRebase,
+        op_id: &str,
+        begin_revision_op_id: &str,
+        after_cut_id: &str,
+        actor: &str,
+        recorded_at: &str,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<FlowingRewriteOutcome> {
+        let prepared = crate::content::publication::PreparedBlobs::new(&self.content);
+        let manifest_hash = crate::manifest_tree::build(&prepared, plan.proposed_manifest())?;
+        let mut retained: BTreeSet<String> = prepared.ids().into_iter().collect();
+        retained.extend(plan.proposed_manifest().values().cloned());
+        retained.insert(plan.old_head_manifest_hash().to_owned());
+        if let Some(hash) = plan.parent_head_manifest_hash() {
+            retained.insert(hash.to_owned());
+        }
+        for atom in plan.roots().iter().flat_map(|root| root.atoms()) {
+            retained.extend(atom.before.iter().cloned());
+            retained.extend(atom.after.iter().cloned());
+        }
+        let ids: Vec<String> = retained.into_iter().collect();
+        let branches = &mut self.branches;
+        self.content.publish_retained(&ids, || {
+            branches.commit_flowing_rewrite(
+                CommitFlowingRewrite::new(
+                    op_id,
+                    begin_revision_op_id,
+                    plan,
+                    after_cut_id,
+                    &manifest_hash,
+                    actor,
+                    recorded_at,
+                ),
+                check,
+            )
+        })
+    }
+}
+
 #[cfg(all(test, feature = "native"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::branches::flowing_fence::{
-        FlowingFence, OpenFlowingSource, OpenFlowingSourceOutcome,
+        FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
+        OpenFlowingSource, OpenFlowingSourceOutcome,
+    };
+    use crate::branches::flowing_rewrite::{
+        check_current, FlowingRewriteOutcome, FlowingRewriteReceipt, FlowingRewriteRefusal,
+        FlowingRewrites, RewriteUnitState,
     };
     use crate::branches::flowing_sources::{
         BindContributionBasis, BindContributionBasisOutcome, DeclareContribution,
@@ -483,6 +575,555 @@ mod tests {
         bound_write(&mut vcs, "a.txt", "A", "cut-a", "unit-a");
         bound_write(&mut vcs, "b.txt", "B", "cut-b", "unit-b");
         vcs
+    }
+
+    fn begin_rewrite(
+        vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
+        plan: &FlowingDisjointRebase,
+    ) {
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: plan.source_incarnation_id().into(),
+                    expected_eligibility_epoch: plan.source_eligibility_epoch(),
+                    expected_owner_epoch: plan.source_owner_epoch(),
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some(plan.old_head_cut_id().into()),
+                        after_cut_id: "rebased".into(),
+                    },
+                    recorded_at: "t5".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn rewrite_commits_roots_point_head_and_receipt_atomically() {
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let mut checked = 0;
+        let result = vcs
+            .commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || {
+                    checked += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let FlowingRewriteOutcome::Committed(receipt) = result else {
+            panic!("committed");
+        };
+        assert_eq!(checked, 1);
+        assert_eq!(receipt.roots.len(), 2);
+        assert_eq!(receipt.roots[0].unit_id(), "unit-a");
+        assert_eq!(receipt.roots[1].unit_id(), "unit-b");
+        let source = vcs.branches.get_branch("twig").unwrap().unwrap();
+        assert_eq!(source.head_cut_id.as_deref(), Some("rebased"));
+        assert_eq!(source.branch_point_cut_id.as_deref(), Some("parent-next"));
+        assert_eq!(
+            source.head_manifest_hash.as_deref(),
+            Some(receipt.after_manifest_hash.as_str())
+        );
+        let cut = vcs.branches.get_cut("rebased").unwrap().unwrap();
+        assert_eq!(cut.parent_cut_id.as_deref(), Some("parent-next"));
+        assert_eq!(cut.origin.as_deref(), Some("flowing:rebase"));
+        assert_eq!(
+            vcs.branches.flowing_rewrite_for_cut("rebased").unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            vcs.branches.flowing_rewrite_receipt("rewrite-1").unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || panic!("an exact retry must read the receipt"),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Existing(receipt.clone()),
+        );
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-2",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::CutAlreadyRecorded),
+        );
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "different-time",
+                &mut || panic!("changed retry must refuse"),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::IdentityMismatch),
+        );
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "twig-inc-1".into(),
+                    expected_eligibility_epoch: 1,
+                    expected_owner_epoch: 0,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert!(vcs
+            .branches
+            .flowing_source("twig")
+            .unwrap()
+            .unwrap()
+            .revision
+            .is_none());
+        assert_eq!(
+            vcs.branches.flowing_rewrite_receipt("rewrite-1").unwrap(),
+            Some(receipt),
+        );
+    }
+
+    #[test]
+    fn rewrite_stale_parent_and_failed_final_check_leave_old_source_ref() {
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let old = vcs.branches.get_branch("twig").unwrap().unwrap();
+        let error = vcs
+            .commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Err(crate::StoreError::Conflict("semantic basis changed".into())),
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("semantic basis changed"));
+        assert_eq!(vcs.branches.get_branch("twig").unwrap().unwrap(), old);
+        assert!(vcs.branches.get_cut("rebased").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .flowing_rewrite_receipt("rewrite-1")
+            .unwrap()
+            .is_none());
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "later.txt",
+            Some("later"),
+            "parent-later",
+            "t7",
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || panic!("stale parent must refuse first"),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::ParentMoved),
+        );
+        assert_eq!(vcs.branches.get_branch("twig").unwrap().unwrap(), old);
+    }
+
+    #[test]
+    fn rewrite_receipt_insert_failure_rolls_back_cut_ref_and_operation() {
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let old = vcs.branches.get_branch("twig").unwrap().unwrap();
+        vcs.branches
+            .test_connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_flowing_rewrite BEFORE INSERT ON flowing_rewrites \
+             BEGIN SELECT RAISE(ABORT, 'injected rewrite failure'); END;",
+            )
+            .unwrap();
+        assert!(vcs
+            .commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .is_err());
+        assert_eq!(vcs.branches.get_branch("twig").unwrap().unwrap(), old);
+        assert!(vcs.branches.get_cut("rebased").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .flowing_rewrite_receipt("rewrite-1")
+            .unwrap()
+            .is_none());
+        assert!(!vcs
+            .branches
+            .test_connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ops WHERE op_id = 'rewrite-1')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        vcs.branches
+            .test_connection()
+            .execute_batch("DROP TRIGGER fail_flowing_rewrite")
+            .unwrap();
+        assert!(matches!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn rewrite_rechecks_all_units_and_bound_atoms_after_preparation() {
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let before = vcs.branches.get_branch("twig").unwrap().unwrap();
+        vcs.branches
+            .declare_contribution(DeclareContribution {
+                unit_id: "unit-late",
+                pin_id: "pin-unit-a",
+                principal: "s:author",
+                intent: "late declaration",
+                read_basis_digest: "read-fixture",
+                dependency_basis_digest: "deps-fixture",
+                scope_digest: "late",
+                declared_at: "t5",
+            })
+            .unwrap();
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || panic!("roster changed"),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::UnitRosterChanged),
+        );
+        assert_eq!(vcs.branches.get_branch("twig").unwrap().unwrap(), before);
+        assert!(vcs.branches.get_cut("rebased").unwrap().is_none());
+
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || panic!("basis changed"),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into(),
+            }),
+        );
+        assert!(vcs.branches.get_cut("rebased").unwrap().is_none());
+    }
+
+    #[test]
+    fn rewrite_preflight_refuses_each_broken_authority_basis() {
+        #[derive(Clone)]
+        struct Snapshot {
+            receipt: FlowingRewriteReceipt,
+            source: Option<crate::branches::BranchRow>,
+            parent: Option<crate::branches::BranchRow>,
+            fence: Option<crate::branches::flowing_fence::FlowingFenceState>,
+            reserved: bool,
+            units: Vec<RewriteUnitState>,
+        }
+        impl Snapshot {
+            fn check(&self) -> Result<crate::branches::BranchRow, FlowingRewriteRefusal> {
+                check_current(
+                    &self.receipt,
+                    self.source.clone(),
+                    self.parent.clone(),
+                    self.fence.clone(),
+                    self.reserved,
+                    &self.units,
+                )
+            }
+        }
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let units = vcs
+            .branches
+            .source_contributions("twig")
+            .unwrap()
+            .into_iter()
+            .map(|declaration| RewriteUnitState {
+                basis: vcs
+                    .branches
+                    .contribution_basis(&declaration.unit_id)
+                    .unwrap(),
+                pin: vcs.branches.private_cut_pin(&declaration.pin_id).unwrap(),
+                handed_off: false,
+                admitted: false,
+                declaration,
+            })
+            .collect();
+        let snapshot = Snapshot {
+            receipt: crate::branches::flowing_rewrite::CommitFlowingRewrite::new(
+                "rewrite-1",
+                "begin-rewrite",
+                &plan,
+                "rebased",
+                "manifest",
+                "s:author",
+                "t6",
+            )
+            .receipt(),
+            source: vcs.branches.get_branch("twig").unwrap(),
+            parent: vcs.branches.get_branch(MAINLINE_BRANCH_ID).unwrap(),
+            fence: vcs.branches.flowing_source("twig").unwrap(),
+            reserved: false,
+            units,
+        };
+        assert!(snapshot.check().is_ok());
+
+        let mut changed = snapshot.clone();
+        changed.receipt.op_id.clear();
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::Invalid { field: "op_id" })
+        );
+        let mut changed = snapshot.clone();
+        changed.receipt.after_cut_id = changed.receipt.old_head_cut_id.clone();
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::Invalid {
+                field: "rewrite_basis"
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.source = None;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::SourceMissing));
+        let mut changed = snapshot.clone();
+        changed.source.as_mut().unwrap().status = crate::branches::BranchStatus::Discarded;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::SourceNotActive));
+        let mut changed = snapshot.clone();
+        changed.reserved = true;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::HeadReserved));
+        let mut changed = snapshot.clone();
+        changed.source.as_mut().unwrap().head_cut_id = Some("other".into());
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::SourceMoved));
+        let mut changed = snapshot.clone();
+        changed.parent = None;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::ParentMissing));
+        let mut changed = snapshot.clone();
+        changed.parent.as_mut().unwrap().head_cut_id = Some("other".into());
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::ParentMoved));
+        let mut changed = snapshot.clone();
+        changed.fence = None;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::RevisionMissing));
+        let mut changed = snapshot.clone();
+        changed.fence.as_mut().unwrap().revision = None;
+        assert_eq!(changed.check(), Err(FlowingRewriteRefusal::RevisionMissing));
+        let mut changed = snapshot.clone();
+        changed.fence.as_mut().unwrap().owner_epoch += 1;
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::RevisionMismatch)
+        );
+        let mut changed = snapshot.clone();
+        changed.units.clear();
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitRosterChanged)
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].handed_off = true;
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitNoLongerOwed {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].admitted = true;
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitNoLongerOwed {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].basis = None;
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].pin = None;
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].basis.as_mut().unwrap().atoms.clear();
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot.clone();
+        changed.units[0].pin.as_mut().unwrap().principal = "s:other".into();
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut changed = snapshot;
+        changed.units[0].pin.as_mut().unwrap().released_at = Some("t7".into());
+        assert_eq!(
+            changed.check(),
+            Err(FlowingRewriteRefusal::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
     }
 
     #[test]

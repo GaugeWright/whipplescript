@@ -16,6 +16,7 @@
 
 mod flowing_admission;
 mod flowing_fence;
+mod flowing_rewrite;
 mod flowing_sources;
 mod resolution_batch;
 mod resolution_origin;
@@ -224,6 +225,9 @@ impl<S: DoSql> DoBranches<S> {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_fence::SCHEMA {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_rewrite::SCHEMA {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_admission::SCHEMA {

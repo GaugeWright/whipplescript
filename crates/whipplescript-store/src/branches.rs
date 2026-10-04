@@ -17,6 +17,7 @@
 
 pub mod flowing_admission;
 pub mod flowing_fence;
+pub mod flowing_rewrite;
 pub mod flowing_sources;
 pub mod resolution_batch;
 pub mod resolution_origin;
@@ -1138,7 +1139,9 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// ref-owned flowing source fences and their exact operation receipts.
 /// Version 9 records gated trunk admissions and per-unit uniqueness with the
 /// ref authority; an older writer must not reuse an admitted source unit.
-const SATELLITE_SCHEMA_VERSION: i64 = 10;
+/// Version 11 adds atomic flowing rewrite receipts and their constituent root
+/// lineage; an older writer cannot interpret a rewritten source head.
+const SATELLITE_SCHEMA_VERSION: i64 = 11;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1153,6 +1156,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute(statement, [])?;
     }
     for statement in flowing_fence::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_rewrite::SCHEMA {
         connection.execute(statement, [])?;
     }
     for statement in flowing_admission::SCHEMA {
