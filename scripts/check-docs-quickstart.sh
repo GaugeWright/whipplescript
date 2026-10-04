@@ -2,16 +2,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STORE="$ROOT/.whipplescript/docs-quickstart-smoke.sqlite"
+SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/whip-docs.XXXXXX")"
+STORE="$SMOKE_ROOT/docs-quickstart-smoke.sqlite"
 REPORT="$ROOT/target/docs-quickstart-smoke.json"
+export WHIPPLESCRIPT_STORE="$STORE"
+export WHIPPLESCRIPT_COORDINATION_STORE="$SMOKE_ROOT/coordination.sqlite"
 
 cleanup() {
-  rm -f "$STORE" "$STORE-shm" "$STORE-wal"
+  rm -rf "$SMOKE_ROOT"
 }
 trap cleanup EXIT
 
-mkdir -p "$ROOT/.whipplescript" "$ROOT/target"
-cleanup
+mkdir -p "$ROOT/target"
 
 . "$ROOT/scripts/whip-bin.sh"
 WHIP=("$(whip_bin)")

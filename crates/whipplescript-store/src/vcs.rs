@@ -22,6 +22,7 @@
 
 #[cfg(feature = "native")]
 pub mod flowing_gate;
+pub mod flowing_rewrite;
 mod flowing_selection;
 pub mod flowing_subject;
 #[cfg(feature = "native")]
