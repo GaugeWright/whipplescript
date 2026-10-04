@@ -647,7 +647,7 @@ pub fn missing_derived_cut_field(request: RecordFlowingDerivedCut<'_>) -> Option
     ]
     .into_iter()
     .find_map(|(field, value)| value.trim().is_empty().then_some(field))
-    .or_else(|| (request.witness.units().len() < 2).then_some("units"))
+    .or_else(|| request.witness.units().is_empty().then_some("units"))
 }
 
 pub fn derived_cut_digest(witness: &crate::vcs::FlowingBatchTargetEffects) -> String {

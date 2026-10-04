@@ -1885,6 +1885,123 @@ mod tests {
                 .len(),
             2
         );
+        vcs.write("twig", "a.txt", Some("E"), "twig-single", "t11")
+            .unwrap();
+        let single_cut = branches.get_cut("twig-single").unwrap().unwrap();
+        assert_eq!(
+            branches
+                .pin_private_cut(PinPrivateCut {
+                    pin_id: "pin-single",
+                    twig_branch_id: "twig",
+                    cut_id: "twig-single",
+                    manifest_hash: &single_cut.manifest_hash,
+                    principal: "s:author",
+                    retained_at: "t11",
+                })
+                .unwrap(),
+            PinPrivateCutOutcome::Pinned
+        );
+        let previous_manifest = branches
+            .get_cut("twig-tail-2")
+            .unwrap()
+            .unwrap()
+            .manifest_hash;
+        let read = native_read_basis_digest(Some("twig-tail-2"), Some(&previous_manifest));
+        let deps = native_dependency_basis_digest(&tail_predecessors);
+        assert_eq!(
+            branches
+                .declare_contribution(DeclareContribution {
+                    unit_id: "unit-single",
+                    pin_id: "pin-single",
+                    principal: "s:author",
+                    intent: "mixed change",
+                    read_basis_digest: &read,
+                    dependency_basis_digest: &deps,
+                    scope_digest: "unit-single",
+                    declared_at: "t11",
+                })
+                .unwrap(),
+            DeclareContributionOutcome::Declared
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-single", &parse("change(twig-single)").unwrap())
+            .unwrap()
+        else {
+            panic!("hosted one-unit selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-single", &selection, "t11")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        branches
+            .record_cut(CutRecord {
+                cut_id: "batch-single",
+                change_id: "batch-single",
+                branch_id: "branch",
+                manifest_hash: &single_cut.manifest_hash,
+                parent_cut_id: Some("batch-tail"),
+                origin: Some("transport-batch:derive-single"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t12",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(single_witness) = vcs
+            .verify_private_batch_target_effects(&["unit-single"], "batch-single")
+            .unwrap()
+        else {
+            panic!("hosted one-unit target")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&single_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        sql.execute(
+            "UPDATE flowing_contributions SET dependency_basis_digest = ?2 WHERE unit_id = ?1",
+            &[
+                text("unit-single"),
+                text(&native_dependency_basis_digest(&[])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&single_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::UnprovenBasis {
+                unit_id: "unit-single".into()
+            }
+        );
+        sql.execute(
+            "UPDATE flowing_contributions SET dependency_basis_digest = ?2 WHERE unit_id = ?1",
+            &[text("unit-single"), text(&deps)],
+        )
+        .unwrap();
+        let D::Recorded(single_derived) = vcs
+            .record_private_batch_derivation("derive-single", &single_witness, "mediator", "t12")
+            .unwrap()
+        else {
+            panic!("hosted one-unit derivation")
+        };
+        let HandoffBatchContributionOutcome::Transferred(single_receipt) = vcs
+            .handoff_private_batch_derivation(
+                "derive-single",
+                &single_derived.witness_digest,
+                "mediator",
+                "t13",
+            )
+            .unwrap()
+        else {
+            panic!("hosted one-unit continuation")
+        };
+        assert_eq!(single_receipt.units.len(), 1);
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("hosted one-unit lineage")
+        };
+        assert_eq!(lineage.handoffs().len(), 5);
         sql.execute(
             "DELETE FROM flowing_handoffs WHERE unit_id = ?1",
             &[text("unit-b")],

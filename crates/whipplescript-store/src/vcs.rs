@@ -24,6 +24,8 @@
 pub mod flowing_gate;
 mod flowing_selection;
 pub mod flowing_subject;
+#[cfg(feature = "native")]
+pub mod recorded_review;
 pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
@@ -300,6 +302,20 @@ pub enum MergeProbeOutcome {
     /// The merge would adopt cleanly, producing this manifest.
     Clean {
         merged_manifest_hash: String,
+        changed_paths: Vec<String>,
+    },
+    Conflicted {
+        conflicts: Vec<PathConflict>,
+    },
+    BranchMissing,
+    BranchNotActive,
+    NoParent,
+}
+
+enum MergeProbePlan {
+    UpToDate,
+    Clean {
+        manifest: BTreeMap<String, String>,
         changed_paths: Vec<String>,
     },
     Conflicted {
@@ -1734,6 +1750,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         &self,
         conflicts: Vec<PathConflict>,
     ) -> StoreResult<(BTreeMap<String, String>, Vec<PathConflict>)> {
+        self.refine_source_conflicts_using(conflicts, &|body| self.content.put_text(body))
+    }
+
+    fn refine_source_conflicts_using(
+        &self,
+        conflicts: Vec<PathConflict>,
+        prepare: &impl Fn(&str) -> StoreResult<String>,
+    ) -> StoreResult<(BTreeMap<String, String>, Vec<PathConflict>)> {
         let mut resolved = BTreeMap::new();
         let mut unremembered = Vec::new();
         for conflict in conflicts {
@@ -1786,7 +1810,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 };
                 match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
                     SourceMergeVerdict::Certified { merged } => {
-                        let hash = self.content.put_text(&merged)?;
+                        let hash = prepare(&merged)?;
                         resolved.insert(conflict.path.clone(), hash);
                     }
                     SourceMergeVerdict::Conflict => remaining.push(conflict),
@@ -1832,7 +1856,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 crate::text_merge::text_merge(&base_body, &ours_body, &theirs_body, &text_config);
             match self.apply_region_memory(outcome)? {
                 TextMergeOutcome::Clean { merged, .. } => {
-                    let hash = self.content.put_text(&merged)?;
+                    let hash = prepare(&merged)?;
                     resolved.insert(conflict.path.clone(), hash);
                 }
                 TextMergeOutcome::Conflicted { .. } => still_conflicted.push(conflict),
@@ -2777,17 +2801,42 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// before they act (vw note §7.3: dry-run is the default
     /// interaction).
     pub fn merge_probe(&self, branch_id: &str) -> StoreResult<MergeProbeOutcome> {
+        Ok(
+            match self.plan_merge_probe(branch_id, &|body| self.content.put_text(body))? {
+                MergeProbePlan::UpToDate => MergeProbeOutcome::UpToDate,
+                MergeProbePlan::Clean {
+                    manifest,
+                    changed_paths,
+                } => MergeProbeOutcome::Clean {
+                    merged_manifest_hash: self.store_manifest(&manifest)?,
+                    changed_paths,
+                },
+                MergeProbePlan::Conflicted { conflicts } => {
+                    MergeProbeOutcome::Conflicted { conflicts }
+                }
+                MergeProbePlan::BranchMissing => MergeProbeOutcome::BranchMissing,
+                MergeProbePlan::BranchNotActive => MergeProbeOutcome::BranchNotActive,
+                MergeProbePlan::NoParent => MergeProbeOutcome::NoParent,
+            },
+        )
+    }
+
+    fn plan_merge_probe(
+        &self,
+        branch_id: &str,
+        prepare: &impl Fn(&str) -> StoreResult<String>,
+    ) -> StoreResult<MergeProbePlan> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {
-            return Ok(MergeProbeOutcome::BranchMissing);
+            return Ok(MergeProbePlan::BranchMissing);
         };
         if branch.status != BranchStatus::Active {
-            return Ok(MergeProbeOutcome::BranchNotActive);
+            return Ok(MergeProbePlan::BranchNotActive);
         }
         let Some(parent_id) = branch.parent_branch_id.clone() else {
-            return Ok(MergeProbeOutcome::NoParent);
+            return Ok(MergeProbePlan::NoParent);
         };
         let Some(parent) = self.branches.get_branch(&parent_id)? else {
-            return Ok(MergeProbeOutcome::NoParent);
+            return Ok(MergeProbePlan::NoParent);
         };
         let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
         let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
@@ -2812,9 +2861,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         conflicts,
                         merged_remainder,
                     } => {
-                        let (resolved, remaining) = self.refine_source_conflicts(conflicts)?;
+                        let (resolved, remaining) =
+                            self.refine_source_conflicts_using(conflicts, prepare)?;
                         if !remaining.is_empty() {
-                            return Ok(MergeProbeOutcome::Conflicted {
+                            return Ok(MergeProbePlan::Conflicted {
                                 conflicts: remaining,
                             });
                         }
@@ -2826,11 +2876,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             };
         let changed_paths = Self::diff_paths(&target, &candidate);
         if changed_paths.is_empty() {
-            return Ok(MergeProbeOutcome::UpToDate);
+            return Ok(MergeProbePlan::UpToDate);
         }
-        let merged_manifest_hash = self.store_manifest(&candidate)?;
-        Ok(MergeProbeOutcome::Clean {
-            merged_manifest_hash,
+        Ok(MergeProbePlan::Clean {
+            manifest: candidate,
             changed_paths,
         })
     }

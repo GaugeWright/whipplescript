@@ -162,7 +162,7 @@ pub enum FlowingTargetEffectsOutcome {
     UnexpectedEffect { path: String },
 }
 
-/// Ordered per-unit effects of one mixed target cut. This is a content
+/// Ordered per-unit effects of one target cut, including a one-unit tail. This is a content
 /// comparison only; no holder transfers until an atomic batch receipt exists.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FlowingBatchUnitEffect {
@@ -226,7 +226,7 @@ pub enum FlowingBatchTargetEffectsOutcome {
     Refused(FlowingTargetEffectsOutcome),
 }
 
-/// Source-order evidence for a mixed cut drawn from one complete twig prefix.
+/// Source-order evidence for a cut drawn from one complete twig prefix.
 /// Cross-source ordering still needs an explicit dependency contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FlowingBatchSourceOrderOutcome {
@@ -1938,7 +1938,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(R::Verified)
     }
 
-    /// Publish the mixed content witness and its content closure before a
+    /// Publish an ordered cut witness and its content closure before a
     /// handoff can try to move a branch ref. This record does not prove the
     /// source-unit dependency order or transfer a holder: every unit remains
     /// owed until a later atomic head-and-receipt transaction consumes it.
@@ -2022,7 +2022,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             .publish_retained(&ids, || branches.record_flowing_derived_cut(request))
     }
 
-    /// Transfer a stored mixed derivation only after both its current content
+    /// Transfer a stored derivation only after both its current content
     /// and complete same-twig predecessor basis have been re-proved. The
     /// branch store recaptures mutable source, target and fence premises in
     /// one transaction with the head and complete receipt roster.
@@ -5767,6 +5767,124 @@ mod tests {
             FlowingUnitOutcome::Neutralized
         );
         assert_eq!(tail_candidate.units[3].outcome, FlowingUnitOutcome::Applied);
+        vcs.write("twig", "a.txt", Some("E"), "twig-single", "t16")
+            .unwrap();
+        pin(&mut vcs, "twig-single", "pin-single");
+        declare_native(
+            &mut vcs,
+            "unit-single",
+            "pin-single",
+            Some("twig-tail-2"),
+            &prior,
+            None,
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes(
+                "pin-single",
+                &selection::parse("change(twig-single)").unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("one later source unit")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-single", &selection, "t16")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let single_manifest = vcs
+            .branches
+            .get_cut("twig-single")
+            .unwrap()
+            .unwrap()
+            .manifest_hash;
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "batch-single",
+                change_id: "batch-single",
+                branch_id: "branch",
+                manifest_hash: &single_manifest,
+                parent_cut_id: Some("batch-tail"),
+                origin: Some("transport-batch:derive-single"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t17",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(single_witness) = vcs
+            .verify_private_batch_target_effects(&["unit-single"], "batch-single")
+            .unwrap()
+        else {
+            panic!("one-unit target content")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&single_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contributions SET dependency_basis_digest = ?1 WHERE unit_id = 'unit-single'",
+                [native_dependency_basis_digest(&[])],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&single_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::UnprovenBasis {
+                unit_id: "unit-single".into()
+            }
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contributions SET dependency_basis_digest = ?1 WHERE unit_id = 'unit-single'",
+                [native_dependency_basis_digest(&prior)],
+            )
+            .unwrap();
+        let D::Recorded(single_derived) = vcs
+            .record_private_batch_derivation("derive-single", &single_witness, "mediator", "t17")
+            .unwrap()
+        else {
+            panic!("one-unit derivation retained")
+        };
+        let H::Transferred(single_receipt) = vcs
+            .handoff_private_batch_derivation(
+                "derive-single",
+                &single_derived.witness_digest,
+                "mediator",
+                "t18",
+            )
+            .unwrap()
+        else {
+            panic!("one-unit continuation transfers")
+        };
+        assert_eq!(single_receipt.units.len(), 1);
+        let mut single_revision = tail_revision;
+        single_revision.source_cut_id = "batch-single".into();
+        single_revision.source_manifest_hash = single_manifest;
+        single_revision.units.push(NativeUnitRef {
+            unit_id: "unit-single".into(),
+            source_cut_id: "twig-single".into(),
+            pin_id: "pin-single".into(),
+            basis_digest: selection.digest().into(),
+            principal: "s:author".into(),
+            intent: "customer change".into(),
+        });
+        let NativeCandidateOutcome::Prepared(single_candidate) = vcs
+            .prepare_named_branch_candidate(
+                &single_revision,
+                None,
+                "candidate-single",
+                "mediator",
+                "t19",
+            )
+            .unwrap()
+        else {
+            panic!("one-unit continuation remains in complete candidate")
+        };
+        assert_eq!(single_candidate.units.len(), 5);
         vcs.branches
             .test_connection()
             .execute("DELETE FROM flowing_handoffs WHERE unit_id = 'unit-b'", [])

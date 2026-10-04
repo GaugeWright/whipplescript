@@ -819,6 +819,47 @@ impl BranchStore {
         Ok(Self { connection })
     }
 
+    /// Open the current existing branch authority for a fenced observation.
+    /// No directory, database, migration or schema is created by this path.
+    pub(crate) fn open_for_fenced_observation(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        let version: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != SATELLITE_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedVersion {
+                subject: "existing branch review schema".into(),
+                found: version,
+                supported: SATELLITE_SCHEMA_VERSION,
+            });
+        }
+        Ok(Self { connection })
+    }
+
+    /// Native writers cannot change reviewed metadata before reference publication.
+    /// Acquire the content exclusion first. The callback writes no native data.
+    pub(crate) fn with_fenced_observation<T>(
+        &self,
+        observe: impl FnOnce() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        if self.connection.is_readonly(rusqlite::MAIN_DB)? {
+            return Err(StoreError::Conflict(
+                "recorded review requires a writable branch authority".into(),
+            ));
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = observe()?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
