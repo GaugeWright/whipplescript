@@ -202,6 +202,120 @@ async function bootstrapSession(
 }
 
 describe("real WorkflowInstance hibernation", () => {
+  it("bounds every public visitor file route before the listing limit", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("visitor-file-boundary"));
+    await bootstrapSession(stub, "visitor-file-boundary");
+    // Synthetic admitted-instance data, not evidence of tool execution.
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<{ instance_ref: string }>("public-session-state");
+      state.storage.transactionSync(() => {
+        for (let index = 0; index < 5001; index += 1) {
+          state.storage.sql.exec("INSERT INTO files (key, content) VALUES (?, ?)", `${session!.instance_ref}/Artifacts/${index}`, "hidden");
+        }
+        // `ins_` contains a SQL LIKE wildcard; other retained prefixes must
+        // not become this session's visitor projection.
+        expect(session!.instance_ref.startsWith("ins_")).toBe(true);
+        for (const foreign of [session!.instance_ref.replace("_", "X"), session!.instance_ref.toUpperCase()]) {
+          state.storage.sql.exec("INSERT INTO files (key, content) VALUES (?, ?)", `${foreign}/artifacts/foreign.txt`, "foreign");
+        }
+        for (const path of ["artifacts/report.txt", "artifacts/nested/report.txt", "work/notes.txt", "outbox/record.txt", "agent/0", "artifacts-other/report.txt", "report.txt", "artifacts//bad", "artifacts/../bad", "artifacts/./bad", "artifacts/back\\slash", "artifacts/trailing/"]) {
+          state.storage.sql.exec("INSERT INTO files (key, content) VALUES (?, ?)", `${session!.instance_ref}/${path}`, "A\u0000é");
+        }
+      });
+    });
+    const headers = { authorization: "Bearer session-token" };
+    const expected = [{ path: "artifacts/nested/report.txt" }, { path: "artifacts/report.txt" }];
+    for (const endpoint of ["state", "files"]) {
+      const response = await stub.fetch(`https://session.test/public/session/${endpoint}`, { headers });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { files: unknown[] }).files).toEqual(expected);
+      expect((await stub.fetch(`https://session.test/public/session/${endpoint}`)).status).toBe(401);
+    }
+    for (const path of ["artifacts/report.txt", "artifacts/nested/report.txt"]) {
+      const url = new URL("https://session.test/public/session/files"); url.searchParams.set("path", path);
+      const response = await stub.fetch(url, { headers });
+      expect(response.status).toBe(200);
+      expect(await response.clone().text()).toBe("A\u0000é");
+      expect([...new Uint8Array(await response.arrayBuffer())]).toEqual([65, 0, 195, 169]);
+      expect((await stub.fetch(url)).status).toBe(401);
+    }
+    for (const path of ["work/notes.txt", "outbox/record.txt", "agent/0", "Artifacts/0", "artifacts-other/report.txt", "report.txt", "artifacts", "artifacts/missing.txt"]) {
+      const url = new URL("https://session.test/public/session/files"); url.searchParams.set("path", path);
+      const response = await stub.fetch(url, { headers });
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: "file not found" });
+    }
+    for (const path of ["/artifacts/report.txt", "artifacts//bad", "artifacts/../bad", "artifacts/./bad", "artifacts/back\\slash", "artifacts/trailing/"]) {
+      const url = new URL("https://session.test/public/session/files"); url.searchParams.set("path", path);
+      expect((await stub.fetch(url, { headers })).status).toBe(400);
+    }
+    expect((await stub.fetch("https://session.test/public/session/files?path=artifacts%2F..%2Foutbox%2Frecord.txt", { headers })).status).toBe(400);
+    expect((await stub.fetch("https://session.test/public/session/files?path=artifacts%2Fnested%2Freport.txt", { headers })).status).toBe(200);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", sequence: 0, snapshot: { cursor: 0, files: expected } });
+    socket.close(1000, "done");
+    expect(await runInDurableObject(stub, async (_instance, state) => state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM files").one().total)).toBe(5015);
+  });
+
+  it("projects legacy visitor workspace replay without rewriting evidence", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("visitor-legacy-replay"));
+    await bootstrapSession(stub, "visitor-legacy-replay");
+    // Historical public event fixture: retain its full original payload.
+    const original = { type: "workspace_snapshot", request_id: "historical", command_id: "historical-command", files: [{ path: "artifacts/report.txt", retained: true }, { path: "work/notes.txt" }, { path: "outbox/record.txt" }, { path: "artifacts/../bad" }] };
+    const stateResponse = await stub.fetch("https://session.test/public/session/state", { headers: { authorization: "Bearer session-token" } });
+    expect(stateResponse.status).toBe(200);
+    await stateResponse.json();
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO public_session_events (sequence, event_key, event_json) VALUES (?, ?, ?)", 7, "historical-workspace", JSON.stringify(original));
+    });
+    const projected = { ...original, sequence: 7, files: [original.files[0]] };
+    const socket = await openSocket(stub, 1);
+    expect(await nextMessage(socket)).toEqual(projected);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", sequence: 7, snapshot: { cursor: 7, files: [] } });
+    const duplicate = await runInDurableObject(stub, async (instance) => (instance as unknown as {
+      appendPublicEvent(event: Record<string, unknown>, key: string): unknown;
+    }).appendPublicEvent(original, "historical-workspace"));
+    expect(duplicate).toEqual(projected);
+    await evictDurableObject(stub);
+    const resumed = nextMessage(socket);
+    socket.send(JSON.stringify({ type: "resume", after: 1 }));
+    expect(await resumed).toEqual(projected);
+    expect(await runInDurableObject(stub, async (_instance, state) => state.storage.sql.exec<{ sequence: number; event_json: string }>("SELECT sequence, event_json FROM public_session_events").toArray())).toEqual([{ sequence: 7, event_json: JSON.stringify(original) }]);
+    socket.close(1000, "done");
+  });
+
+  it("publishes only visitor artifacts from an actual public turn", async () => {
+    const providerFetch = vi.fn(async () => new Response([
+      'data: {"type":"response.output_text.delta","delta":"done"}', "",
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1}}}', "",
+    ].join("\n"), { headers: { "content-type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", providerFetch);
+    onTestFinished(() => vi.unstubAllGlobals());
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("visitor-live-workspace"));
+    await bootstrapSession(stub, "visitor-live-workspace");
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<{ instance_ref: string }>("public-session-state");
+      for (const path of ["artifacts/report.txt", "work/notes.txt", "outbox/record.txt"]) state.storage.sql.exec("INSERT INTO files (key, content) VALUES (?, ?)", `${session!.instance_ref}/${path}`, "synthetic");
+    });
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", snapshot: { files: [{ path: "artifacts/report.txt" }] } });
+    socket.send(JSON.stringify({ type: "send_message", request_id: "visitor-turn", text: "hello" }));
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 80; index += 1) {
+      const message = await nextMessage(socket); observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+    expect(observed.at(-1)).toMatchObject({ type: "turn_terminal", request_id: "visitor-turn", status: 200 });
+    expect(observed.filter((event) => event.type === "workspace_snapshot")).toHaveLength(1);
+    expect(observed.find((event) => event.type === "workspace_snapshot")).toMatchObject({ request_id: "visitor-turn", files: [{ path: "artifacts/report.txt" }] });
+    expect(providerFetch).toHaveBeenCalledOnce();
+    expect(await runInDurableObject(stub, async (_instance, state) => state.storage.sql.exec<{ total: number }>("SELECT COUNT(*) AS total FROM files").one().total)).toBe(3);
+    socket.close(1000, "done");
+  });
+
   it("nests synchronous publication transactions and rolls back the outer failure", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName("retained-publication-transactions"));

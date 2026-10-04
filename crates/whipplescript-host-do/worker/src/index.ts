@@ -1452,6 +1452,28 @@ type PublicSessionEventInput = Omit<PublicSessionEvent, "sequence"> & {
   type: string;
 };
 
+function canonicalWorkspacePath(path: string): boolean {
+  return !path.startsWith("/") && !path.includes("\\")
+    && !path.split("/").some((part) => !part || part === "." || part === "..");
+}
+
+function visitorFilePath(path: string): boolean {
+  return path.startsWith("artifacts/") && canonicalWorkspacePath(path);
+}
+
+// Retained events are evidence. Project legacy workspace snapshots at the
+// visitor boundary without rewriting their payload, sequence, or cursor.
+function visitorEvent<T extends PublicSessionEventInput>(event: T): T {
+  if (event.type !== "workspace_snapshot") return event;
+  return {
+    ...event,
+    files: Array.isArray(event.files) ? event.files.filter((file) =>
+      typeof file === "object" && file !== null
+      && typeof file.path === "string" && visitorFilePath(file.path)
+    ) : [],
+  };
+}
+
 interface PublicImageBody {
   media_type: string;
   data_base64: string;
@@ -2068,8 +2090,8 @@ export class WorkflowInstance implements DurableObject {
           after,
         )
         .toArray() as { sequence: number; event_json: string }[]
-    ).map((row) => ({
-          ...(JSON.parse(row.event_json) as PublicSessionEventInput),
+    ).map((row) => visitorEvent({
+      ...(JSON.parse(row.event_json) as PublicSessionEventInput),
       sequence: row.sequence,
     }));
   }
@@ -2088,10 +2110,10 @@ export class WorkflowInstance implements DurableObject {
         )
         .toArray() as { sequence: number; event_json: string }[];
       if (existing.length) {
-        return {
+        return visitorEvent({
           ...(JSON.parse(existing[0].event_json) as PublicSessionEventInput),
           sequence: Number(existing[0].sequence),
-        };
+        });
       }
     }
     const rows = this.ctx.storage.sql
@@ -2106,13 +2128,14 @@ export class WorkflowInstance implements DurableObject {
       ...event,
       sequence: Number(rows[0]?.sequence ?? 0),
     };
+    const projected = visitorEvent(persisted);
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() as
         | { publicSession?: boolean }
         | null;
-      if (attachment?.publicSession) socket.send(JSON.stringify(persisted));
+      if (attachment?.publicSession) socket.send(JSON.stringify(projected));
     }
-    return persisted;
+    return projected;
   }
 
   private sendPublicLatency(
@@ -2153,8 +2176,15 @@ export class WorkflowInstance implements DurableObject {
     const prefix = `${session.instance_ref}/`;
     const files = this.ctx.storage.sql
       .exec(
-        `SELECT substr(key, length(?1) + 1) AS path
-           FROM files WHERE key LIKE ?1 || '%' ORDER BY key LIMIT 5000`,
+        `SELECT path FROM (
+           SELECT substr(key, length(?1) + 1) AS path
+             FROM files WHERE substr(key, 1, length(?1)) = ?1
+         ) WHERE substr(path, 1, 10) = 'artifacts/'
+             AND instr(path, char(92)) = 0
+             AND instr('/' || path || '/', '//') = 0
+             AND instr('/' || path || '/', '/./') = 0
+             AND instr('/' || path || '/', '/../') = 0
+         ORDER BY path LIMIT 5000`,
         prefix,
       )
       .toArray();
@@ -2245,12 +2275,11 @@ export class WorkflowInstance implements DurableObject {
     if (session instanceof Response) return session;
     const path = url.searchParams.get("path");
     if (!path) return this.publicSessionState();
-    if (
-      path.startsWith("/") ||
-      path.includes("\\") ||
-      path.split("/").some((part) => !part || part === "." || part === "..")
-    ) {
+    if (!canonicalWorkspacePath(path)) {
       return Response.json({ error: "invalid file path" }, { status: 400 });
+    }
+    if (!visitorFilePath(path)) {
+      return Response.json({ error: "file not found" }, { status: 404 });
     }
     ensureSchema(this.ctx.storage.sql);
     const rows = this.ctx.storage.sql
@@ -2905,7 +2934,7 @@ export class WorkflowInstance implements DurableObject {
             )
           : undefined;
         if (completed) {
-          socket.send(JSON.stringify(completed));
+          socket.send(JSON.stringify(visitorEvent(completed)));
           return;
         }
         const inProcess = requestId
@@ -2913,7 +2942,7 @@ export class WorkflowInstance implements DurableObject {
           : undefined;
         if (inProcess) {
           const event = await inProcess;
-          if (event) socket.send(JSON.stringify(event));
+          if (event) socket.send(JSON.stringify(visitorEvent(event)));
           return;
         }
         const run = (async () => {
