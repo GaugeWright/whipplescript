@@ -84,12 +84,44 @@ impl<B: Branches + FlowingRewrites + FlowingSources + FlowingAdmissions, C: Cont
         after_cut_id: &str,
     ) -> StoreResult<CurrentFlowingRewriteRosterOutcome> {
         use CurrentFlowingRewriteRosterOutcome as R;
-
         let prefix =
             match self.verify_current_flowing_rewrite_prefix(source_branch_id, after_cut_id)? {
                 CurrentFlowingRewritePrefixOutcome::Verified(prefix) => *prefix,
                 outcome => return Ok(R::Source(outcome)),
             };
+        self.verify_flowing_rewrite_roster_from_prefix(source_branch_id, prefix)
+    }
+
+    /// Account for exactly the units through `selected_cut_id`; an ordinary
+    /// later tail remains owed but cannot invalidate this earlier selection.
+    /// Admission must recapture the selected cut and current source ancestry
+    /// under ref exclusion before using the result.
+    pub fn verify_selected_flowing_rewrite_roster(
+        &self,
+        source_branch_id: &str,
+        after_cut_id: &str,
+        selected_cut_id: &str,
+    ) -> StoreResult<CurrentFlowingRewriteRosterOutcome> {
+        use CurrentFlowingRewriteRosterOutcome as R;
+        let prefix = match self.verify_selected_flowing_rewrite_prefix(
+            source_branch_id,
+            after_cut_id,
+            selected_cut_id,
+        )? {
+            CurrentFlowingRewritePrefixOutcome::Verified(prefix) => *prefix,
+            outcome => return Ok(R::Source(outcome)),
+        };
+        self.verify_flowing_rewrite_roster_from_prefix(source_branch_id, prefix)
+    }
+
+    fn verify_flowing_rewrite_roster_from_prefix(
+        &self,
+        source_branch_id: &str,
+        prefix: CurrentFlowingRewritePrefix,
+    ) -> StoreResult<CurrentFlowingRewriteRosterOutcome> {
+        use CurrentFlowingRewriteRosterOutcome as R;
+        let later_cut_ids: BTreeSet<&str> =
+            prefix.later_cut_ids().iter().map(String::as_str).collect();
         let mut declarations = BTreeMap::new();
         for declaration in self.branches.source_contributions(source_branch_id)? {
             if declarations
@@ -148,7 +180,9 @@ impl<B: Branches + FlowingRewrites + FlowingSources + FlowingAdmissions, C: Cont
         let mut cut_owners = BTreeMap::new();
         let mut tail_units = Vec::new();
         for declaration in declarations.values() {
-            if used.contains(&declaration.unit_id) {
+            if used.contains(&declaration.unit_id)
+                || later_cut_ids.contains(declaration.source_cut_id.as_str())
+            {
                 continue;
             }
             let Some(basis) = self.branches.contribution_basis(&declaration.unit_id)? else {
@@ -212,7 +246,13 @@ impl<B: Branches + FlowingRewrites + FlowingSources + FlowingAdmissions, C: Cont
             ));
             used.insert(declaration.unit_id.clone());
         }
-        if used.len() != declarations.len() || owners.len() != tail.len() {
+        if used.len()
+            != declarations
+                .values()
+                .filter(|declaration| !later_cut_ids.contains(declaration.source_cut_id.as_str()))
+                .count()
+            || owners.len() != tail.len()
+        {
             return Ok(R::IncompleteRoster);
         }
         tail_units.sort_by_key(|(position, _)| *position);

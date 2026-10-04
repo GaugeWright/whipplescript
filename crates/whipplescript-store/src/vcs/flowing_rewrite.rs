@@ -760,6 +760,16 @@ mod tests {
                 .unwrap(),
             R::IncompleteRoster
         );
+        let R::Verified(selected) = vcs
+            .verify_selected_flowing_rewrite_roster("twig", "rebased", "rebased")
+            .unwrap()
+        else {
+            panic!("the old roots remain selectable before an unbound tail");
+        };
+        assert_eq!(selected.prefix().selected_cut_id(), "rebased");
+        assert_eq!(selected.prefix().source_head_cut_id(), "unowned");
+        assert_eq!(selected.prefix().later_cut_ids(), &["unowned"]);
+        assert_eq!(selected.units().len(), 2);
         // A subsequent declaration cannot hide the earlier unowned write.
         bound_write(&mut vcs, "later.txt", "tail", "later-cut", "unit-tail");
         assert_eq!(
@@ -767,6 +777,13 @@ mod tests {
                 .unwrap(),
             R::IncompleteRoster
         );
+        let R::Verified(selected) = vcs
+            .verify_selected_flowing_rewrite_roster("twig", "rebased", "rebased")
+            .unwrap()
+        else {
+            panic!("neither later cut changes the selected old roots");
+        };
+        assert_eq!(selected.units().len(), 2);
     }
 
     #[test]
@@ -794,6 +811,29 @@ mod tests {
         assert!(roster.units()[..2].iter().all(|unit| unit.from_rewrite));
         assert!(!roster.units()[2].from_rewrite);
         assert_eq!(roster.units()[2].atoms[0].cut_id, "later-cut");
+
+        vcs.write("twig", "newer.txt", Some("unbound"), "newer-cut", "t9")
+            .unwrap();
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_roster("twig", "rebased")
+                .unwrap(),
+            R::IncompleteRoster
+        );
+        let R::Verified(selected) = vcs
+            .verify_selected_flowing_rewrite_roster("twig", "rebased", "later-cut")
+            .unwrap()
+        else {
+            panic!("a bound selected prefix survives an unbound later tail");
+        };
+        assert_eq!(selected.prefix().selected_cut_id(), "later-cut");
+        assert_eq!(selected.prefix().source_head_cut_id(), "newer-cut");
+        assert_eq!(selected.prefix().later_cut_ids(), &["newer-cut"]);
+        assert_eq!(selected.units().len(), 3);
+        assert!(!matches!(
+            vcs.verify_selected_flowing_rewrite_roster("twig", "rebased", "cut-a")
+                .unwrap(),
+            R::Verified(_)
+        ));
     }
 
     #[test]

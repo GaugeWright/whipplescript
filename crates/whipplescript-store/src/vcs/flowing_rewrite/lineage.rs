@@ -54,6 +54,9 @@ pub struct CurrentFlowingRewritePrefix {
     lineage: FlowingRewriteLineage,
     source_head_cut_id: String,
     source_head_manifest_hash: String,
+    selected_cut_id: String,
+    selected_manifest_hash: String,
+    later_cut_ids: Vec<String>,
     tail_atoms: Vec<FlowingSourceAtom>,
 }
 
@@ -68,6 +71,19 @@ impl CurrentFlowingRewritePrefix {
 
     pub fn source_head_manifest_hash(&self) -> &str {
         &self.source_head_manifest_hash
+    }
+
+    pub fn selected_cut_id(&self) -> &str {
+        &self.selected_cut_id
+    }
+
+    pub fn selected_manifest_hash(&self) -> &str {
+        &self.selected_manifest_hash
+    }
+
+    /// Ordinary later cuts on the active source line, outside this selection.
+    pub fn later_cut_ids(&self) -> &[String] {
+        &self.later_cut_ids
     }
 
     pub fn tail_atoms(&self) -> &[FlowingSourceAtom] {
@@ -96,6 +112,31 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
         source_branch_id: &str,
         after_cut_id: &str,
     ) -> StoreResult<CurrentFlowingRewritePrefixOutcome> {
+        self.verify_flowing_rewrite_prefix_at_cut(source_branch_id, after_cut_id, None)
+    }
+
+    /// Verify an exact selected cut on the current twig after one rewrite.
+    /// Later ordinary writes prove continuing ancestry but need not have
+    /// readable bodies or bound units for this earlier prefix to be selected.
+    pub fn verify_selected_flowing_rewrite_prefix(
+        &self,
+        source_branch_id: &str,
+        after_cut_id: &str,
+        selected_cut_id: &str,
+    ) -> StoreResult<CurrentFlowingRewritePrefixOutcome> {
+        self.verify_flowing_rewrite_prefix_at_cut(
+            source_branch_id,
+            after_cut_id,
+            Some(selected_cut_id),
+        )
+    }
+
+    fn verify_flowing_rewrite_prefix_at_cut(
+        &self,
+        source_branch_id: &str,
+        after_cut_id: &str,
+        selected_cut_id: Option<&str>,
+    ) -> StoreResult<CurrentFlowingRewritePrefixOutcome> {
         use CurrentFlowingRewritePrefixOutcome as R;
 
         let Some(source) = self.branches.get_branch(source_branch_id)? else {
@@ -118,9 +159,48 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(source_head_manifest_hash) = source.head_manifest_hash.as_deref() else {
             return Ok(R::SourceNotReady);
         };
+        let selected_cut_id = selected_cut_id.unwrap_or(source_head_cut_id);
         let mut cursor = Some(source_head_cut_id.to_owned());
         let mut expected_hash = Some(source_head_manifest_hash.to_owned());
+        let mut later_cut_ids = Vec::new();
         let mut seen = BTreeSet::new();
+        while cursor.as_deref() != Some(selected_cut_id) {
+            let Some(cut_id) = cursor else {
+                return Ok(R::RewriteNotOnSource);
+            };
+            if !seen.insert(cut_id.clone()) {
+                return Ok(R::UnsupportedTail { cut_id });
+            }
+            let Some(cut) = self.branches.get_cut(&cut_id)? else {
+                return Ok(R::CutMissing { cut_id });
+            };
+            if cut.branch_id != source_branch_id
+                || expected_hash.as_deref() != Some(cut.manifest_hash.as_str())
+                || !cut
+                    .origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.starts_with("write:"))
+            {
+                return Ok(R::UnsupportedTail { cut_id });
+            }
+            expected_hash = match cut.parent_cut_id.as_deref() {
+                Some(parent_id) => {
+                    let Some(parent) = self.branches.get_cut(parent_id)? else {
+                        return Ok(R::CutMissing {
+                            cut_id: parent_id.into(),
+                        });
+                    };
+                    Some(parent.manifest_hash)
+                }
+                None => None,
+            };
+            cursor = cut.parent_cut_id.clone();
+            later_cut_ids.push(cut_id);
+        }
+        let Some(selected_manifest_hash) = expected_hash.clone() else {
+            return Ok(R::RewriteNotOnSource);
+        };
+        later_cut_ids.reverse();
         let mut reverse = Vec::new();
         while cursor.as_deref() != Some(after_cut_id) {
             let Some(cut_id) = cursor else {
@@ -207,6 +287,9 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
             lineage: *lineage,
             source_head_cut_id: source_head_cut_id.into(),
             source_head_manifest_hash: source_head_manifest_hash.into(),
+            selected_cut_id: selected_cut_id.into(),
+            selected_manifest_hash,
+            later_cut_ids,
             tail_atoms,
         })))
     }

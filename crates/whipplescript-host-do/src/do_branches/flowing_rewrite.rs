@@ -492,6 +492,22 @@ mod tests {
             ["unit-a", "unit-tail"]
         );
         assert!(!roster.units()[1].from_rewrite);
+        vcs.write("twig", "newer.txt", Some("unbound"), "newer-cut", "t10")
+            .unwrap();
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_roster("twig", "rebased")
+                .unwrap(),
+            CurrentFlowingRewriteRosterOutcome::IncompleteRoster
+        );
+        let CurrentFlowingRewriteRosterOutcome::Verified(selected) = vcs
+            .verify_selected_flowing_rewrite_roster("twig", "rebased", "later-cut")
+            .unwrap()
+        else {
+            panic!("hosted selected prefix survives an unbound later write");
+        };
+        assert_eq!(selected.units().len(), 2);
+        assert_eq!(selected.prefix().source_head_cut_id(), "newer-cut");
+        assert_eq!(selected.prefix().later_cut_ids(), &["newer-cut"]);
     }
 
     #[test]
