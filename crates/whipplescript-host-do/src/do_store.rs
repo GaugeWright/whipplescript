@@ -988,7 +988,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 "effect_status": "failed",
             })
             .to_string();
-            do_append_event(
+            let event = do_append_event(
                 &self.sql,
                 NewEvent {
                     instance_id,
@@ -1026,9 +1026,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             }
             self.sql
                 .execute(
-                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+                    "UPDATE runs SET status = 'lease_expired', completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2) \
                      WHERE run_id = ?1 AND status = 'running'",
-                    &[text(&lease.run_id)],
+                    &[text(&lease.run_id), text(&event.event_id)],
                 )
                 .map_err(sql_err)?;
             self.sql

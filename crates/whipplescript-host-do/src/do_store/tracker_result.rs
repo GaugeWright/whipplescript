@@ -264,6 +264,47 @@ mod tests {
     use super::super::test_support::RusqliteDoSql;
     use super::*;
 
+    /// Mint a valid event chain on an earlier clock than subsequent SQL
+    /// statements. No sleep or second-boundary scheduling can hide the defect.
+    struct EarlierEventClock(RusqliteDoSql);
+
+    impl DoSql for EarlierEventClock {
+        fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            self.0.atomic(body)
+        }
+
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+            self.0.execute(sql, params)
+        }
+
+        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            if sql == "SELECT 'evt_' || lower(hex(randomblob(16))), CURRENT_TIMESTAMP" {
+                self.0.query(
+                    "SELECT 'evt_' || lower(hex(randomblob(16))), '2026-01-01 00:00:00'",
+                    params,
+                )
+            } else {
+                self.0.query(sql, params)
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_expired_attempt_keeps_event_time_through_result_replay() {
+        let suites: [fn(&mut DoSqliteStore<EarlierEventClock>, &str); 3] = [
+            whipplescript_store::tracker_result::conformance::run_suite,
+            whipplescript_store::tracker_result::closing_conformance::run_suite,
+            whipplescript_store::tracker_result::control_conformance::run_suite,
+        ];
+        for suite in suites {
+            let mut store =
+                DoSqliteStore::new(EarlierEventClock(RusqliteDoSql::with_runtime_schema()));
+            suite(&mut store, "lease_expired");
+            // Each shared suite verifies exact before/after projections and
+            // the immutable delivery. The timestamp is minted before append.
+        }
+    }
+
     #[test]
     fn hosted_tracker_result_delivery_preserves_terminal_history_and_replays() {
         for status in ["running", "lease_expired", "failed"] {
