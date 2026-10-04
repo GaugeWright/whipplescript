@@ -38,12 +38,6 @@ section_temp_roots=()
 section_cleanup() { [ ${#section_temp_roots[@]} -eq 0 ] || rm -rf "${section_temp_roots[@]}"; }
 trap section_cleanup EXIT
 
-if [ -z "${WHIPPLESCRIPT_ITEMS_STORE:-}" ]; then
-    section_items_root="$(mktemp -d)"
-    section_temp_roots+=("$section_items_root")
-    export WHIPPLESCRIPT_ITEMS_STORE="$section_items_root/items.sqlite"
-fi
-
 # Where anything this section runs writes its temporary files. A Unix-domain
 # socket path has a hard length limit — SUN_LEN, 104 bytes on macOS — and the
 # CLI tests bind one under $TMPDIR, directly and again through the worker's
@@ -76,6 +70,14 @@ section_tmpdir="$(mktemp -d "$section_tmp_base/whip-check.XXXXXX")"
 section_temp_roots+=("$section_tmpdir")
 export TMPDIR="$section_tmpdir"
 
+# Initialize the isolated tracker only after choosing writable temporary storage.
+# Incoming Buck2 TMPDIR may be under protected read-only artifact output.
+if [ -z "${WHIPPLESCRIPT_ITEMS_STORE:-}" ]; then
+    section_items_root="$(mktemp -d "$section_tmpdir/tracker.XXXXXX")"
+    section_temp_roots+=("$section_items_root")
+    export WHIPPLESCRIPT_ITEMS_STORE="$section_items_root/items.sqlite"
+fi
+
 case "${1:-}" in
   agent-guide)          node scripts/check-agent-guide.mjs ;;
   carries-agent-guide|carries-agent-guide-checker|carries-build-coverage|carries-buckify-crates)
@@ -92,7 +94,7 @@ case "${1:-}" in
   substrate-refusals)   scripts/check-substrate-refusals.sh ;;
   build-coverage)       node scripts/check-build-coverage.mjs ;;
   gate-test-filters)
-    node --test scripts/check-windows-compile.test.mjs scripts/windows-cargo-timings.test.mjs \
+    node --test scripts/section-temp.test.mjs scripts/check-windows-compile.test.mjs scripts/windows-cargo-timings.test.mjs \
       scripts/windows-buck2-readiness.test.mjs scripts/model-catalog.test.mjs
     python3 scripts/test-cargo-test-helper.py
     node scripts/check-cargo-test-guarded.mjs --selftest
