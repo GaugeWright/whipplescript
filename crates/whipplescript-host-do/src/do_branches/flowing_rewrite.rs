@@ -195,8 +195,8 @@ mod tests {
     use whipplescript_store::branches::MAINLINE_BRANCH_ID;
     use whipplescript_store::selection;
     use whipplescript_store::vcs::flowing_rewrite::{
-        CurrentFlowingRewritePrefixOutcome, FlowingDisjointRebaseOutcome,
-        FlowingRewriteLineageOutcome,
+        CurrentFlowingRewritePrefixOutcome, CurrentFlowingRewriteRosterOutcome,
+        FlowingDisjointRebaseOutcome, FlowingRewriteLineageOutcome,
     };
     use whipplescript_store::vcs::{FlowingSelectionOutcome, WorkspaceVcs};
 
@@ -441,6 +441,57 @@ mod tests {
         assert_eq!(prefix.lineage().receipt().roots.len(), 1);
         assert_eq!(prefix.tail_atoms().len(), 1);
         assert_eq!(prefix.tail_atoms()[0].cut_id, "later-cut");
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_roster("twig", "rebased")
+                .unwrap(),
+            CurrentFlowingRewriteRosterOutcome::IncompleteRoster
+        );
+        let cut = branches.get_cut("later-cut").unwrap().unwrap();
+        branches
+            .pin_private_cut(PinPrivateCut {
+                pin_id: "pin-tail",
+                twig_branch_id: "twig",
+                cut_id: "later-cut",
+                manifest_hash: &cut.manifest_hash,
+                principal: "s:author",
+                retained_at: "t9",
+            })
+            .unwrap();
+        branches
+            .declare_contribution(DeclareContribution {
+                unit_id: "unit-tail",
+                pin_id: "pin-tail",
+                principal: "s:author",
+                intent: "hosted tail",
+                read_basis_digest: "read",
+                dependency_basis_digest: "deps",
+                scope_digest: "tail",
+                declared_at: "t9",
+            })
+            .unwrap();
+        let FlowingSelectionOutcome::Selected(selected) = vcs
+            .select_private_changes("pin-tail", &selection::parse("change(later-cut)").unwrap())
+            .unwrap()
+        else {
+            panic!("later write can be selected after the rewrite");
+        };
+        vcs.bind_private_selection("unit-tail", &selected, "t9")
+            .unwrap();
+        let CurrentFlowingRewriteRosterOutcome::Verified(roster) = vcs
+            .verify_current_flowing_rewrite_roster("twig", "rebased")
+            .unwrap()
+        else {
+            panic!("hosted source roster verifies old roots and later tail");
+        };
+        assert_eq!(
+            roster
+                .units()
+                .iter()
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unit-a", "unit-tail"]
+        );
+        assert!(!roster.units()[1].from_rewrite);
     }
 
     #[test]

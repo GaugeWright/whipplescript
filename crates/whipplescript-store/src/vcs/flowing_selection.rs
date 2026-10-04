@@ -2290,14 +2290,19 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     }
 
     /// Select a unit's constituent per-path writes from the pinned cut's
-    /// recorded ancestry. Missing content or an unmodeled rewrite refuses;
+    /// recorded ancestry. A verified flowing rewrite roots a later write
+    /// tail, but contributes none of its old atoms to that new selection.
+    /// Missing content or an unmodeled rewrite/transport still refuses;
     /// `change_units` archaeology may skip unreadable cuts and therefore is
     /// not a safe declaration basis by itself.
     pub fn select_private_changes(
         &self,
         pin_id: &str,
         expr: &SelExpr,
-    ) -> StoreResult<FlowingSelectionOutcome> {
+    ) -> StoreResult<FlowingSelectionOutcome>
+    where
+        B: crate::branches::flowing_rewrite::FlowingRewrites,
+    {
         if requires_unproved_semantics(expr) {
             return Ok(FlowingSelectionOutcome::UnsupportedSelection);
         }
@@ -2326,8 +2331,27 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             if self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none() {
                 return Ok(FlowingSelectionOutcome::MissingManifest { cut_id: cut.cut_id });
             }
-            // A rewrite or mixed transport needs an explicit source-identity
-            // derivation edge. Its output cut/change id is not that edge.
+            // A retained, current flowing rewrite is the boundary between old
+            // roots and new writes. Its output cut is not a new source atom.
+            if cut.origin.as_deref() == Some("flowing:rebase") {
+                use crate::vcs::flowing_rewrite::CurrentFlowingRewritePrefixOutcome;
+                let CurrentFlowingRewritePrefixOutcome::Verified(prefix) =
+                    self.verify_current_flowing_rewrite_prefix(&pin.twig_branch_id, &cut.cut_id)?
+                else {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: cut.cut_id });
+                };
+                if pin.cut_id == cut.cut_id
+                    || !prefix
+                        .tail_atoms()
+                        .iter()
+                        .any(|atom| atom.cut_id == pin.cut_id)
+                {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: pin.cut_id });
+                }
+                break;
+            }
+            // A mixed transport needs an explicit constituent derivation edge.
+            // Its output cut/change id cannot stand for its source atoms.
             if !cut
                 .origin
                 .as_deref()

@@ -3,6 +3,7 @@ use whipplescript_store::branches::flowing_admission::RetainFlowingAttemptOutcom
 use whipplescript_store::branches::flowing_fence::{
     FlowingFence, FlowingSourceKind, OpenFlowingSource,
 };
+use whipplescript_store::branches::flowing_rewrite::FlowingRewrites;
 use whipplescript_store::branches::flowing_sources::{
     DeclareContribution, FlowingSources, PinPrivateCut,
 };
@@ -33,6 +34,7 @@ fn seed_candidate<B, C>(
 where
     B: Branches
         + FlowingFence
+        + FlowingRewrites
         + FlowingSources
         + whipplescript_store::branches::flowing_admission::FlowingAdmissions,
     C: whipplescript_store::content::ContentBlobs,

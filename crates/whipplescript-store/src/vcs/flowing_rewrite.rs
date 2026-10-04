@@ -23,9 +23,13 @@ use super::flowing_selection::FlowingSourceAtom;
 use super::WorkspaceVcs;
 
 mod lineage;
+mod roster;
 pub use lineage::{
     CurrentFlowingRewritePrefix, CurrentFlowingRewritePrefixOutcome, FlowingRewriteLineage,
     FlowingRewriteLineageOutcome,
+};
+pub use roster::{
+    CurrentFlowingRewriteRoster, CurrentFlowingRewriteRosterOutcome, FlowingRewriteOwedUnit,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -643,6 +647,27 @@ mod tests {
         (vcs, receipt)
     }
 
+    fn finish_rewrite(vcs: &mut WorkspaceVcs<BranchStore, ContentStore>) {
+        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+    }
+
     #[test]
     fn rewrite_lineage_reader_rederives_both_old_roots_and_output_content() {
         let (vcs, receipt) = committed_two_unit_rewrite();
@@ -679,24 +704,7 @@ mod tests {
                 .unwrap(),
             R::SourceNotReady
         );
-        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
-        assert!(matches!(
-            vcs.branches
-                .transition_flowing_source(&FlowingFenceTransition {
-                    op_id: "finish-rewrite".into(),
-                    source_branch_id: "twig".into(),
-                    incarnation_id: fence.incarnation_id,
-                    expected_eligibility_epoch: fence.eligibility_epoch,
-                    expected_owner_epoch: fence.owner_epoch,
-                    actor: "s:author".into(),
-                    action: FlowingFenceAction::FinishRevision {
-                        begin_op_id: "begin-rewrite".into(),
-                    },
-                    recorded_at: "t7".into(),
-                })
-                .unwrap(),
-            FlowingFenceOutcome::Applied(_)
-        ));
+        finish_rewrite(&mut vcs);
         let initial = vcs
             .verify_current_flowing_rewrite_prefix("twig", "rebased")
             .unwrap();
@@ -728,6 +736,64 @@ mod tests {
                 cut_id: "rebased".into()
             }
         );
+    }
+
+    #[test]
+    fn rewritten_source_roster_accounts_for_old_roots_and_later_tail() {
+        use crate::vcs::flowing_rewrite::CurrentFlowingRewriteRosterOutcome as R;
+
+        let (mut vcs, _) = committed_two_unit_rewrite();
+        finish_rewrite(&mut vcs);
+        let R::Verified(before_tail) = vcs
+            .verify_current_flowing_rewrite_roster("twig", "rebased")
+            .unwrap()
+        else {
+            panic!("both historical roots are still owed");
+        };
+        assert_eq!(before_tail.units().len(), 2);
+        assert!(before_tail.units().iter().all(|unit| unit.from_rewrite));
+
+        vcs.write("twig", "unowned.txt", Some("draft"), "unowned", "t8")
+            .unwrap();
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_roster("twig", "rebased")
+                .unwrap(),
+            R::IncompleteRoster
+        );
+        // A subsequent declaration cannot hide the earlier unowned write.
+        bound_write(&mut vcs, "later.txt", "tail", "later-cut", "unit-tail");
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_roster("twig", "rebased")
+                .unwrap(),
+            R::IncompleteRoster
+        );
+    }
+
+    #[test]
+    fn rewritten_source_roster_keeps_a_bound_tail_separately_owed() {
+        use crate::vcs::flowing_rewrite::CurrentFlowingRewriteRosterOutcome as R;
+
+        let (mut vcs, _) = committed_two_unit_rewrite();
+        finish_rewrite(&mut vcs);
+        bound_write(&mut vcs, "later.txt", "tail", "later-cut", "unit-tail");
+        let result = vcs
+            .verify_current_flowing_rewrite_roster("twig", "rebased")
+            .unwrap();
+        let R::Verified(roster) = result else {
+            panic!("the old roots and new tail have exact owners: {result:?}");
+        };
+        assert_eq!(roster.units().len(), 3);
+        assert_eq!(
+            roster
+                .units()
+                .iter()
+                .map(|unit| unit.unit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unit-a", "unit-b", "unit-tail"]
+        );
+        assert!(roster.units()[..2].iter().all(|unit| unit.from_rewrite));
+        assert!(!roster.units()[2].from_rewrite);
+        assert_eq!(roster.units()[2].atoms[0].cut_id, "later-cut");
     }
 
     #[test]
