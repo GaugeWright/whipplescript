@@ -19,6 +19,8 @@ pub mod flowing_admission;
 pub mod flowing_fence;
 pub mod flowing_rewrite;
 pub mod flowing_sources;
+#[cfg(feature = "native")]
+mod recorded_merge;
 pub mod resolution_batch;
 pub mod resolution_origin;
 pub mod write_commit;

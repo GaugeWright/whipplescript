@@ -1,6 +1,10 @@
 //! Publish an observation of recorded native merge inputs under both owners.
 //! Candidate merge bytes are ephemeral; no filesystem import or native write.
 use super::*;
+mod settlement;
+pub use settlement::{
+    AppliedRecordedSettlement, PreparedRecordedSettlement, RecordedSettlementOutcome,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordedMergeOutcome {
