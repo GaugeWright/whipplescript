@@ -1713,6 +1713,11 @@ values are in USD for each million tokens, for each provider and model, with the
 input side and the output side separate. The rates are in the configuration
 only. The system ships no default rate. Usage with no matching rate records
 honestly as `unpriced` with a cost of 0, and such usage cannot bind the cap.
+Completed and failed scenario evaluations both enter the campaign spend ledger.
+If a failed evaluation has a provider run whose cost cannot be established,
+an invocation with `--spend-cap` stops instead of continuing under an
+incomplete total. Its `campaign.spend` event names the failed evaluation and
+the unaccounted runs.
 
 A campaign that crosses its cap **parks**. The record then has a
 `campaign.parked` event, and the report has `"parked": true`. The

@@ -1148,6 +1148,106 @@ struct RunObservation {
     judge_usage: Vec<TurnUsage>,
 }
 
+struct EvaluationBatch {
+    observations: Vec<RunObservation>,
+    failure: Option<String>,
+    failed_seqs: Vec<usize>,
+}
+
+impl EvaluationBatch {
+    fn from_results(base: usize, results: Vec<Result<RunObservation, String>>) -> Self {
+        let mut batch = Self {
+            observations: Vec::new(),
+            failure: None,
+            failed_seqs: Vec::new(),
+        };
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(observation) => batch.observations.push(observation),
+                Err(reason) => {
+                    batch.failure.get_or_insert(reason);
+                    batch.failed_seqs.push(base + index + 1);
+                }
+            }
+        }
+        batch
+    }
+}
+
+/// A failed regeneration may already have provider runs in its scratch store.
+/// Read their recorded usage before the scratch guard reclaims the store.
+fn failed_evaluation_spend(seq: usize, prices: &PriceTable) -> Result<Option<Value>, String> {
+    let eval_path = eval_scratch_dir_path().join(format!("eval-{seq}.sqlite"));
+    let replay_path = eval_scratch_dir_path().join(format!("replay-{seq}.sqlite"));
+    let prefix_path = eval_scratch_dir_path().join(format!("replay-{seq}.prefix-runs.json"));
+    let (store_path, prefix_runs) = if eval_path.exists() {
+        (eval_path, BTreeSet::new())
+    } else if replay_path.exists() && prefix_path.exists() {
+        let bytes = std::fs::read(&prefix_path)
+            .map_err(|error| format!("failed to read replay prefix runs: {error}"))?;
+        let prefix = serde_json::from_slice::<BTreeSet<String>>(&bytes)
+            .map_err(|error| format!("failed to decode replay prefix runs: {error}"))?;
+        (replay_path, prefix)
+    } else {
+        return Ok(None);
+    };
+    let store = SqliteStore::open(&store_path)
+        .map_err(|error| format!("failed to read partial evaluation store: {error:?}"))?;
+    let mut cost = 0i64;
+    let mut tokens = 0i64;
+    let mut runs_seen = 0usize;
+    let mut unaccounted = 0usize;
+    for instance in store
+        .list_instances()
+        .map_err(|error| format!("failed to list partial evaluation instances: {error:?}"))?
+    {
+        for run in store
+            .list_runs(&instance.instance_id)
+            .map_err(|error| format!("failed to list partial evaluation runs: {error:?}"))?
+        {
+            if prefix_runs.contains(&run.run_id) {
+                continue;
+            }
+            runs_seen += 1;
+            let usage = serde_json::from_str::<Value>(&run.metadata_json)
+                .ok()
+                .and_then(|metadata| {
+                    let usage = metadata
+                        .get("usage")
+                        .or_else(|| metadata.get("usage_json"))?
+                        .as_object()?;
+                    let model = metadata
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .or_else(|| usage.get("model").and_then(Value::as_str))
+                        .unwrap_or("");
+                    Some(TurnUsage::from_usage_json(
+                        &run.provider,
+                        model,
+                        &Value::Object(usage.clone()),
+                    ))
+                });
+            let Some(usage) = usage else {
+                unaccounted += 1;
+                continue;
+            };
+            tokens += usage.total_tokens;
+            if usage.total_tokens == 0 {
+                unaccounted += 1;
+                continue;
+            }
+            match prices.cost_micros(&usage) {
+                Some(micros) => cost += micros,
+                None => unaccounted += 1,
+            }
+        }
+    }
+    Ok((runs_seen > 0).then(|| {
+        json!({"cost_micros": cost, "priced": unaccounted == 0,
+            "tokens": tokens, "runs": runs_seen, "unaccounted_runs": unaccounted})
+    }))
+}
+
 /// Score every scoreable gauge against one completed instance in `store`.
 /// `ambient` restricts to judges that are free and deterministic (exec +
 /// labels-with-scenario + builtins); campaign evaluation also scores prompt
@@ -2446,6 +2546,30 @@ fn replay_scenario(
             .map_err(|error| format!("failed to activate the candidate: {error:?}"))?;
     }
     drop(kernel);
+    // A cloned replay store already contains the recorded prefix's runs.
+    // Preserve their identities before any suffix effect executes so a hard
+    // failure can account only new provider use, never charge the prefix twice.
+    let prefix_store = SqliteStore::open(&store_path)
+        .map_err(|error| format!("failed to reopen replay prefix: {error:?}"))?;
+    let mut prefix_runs = BTreeSet::new();
+    for instance in prefix_store
+        .list_instances()
+        .map_err(|error| format!("failed to list replay prefix instances: {error:?}"))?
+    {
+        for run in prefix_store
+            .list_runs(&instance.instance_id)
+            .map_err(|error| format!("failed to list replay prefix runs: {error:?}"))?
+        {
+            prefix_runs.insert(run.run_id);
+        }
+    }
+    std::fs::write(
+        eval_scratch_dir().join(format!("replay-{seq}.prefix-runs.json")),
+        serde_json::to_vec(&prefix_runs)
+            .map_err(|error| format!("failed to encode replay prefix runs: {error}"))?,
+    )
+    .map_err(|error| format!("failed to record replay prefix runs: {error}"))?;
+    drop(prefix_store);
     // Everything below has executed suffix work: errors are HARD (inner
     // Err) — a fallback here would re-run provider effects.
     Ok(replay_drive_and_score(
@@ -4428,12 +4552,12 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                                 context_snapshot: Option<&ContextSnapshot>,
                                 rows: &[&ScenarioRow],
                                 seq: &mut usize|
-             -> Result<Vec<RunObservation>, String> {
+             -> EvaluationBatch {
                 let base = *seq;
                 *seq += rows.len();
                 let limit = eval_concurrency().min(rows.len().max(1));
                 if limit <= 1 {
-                    return rows
+                    let results = rows
                         .iter()
                         .enumerate()
                         .map(|(index, scenario)| {
@@ -4451,6 +4575,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             )
                         })
                         .collect();
+                    return EvaluationBatch::from_results(base, results);
                 }
                 let mut results: Vec<Result<RunObservation, String>> =
                     Vec::with_capacity(rows.len());
@@ -4486,7 +4611,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         }
                     }
                 });
-                results.into_iter().collect()
+                EvaluationBatch::from_results(base, results)
             };
             // Judge turns are provider spend like proposer turns: recorded
             // per evaluation batch at record-time prices, counting toward
@@ -4600,35 +4725,76 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 }
                 Ok(())
             };
+            let evaluation_spend_cap = campaign_spec.spend_cap_micros;
+            let accounted_evaluate_all = |store: &mut ImproveStore,
+                                          spent: &mut i64,
+                                          path: &str,
+                                          ir: &IrProgram,
+                                          context_snapshot: Option<&ContextSnapshot>,
+                                          rows: &[&ScenarioRow],
+                                          seq: &mut usize,
+                                          what: &str|
+             -> Result<Vec<RunObservation>, String> {
+                let batch = evaluate_all(path, ir, context_snapshot, rows, seq);
+                judge_spend(
+                    store,
+                    &batch.observations,
+                    &format!("judge turns ({what})"),
+                    spent,
+                )?;
+                workflow_spend(
+                    store,
+                    &batch.observations,
+                    &format!("workflow turns ({what})"),
+                    spent,
+                )?;
+                let mut unaccounted = false;
+                for failed_seq in batch.failed_seqs {
+                    if let Some(mut usage) = failed_evaluation_spend(failed_seq, &prices)? {
+                        unaccounted |= usage["priced"] == false;
+                        usage["what"] =
+                            json!(format!("workflow turns ({what}, failed evaluation)"));
+                        let cost = usage["cost_micros"].as_i64().unwrap_or(0);
+                        store
+                            .append_campaign_event(&campaign_id, "campaign.spend", &usage)
+                            .map_err(|error| {
+                                format!("failed to record partial workflow spend: {error:?}")
+                            })?;
+                        *spent += cost;
+                    }
+                }
+                if unaccounted && evaluation_spend_cap.is_some() {
+                    return Err(format!(
+                        "failed evaluation in {what} has unaccounted provider use under --spend-cap; campaign stopped: {}",
+                        batch.failure.as_deref().unwrap_or("unknown evaluation failure")
+                    ));
+                }
+                match batch.failure {
+                    Some(reason) => Err(reason),
+                    None => Ok(batch.observations),
+                }
+            };
             let mut spent_micros: i64 = 0;
             let baseline_context = context.as_ref().map(|(_, snapshot)| snapshot);
-            let baseline_open =
-                evaluate_all(&program_path, &ir, baseline_context, &open, &mut seq)?;
-            let baseline_sealed =
-                evaluate_all(&program_path, &ir, baseline_context, &sealed, &mut seq)?;
-            judge_spend(
+            let baseline_open = accounted_evaluate_all(
                 store,
-                &baseline_open,
-                "judge turns (baseline)",
                 &mut spent_micros,
+                &program_path,
+                &ir,
+                baseline_context,
+                &open,
+                &mut seq,
+                "baseline",
             )?;
-            judge_spend(
+            let baseline_sealed = accounted_evaluate_all(
                 store,
-                &baseline_sealed,
-                "judge turns (baseline, sealed)",
                 &mut spent_micros,
-            )?;
-            workflow_spend(
-                store,
-                &baseline_open,
-                "workflow turns (baseline)",
-                &mut spent_micros,
-            )?;
-            workflow_spend(
-                store,
-                &baseline_sealed,
-                "workflow turns (baseline, sealed)",
-                &mut spent_micros,
+                &program_path,
+                &ir,
+                baseline_context,
+                &sealed,
+                &mut seq,
+                "baseline, sealed",
             )?;
             let mut baseline_tags = campaign_tags.clone();
             baseline_tags.push("baseline".to_owned());
@@ -5128,33 +5294,25 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                                             &prices,
                                             &mut spent_micros,
                                         )?;
-                                        match evaluate_all(
+                                        match accounted_evaluate_all(
+                                            store,
+                                            &mut spent_micros,
                                             &refined_path_str,
                                             &refined_ir,
                                             refined_context.as_ref(),
                                             &open,
                                             &mut seq,
+                                            &format!("{candidate_id}, refinement"),
                                         ) {
                                             Err(reason) => {
+                                                if reason.contains("unaccounted provider use") {
+                                                    return Err(reason);
+                                                }
                                                 refinement_event["status"] =
                                                     json!("open-evaluation-failed");
                                                 refinement_event["reason"] = json!(reason);
                                             }
                                             Ok(refined_observations) => {
-                                                judge_spend(
-                                                    store,
-                                                    &refined_observations,
-                                                    &format!(
-                                                        "judge turns ({candidate_id}, refinement)"
-                                                    ),
-                                                    &mut spent_micros,
-                                                )?;
-                                                workflow_spend(
-                                                    store,
-                                                    &refined_observations,
-                                                    &format!("workflow turns ({candidate_id}, refinement)"),
-                                                    &mut spent_micros,
-                                                )?;
                                                 let (base, cand, _) = comparable_pairs(
                                                     &baseline_open,
                                                     &refined_observations,
@@ -5193,30 +5351,24 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                                                             {
                                                                 refinement_event["comparison"] = json!({"status": "skipped-cap"});
                                                             } else {
-                                                                match evaluate_all(
+                                                                match accounted_evaluate_all(
+                                                                    store,
+                                                                    &mut spent_micros,
                                                                     &candidate_path_str,
                                                                     &candidate_ir,
                                                                     candidate_context.as_ref(),
                                                                     &open,
                                                                     &mut seq,
+                                                                    &format!("{candidate_id}, original comparison"),
                                                                 ) {
                                                                     Err(reason) => {
+                                                                        if reason.contains("unaccounted provider use") {
+                                                                            return Err(reason);
+                                                                        }
                                                                         refinement_event
                                                                             ["comparison"] = json!({"status": "open-evaluation-failed", "reason": reason});
                                                                     }
                                                                     Ok(original_observations) => {
-                                                                        judge_spend(
-                                                                            store,
-                                                                            &original_observations,
-                                                                            &format!("judge turns ({candidate_id}, original comparison)"),
-                                                                            &mut spent_micros,
-                                                                        )?;
-                                                                        workflow_spend(
-                                                                            store,
-                                                                            &original_observations,
-                                                                            &format!("workflow turns ({candidate_id}, original comparison)"),
-                                                                            &mut spent_micros,
-                                                                        )?;
                                                                         if let Some((against_baseline, against_refinement)) = original_dominates_refinement(
                                                                             &specs,
                                                                             &spec_active,
@@ -5296,12 +5448,15 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 let candidate_open = if let Some(observations) = prefetched_open {
                     observations
                 } else {
-                    let observations = match evaluate_all(
+                    let observations = match accounted_evaluate_all(
+                        store,
+                        &mut spent_micros,
                         &candidate_path_str,
                         &candidate_ir,
                         candidate_context.as_ref(),
                         &open,
                         &mut seq,
+                        &candidate_id,
                     ) {
                         Ok(observations) => observations,
                         Err(reason) => {
@@ -5309,7 +5464,9 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             // when a ready rule is lowered against a concrete
                             // turn (for example, an unknown turn projection).
                             // Keep provider and infrastructure failures fatal.
-                            if !reason.contains("lowering failed:") {
+                            if !reason.contains("lowering failed:")
+                                || reason.contains("unaccounted provider use")
+                            {
                                 return Err(reason);
                             }
                             let reason = format!("open evaluation failed: {reason}");
@@ -5341,18 +5498,6 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             continue;
                         }
                     };
-                    judge_spend(
-                        store,
-                        &observations,
-                        &format!("judge turns ({candidate_id})"),
-                        &mut spent_micros,
-                    )?;
-                    workflow_spend(
-                        store,
-                        &observations,
-                        &format!("workflow turns ({candidate_id})"),
-                        &mut spent_micros,
-                    )?;
                     observations
                 };
                 record_observations(
@@ -5458,24 +5603,15 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     // Promotion gate: score the sealed holdout on BOTH arms and
                     // re-check dominance over the combined evidence. Every gate
                     // exposure wears the seal (cumulative, k=3).
-                    let candidate_sealed = evaluate_all(
+                    let candidate_sealed = accounted_evaluate_all(
+                        store,
+                        &mut spent_micros,
                         &candidate_path_str,
                         &candidate_ir,
                         candidate_context.as_ref(),
                         &sealed,
                         &mut seq,
-                    )?;
-                    judge_spend(
-                        store,
-                        &candidate_sealed,
-                        &format!("judge turns ({candidate_id}, sealed)"),
-                        &mut spent_micros,
-                    )?;
-                    workflow_spend(
-                        store,
-                        &candidate_sealed,
-                        &format!("workflow turns ({candidate_id}, sealed)"),
-                        &mut spent_micros,
+                        &format!("{candidate_id}, sealed"),
                     )?;
                     record_observations(
                         store,

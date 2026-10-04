@@ -387,7 +387,61 @@ rule route
         }),
         "the next proposer must receive the actionable open-case diagnostic: {campaign}"
     );
+    assert!(
+        campaign["events"].as_array().unwrap().iter().any(|event| {
+            event["type"] == "campaign.spend"
+                && event["payload"]["what"] == "workflow turns (K-1, failed evaluation)"
+                && event["payload"]["runs"]
+                    .as_u64()
+                    .is_some_and(|runs| runs > 0)
+        }),
+        "provider work before the lowering failure must enter the ledger: {campaign}"
+    );
     assert_eq!(report["cards"][0]["candidate"], "K-2", "{report}");
+
+    let capped = env
+        .command()
+        .args([
+            "--json",
+            "improve",
+            "route_correct",
+            "--program",
+            &program_str,
+            "--provider",
+            "fixture",
+            "--proposer",
+            "fixture",
+            "--spend-cap",
+            "$1",
+        ])
+        .env("WHIPPLESCRIPT_IMPROVE_PROPOSALS", &proposals)
+        .output()
+        .expect("capped improve");
+    assert!(!capped.status.success(), "capped campaign must stop");
+    assert!(
+        String::from_utf8_lossy(&capped.stderr).contains("unaccounted provider use"),
+        "{}",
+        String::from_utf8_lossy(&capped.stderr)
+    );
+    let campaigns = env.run_json(&["--json", "campaigns"], &[]);
+    let failed = campaigns["campaigns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "failed")
+        .expect("capped campaign is recorded as failed");
+    let detail = env.run_json(
+        &["--json", "campaign", failed["campaign"].as_str().unwrap()],
+        &[],
+    );
+    assert!(
+        detail["events"].as_array().unwrap().iter().any(|event| {
+            event["type"] == "campaign.spend"
+                && event["payload"]["what"] == "workflow turns (K-1, failed evaluation)"
+                && event["payload"]["priced"] == false
+        }),
+        "unaccounted provider use must remain visible in failed campaign: {detail}"
+    );
 }
 
 #[test]
