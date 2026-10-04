@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -269,6 +270,149 @@ rule route
     );
     assert_eq!(report["proposed"], true, "{report}");
     assert_eq!(report["cards"][0]["proposable"], true, "{report}");
+}
+
+#[test]
+fn improve_regeneration_uses_the_content_pinned_script_manifest() {
+    let env = Env::new("script-manifest-regeneration");
+    let script = env.dir.join("echo.py");
+    let script_source = "import json,sys\nrequest=json.load(sys.stdin)\nprint(json.dumps({'value':request['id']}))\n";
+    fs::write(&script, script_source).expect("write script");
+    let manifest = env.dir.join("scripts.json");
+    fs::write(
+        &manifest,
+        serde_json::json!({"echo_ticket": {
+            "argv": ["python3", script.to_string_lossy()],
+            "sha256": Sha256::digest(script_source.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }})
+        .to_string(),
+    )
+    .expect("write script manifest");
+    let judge = env.dir.join("judge.py");
+    fs::write(
+        &judge,
+        "import json,sys\nr=json.load(sys.stdin)\nt=r.get('terminal') or {}\nprint(json.dumps({'ok':r.get('status')=='completed' and t.get('value')=='T-1' and t.get('route')=='right'}))\n",
+    )
+    .expect("write judge");
+    let source = |route: &str| {
+        format!(
+            r#"use std.script
+workflow ScriptEval
+input ticket Ticket
+output result Reply
+class Ticket {{ id string }}
+class ScriptReply {{ value string }}
+class Reply {{ value string route string }}
+gauge script_quality {{
+  judge via exec "python3 {}"
+  expect P(ok) at least 0.5
+}}
+rule evaluate
+  when Ticket as ticket
+=> {{
+  exec echo_ticket with ticket -> ScriptReply as called
+  after called succeeds as answer {{
+    complete result {{ value answer.value route "{route}" }}
+  }}
+}}
+"#,
+            judge.display()
+        )
+    };
+    let baseline = env.dir.join("baseline.whip");
+    let candidate = env.dir.join("candidate.whip");
+    fs::write(&baseline, source("wrong")).expect("write baseline");
+    fs::write(&candidate, source("right")).expect("write candidate");
+    let baseline = baseline.to_string_lossy().into_owned();
+    let candidate = candidate.to_string_lossy().into_owned();
+    let manifest = manifest.to_string_lossy().into_owned();
+    let script_env = [
+        ("WHIPPLESCRIPT_SCRIPT_MANIFEST", manifest.as_str()),
+        ("WHIPPLESCRIPT_EXEC_PROFILE", "hosted"),
+    ];
+    let run = env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "--input",
+            r#"{"ticket":{"id":"T-1"}}"#,
+            "run",
+            &baseline,
+            "--provider",
+            "fixture",
+        ],
+        &script_env,
+    );
+    env.run_json(
+        &[
+            "--json",
+            "--store",
+            &env.store,
+            "pin",
+            run["instance_id"].as_str().expect("instance id"),
+            "--as",
+            "script-case",
+        ],
+        &script_env,
+    );
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "script_quality",
+            "--program",
+            &baseline,
+            "--provider",
+            "fixture",
+            "--proposer",
+            "fixture",
+        ],
+        &[
+            script_env[0],
+            script_env[1],
+            ("WHIPPLESCRIPT_IMPROVE_PROPOSALS", candidate.as_str()),
+        ],
+    );
+    assert_eq!(report["proposed"], true, "{report}");
+    assert_eq!(report["cards"][0]["proposable"], true, "{report}");
+}
+
+#[test]
+fn improve_stops_when_a_declared_baseline_judge_is_unscored() {
+    let env = Env::new("unscored-baseline-judge");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("high", "ticket.id", &env.dir)).expect("write program");
+    let program_path = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_path);
+    let output = env
+        .command()
+        .env("WHIPPLESCRIPT_EXEC_ALLOW", "")
+        .args([
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_path,
+            "--provider",
+            "fixture",
+            "--proposer",
+            "fixture",
+        ])
+        .output()
+        .expect("run improve");
+    assert!(!output.status.success(), "unscored judge was accepted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("baseline gauge unscored")
+            && stderr.contains("exec judge")
+            && stderr.contains("not granted"),
+        "{stderr}"
+    );
 }
 
 #[test]

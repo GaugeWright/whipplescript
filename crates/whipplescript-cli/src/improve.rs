@@ -27,12 +27,9 @@
 //!   inherits the versioned-workspace containment posture when it lands and
 //!   is not enforced here yet.
 //!
-//! Honest v1 gaps (all tagged, none silent): `coerce` judges are declared
-//! but not yet scoreable (parameter binding needs program context); `prompt`
-//! judges need a configured native coerce provider and are skipped
-//! (`judge-unscored`) without one; spend accounting records what is
-//! derivable and the cap applies to recorded cost, with provider price
-//! tables a follow-on.
+//! Native `coerce` and `prompt` judges need a configured provider. A declared
+//! gauge that cannot score a baseline now fails the campaign with its reason;
+//! the spend ledger records priced and unpriced use separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -2179,7 +2176,7 @@ fn drive_to_idle(
                 instance_id: instance_id.to_owned(),
                 provider: provider.to_owned(),
                 exec_profile: crate::ExecProfile::from_env()?,
-                script_manifest_path: None,
+                script_manifest_path: crate::script_manifest_path_from_env(),
                 package_lock_path: None,
                 outcome: crate::FixtureOutcome::default(),
                 variant: None,
@@ -4818,6 +4815,37 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 Some("baseline"),
                 &baseline_tags,
             );
+            // A campaign cannot optimize or protect a declared gauge if its
+            // baseline judge did not run. In particular, a missing exec-judge
+            // grant must not look like a completed campaign with no gain.
+            let mut missing_baseline_gauges = Vec::new();
+            for (partition, observations) in
+                [("open", &baseline_open), ("sealed", &baseline_sealed)]
+            {
+                for (index, observation) in observations.iter().enumerate() {
+                    for gauge in specs.iter().filter(|gauge| !gauge.builtin) {
+                        if !observation.readings.contains_key(&gauge.name) {
+                            let reason = observation
+                                .skipped
+                                .iter()
+                                .find(|(name, _)| name == &gauge.name)
+                                .map(|(_, reason)| reason.as_str())
+                                .unwrap_or("no reading produced");
+                            missing_baseline_gauges.push(format!(
+                                "{partition} scenario {} / {}: {reason}",
+                                index + 1,
+                                gauge.name
+                            ));
+                        }
+                    }
+                }
+            }
+            if !missing_baseline_gauges.is_empty() {
+                return Err(format!(
+                    "baseline gauge unscored; campaign stopped: {}",
+                    missing_baseline_gauges.join("; ")
+                ));
+            }
             let unscored: BTreeSet<String> = baseline_open
                 .iter()
                 .flat_map(|observation| observation.skipped.iter().cloned())

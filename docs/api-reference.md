@@ -1743,6 +1743,11 @@ baseline. A configured global context directory or
 which instructions the evaluated agent sees. With no `--context-root`, improve
 retains its source-only behavior.
 
+If the workflow uses content-pinned `std.script` capabilities, set
+`WHIPPLESCRIPT_SCRIPT_MANIFEST` for `whip improve` as for `whip run`. Baseline
+and candidate regenerations load that manifest into their disposable stores;
+the manifest and its scripts stay outside the editable context tree.
+
 An inline target such as `extract_quality>=0.9` becomes a reach bound. The
 `then` keyword separates the lexicographic stages, and the stages have ratchet
 semantics. A stage whose reach targets the baseline already meets advances at
@@ -1774,6 +1779,10 @@ instance status and input, all produced facts including consumed facts, and
 `terminal`: the final workflow completion or failure payload, or `null` if no
 terminal event exists. This is the same record shape for baseline and candidate
 evaluations.
+
+If any declared gauge is unscored on a baseline scenario, the campaign fails
+with the judge's reason. It cannot select a candidate against an unknown
+baseline or claim that a protected gauge held when its judge did not run.
 
 The command proposes a candidate only when the candidate improves a gauge in the
 ascend set, causes no regression in a guarded gauge, and meets each bar. The
