@@ -1,10 +1,10 @@
 //! Content-derived preparation for a disjoint flowing twig rebase (FB-2).
 //!
-//! This establishes only content replay, not compatibility of a unit's read
-//! or dependency basis with the new parent. It does not publish a cut or move
-//! a ref. A future writer must retain the prepared bodies, record the exact
-//! root edge, revalidate affected read/dependency bases, and atomically
-//! recapture both refs and the source revision before making the head visible.
+//! Preparation establishes content replay, not compatibility of a unit's read
+//! or dependency basis with the new parent. The writer below publishes the
+//! cut, root edge, and ref move under an embedding-provided final authority
+//! check. The reader verifies the historical edge and content independently;
+//! neither step by itself certifies trunk admission.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,9 @@ use crate::StoreResult;
 
 use super::flowing_selection::FlowingSourceAtom;
 use super::WorkspaceVcs;
+
+mod lineage;
+pub use lineage::{FlowingRewriteLineage, FlowingRewriteLineageOutcome};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -598,6 +601,151 @@ mod tests {
                 })
                 .unwrap(),
             FlowingFenceOutcome::Applied(_)
+        ));
+    }
+
+    fn committed_two_unit_rewrite() -> (
+        WorkspaceVcs<BranchStore, ContentStore>,
+        FlowingRewriteReceipt,
+    ) {
+        let mut vcs = two_units();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "parent.txt",
+            Some("parent"),
+            "parent-next",
+            "t4",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin_rewrite(&mut vcs, &plan);
+        let FlowingRewriteOutcome::Committed(receipt) = vcs
+            .commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("committed");
+        };
+        (vcs, receipt)
+    }
+
+    #[test]
+    fn rewrite_lineage_reader_rederives_both_old_roots_and_output_content() {
+        let (vcs, receipt) = committed_two_unit_rewrite();
+        let FlowingRewriteLineageOutcome::Verified(lineage) =
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap()
+        else {
+            panic!("verified rewrite");
+        };
+        assert_eq!(lineage.receipt(), &receipt);
+        assert_eq!(lineage.source_atoms().len(), 2);
+        assert_eq!(lineage.source_atoms()[0].cut_id, "cut-a");
+        assert_eq!(lineage.source_atoms()[1].cut_id, "cut-b");
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("absent").unwrap(),
+            FlowingRewriteLineageOutcome::CutMissing {
+                cut_id: "absent".into()
+            }
+        );
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("cut-a").unwrap(),
+            FlowingRewriteLineageOutcome::ReceiptMissing {
+                cut_id: "cut-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rewrite_lineage_reader_refuses_missing_root_and_changed_output() {
+        use rusqlite::params;
+
+        let (vcs, receipt) = committed_two_unit_rewrite();
+        let mut missing_root = receipt.clone();
+        missing_root.roots.pop();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_rewrites SET witness_json = ?1, witness_digest = ?2 WHERE op_id = ?3",
+                params![
+                    serde_json::to_string(&missing_root).unwrap(),
+                    crate::branches::flowing_rewrite::digest(&missing_root),
+                    "rewrite-1"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap(),
+            FlowingRewriteLineageOutcome::IncompleteRoots
+        );
+
+        let mut reversed_roots = receipt.clone();
+        reversed_roots.roots.reverse();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_rewrites SET witness_json = ?1, witness_digest = ?2 WHERE op_id = ?3",
+                params![
+                    serde_json::to_string(&reversed_roots).unwrap(),
+                    crate::branches::flowing_rewrite::digest(&reversed_roots),
+                    "rewrite-1"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap(),
+            FlowingRewriteLineageOutcome::IncompleteRoots
+        );
+
+        let mut changed_output = receipt.clone();
+        changed_output.after_manifest_hash = receipt.old_head_manifest_hash.clone();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_rewrites SET witness_json = ?1, witness_digest = ?2 WHERE op_id = ?3",
+                params![
+                    serde_json::to_string(&changed_output).unwrap(),
+                    crate::branches::flowing_rewrite::digest(&changed_output),
+                    "rewrite-1"
+                ],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = ?1 WHERE cut_id = 'rebased'",
+                [&changed_output.after_manifest_hash],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap(),
+            FlowingRewriteLineageOutcome::OutputMismatch
+        );
+    }
+
+    #[test]
+    fn rewrite_lineage_reader_refuses_severed_old_source_ancestry() {
+        let (vcs, _) = committed_two_unit_rewrite();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET parent_cut_id = 'parent-next' WHERE cut_id = 'cut-b'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap(),
+            FlowingRewriteLineageOutcome::UnsupportedLineage { .. }
         ));
     }
 

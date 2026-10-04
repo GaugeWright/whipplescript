@@ -194,7 +194,9 @@ mod tests {
     use whipplescript_store::branches::flowing_sources::{DeclareContribution, PinPrivateCut};
     use whipplescript_store::branches::MAINLINE_BRANCH_ID;
     use whipplescript_store::selection;
-    use whipplescript_store::vcs::flowing_rewrite::FlowingDisjointRebaseOutcome;
+    use whipplescript_store::vcs::flowing_rewrite::{
+        FlowingDisjointRebaseOutcome, FlowingRewriteLineageOutcome,
+    };
     use whipplescript_store::vcs::{FlowingSelectionOutcome, WorkspaceVcs};
 
     type HostedVcs = WorkspaceVcs<DoBranches<Rc<RusqliteDoSql>>, DoContentBlobs<Rc<RusqliteDoSql>>>;
@@ -333,6 +335,13 @@ mod tests {
             Some(receipt.clone())
         );
         assert_eq!(receipt.roots[0].unit_id(), "unit-a");
+        let FlowingRewriteLineageOutcome::Verified(lineage) =
+            vcs.verify_flowing_rewrite_lineage("rebased").unwrap()
+        else {
+            panic!("hosted rewrite lineage verified");
+        };
+        assert_eq!(lineage.receipt(), &receipt);
+        assert_eq!(lineage.source_atoms()[0].cut_id, "cut-a");
         assert_eq!(
             vcs.commit_prepared_disjoint_flowing_rebase(
                 &plan,
