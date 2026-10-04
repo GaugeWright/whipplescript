@@ -666,6 +666,82 @@ fn tracker_control_retains_keys_through_mutation_and_refuses_erased_retry() {
 }
 
 #[test]
+fn guarded_filing_retains_codec_through_commit_replay_and_publication() {
+    struct RetainedCodec {
+        inner: Codec,
+        gate: std::sync::RwLock<bool>,
+        enforce: AtomicBool,
+    }
+    impl PayloadCodec for RetainedCodec {
+        fn seal(&self, aad: &[u8], plaintext: &[u8]) -> StoreResult<Vec<u8>> {
+            if self.enforce.load(Ordering::SeqCst) {
+                assert!(self.gate.try_write().is_err(), "seal escaped retention");
+            }
+            self.inner.seal(aad, plaintext)
+        }
+        fn open(&self, aad: &[u8], ciphertext: &[u8]) -> StoreResult<Vec<u8>> {
+            if self.enforce.load(Ordering::SeqCst) {
+                assert!(
+                    self.gate.try_write().is_err(),
+                    "creation evidence escaped retention"
+                );
+            }
+            self.inner.open(aad, ciphertext)
+        }
+        fn retain(&self, callback: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            let guard = self.gate.read().unwrap();
+            if !*guard {
+                return Err(StoreError::Conflict("original filing key erased".into()));
+            }
+            callback()
+        }
+    }
+    let codec = Arc::new(RetainedCodec {
+        inner: Codec::default(),
+        gate: std::sync::RwLock::new(true),
+        enforce: AtomicBool::new(false),
+    });
+    let mut store = WorkItemStore::open_in_memory_protected(
+        PayloadProtection::new("office-filing", codec.clone()).unwrap(),
+    )
+    .unwrap();
+    codec.enforce.store(true, Ordering::SeqCst);
+    let filing = crate::tracker_filing::conformance::request();
+    let receipt = store
+        .file_issue_once_guarded(&filing, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(
+        store
+            .file_issue_once_guarded(&filing, &mut || Ok(()))
+            .unwrap(),
+        receipt
+    );
+    store
+        .publish_filing_receipt(&filing, &receipt, |_| {
+            assert!(
+                codec.gate.try_write().is_err(),
+                "publication escaped retention"
+            );
+            Ok(())
+        })
+        .unwrap();
+    *codec.gate.write().unwrap() = false;
+    let error = store
+        .file_issue_once_guarded(&filing, &mut || Ok(()))
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("original filing key erased"));
+    let error = store
+        .publish_filing_receipt::<()>(&filing, &receipt, |_| panic!("erased filing published"))
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("original filing key erased"));
+    // Body-free lookup is evidence only, not an execution or publication grant.
+    assert_eq!(
+        store.filing_receipt(&filing.operation_id).unwrap(),
+        Some(receipt)
+    );
+}
+
+#[test]
 fn label_changes_stay_sealed_and_replay_under_protection() {
     let mut store = store();
     let item = file(&mut store);

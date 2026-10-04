@@ -166,6 +166,13 @@ impl Drop for Generation {
 }
 impl DiscoveryTransaction<'_> {
     pub(super) fn commit(self) -> StoreResult<()> {
+        self.commit_guarded(&mut || Ok(()))
+    }
+
+    pub(super) fn commit_guarded(
+        self,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
         let enrolled = roots(&self.tx)?;
         let mut staged = Vec::new();
         if let Some(owner) = &self.owner {
@@ -251,6 +258,9 @@ impl DiscoveryTransaction<'_> {
                 fs::remove_dir_all(&generation.destination)?;
             }
         }
+        // Discovery preparation can take time. Original embedding access must
+        // still hold at the actual durable database boundary.
+        check()?;
         self.tx.commit()?;
         for generation in &staged {
             fs::rename(&generation.stage, &generation.destination).map_err(|e| {
