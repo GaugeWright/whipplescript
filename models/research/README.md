@@ -197,6 +197,27 @@ transaction scope, real blob publication, content reconciliation, or hosted
 implementation. The existing legacy transport advances the target head before
 recording its cut, and flowing transport remains refused.
 
+`flowing_rewrite_commit.py` probes the corresponding source-head boundary for
+a disjoint rebase:
+
+```sh
+python3 models/research/flowing_rewrite_commit.py
+```
+
+It retains two owed source units while replaying their exact atoms onto a new
+parent cut. Preparation publishes an immutable rewritten cut and complete
+root edge under a temporary pin; one ref entry then changes source head,
+branch point, head revision and continuing retention together. Crashes on
+both sides preserve the obligations. Stale source, parent or head revision bases and
+overlapping changed effects refuse. Ten defective durable states expose a
+head without its cut, bodies or edge, a missing root, changed output,
+point-before-head, head/point manifest mismatches, lost old retention or a
+dropped unit. The probe deliberately stops at disjoint
+rebase: an overlapping repair needs a new atom identity and an explicit
+disposition for the old unit. It does not prove real reconciliation, SQL
+transaction scope, content publication or lock composition, and does not
+decide whether an already checked prefix remains eligible across the rewrite.
+
 `revision_lineage.py` probes the other half of that boundary: every
 acknowledged mutation of a selected unit's meaning must advance the ref-owned
 source epoch before the topology head changes. It models eight mutation
