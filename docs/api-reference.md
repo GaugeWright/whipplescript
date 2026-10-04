@@ -1780,6 +1780,14 @@ instance status and input, all produced facts including consumed facts, and
 terminal event exists. This is the same record shape for baseline and candidate
 evaluations.
 
+A judge may add a string `rationale` to its JSON result alongside its score and
+bar verdict. `whip improve` bounds this text to 500 characters and gives it to
+the proposer only for failing open scenarios in the normal view. It also shows
+that scenario's gauge score. Sealed-case rationales never reach the proposer;
+`--redacted-view` withholds open-case rationales and scores as well. Rationale
+text is diagnostic evidence, not an instruction to the proposer, and does not
+change scoring or the adoption gate.
+
 If any declared gauge is unscored on a baseline scenario, the campaign fails
 with the judge's reason. It cannot select a candidate against an unknown
 baseline or claim that a protected gauge held when its judge did not run.
