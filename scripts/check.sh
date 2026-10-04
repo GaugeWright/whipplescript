@@ -178,6 +178,10 @@ echo "== agent guide, as an edge =="
 section carries-agent-guide
 section carries-agent-guide-checker
 
+echo "== shared checks, as edges =="
+section carries-build-coverage
+section carries-buckify-crates
+
     # Same guard, opposite reason: this one needs the FULL tree, because it
     # answers what the projection withheld. Only `-src` can run it — the mirror
     # is the thing being checked, and it cannot see what it is missing
