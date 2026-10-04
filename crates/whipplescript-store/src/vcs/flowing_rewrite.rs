@@ -23,7 +23,10 @@ use super::flowing_selection::FlowingSourceAtom;
 use super::WorkspaceVcs;
 
 mod lineage;
-pub use lineage::{FlowingRewriteLineage, FlowingRewriteLineageOutcome};
+pub use lineage::{
+    CurrentFlowingRewritePrefix, CurrentFlowingRewritePrefixOutcome, FlowingRewriteLineage,
+    FlowingRewriteLineageOutcome,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -662,6 +665,67 @@ mod tests {
             vcs.verify_flowing_rewrite_lineage("cut-a").unwrap(),
             FlowingRewriteLineageOutcome::ReceiptMissing {
                 cut_id: "cut-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn current_rewrite_prefix_keeps_old_roots_distinct_from_later_writes() {
+        use crate::vcs::flowing_rewrite::CurrentFlowingRewritePrefixOutcome as R;
+
+        let (mut vcs, receipt) = committed_two_unit_rewrite();
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_prefix("twig", "rebased")
+                .unwrap(),
+            R::SourceNotReady
+        );
+        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        let initial = vcs
+            .verify_current_flowing_rewrite_prefix("twig", "rebased")
+            .unwrap();
+        let R::Verified(at_rewrite) = initial else {
+            panic!("rewritten head must retain its historical roots: {initial:?}");
+        };
+        assert_eq!(at_rewrite.lineage().receipt(), &receipt);
+        assert_eq!(at_rewrite.lineage().source_atoms().len(), 2);
+        assert!(at_rewrite.tail_atoms().is_empty());
+
+        vcs.write("twig", "later.txt", Some("later"), "later-cut", "t7")
+            .unwrap();
+        let after_append = vcs
+            .verify_current_flowing_rewrite_prefix("twig", "rebased")
+            .unwrap();
+        let R::Verified(with_tail) = after_append else {
+            panic!("an ordinary append must retain the rewrite prefix: {after_append:?}");
+        };
+        assert_eq!(with_tail.source_head_cut_id(), "later-cut");
+        assert_eq!(with_tail.lineage().receipt(), &receipt);
+        assert_eq!(with_tail.lineage().source_atoms().len(), 2);
+        assert_eq!(with_tail.tail_atoms().len(), 1);
+        assert_eq!(with_tail.tail_atoms()[0].cut_id, "later-cut");
+        assert_eq!(with_tail.tail_atoms()[0].path, "later.txt");
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_prefix("twig", "cut-a")
+                .unwrap(),
+            R::UnsupportedTail {
+                cut_id: "rebased".into()
             }
         );
     }

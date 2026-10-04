@@ -195,7 +195,8 @@ mod tests {
     use whipplescript_store::branches::MAINLINE_BRANCH_ID;
     use whipplescript_store::selection;
     use whipplescript_store::vcs::flowing_rewrite::{
-        FlowingDisjointRebaseOutcome, FlowingRewriteLineageOutcome,
+        CurrentFlowingRewritePrefixOutcome, FlowingDisjointRebaseOutcome,
+        FlowingRewriteLineageOutcome,
     };
     use whipplescript_store::vcs::{FlowingSelectionOutcome, WorkspaceVcs};
 
@@ -381,6 +382,65 @@ mod tests {
             .unwrap(),
             FlowingRewriteOutcome::Refused(FlowingRewriteRefusal::CutAlreadyRecorded),
         );
+    }
+
+    #[test]
+    fn hosted_current_rewrite_prefix_survives_a_later_write() {
+        let (sql, mut vcs) = fixture();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("prepared");
+        };
+        begin(&sql);
+        assert!(matches!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Committed(_)
+        ));
+        assert_eq!(
+            vcs.verify_current_flowing_rewrite_prefix("twig", "rebased")
+                .unwrap(),
+            CurrentFlowingRewritePrefixOutcome::SourceNotReady
+        );
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        let fence = branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        vcs.write("twig", "later.txt", Some("tail"), "later-cut", "t8")
+            .unwrap();
+        let CurrentFlowingRewritePrefixOutcome::Verified(prefix) = vcs
+            .verify_current_flowing_rewrite_prefix("twig", "rebased")
+            .unwrap()
+        else {
+            panic!("active hosted source keeps the verified rewrite and later tail");
+        };
+        assert_eq!(prefix.lineage().receipt().roots.len(), 1);
+        assert_eq!(prefix.tail_atoms().len(), 1);
+        assert_eq!(prefix.tail_atoms()[0].cut_id, "later-cut");
     }
 
     #[test]

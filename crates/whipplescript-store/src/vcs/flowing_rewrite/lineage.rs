@@ -7,8 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::branches::flowing_fence::FlowingSourceKind;
 use crate::branches::flowing_rewrite::{FlowingRewriteReceipt, FlowingRewrites};
-use crate::branches::Branches;
+use crate::branches::{BranchStatus, Branches};
 use crate::content::ContentBlobs;
 use crate::StoreResult;
 
@@ -45,7 +46,171 @@ pub enum FlowingRewriteLineageOutcome {
     OutputMismatch,
 }
 
+/// The old roots proved by a rewrite, followed by writes on its continuing
+/// source line. The tail is deliberately not attributed to those roots: its
+/// own contribution bindings and current read/dependency basis remain owed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentFlowingRewritePrefix {
+    lineage: FlowingRewriteLineage,
+    source_head_cut_id: String,
+    source_head_manifest_hash: String,
+    tail_atoms: Vec<FlowingSourceAtom>,
+}
+
+impl CurrentFlowingRewritePrefix {
+    pub fn lineage(&self) -> &FlowingRewriteLineage {
+        &self.lineage
+    }
+
+    pub fn source_head_cut_id(&self) -> &str {
+        &self.source_head_cut_id
+    }
+
+    pub fn source_head_manifest_hash(&self) -> &str {
+        &self.source_head_manifest_hash
+    }
+
+    pub fn tail_atoms(&self) -> &[FlowingSourceAtom] {
+        &self.tail_atoms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentFlowingRewritePrefixOutcome {
+    Verified(Box<CurrentFlowingRewritePrefix>),
+    SourceNotReady,
+    Rewrite(FlowingRewriteLineageOutcome),
+    RewriteNotOnSource,
+    CutMissing { cut_id: String },
+    UnsupportedTail { cut_id: String },
+    MissingContent { content_id: String },
+}
+
 impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Prove that one committed rewrite still roots the active flowing twig,
+    /// even after later ordinary writes. This is a read-only observation that
+    /// must be recaptured under ref exclusion before admission. It neither
+    /// attributes tail atoms to units nor authorizes a candidate.
+    pub fn verify_current_flowing_rewrite_prefix(
+        &self,
+        source_branch_id: &str,
+        after_cut_id: &str,
+    ) -> StoreResult<CurrentFlowingRewritePrefixOutcome> {
+        use CurrentFlowingRewritePrefixOutcome as R;
+
+        let Some(source) = self.branches.get_branch(source_branch_id)? else {
+            return Ok(R::SourceNotReady);
+        };
+        let Some(fence) = self.branches.flowing_source(source_branch_id)? else {
+            return Ok(R::SourceNotReady);
+        };
+        if source.status != BranchStatus::Active
+            || fence.kind != FlowingSourceKind::Twig
+            || !fence.admission_enabled
+            || fence.held
+            || fence.revision.is_some()
+        {
+            return Ok(R::SourceNotReady);
+        }
+        let Some(source_head_cut_id) = source.head_cut_id.as_deref() else {
+            return Ok(R::SourceNotReady);
+        };
+        let Some(source_head_manifest_hash) = source.head_manifest_hash.as_deref() else {
+            return Ok(R::SourceNotReady);
+        };
+        let mut cursor = Some(source_head_cut_id.to_owned());
+        let mut expected_hash = Some(source_head_manifest_hash.to_owned());
+        let mut seen = BTreeSet::new();
+        let mut reverse = Vec::new();
+        while cursor.as_deref() != Some(after_cut_id) {
+            let Some(cut_id) = cursor else {
+                return Ok(R::RewriteNotOnSource);
+            };
+            if !seen.insert(cut_id.clone()) {
+                return Ok(R::UnsupportedTail { cut_id });
+            }
+            let Some(cut) = self.branches.get_cut(&cut_id)? else {
+                return Ok(R::CutMissing { cut_id });
+            };
+            if cut.branch_id != source_branch_id
+                || expected_hash.as_deref() != Some(cut.manifest_hash.as_str())
+                || !cut
+                    .origin
+                    .as_deref()
+                    .is_some_and(|origin| origin.starts_with("write:"))
+            {
+                return Ok(R::UnsupportedTail { cut_id });
+            }
+            expected_hash = match cut.parent_cut_id.as_deref() {
+                Some(parent_id) => {
+                    let Some(parent) = self.branches.get_cut(parent_id)? else {
+                        return Ok(R::CutMissing {
+                            cut_id: parent_id.into(),
+                        });
+                    };
+                    Some(parent.manifest_hash)
+                }
+                None => None,
+            };
+            cursor = cut.parent_cut_id.clone();
+            reverse.push(cut);
+        }
+        let lineage = match self.verify_flowing_rewrite_lineage(after_cut_id)? {
+            FlowingRewriteLineageOutcome::Verified(lineage) => lineage,
+            outcome => return Ok(R::Rewrite(outcome)),
+        };
+        let receipt = lineage.receipt();
+        if receipt.source_branch_id != source_branch_id
+            || receipt.source_incarnation_id != fence.incarnation_id
+            || source.branch_point_cut_id != receipt.parent_head_cut_id
+            || source.branch_point_manifest_hash != receipt.parent_head_manifest_hash
+            || expected_hash.as_deref() != Some(receipt.after_manifest_hash.as_str())
+        {
+            return Ok(R::RewriteNotOnSource);
+        }
+        reverse.reverse();
+        let mut tail_atoms = Vec::new();
+        for cut in &reverse {
+            if self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none() {
+                return Ok(R::MissingContent {
+                    content_id: cut.manifest_hash.clone(),
+                });
+            }
+            let mut changes = Vec::new();
+            self.push_units_for_cut(cut, &mut changes)?;
+            if changes.is_empty() {
+                return Ok(R::UnsupportedTail {
+                    cut_id: cut.cut_id.clone(),
+                });
+            }
+            for change in changes {
+                for content_id in [change.before.as_ref(), change.after.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !self.content.cached_read_available(content_id)? {
+                        return Ok(R::MissingContent {
+                            content_id: content_id.clone(),
+                        });
+                    }
+                }
+                tail_atoms.push(FlowingSourceAtom {
+                    cut_id: change.cut_id,
+                    change_id: change.change_id,
+                    path: change.path,
+                    before: change.before,
+                    after: change.after,
+                });
+            }
+        }
+        Ok(R::Verified(Box::new(CurrentFlowingRewritePrefix {
+            lineage: *lineage,
+            source_head_cut_id: source_head_cut_id.into(),
+            source_head_manifest_hash: source_head_manifest_hash.into(),
+            tail_atoms,
+        })))
+    }
+
     /// Verify a historical disjoint rewrite without relying on today's source
     /// head, current unit rows, or a retained private pin. This is lineage
     /// evidence only; it says nothing about current read/dependency validity
