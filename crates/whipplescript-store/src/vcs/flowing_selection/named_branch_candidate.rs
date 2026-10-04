@@ -115,6 +115,7 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
                 match self.verify_batch_source_order_with_prior(
                     &derived.witness,
                     &prior,
+                    &handoffs[..start],
                     Some(group),
                 )? {
                     FlowingBatchSourceOrderOutcome::Verified => {}

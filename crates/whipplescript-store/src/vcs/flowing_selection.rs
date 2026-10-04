@@ -1698,7 +1698,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         B: FlowingAdmissions,
     {
         use FlowingBatchSourceOrderOutcome as R;
-        let prior = if let Some(before_id) = witness.target_before_cut_id() {
+        let prior_handoffs = if let Some(before_id) = witness.target_before_cut_id() {
             let FlowingBranchLineageOutcome::Verified(lineage) =
                 self.inspect_flowing_branch_lineage(witness.target_branch_id())?
             else {
@@ -1707,21 +1707,22 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             if lineage.head_cut_id() != Some(before_id) {
                 return Ok(R::SourceUnproven);
             }
-            lineage
-                .handoffs()
-                .iter()
-                .map(|receipt| (receipt.unit_id.clone(), receipt.source_basis_digest.clone()))
-                .collect::<Vec<_>>()
+            lineage.handoffs().to_vec()
         } else {
             Vec::new()
         };
-        self.verify_batch_source_order_with_prior(witness, &prior, None)
+        let prior = prior_handoffs
+            .iter()
+            .map(|receipt| (receipt.unit_id.clone(), receipt.source_basis_digest.clone()))
+            .collect::<Vec<_>>();
+        self.verify_batch_source_order_with_prior(witness, &prior, &prior_handoffs, None)
     }
 
     fn verify_batch_source_order_with_prior(
         &self,
         witness: &FlowingBatchTargetEffects,
         branch_predecessors: &[(String, String)],
+        prior_handoffs: &[HandoffReceipt],
         handed: Option<&[HandoffReceipt]>,
     ) -> StoreResult<FlowingBatchSourceOrderOutcome> {
         use FlowingBatchSourceOrderOutcome as R;
@@ -1742,8 +1743,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         };
         let wrong_source = (handed.is_none() && source.status != BranchStatus::Active)
             || source.name.is_some()
-            || source.parent_branch_id.as_deref() != Some(witness.target_branch_id())
-            || source.branch_point_cut_id.as_deref() != witness.target_before_cut_id();
+            || source.parent_branch_id.as_deref() != Some(witness.target_branch_id());
         // REFUSAL: a changed branch point cannot satisfy the declared reads
         if wrong_source {
             return Ok(R::SourceUnproven);
@@ -1760,9 +1760,29 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             None => None,
         };
-        if target_before_manifest != source.branch_point_manifest_hash {
-            return Ok(R::SourceUnproven);
-        }
+        let (start_cut_id, start_manifest_hash) = if source.branch_point_cut_id.as_deref()
+            == witness.target_before_cut_id()
+            && source.branch_point_manifest_hash == target_before_manifest
+        {
+            (
+                source.branch_point_cut_id.clone(),
+                source.branch_point_manifest_hash.clone(),
+            )
+        } else {
+            let Some(last) = prior_handoffs.last() else {
+                return Ok(R::SourceUnproven);
+            };
+            if Some(last.target_after_cut_id.as_str()) != witness.target_before_cut_id()
+                || last.source_branch_id != source_id
+                || Some(last.source_manifest_hash.clone()) != target_before_manifest
+            {
+                return Ok(R::SourceUnproven);
+            }
+            (
+                Some(last.source_cut_id.clone()),
+                Some(last.source_manifest_hash.clone()),
+            )
+        };
 
         let selected_cut_id = witness.units().last().expect("nonempty").source_cut_id();
         if handed.is_none() {
@@ -1795,7 +1815,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let mut cuts = Vec::new();
         let mut cursor = Some(selected_cut_id.to_owned());
         let mut prefix_ids = BTreeSet::new();
-        while cursor != source.branch_point_cut_id {
+        while cursor != start_cut_id {
             let Some(id) = cursor else {
                 return Ok(R::SourceUnproven);
             };
@@ -1845,8 +1865,8 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
 
         let mut next_cut = 0;
-        let mut prior_cut_id = source.branch_point_cut_id.clone();
-        let mut prior_manifest_hash = source.branch_point_manifest_hash.clone();
+        let mut prior_cut_id = start_cut_id;
+        let mut prior_manifest_hash = start_manifest_hash;
         let mut predecessors = branch_predecessors.to_vec();
         if handed.is_some_and(|receipts| receipts.len() != witness.units().len()) {
             return Ok(R::IncompletePrefix);
@@ -5572,6 +5592,181 @@ mod tests {
             .unwrap(),
             H::IdentityMismatch
         );
+        let mut prior = receipt
+            .units
+            .iter()
+            .map(|unit| (unit.unit_id.clone(), unit.source_basis_digest.clone()))
+            .collect::<Vec<_>>();
+        let mut previous_cut = "twig-b";
+        let mut tail_units = Vec::new();
+        for (unit_id, pin_id, cut_id, body) in [
+            ("unit-tail-1", "pin-tail-1", "twig-tail-1", "C"),
+            ("unit-tail-2", "pin-tail-2", "twig-tail-2", "D"),
+        ] {
+            vcs.write("twig", "a.txt", Some(body), cut_id, "t12")
+                .unwrap();
+            pin(&mut vcs, cut_id, pin_id);
+            declare_native(&mut vcs, unit_id, pin_id, Some(previous_cut), &prior, None);
+            let FlowingSelectionOutcome::Selected(selection) = vcs
+                .select_private_changes(
+                    pin_id,
+                    &selection::parse(&format!("change({cut_id})")).unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("selected later twig tail")
+            };
+            assert_eq!(
+                vcs.bind_private_selection(unit_id, &selection, "t12")
+                    .unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            prior.push((unit_id.into(), selection.digest().into()));
+            tail_units.push(NativeUnitRef {
+                unit_id: unit_id.into(),
+                source_cut_id: cut_id.into(),
+                pin_id: pin_id.into(),
+                basis_digest: selection.digest().into(),
+                principal: "s:author".into(),
+                intent: "customer change".into(),
+            });
+            previous_cut = cut_id;
+        }
+        let tail_manifest = vcs
+            .branches
+            .get_cut("twig-tail-2")
+            .unwrap()
+            .unwrap()
+            .manifest_hash;
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "batch-tail",
+                change_id: "batch-tail",
+                branch_id: "branch",
+                manifest_hash: &tail_manifest,
+                parent_cut_id: Some("batch-cut"),
+                origin: Some("transport-batch:derive-tail"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t13",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(tail_witness) = vcs
+            .verify_private_batch_target_effects(&["unit-tail-1", "unit-tail-2"], "batch-tail")
+            .unwrap()
+        else {
+            panic!("tail target contains its exact effect")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contributions SET dependency_basis_digest = ?1 WHERE unit_id = 'unit-tail-1'",
+                [native_dependency_basis_digest(&[])],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::UnprovenBasis {
+                unit_id: "unit-tail-1".into()
+            }
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contributions SET dependency_basis_digest = ?1 WHERE unit_id = 'unit-tail-1'",
+                [native_dependency_basis_digest(&prior[..2])],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET parent_cut_id = NULL WHERE cut_id = 'twig-tail-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::SourceUnproven
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET parent_cut_id = 'twig-b' WHERE cut_id = 'twig-tail-1'",
+                [],
+            )
+            .unwrap();
+        let tail_derivation = match vcs
+            .record_private_batch_derivation("derive-tail", &tail_witness, "mediator", "t13")
+            .unwrap()
+        {
+            D::Recorded(derived) => derived,
+            other => panic!("tail derivation is retained: {other:?}"),
+        };
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = 'corrupt' WHERE cut_id = 'twig-b'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.handoff_private_batch_derivation(
+                "derive-tail",
+                &tail_derivation.witness_digest,
+                "mediator",
+                "t14",
+            )
+            .unwrap(),
+            H::SourceOrderUnproven
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE cuts SET manifest_hash = ?1 WHERE cut_id = 'twig-b'",
+                [&receipt.units.last().unwrap().source_manifest_hash],
+            )
+            .unwrap();
+        let H::Transferred(tail_receipt) = vcs
+            .handoff_private_batch_derivation(
+                "derive-tail",
+                &tail_derivation.witness_digest,
+                "mediator",
+                "t14",
+            )
+            .unwrap()
+        else {
+            panic!("later twig tail transfers without replaying prior units")
+        };
+        assert_eq!(tail_receipt.units.len(), 2);
+        let mut tail_revision = revision.clone();
+        tail_revision.source_cut_id = "batch-tail".into();
+        tail_revision.source_manifest_hash = tail_manifest;
+        tail_revision.units.extend(tail_units);
+        let NativeCandidateOutcome::Prepared(tail_candidate) = vcs
+            .prepare_named_branch_candidate(
+                &tail_revision,
+                None,
+                "candidate-tail",
+                "mediator",
+                "t15",
+            )
+            .unwrap()
+        else {
+            panic!("the later tail and earlier handoff form one complete candidate")
+        };
+        assert_eq!(tail_candidate.units.len(), 4);
+        assert_eq!(
+            tail_candidate.units[2].outcome,
+            FlowingUnitOutcome::Neutralized
+        );
+        assert_eq!(tail_candidate.units[3].outcome, FlowingUnitOutcome::Applied);
         vcs.branches
             .test_connection()
             .execute("DELETE FROM flowing_handoffs WHERE unit_id = 'unit-b'", [])

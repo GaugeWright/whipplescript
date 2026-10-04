@@ -293,6 +293,14 @@ fn read_batch<S: DoSql>(
     Ok(Some(receipt))
 }
 
+fn preceding_target_handoff<S: DoSql>(
+    sql: &S,
+    target_cut_id: &str,
+) -> StoreResult<Option<HandoffReceipt>> {
+    Ok(read_batch(sql, "target_after_cut_id", target_cut_id)?
+        .and_then(|batch| batch.units.last().cloned()))
+}
+
 impl<S: DoSql> FlowingSources for DoBranches<S> {
     fn pin_private_cut(&mut self, request: PinPrivateCut<'_>) -> StoreResult<PinPrivateCutOutcome> {
         if let Some(field) = missing_pin_field(request) {
@@ -960,6 +968,11 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
                     return Ok(R::TargetFenceRefused);
                 }
             }
+            let preceding = witness
+                .target_before_cut_id()
+                .map(|cut_id| preceding_target_handoff(&self.sql, cut_id))
+                .transpose()?
+                .flatten();
             let mut units = Vec::with_capacity(witness.units().len());
             for (index, selected) in witness.units().iter().enumerate() {
                 let unit_id = selected.unit_id().to_owned();
@@ -1039,8 +1052,56 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
                 if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
                     return Ok(R::SourceNotParent { unit_id });
                 }
-                if source.branch_point_cut_id.as_deref() != witness.target_before_cut_id()
-                    || source.branch_point_manifest_hash != target.head_manifest_hash
+                let starts_at_branch_point = source.branch_point_cut_id.as_deref()
+                    == witness.target_before_cut_id()
+                    && source.branch_point_manifest_hash == target.head_manifest_hash;
+                let continues_from_prior = preceding.as_ref().is_some_and(|previous| {
+                    previous.source_branch_id == unit.source_branch_id
+                        && previous.target_branch_id == witness.target_branch_id()
+                        && Some(previous.target_after_cut_id.as_str())
+                            == witness.target_before_cut_id()
+                        && Some(previous.target_after_manifest_hash.as_str())
+                            == target.head_manifest_hash.as_deref()
+                        && Some(previous.source_manifest_hash.as_str())
+                            == target.head_manifest_hash.as_deref()
+                });
+                let prior_source_cut_matches = if let Some(previous) = preceding.as_ref() {
+                    self.get_cut(&previous.source_cut_id)?.is_some_and(|cut| {
+                        cut.branch_id == previous.source_branch_id
+                            && cut.manifest_hash == previous.source_manifest_hash
+                    })
+                } else {
+                    false
+                };
+                let mut prior_reachable = false;
+                if !starts_at_branch_point && continues_from_prior && prior_source_cut_matches {
+                    let previous = preceding.as_ref().expect("prior checked");
+                    let mut cursor = Some(unit.source_cut_id.clone());
+                    let mut seen = BTreeSet::new();
+                    while let Some(id) = cursor {
+                        if !seen.insert(id.clone()) {
+                            break;
+                        }
+                        let Some(cut) = self.get_cut(&id)? else {
+                            break;
+                        };
+                        if cut.branch_id != unit.source_branch_id
+                            || !cut
+                                .origin
+                                .as_deref()
+                                .is_some_and(|origin| origin.starts_with("write:"))
+                        {
+                            break;
+                        }
+                        if id == previous.source_cut_id {
+                            prior_reachable = true;
+                            break;
+                        }
+                        cursor = cut.parent_cut_id;
+                    }
+                }
+                if !(starts_at_branch_point
+                    || continues_from_prior && prior_source_cut_matches && prior_reachable)
                 {
                     return Ok(R::SourceOrderUnproven);
                 }
@@ -1646,6 +1707,183 @@ mod tests {
             )
             .unwrap(),
             HandoffBatchContributionOutcome::Existing(receipt.clone())
+        );
+        let mut previous_cut = Some("twig-b");
+        let mut tail_predecessors = predecessors.clone();
+        for (unit_id, pin_id, cut_id, body) in [
+            ("unit-tail-1", "pin-tail-1", "twig-tail-1", "C"),
+            ("unit-tail-2", "pin-tail-2", "twig-tail-2", "D"),
+        ] {
+            vcs.write("twig", "a.txt", Some(body), cut_id, "t8")
+                .unwrap();
+            let cut = branches.get_cut(cut_id).unwrap().unwrap();
+            assert_eq!(
+                branches
+                    .pin_private_cut(PinPrivateCut {
+                        pin_id,
+                        twig_branch_id: "twig",
+                        cut_id,
+                        manifest_hash: &cut.manifest_hash,
+                        principal: "s:author",
+                        retained_at: "t8",
+                    })
+                    .unwrap(),
+                PinPrivateCutOutcome::Pinned
+            );
+            let previous_manifest =
+                previous_cut.map(|id| branches.get_cut(id).unwrap().unwrap().manifest_hash);
+            let read = native_read_basis_digest(previous_cut, previous_manifest.as_deref());
+            let deps = native_dependency_basis_digest(&tail_predecessors);
+            assert_eq!(
+                branches
+                    .declare_contribution(DeclareContribution {
+                        unit_id,
+                        pin_id,
+                        principal: "s:author",
+                        intent: "mixed change",
+                        read_basis_digest: &read,
+                        dependency_basis_digest: &deps,
+                        scope_digest: unit_id,
+                        declared_at: "t8",
+                    })
+                    .unwrap(),
+                DeclareContributionOutcome::Declared
+            );
+            let FlowingSelectionOutcome::Selected(selection) = vcs
+                .select_private_changes(pin_id, &parse(&format!("change({cut_id})")).unwrap())
+                .unwrap()
+            else {
+                panic!("selected later twig tail")
+            };
+            assert_eq!(
+                vcs.bind_private_selection(unit_id, &selection, "t8")
+                    .unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            tail_predecessors.push((unit_id.to_owned(), selection.digest().to_owned()));
+            previous_cut = Some(cut_id);
+        }
+        let tail_manifest = branches
+            .get_cut("twig-tail-2")
+            .unwrap()
+            .unwrap()
+            .manifest_hash;
+        branches
+            .record_cut(CutRecord {
+                cut_id: "batch-tail",
+                change_id: "batch-tail",
+                branch_id: "branch",
+                manifest_hash: &tail_manifest,
+                parent_cut_id: Some("batch-cut"),
+                origin: Some("transport-batch:derive-tail"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t9",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(tail_witness) = vcs
+            .verify_private_batch_target_effects(&["unit-tail-1", "unit-tail-2"], "batch-tail")
+            .unwrap()
+        else {
+            panic!("hosted tail target content")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        sql.execute(
+            "UPDATE flowing_contributions SET dependency_basis_digest = ?2 WHERE unit_id = ?1",
+            &[
+                text("unit-tail-1"),
+                text(&native_dependency_basis_digest(&[])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::UnprovenBasis {
+                unit_id: "unit-tail-1".into()
+            }
+        );
+        sql.execute(
+            "UPDATE flowing_contributions SET dependency_basis_digest = ?2 WHERE unit_id = ?1",
+            &[
+                text("unit-tail-1"),
+                text(&native_dependency_basis_digest(&tail_predecessors[..2])),
+            ],
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE cuts SET parent_cut_id = NULL WHERE cut_id = ?1",
+            &[text("twig-tail-1")],
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&tail_witness)
+                .unwrap(),
+            FlowingBatchSourceOrderOutcome::SourceUnproven
+        );
+        sql.execute(
+            "UPDATE cuts SET parent_cut_id = ?2 WHERE cut_id = ?1",
+            &[text("twig-tail-1"), text("twig-b")],
+        )
+        .unwrap();
+        let D::Recorded(tail_derived) = vcs
+            .record_private_batch_derivation("derive-tail", &tail_witness, "mediator", "t9")
+            .unwrap()
+        else {
+            panic!("hosted tail derivation")
+        };
+        sql.execute(
+            "UPDATE cuts SET manifest_hash = ?2 WHERE cut_id = ?1",
+            &[text("twig-b"), text("corrupt")],
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.handoff_private_batch_derivation(
+                "derive-tail",
+                &tail_derived.witness_digest,
+                "mediator",
+                "t10",
+            )
+            .unwrap(),
+            HandoffBatchContributionOutcome::SourceOrderUnproven
+        );
+        sql.execute(
+            "UPDATE cuts SET manifest_hash = ?2 WHERE cut_id = ?1",
+            &[
+                text("twig-b"),
+                text(&receipt.units.last().unwrap().source_manifest_hash),
+            ],
+        )
+        .unwrap();
+        let HandoffBatchContributionOutcome::Transferred(tail_receipt) = vcs
+            .handoff_private_batch_derivation(
+                "derive-tail",
+                &tail_derived.witness_digest,
+                "mediator",
+                "t10",
+            )
+            .unwrap()
+        else {
+            panic!("hosted later twig tail transfers once")
+        };
+        assert_eq!(tail_receipt.units.len(), 2);
+        let FlowingBranchLineageOutcome::Verified(lineage) =
+            vcs.inspect_flowing_branch_lineage("branch").unwrap()
+        else {
+            panic!("hosted tail lineage")
+        };
+        assert_eq!(lineage.handoffs().len(), 4);
+        assert_eq!(
+            lineage
+                .prefix_through("batch-cut")
+                .unwrap()
+                .later_handoffs()
+                .len(),
+            2
         );
         sql.execute(
             "DELETE FROM flowing_handoffs WHERE unit_id = ?1",

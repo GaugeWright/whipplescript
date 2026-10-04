@@ -350,6 +350,16 @@ fn source_cut_reachable(
     Ok(false)
 }
 
+fn preceding_target_handoff(
+    connection: &Connection,
+    target_cut_id: &str,
+) -> StoreResult<Option<HandoffReceipt>> {
+    Ok(
+        read_batch(connection, "target_after_cut_id", target_cut_id)?
+            .and_then(|batch| batch.units.last().cloned()),
+    )
+}
+
 impl FlowingSources for BranchStore {
     fn pin_private_cut(&mut self, request: PinPrivateCut<'_>) -> StoreResult<PinPrivateCutOutcome> {
         if let Some(field) = missing_pin_field(request) {
@@ -1032,6 +1042,11 @@ impl FlowingSources for BranchStore {
                 return Ok(R::TargetFenceRefused);
             }
         }
+        let preceding = witness
+            .target_before_cut_id()
+            .map(|cut_id| preceding_target_handoff(&tx, cut_id))
+            .transpose()?
+            .flatten();
         let mut units = Vec::with_capacity(witness.units().len());
         for (index, selected) in witness.units().iter().enumerate() {
             let unit_id = selected.unit_id().to_owned();
@@ -1091,8 +1106,35 @@ impl FlowingSources for BranchStore {
             if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
                 return Ok(R::SourceNotParent { unit_id });
             }
-            if source.branch_point_cut_id.as_deref() != witness.target_before_cut_id()
-                || source.branch_point_manifest_hash != target.head_manifest_hash
+            let starts_at_branch_point = source.branch_point_cut_id.as_deref()
+                == witness.target_before_cut_id()
+                && source.branch_point_manifest_hash == target.head_manifest_hash;
+            let continues_from_prior = preceding.as_ref().is_some_and(|previous| {
+                previous.source_branch_id == unit.source_branch_id
+                    && previous.target_branch_id == witness.target_branch_id()
+                    && Some(previous.target_after_cut_id.as_str()) == witness.target_before_cut_id()
+                    && Some(previous.target_after_manifest_hash.as_str())
+                        == target.head_manifest_hash.as_deref()
+                    && Some(previous.source_manifest_hash.as_str())
+                        == target.head_manifest_hash.as_deref()
+            });
+            let prior_source_cut_matches = if let Some(previous) = preceding.as_ref() {
+                BranchStore::cut_by_id(&tx, &previous.source_cut_id)?.is_some_and(|cut| {
+                    cut.branch_id == previous.source_branch_id
+                        && cut.manifest_hash == previous.source_manifest_hash
+                })
+            } else {
+                false
+            };
+            if !starts_at_branch_point
+                && (!continues_from_prior
+                    || !prior_source_cut_matches
+                    || !source_cut_reachable(
+                        &tx,
+                        &unit.source_branch_id,
+                        Some(&unit.source_cut_id),
+                        &preceding.as_ref().expect("prior checked").source_cut_id,
+                    )?)
             {
                 return Ok(R::SourceOrderUnproven);
             }
