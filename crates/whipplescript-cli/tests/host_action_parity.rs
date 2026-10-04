@@ -159,6 +159,7 @@ rule echo
         first.validate_for(&command).expect("bound receipt");
         let mut query = ReadActionResult {
             protocol: ACTION_RESULT_PROTOCOL.into(),
+            read_authority: None,
             issuer: command.issuer.clone(),
             scope: command.scope.clone(),
             policy: command.policy.clone(),

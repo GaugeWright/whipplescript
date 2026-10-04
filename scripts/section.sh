@@ -124,7 +124,9 @@ case "${1:-}" in
     python3 scripts/check-host-action-contract-v3.py
     python3 scripts/test-host-action-contract-v3.py
     python3 scripts/check-host-action-contract-v4.py
-    python3 scripts/test-host-action-contract-v4.py ;;
+    python3 scripts/test-host-action-contract-v4.py
+    python3 scripts/check-host-action-contract-v5.py
+    python3 scripts/test-host-action-contract-v5.py ;;
   advisories)           scripts/check-new-advisories.sh ;;
   supply-chain)
     if prerequisite cargo-deny "the supply-chain policy check" \

@@ -662,6 +662,7 @@ where
                     .expect("retained closing dispatch");
             let read = ReadActionResult {
                 protocol: ACTION_RESULT_PROTOCOL.into(),
+                read_authority: None,
                 issuer: request.issuer.clone(),
                 scope: request.scope.clone(),
                 policy: facade.policy_ref().clone(),

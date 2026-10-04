@@ -1,0 +1,255 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v5",
+  "contract_revision": "whipplescript-host-action/v5.0.0",
+  "description": "Current read authority remains independent of historical command issuer and cryptographic policy signer. V1 retains its exact wire and signing domain; V2 explicitly binds the current authority. Codec validity grants no authority.",
+  "cases": [
+    {
+      "id": "current-authority-read",
+      "message_type": "ReadActionResult",
+      "value": {
+        "protocol": "whipplescript.action-result.v2",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "through": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        },
+        "read_authority": "fixture-current-authority"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "current-authority-read-missing-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "remove": [
+        "/read_authority"
+      ]
+    },
+    {
+      "id": "current-authority-read-null-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-number-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": 42
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-empty-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-blank-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": " \t\n"
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-extra",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/unknown_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-wrong-protocol",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "whipplescript.action-result.v3"
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-other-authority",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": "fixture-replacement-authority"
+        }
+      ]
+    },
+    {
+      "id": "current-authority-read-old-issuer",
+      "message_type": "ReadActionResult",
+      "base": "current-authority-read",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "set": [
+        {
+          "pointer": "/issuer",
+          "value": "fixture-historical-issuer"
+        }
+      ]
+    },
+    {
+      "id": "legacy-authority-read",
+      "message_type": "ReadActionResult",
+      "value": {
+        "protocol": "whipplescript.action-result.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "through": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "legacy-authority-read-new-field",
+      "message_type": "ReadActionResult",
+      "base": "legacy-authority-read",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": "fixture-current-authority"
+        }
+      ]
+    },
+    {
+      "id": "legacy-authority-read-null-field",
+      "message_type": "ReadActionResult",
+      "base": "legacy-authority-read",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/read_authority",
+          "value": null
+        }
+      ]
+    }
+  ]
+}

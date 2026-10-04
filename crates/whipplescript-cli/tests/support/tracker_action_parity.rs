@@ -880,6 +880,7 @@ where
                 .expect("replay recovered result");
             let read = ReadActionResult {
                 protocol: ACTION_RESULT_PROTOCOL.into(),
+                read_authority: None,
                 issuer: request.issuer.clone(),
                 scope: request.scope.clone(),
                 policy: facade.policy_ref().clone(),
@@ -999,15 +1000,9 @@ where
 }
 
 fn native_recovery_store() -> RecoveryStore<NativeStores> {
-    let root = std::env::temp_dir().join(format!(
-        "whip-tracker-parity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("fixture time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("create native fixture");
+    // Filing and closing journeys run concurrently. Timestamp names can collide
+    // and silently reopen another test's retained history; allocate exclusively.
+    let root = tempfile::tempdir().expect("allocate native fixture").keep();
     let runtime = root.join("runtime.sqlite");
     let store = NativeStores::open(
         &runtime,

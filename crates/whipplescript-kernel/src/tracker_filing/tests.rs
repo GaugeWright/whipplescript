@@ -1089,6 +1089,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
         let events = f.facade.kernel().store().list_events(&instance).unwrap();
         let result_read = crate::host_protocol::action_result::ReadActionResult {
             protocol: crate::host_protocol::action_result::ACTION_RESULT_PROTOCOL.into(),
+            read_authority: None,
             issuer: recovery.issuer.clone(),
             scope: recovery.scope.clone(),
             policy: recovery.policy.clone(),

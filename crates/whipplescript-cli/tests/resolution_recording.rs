@@ -290,6 +290,7 @@ fn recover<S: RuntimeStore + LogAppend, B: Branches, C: ContentBlobs>(
     );
     let query = ReadActionResult {
         protocol: ACTION_RESULT_PROTOCOL.into(),
+        read_authority: None,
         issuer: authority.original.issuer.clone(),
         scope: authority.original.scope.clone(),
         policy: facade.policy_ref().clone(),

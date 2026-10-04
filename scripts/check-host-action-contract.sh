@@ -16,6 +16,10 @@ python3 scripts/check-host-action-contract-v4.py
 cargo run --quiet -p whipplescript-kernel --example host_action_contract_v4 \
   | python3 scripts/check-host-action-contract-v4.py --reports
 
+python3 scripts/check-host-action-contract-v5.py
+cargo run --quiet -p whipplescript-kernel --example host_action_contract_v5 \
+  | python3 scripts/check-host-action-contract-v5.py --reports
+
 source scripts/lib-cargo-test.sh
 action_report_dir="$(mktemp -d)"
 scoped_action_report_dir="$(mktemp -d)"

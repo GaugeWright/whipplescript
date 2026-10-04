@@ -9,6 +9,7 @@ use super::{nonempty, PinnedPosition, PolicyEpochRef, ProtocolError};
 use crate::ifc::VerifiedEnvelope;
 
 pub const ACTION_RESULT_PROTOCOL: &str = "whipplescript.action-result.v1";
+pub const ACTION_RESULT_PROTOCOL_V2: &str = "whipplescript.action-result.v2";
 
 /// A projection read, not a resubmission or a permission to execute anything.
 /// `evidence_handle` and its label identify the complete instance evidence
@@ -18,6 +19,14 @@ pub const ACTION_RESULT_PROTOCOL: &str = "whipplescript.action-result.v1";
 pub struct ReadActionResult {
     pub protocol: String,
     pub issuer: String,
+    /// V2 current read-policy authority, distinct from the historical issuer
+    /// and from the policy's cryptographic signer. V1 omits this field.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_authority"
+    )]
+    pub read_authority: Option<String>,
     pub scope: String,
     #[serde(deserialize_with = "super::action_wire::Policy::deserialize")]
     pub policy: PolicyEpochRef,
@@ -30,11 +39,28 @@ pub struct ReadActionResult {
     pub through: Option<PinnedPosition>,
 }
 
+fn read_authority<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<String>, D::Error> {
+    // Absence is the V1 default; an explicit null is not an authority name.
+    String::deserialize(decoder).map(Some)
+}
+
 impl ReadActionResult {
+    fn current_authority(&self) -> Result<&str, ProtocolError> {
+        match (self.protocol.as_str(), self.read_authority.as_deref()) {
+            (ACTION_RESULT_PROTOCOL, None) => Ok(&self.issuer),
+            (ACTION_RESULT_PROTOCOL_V2, Some(authority)) if !authority.trim().is_empty() => {
+                Ok(authority)
+            }
+            // MUTATION-SUCCESS-EXPR: Ok(&self.issuer)
+            _ => Err(ProtocolError::WrongVersion(self.protocol.clone())),
+        }
+    }
+
     pub fn signing_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
-        if self.protocol != ACTION_RESULT_PROTOCOL
-            || self.admission.protocol != HOST_ACTION_PROTOCOL
-        {
+        self.current_authority()?;
+        if self.admission.protocol != HOST_ACTION_PROTOCOL {
             return Err(ProtocolError::WrongVersion(self.protocol.clone()));
         }
         for (field, value) in [
@@ -65,7 +91,10 @@ impl ReadActionResult {
         self.provenance.validate()?;
         let value = serde_json::to_value(self)
             .map_err(|_| ProtocolError::Invalid("result query serialization"))?;
-        let mut bytes = b"whipplescript:action-result:read:v1\0".to_vec();
+        let mut bytes = match self.protocol.as_str() {
+            ACTION_RESULT_PROTOCOL => b"whipplescript:action-result:read:v1\0".to_vec(),
+            _ => b"whipplescript:action-result:read:v2\0".to_vec(),
+        };
         canonical_json(&value, &mut bytes)?;
         Ok(bytes)
     }
@@ -95,10 +124,11 @@ impl VerifiedResultRead {
         proof: &[u8],
     ) -> Result<Self, ProtocolError> {
         let policy = PolicyEpochRef::from_verified(request.policy.epoch, envelope)?;
+        let authority = request.current_authority()?;
         if request.policy != policy
             || !envelope.attestation().is_some_and(|attestation| {
                 attestation.epoch == Some(request.policy.epoch)
-                    && attestation.authority.as_deref() == Some(request.issuer.as_str())
+                    && attestation.authority.as_deref() == Some(authority)
             })
         {
             return Err(ProtocolError::Mismatch(

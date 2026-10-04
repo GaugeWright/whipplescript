@@ -21,6 +21,12 @@ next free number rather than a patch — it says so.
 
 - The curated mirror publisher accepts an explicit maintenance destination with source/tree and forward-history checks; its default remains `main`.
 
+- Version 2 action-result reads name the current policy authority separately
+  from the original command issuer. Version 1 retains its original contract.
+  Rust embeddings add `read_authority: None` to existing V1 request constructors;
+  V2 requires an explicit authority. Reads still require current access and
+  exact original evidence.
+
 - Hosted lease expiry preserves the original event completion time when rebuilding run projections, including tracker result recovery.
 
 - Workspace edit and grep semantics now share pure helpers across native and Durable Object hosts. The native workspace resolver rejects overlapping edits while preserving leading BOMs; hosted grep keeps the same parameter behavior and 500-character line cap.

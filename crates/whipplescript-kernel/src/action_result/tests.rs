@@ -64,6 +64,7 @@ rule echo when InputReference as reference => { complete result { handle referen
         .unwrap();
     let request = ReadActionResult {
         protocol: ACTION_RESULT_PROTOCOL.into(),
+        read_authority: None,
         issuer: command.issuer,
         scope: command.scope,
         policy: command.policy,
@@ -202,12 +203,75 @@ fn result_lookup_requires_current_exact_read_authority() {
     let mut wrong_protocol = request.clone();
     wrong_protocol.protocol = "future".into();
     assert!(wrong_protocol.signing_bytes().is_err());
+    wrong_protocol = request.clone();
+    wrong_protocol.admission.protocol = "future".into();
+    assert!(wrong_protocol.signing_bytes().is_err());
     let mut wrong_coordinate = request.clone();
     wrong_coordinate.admission.admitted_at.instance_ref = "another".into();
     assert!(wrong_coordinate.signing_bytes().is_err());
     wrong_coordinate = request.clone();
     wrong_coordinate.admission.admitted_at.sequence = 0;
     assert!(wrong_coordinate.signing_bytes().is_err());
+}
+
+#[test]
+fn current_read_authority_can_change_without_reissuing_original_history() {
+    let (_, mut request, facade) = fixture();
+    let original = read(&facade, &request).unwrap();
+    let old_request = request.clone();
+    let old_proof = ReadAuthority(request.signing_bytes().unwrap());
+    let store = facade.into_kernel().into_store();
+    let facade =
+        GovernedHostFacade::from_verified_store(store, 8, envelope(8, "project-authority"))
+            .unwrap();
+    request.policy = facade.policy_ref().clone();
+    request.protocol = crate::host_protocol::action_result::ACTION_RESULT_PROTOCOL_V2.into();
+    request.read_authority = Some("project-authority".into());
+    assert_ne!(request.issuer, request.read_authority.as_deref().unwrap());
+    assert!(facade
+        .read_action_result(request.clone(), &old_proof, b"read authorization")
+        .is_err());
+    assert!(read(&facade, &old_request).is_err());
+    let renewed = read(&facade, &request).unwrap();
+    assert_eq!(renewed.command, original.command);
+    assert_eq!(renewed.admission, original.admission);
+    assert_eq!(renewed.observed_at, original.observed_at);
+    assert_eq!(renewed.command.issuer, request.issuer);
+    assert_eq!(renewed.read_policy.signer, "policy-signer");
+    assert_ne!(
+        renewed.read_policy.signer,
+        request.read_authority.as_deref().unwrap()
+    );
+    for field in [
+        "issuer",
+        "scope",
+        "signer",
+        "epoch",
+        "authority",
+        "absent",
+        "empty",
+        "mixed",
+    ] {
+        let mut wrong = request.clone();
+        match field {
+            "issuer" => wrong.issuer = "other-original".into(),
+            "scope" => wrong.scope = "other-original".into(),
+            "signer" => wrong.policy.signer = "other-current".into(),
+            "epoch" => wrong.policy.epoch += 1,
+            "authority" => wrong.read_authority = Some("other-current".into()),
+            "absent" => wrong.read_authority = None,
+            "empty" => wrong.read_authority = Some(" ".into()),
+            "mixed" => wrong.protocol = ACTION_RESULT_PROTOCOL.into(),
+            _ => unreachable!(),
+        }
+        if matches!(field, "absent" | "empty" | "mixed") {
+            assert!(
+                wrong.signing_bytes().is_err(),
+                "{field} must refuse before authentication"
+            );
+        }
+        assert!(read(&facade, &wrong).is_err(), "{field}");
+    }
 }
 
 #[test]
