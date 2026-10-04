@@ -103,6 +103,7 @@ pub(super) fn check<S, B, C>(
     let command = ReconcileEffectCommand {
         protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
         issuer: "product".into(),
+        original_issuer: None,
         scope: "workspace:1".into(),
         request_id: "recover-versioned-save".into(),
         policy: facade.policy_ref().clone(),

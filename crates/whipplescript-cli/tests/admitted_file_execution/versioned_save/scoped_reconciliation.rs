@@ -494,6 +494,7 @@ fn run_scoped<S, B, C>(
     let command = ReconcileEffectCommand {
         protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
         issuer: original.issuer.clone(),
+        original_issuer: None,
         scope: original.scope.clone(),
         request_id: "recover-scoped".into(),
         policy: facade.policy_ref().clone(),

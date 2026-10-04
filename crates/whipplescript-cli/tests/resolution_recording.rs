@@ -2,7 +2,13 @@
 //! authentication is synthetic; this does not qualify product transport.
 #[path = "support/host_action_contract_reports.rs"]
 mod host_action_contract_reports;
-use host_action_contract_reports::record_recording as record;
+fn record<S, T: serde::Serialize>(scenario: &str, message_type: &str, value: &T) {
+    if let Some(scenario) = scenario.strip_prefix("v2/") {
+        host_action_contract_reports::record_reconciliation::<S, T>(scenario, message_type, value);
+    } else {
+        host_action_contract_reports::record_recording::<S, T>(scenario, message_type, value);
+    }
+}
 use serde_json::json;
 use std::collections::BTreeMap;
 use whipplescript_host_do::{
@@ -55,6 +61,7 @@ struct Authority {
     execution: ExecuteActionEffect,
     binding: ResolutionRecordingBinding,
     investigator: ActionProvenance,
+    current_issuer: &'static str,
 }
 struct Admission(HostActionCommand);
 struct PostCommitContent<C> {
@@ -109,7 +116,7 @@ impl ResolutionRecordingReconciliationAuthority for Authority {
         bytes: &[u8],
         proof: &[u8],
     ) -> Result<(), ProtocolError> {
-        if command.issuer == self.original.issuer
+        if command.issuer == self.current_issuer
             && command.scope == self.original.scope
             && command.provenance == self.investigator
             && bytes == command.signing_bytes()?
@@ -183,8 +190,15 @@ fn recover<S: RuntimeStore + LogAppend, B: Branches, C: ContentBlobs>(
     let attempts = fold_attempts(instance, effect, &before).expect("attempts");
     assert_eq!(attempts[0].disposition, ExternalDisposition::Unknown);
     let command = ReconcileEffectCommand {
-        protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
-        issuer: authority.original.issuer.clone(),
+        protocol: if authority.current_issuer == authority.original.issuer {
+            EFFECT_RECONCILIATION_PROTOCOL
+        } else {
+            EFFECT_RECONCILIATION_PROTOCOL_V2
+        }
+        .into(),
+        issuer: authority.current_issuer.into(),
+        original_issuer: (authority.current_issuer != authority.original.issuer)
+            .then(|| authority.original.issuer.clone()),
         scope: authority.original.scope.clone(),
         request_id: "recover".into(),
         policy: facade.policy_ref().clone(),
@@ -289,8 +303,14 @@ fn recover<S: RuntimeStore + LogAppend, B: Branches, C: ContentBlobs>(
         after
     );
     let query = ReadActionResult {
-        protocol: ACTION_RESULT_PROTOCOL.into(),
-        read_authority: None,
+        protocol: if authority.current_issuer == authority.original.issuer {
+            ACTION_RESULT_PROTOCOL
+        } else {
+            ACTION_RESULT_PROTOCOL_V2
+        }
+        .into(),
+        read_authority: (authority.current_issuer != authority.original.issuer)
+            .then(|| authority.current_issuer.into()),
         issuer: authority.original.issuer.clone(),
         scope: authority.original.scope.clone(),
         policy: facade.policy_ref().clone(),
@@ -413,6 +433,7 @@ fn journey<S, B, C>(
     mut target: impl FnMut() -> (B, C),
     mode: &'static str,
     observer: &WorkspaceVcs<B, C>,
+    separate_authority: bool,
 ) -> Vec<ResolutionMemoryReceipt>
 where
     S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead,
@@ -477,7 +498,24 @@ where
         ("human:one", "first human correction"),
         ("agent:one", "later agent correction"),
     ] {
-        let scenario = format!("{actor}/{mode}");
+        // Each new action still uses the original authority. Investigation
+        // opens the same recorded store under its independently current policy.
+        if separate_authority {
+            facade = GovernedHostFacade::from_verified_store(
+                facade.into_kernel().into_store(),
+                7,
+                VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &Policy)
+                    .expect("original policy verified"),
+            )
+            .expect("original action policy")
+            .with_compiler_artifact_digest(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
+        }
+        let scenario = format!(
+            "{}{actor}/{mode}",
+            if separate_authority { "v2/" } else { "" }
+        );
         let input = input(body);
         record::<S, _>(
             &scenario,
@@ -599,6 +637,11 @@ where
             execution: execution.clone(),
             binding: binding.clone(),
             investigator,
+            current_issuer: if separate_authority {
+                "current-project"
+            } else {
+                "product"
+            },
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             facade.execute_resolution_recording(
@@ -681,6 +724,26 @@ where
                 }
             );
         }
+        if separate_authority {
+            let signed = SignedEnvelope::from_external_signature_v2(
+                &policy.to_string(),
+                "fixture",
+                "fixture",
+                "fixture",
+                "fixture",
+                8,
+                authority.current_issuer,
+            )
+            .expect("current authority policy");
+            let current = VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &Policy)
+                .expect("current policy verified");
+            facade = GovernedHostFacade::from_verified_store(
+                facade.into_kernel().into_store(),
+                8,
+                current,
+            )
+            .expect("independent investigation policy");
+        }
         recover(
             &mut facade,
             &action,
@@ -705,6 +768,15 @@ where
 
 #[test]
 fn governed_resolution_recording_has_the_same_native_and_hosted_journey() {
+    parity(false);
+}
+
+#[test]
+fn governed_resolution_recording_with_new_authority_preserves_native_and_hosted_history() {
+    parity(true);
+}
+
+fn parity(separate_authority: bool) {
     for mode in ["success", "failed", "interrupted"] {
         let dir = std::env::temp_dir().join(format!(
             "whip-recording-parity-{}-{}-{mode}",
@@ -728,6 +800,7 @@ fn governed_resolution_recording_has_the_same_native_and_hosted_journey() {
             native,
             mode,
             &observer,
+            separate_authority,
         );
         drop(observer);
         std::fs::remove_dir_all(&dir).expect("remove fixture");
@@ -743,6 +816,7 @@ fn governed_resolution_recording_has_the_same_native_and_hosted_journey() {
             hosted,
             mode,
             &compose_vcs_shared(&sql).expect("hosted observer"),
+            separate_authority,
         );
         // Existing effect keys include the store-local program-version registration
         // (rule_lowering.rs). Exact operation binding is checked inside each journey;

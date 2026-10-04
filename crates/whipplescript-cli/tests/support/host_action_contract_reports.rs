@@ -41,6 +41,16 @@ pub fn record_tracker<S, T: Serialize>(scenario: &str, message_type: &str, value
     );
 }
 
+#[allow(dead_code)] // Earlier bundles do not emit independent reconciliation profiles.
+pub fn record_reconciliation<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
+    record_into::<S, T>(
+        "WHIPPLESCRIPT_RECONCILIATION_ACTION_REPORT_DIR",
+        scenario,
+        message_type,
+        value,
+    );
+}
+
 fn record_into<S, T: Serialize>(variable: &str, scenario: &str, message_type: &str, value: &T) {
     let Some(directory) = std::env::var_os(variable) else {
         return;

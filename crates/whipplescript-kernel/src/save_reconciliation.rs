@@ -185,7 +185,7 @@ fn prepare_target<B: Branches, C: ContentBlobs>(
     let frame = &command.evidence.frame;
     let (original, admission_index) = crate::host_action::recorded_action_command(
         source.admission,
-        &command.issuer,
+        command.original_issuer()?,
         &command.scope,
         prefix,
     )?;

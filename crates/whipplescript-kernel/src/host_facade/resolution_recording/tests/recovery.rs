@@ -52,6 +52,10 @@ impl ResolutionRecordingReconciliationAuthority for RecoveryAuthority {
 }
 
 fn current_envelope(case: &str) -> VerifiedEnvelope {
+    current_envelope_at(case, "product")
+}
+
+fn current_envelope_at(case: &str, authority: &str) -> VerifiedEnvelope {
     let mut policy = json!({"resources": {"memory:/corrections": {}, "memory:/resolutions": {}, "result": {}, "error": {}},
         "bindings": {"admitted_corrections": "memory:/corrections", "admitted_resolutions": "memory:/resolutions"}});
     if case == "confidentiality" {
@@ -70,11 +74,88 @@ fn current_envelope(case: &str) -> VerifiedEnvelope {
         "fixture",
         "fixture",
         8,
-        "product",
+        authority,
     )
     .expect("renewed policy");
     VerifiedEnvelope::verify_signed_text_with(&signed.to_json(), &PolicyFixture)
         .expect("current envelope")
+}
+
+#[test]
+fn recording_reconciliation_v2_separates_current_authority_original_issuer_and_target_authority() {
+    use crate::host_protocol::recovery::EFFECT_RECONCILIATION_PROTOCOL_V2;
+    let mut f = executed("interrupt-after-publication", "human:one");
+    f.facade = GovernedHostFacade::from_verified_store(
+        f.facade.into_kernel().into_store(),
+        8,
+        current_envelope_at("allowed", "current-project"),
+    )
+    .unwrap();
+    let target = workspace(&f);
+    let batch = target
+        .resolution_receipt(&f.authority.binding.batch().operation_id)
+        .unwrap()
+        .unwrap();
+    let mut command = command(&f, Some(&batch));
+    command.protocol = EFFECT_RECONCILIATION_PROTOCOL_V2.into();
+    command.original_issuer = Some("product".into());
+    command.issuer = "current-project".into();
+    let source = ResolutionRecordingEvidenceSource {
+        action: &f.action,
+        admission: &f.request.admission,
+        workspace: &target,
+        authority_ref: "target-authority",
+    };
+    let instance = f.request.admission.instance_ref.clone();
+    let epoch = f
+        .facade
+        .kernel_mut()
+        .store_mut()
+        .claim_instance_ownership(&instance)
+        .unwrap();
+    let before = f.facade.kernel().store().list_events(&instance).unwrap();
+    for field in ["original", "scope", "current", "legacy"] {
+        let mut changed = command.clone();
+        match field {
+            "original" => changed.original_issuer = Some("foreign-original".into()),
+            "scope" => changed.scope = "foreign-scope".into(),
+            "current" => changed.issuer = "foreign-current".into(),
+            _ => {
+                changed.protocol = EFFECT_RECONCILIATION_PROTOCOL.into();
+                changed.original_issuer = None;
+            }
+        }
+        let verifier = authority(&f, &changed, "allowed");
+        assert!(
+            f.facade
+                .reconcile_resolution_recording(changed, epoch, &source, &verifier, b"recover")
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(
+            f.facade.kernel().store().list_events(&instance).unwrap(),
+            before
+        );
+    }
+    let verifier = authority(&f, &command, "allowed");
+    let receipt = f
+        .facade
+        .reconcile_resolution_recording(command.clone(), epoch, &source, &verifier, b"recover")
+        .unwrap();
+    assert_eq!(
+        f.facade
+            .reconcile_resolution_recording(command, epoch, &source, &verifier, b"recover")
+            .unwrap(),
+        receipt
+    );
+    let after = f.facade.kernel().store().list_events(&instance).unwrap();
+    assert_eq!(&after[..before.len()], &before);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        fold_attempts(&instance, &f.request.effect_id, &after).unwrap()[0].disposition,
+        ExternalDisposition::Applied
+    );
+    assert_eq!(f.authority.original.issuer, "product");
 }
 
 fn executed(case: &str, actor: &str) -> Fixture {
@@ -118,6 +199,7 @@ fn command(f: &Fixture, receipt: Option<&ResolutionMemoryReceipt>) -> ReconcileE
     ReconcileEffectCommand {
         protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
         issuer: "product".into(),
+        original_issuer: None,
         scope: "workspace".into(),
         request_id: "recovery".into(),
         policy: f.facade.policy_ref().clone(),

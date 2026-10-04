@@ -1,6 +1,6 @@
 //! Authenticated late evidence is a new attributable operation. A run's
 //! failure, a submitted label, or the original action's authority cannot mint it.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use whipplescript_store::effect_recovery::{DispositionEvidence, EFFECT_RECOVERY_PROTOCOL};
 
@@ -9,12 +9,21 @@ use super::{nonempty, PinnedPosition, PolicyEpochRef, ProtocolError};
 use crate::ifc::VerifiedEnvelope;
 
 pub const EFFECT_RECONCILIATION_PROTOCOL: &str = "whipplescript.effect-reconciliation.v1";
+pub const EFFECT_RECONCILIATION_PROTOCOL_V2: &str = "whipplescript.effect-reconciliation.v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconcileEffectCommand {
     pub protocol: String,
     pub issuer: String,
+    /// Original immutable command issuer. V2 separates this historical locator
+    /// from the authority accountable for the new reconciliation. V1 omits it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "original_issuer"
+    )]
+    pub original_issuer: Option<String>,
     pub scope: String,
     pub request_id: String,
     #[serde(deserialize_with = "super::action_wire::Policy::deserialize")]
@@ -24,11 +33,25 @@ pub struct ReconcileEffectCommand {
     pub evidence_label_ref: String,
 }
 
+fn original_issuer<'de, D: Deserializer<'de>>(decoder: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(decoder).map(Some)
+}
+
 impl ReconcileEffectCommand {
+    pub(crate) fn original_issuer(&self) -> Result<&str, ProtocolError> {
+        match (self.protocol.as_str(), self.original_issuer.as_deref()) {
+            (EFFECT_RECONCILIATION_PROTOCOL, None) => Ok(&self.issuer),
+            (EFFECT_RECONCILIATION_PROTOCOL_V2, Some(issuer)) if !issuer.trim().is_empty() => {
+                Ok(issuer)
+            }
+            // MUTATION-SUCCESS-EXPR: Ok(&self.issuer)
+            _ => Err(ProtocolError::WrongVersion(self.protocol.clone())),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.protocol != EFFECT_RECONCILIATION_PROTOCOL
-            || self.evidence.frame.protocol != EFFECT_RECOVERY_PROTOCOL
-        {
+        self.original_issuer()?;
+        if self.evidence.frame.protocol != EFFECT_RECOVERY_PROTOCOL {
             return Err(ProtocolError::WrongVersion(self.protocol.clone()));
         }
         let frame = &self.evidence.frame;
@@ -62,7 +85,11 @@ impl ReconcileEffectCommand {
         self.validate()?;
         let value = serde_json::to_value(self)
             .map_err(|_| ProtocolError::Invalid("reconciliation serialization"))?;
-        let mut bytes = b"whipplescript:effect-reconciliation:command:v1\0".to_vec();
+        let mut bytes = if self.protocol == EFFECT_RECONCILIATION_PROTOCOL {
+            b"whipplescript:effect-reconciliation:command:v1\0".to_vec()
+        } else {
+            b"whipplescript:effect-reconciliation:command:v2\0".to_vec()
+        };
         canonical_json(&value, &mut bytes)?;
         Ok(bytes)
     }
@@ -75,14 +102,18 @@ impl ReconcileEffectCommand {
     /// run, evidence, principal or policy under it must collide and be refused.
     pub fn request_key(&self) -> Result<String, ProtocolError> {
         self.validate()?;
-        let bytes = serde_json::to_vec(&[
-            EFFECT_RECONCILIATION_PROTOCOL,
+        let mut identity = vec![
+            self.protocol.as_str(),
             &self.evidence.frame.instance_id,
             &self.issuer,
             &self.scope,
             &self.request_id,
-        ])
-        .map_err(|_| ProtocolError::Invalid("reconciliation identity"))?;
+        ];
+        if self.protocol == EFFECT_RECONCILIATION_PROTOCOL_V2 {
+            identity.push(self.original_issuer()?);
+        }
+        let bytes = serde_json::to_vec(&identity)
+            .map_err(|_| ProtocolError::Invalid("reconciliation identity"))?;
         Ok(format!("reconciliation:{}", hex(&Sha256::digest(bytes))))
     }
 }
@@ -200,6 +231,7 @@ mod tests {
         ReconcileEffectCommand {
             protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
             issuer: action.issuer,
+            original_issuer: None,
             scope: action.scope,
             request_id: "reconcile:1".into(),
             policy: action.policy,
@@ -231,6 +263,69 @@ mod tests {
             },
             evidence_label_ref: "label:private".into(),
         }
+    }
+
+    #[test]
+    fn reconciliation_v2_binds_original_coordinates_and_preserves_v1_domains() {
+        let original = command();
+        let legacy_bytes = original.signing_bytes().unwrap();
+        let legacy_key = original.request_key().unwrap();
+        assert!(legacy_bytes.starts_with(b"whipplescript:effect-reconciliation:command:v1\0"));
+        assert!(!serde_json::to_value(&original)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("original_issuer"));
+        let policy = envelope(7, "current-authority");
+        let mut current = original.clone();
+        current.protocol = EFFECT_RECONCILIATION_PROTOCOL_V2.into();
+        current.original_issuer = Some(original.issuer.clone());
+        current.issuer = "current-authority".into();
+        current.policy = PolicyEpochRef::from_verified(7, &policy).unwrap();
+        let bytes = current.signing_bytes().unwrap();
+        assert!(bytes.starts_with(b"whipplescript:effect-reconciliation:command:v2\0"));
+        VerifiedReconciliation::verify(
+            current.clone(),
+            &policy,
+            &Exact(bytes.clone()),
+            b"current-authority",
+            b"target-receipt",
+        )
+        .unwrap();
+        assert_ne!(current.request_key().unwrap(), legacy_key);
+        for original_issuer in ["other-original", "product:other"] {
+            let mut changed = current.clone();
+            changed.original_issuer = Some(original_issuer.into());
+            assert_ne!(changed.signing_bytes().unwrap(), bytes);
+            assert_ne!(
+                changed.request_key().unwrap(),
+                current.request_key().unwrap()
+            );
+        }
+        for (protocol, issuer) in [
+            (EFFECT_RECONCILIATION_PROTOCOL, Some("product")),
+            (EFFECT_RECONCILIATION_PROTOCOL_V2, None),
+            (EFFECT_RECONCILIATION_PROTOCOL_V2, Some("")),
+            (EFFECT_RECONCILIATION_PROTOCOL_V2, Some("  ")),
+            ("whipplescript.effect-reconciliation.v99", Some("product")),
+        ] {
+            let mut changed = current.clone();
+            changed.protocol = protocol.into();
+            changed.original_issuer = issuer.map(str::to_owned);
+            assert!(
+                changed.signing_bytes().is_err(),
+                "invalid version/locator pair"
+            );
+        }
+        for mut value in [
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&current).unwrap(),
+        ] {
+            value["original_issuer"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<ReconcileEffectCommand>(value).is_err());
+        }
+        assert_eq!(original.signing_bytes().unwrap(), legacy_bytes);
+        assert_eq!(original.request_key().unwrap(), legacy_key);
     }
 
     #[test]

@@ -154,6 +154,7 @@ pub fn journey<S: RuntimeStore + LogAppend>(mut store: S, actor: &str) -> Value 
     let command = ReconcileEffectCommand {
         protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
         issuer: "product".into(),
+        original_issuer: None,
         scope: "workspace:1".into(),
         request_id: "reconcile-first".into(),
         policy: host.policy_ref().clone(),

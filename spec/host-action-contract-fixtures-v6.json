@@ -1,0 +1,271 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v6",
+  "contract_revision": "whipplescript-host-action/v6.0.0",
+  "description": "Independent current reconciliation authority over exact original action coordinates; V1 remains immutable.",
+  "cases": [
+    {
+      "id": "current-authority-reconciliation",
+      "message_type": "ReconcileEffectCommand",
+      "value": {
+        "protocol": "whipplescript.effect-reconciliation.v2",
+        "issuer": "fixture-current-project",
+        "scope": "workspace:fixture",
+        "request_id": "recover-save",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "evidence": {
+          "frame": {
+            "protocol": "whipplescript.effect-recovery.v1",
+            "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "effect_id": "effect:save",
+            "run_id": "run:save",
+            "idempotency_key": "effect-key",
+            "kind": "file.write",
+            "target": "target:fixture",
+            "provider": "files",
+            "input_fingerprint": "observed-input",
+            "execution_fingerprint": "observed-execution",
+            "action_admission": {
+              "sequence": 3,
+              "head_digest": "fixture-prefix",
+              "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+            }
+          },
+          "disposition": "applied",
+          "evidence_ref": "save-result",
+          "evidence_digest": "target-proof-digest",
+          "authority_ref": "fixture-target"
+        },
+        "evidence_label_ref": "private",
+        "original_issuer": "fixture-product"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "current-authority-reconciliation-null-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": null
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "current-authority-reconciliation-number-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": 42
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "current-authority-reconciliation-empty-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": ""
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "current-authority-reconciliation-blank-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": "  "
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "current-authority-reconciliation-extra",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/unexpected",
+          "value": "extra"
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "current-authority-reconciliation-wrong-protocol",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "whipplescript.effect-reconciliation.v99"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "current-authority-reconciliation-other-current",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/issuer",
+          "value": "fixture-other-current"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "current-authority-reconciliation-other-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": "fixture-other-original"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "current-authority-reconciliation-missing-original",
+      "message_type": "ReconcileEffectCommand",
+      "base": "current-authority-reconciliation",
+      "remove": [
+        "/original_issuer"
+      ],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "legacy-reconciliation",
+      "message_type": "ReconcileEffectCommand",
+      "value": {
+        "protocol": "whipplescript.effect-reconciliation.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "request_id": "recover-save",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "evidence": {
+          "frame": {
+            "protocol": "whipplescript.effect-recovery.v1",
+            "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "effect_id": "effect:save",
+            "run_id": "run:save",
+            "idempotency_key": "effect-key",
+            "kind": "file.write",
+            "target": "target:fixture",
+            "provider": "files",
+            "input_fingerprint": "observed-input",
+            "execution_fingerprint": "observed-execution",
+            "action_admission": {
+              "sequence": 3,
+              "head_digest": "fixture-prefix",
+              "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+            }
+          },
+          "disposition": "applied",
+          "evidence_ref": "save-result",
+          "evidence_digest": "target-proof-digest",
+          "authority_ref": "fixture-target"
+        },
+        "evidence_label_ref": "private"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "legacy-reconciliation-new-field",
+      "message_type": "ReconcileEffectCommand",
+      "base": "legacy-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": "fixture-product"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "legacy-reconciliation-null-field",
+      "message_type": "ReconcileEffectCommand",
+      "base": "legacy-reconciliation",
+      "set": [
+        {
+          "pointer": "/original_issuer",
+          "value": null
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    }
+  ]
+}

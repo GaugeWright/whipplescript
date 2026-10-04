@@ -19,6 +19,12 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Version 2 effect reconciliation names the original action issuer separately
+  from the current investigator's authority. Its signature and retry identity
+  bind both coordinates; the target evidence keeps its own authority. Version 1
+  bytes and receipts remain compatible. Rust embeddings add `original_issuer:
+  None` to V1 constructors, or supply the original issuer for V2 commands.
+
 - The curated mirror publisher accepts an explicit maintenance destination with source/tree and forward-history checks; its default remains `main`.
 
 - Version 2 action-result reads name the current policy authority separately
