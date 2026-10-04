@@ -19,6 +19,8 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- The curated mirror publisher accepts an explicit maintenance destination with source/tree and forward-history checks; its default remains `main`.
+
 - Hosted lease expiry preserves the original event completion time when rebuilding run projections, including tracker result recovery.
 
 - Workspace edit and grep semantics now share pure helpers across native and Durable Object hosts. The native workspace resolver rejects overlapping edits while preserving leading BOMs; hosted grep keeps the same parameter behavior and 500-character line cap.
