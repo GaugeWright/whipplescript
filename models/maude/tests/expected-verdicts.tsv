@@ -76,6 +76,7 @@ construct-graph.maude	SSSNNNNSSSSNSNNNNNNSNSNNNSNNNNNN
 construct-interop-examples.maude	SNSNSNSNSNSNSN
 construct-lowering.maude	SSSSSNNNNNNNNNNNNNNNNNSNSSSSSS
 contradiction-reopener.maude	NSSNS
+credential-fingerprint-containment.maude	SSNNSSSSNNNNNSNSNSSSSSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNNSNN
 credential-no-eliminator.maude	SSSSSSSSNNNNNNNNN
 credential-region-escape.maude	SSSSSNNNN
 credential-region-materialization.maude	SSSSSNNNNNN

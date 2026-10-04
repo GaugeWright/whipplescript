@@ -173,7 +173,11 @@ The current scope is **experimental**:
   item to the agent with `source: "agent"`.
 - The sub-workflow tools follow the internal design record DR-0025.
   A workflow with the `@tool` tag becomes a typed tool for an agent. The `input`
-  contract of the workflow is the JSON schema of the tool. The model can
+  contracts of the workflow form the JSON schema of the tool: arguments are
+  keyed by declared input name. For example, `input request EchoRequest` with
+  `EchoRequest { text string }` takes
+  `{ "request": { "text": "hello" } }`, the same object accepted when starting
+  the workflow directly. All declared inputs are required. The model can
   **invoke the tool synchronously** during a turn. The call blocks the turn
   until the sub-workflow gets to its terminal. The call then returns the
   `output` payload of the sub-workflow. A terminal that is not `completed`

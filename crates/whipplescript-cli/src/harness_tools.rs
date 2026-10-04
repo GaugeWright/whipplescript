@@ -3998,19 +3998,42 @@ impl HostDriver for FixtureHost {
 
 /// Build the model-facing tool spec and the dispatch entry for one resolved
 /// `@tool` workflow (DR-0025): the tool name is the workflow name, its declared
-/// `input` contract is the JSON schema, its `description` (if any) the tool blurb,
+/// declared input names and their contracts form the JSON schema, its
+/// `description` (if any) the tool blurb,
 /// and `source_path`+root tell the dispatcher how to drive it.
 fn tool_spec_and_entry(
     ir: &whipplescript_parser::IrProgram,
     source_path: PathBuf,
     package_id: String,
 ) -> (ToolSpec, WorkflowToolEntry) {
-    let input_schema = ir
+    // A workflow start takes { "<input name>": <contract value> }, including
+    // when it has just one input. Advertise the same envelope to the model so
+    // its tool call can pass start-input validation unchanged. Keep all inputs:
+    // projecting only the first also made multi-input tools impossible to call.
+    let inputs = ir
         .workflow_contracts
         .iter()
-        .find(|contract| contract.kind == IrWorkflowContractKind::Input)
-        .map(|contract| json_schema_for_type(&contract.ty, &ir.schemas))
-        .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
+        .filter(|contract| contract.kind == IrWorkflowContractKind::Input)
+        .collect::<Vec<_>>();
+    let properties = inputs
+        .iter()
+        .map(|contract| {
+            (
+                contract.name.clone(),
+                json_schema_for_type(&contract.ty, &ir.schemas),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let required = inputs
+        .iter()
+        .map(|contract| contract.name.clone())
+        .collect::<Vec<_>>();
+    let input_schema = json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    });
     let description = ir
         .source_descriptions
         .iter()
@@ -5624,6 +5647,67 @@ fn owned_max_steps() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_tool_schema_matches_the_start_input_envelope() {
+        // Keep this source in the unit target: the isolated native build does
+        // not mount arbitrary examples alongside harness_tools.rs.
+        let source = r#"
+@tool
+workflow EchoText {
+  input request EchoRequest
+  output result EchoResult
+  class EchoRequest { text string }
+  class EchoResult { echoed string }
+  rule echo
+    when EchoRequest as request
+  => {
+    done request
+    complete result { echoed request.text }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("example tool compiles");
+        let (spec, _) = tool_spec_and_entry(&ir, PathBuf::from("echo.whip"), "local".into());
+        assert_eq!(
+            spec.input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["request"],
+                "additionalProperties": false
+            })
+        );
+        let advertised_call = json!({"request": {"text": "hello"}});
+        whipplescript_kernel::workflow_input::validate_workflow_start_input(&ir, &advertised_call)
+            .expect("arguments accepted by the advertised schema must start the child");
+
+        let two_inputs = source.replacen(
+            "input request EchoRequest",
+            "input request EchoRequest\n  input second EchoRequest",
+            1,
+        );
+        let ir = whipplescript_parser::compile_program(&two_inputs)
+            .ir
+            .expect("multi-input tool compiles");
+        let (spec, _) = tool_spec_and_entry(&ir, PathBuf::from("echo.whip"), "local".into());
+        assert_eq!(spec.input_schema["required"], json!(["request", "second"]));
+        let advertised_call = json!({
+            "request": {"text": "hello"},
+            "second": {"text": "world"}
+        });
+        whipplescript_kernel::workflow_input::validate_workflow_start_input(&ir, &advertised_call)
+            .expect("all advertised inputs must start the child");
+    }
 
     /// An unknown provider name is refused, and the refusal says what is
     /// accepted. Without it the harness would resolve no credential and fail
