@@ -304,6 +304,75 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
     ) -> StoreResult<FlowingRewriteLineageOutcome> {
         use FlowingRewriteLineageOutcome as R;
 
+        // Discover older rewrite receipts with an explicit stack, then verify
+        // them from oldest to newest. A flowing source can be rebased many
+        // times, so recursive verification would make valid history depend on
+        // the process stack limit.
+        let mut verified = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut pending = vec![(after_cut_id.to_owned(), false)];
+        while let Some((cut_id, ready)) = pending.pop() {
+            if verified.contains_key(&cut_id) {
+                continue;
+            }
+            if ready {
+                match self.verify_one_flowing_rewrite_lineage(&cut_id, &verified)? {
+                    R::Verified(lineage) => {
+                        verified.insert(cut_id.clone(), *lineage);
+                    }
+                    outcome => return Ok(outcome),
+                }
+                visiting.remove(&cut_id);
+                continue;
+            }
+            if !visiting.insert(cut_id.clone()) {
+                return Ok(R::UnsupportedLineage { cut_id });
+            }
+            if self.branches.get_cut(&cut_id)?.is_none() {
+                return Ok(R::CutMissing { cut_id });
+            }
+            let Some(receipt) = self.branches.flowing_rewrite_for_cut(&cut_id)? else {
+                return Ok(R::ReceiptMissing { cut_id });
+            };
+            pending.push((cut_id.clone(), true));
+            let mut source_cursor = Some(receipt.old_head_cut_id);
+            let mut source_seen = BTreeSet::new();
+            while source_cursor != receipt.old_point_cut_id {
+                let Some(source_id) = source_cursor else {
+                    break; // The full verifier reports the invalid ancestry.
+                };
+                if !source_seen.insert(source_id.clone()) {
+                    return Ok(R::UnsupportedLineage { cut_id: source_id });
+                }
+                let Some(cut) = self.branches.get_cut(&source_id)? else {
+                    return Ok(R::CutMissing { cut_id: source_id });
+                };
+                if cut.origin.as_deref() == Some("flowing:rebase")
+                    && !verified.contains_key(&source_id)
+                {
+                    if visiting.contains(&source_id) {
+                        return Ok(R::UnsupportedLineage { cut_id: source_id });
+                    }
+                    pending.push((source_id, false));
+                }
+                source_cursor = cut.parent_cut_id;
+            }
+        }
+        match verified.remove(after_cut_id) {
+            Some(lineage) => Ok(R::Verified(Box::new(lineage))),
+            None => Ok(R::UnsupportedLineage {
+                cut_id: after_cut_id.into(),
+            }),
+        }
+    }
+
+    fn verify_one_flowing_rewrite_lineage(
+        &self,
+        after_cut_id: &str,
+        verified: &BTreeMap<String, FlowingRewriteLineage>,
+    ) -> StoreResult<FlowingRewriteLineageOutcome> {
+        use FlowingRewriteLineageOutcome as R;
+
         let Some(after_cut) = self.branches.get_cut(after_cut_id)? else {
             return Ok(R::CutMissing {
                 cut_id: after_cut_id.into(),
@@ -408,14 +477,20 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
                 return Ok(R::CutMissing { cut_id });
             };
             if cut.branch_id != receipt.source_branch_id
-                || cut
-                    .origin
-                    .as_deref()
-                    .is_none_or(|origin| !origin.starts_with("write:"))
                 || expected_hash.as_deref() != Some(cut.manifest_hash.as_str())
             {
                 return Ok(R::UnsupportedLineage { cut_id });
             }
+            let inherited = match cut.origin.as_deref() {
+                Some(origin) if origin.starts_with("write:") => None,
+                Some("flowing:rebase") => {
+                    let Some(lineage) = verified.get(&cut_id) else {
+                        return Ok(R::UnsupportedLineage { cut_id });
+                    };
+                    Some(lineage.source_atoms().to_vec())
+                }
+                _ => return Ok(R::UnsupportedLineage { cut_id }),
+            };
             expected_hash = match cut.parent_cut_id.as_deref() {
                 Some(parent_id) => {
                     let Some(parent) = self.branches.get_cut(parent_id)? else {
@@ -428,7 +503,7 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
                 None => None,
             };
             source_cursor = cut.parent_cut_id.clone();
-            reverse.push(cut);
+            reverse.push((cut, inherited));
         }
         if reverse.is_empty() || expected_hash != receipt.old_point_manifest_hash {
             return Ok(R::IncompleteRoots);
@@ -436,11 +511,15 @@ impl<B: Branches + FlowingRewrites, C: ContentBlobs> WorkspaceVcs<B, C> {
         reverse.reverse();
 
         let mut atoms = Vec::new();
-        for cut in &reverse {
+        for (cut, inherited) in &reverse {
             if self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none() {
                 return Ok(R::MissingManifest {
                     cut_id: cut.cut_id.clone(),
                 });
+            }
+            if let Some(inherited) = inherited {
+                atoms.extend(inherited.iter().cloned());
+                continue;
             }
             let mut changes = Vec::new();
             self.push_units_for_cut(cut, &mut changes)?;

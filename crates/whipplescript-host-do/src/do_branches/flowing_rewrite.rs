@@ -385,6 +385,113 @@ mod tests {
     }
 
     #[test]
+    fn hosted_second_rewrite_rederives_the_first_receipt() {
+        let (sql, mut vcs) = fixture();
+        let FlowingDisjointRebaseOutcome::Prepared(first) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("first rewrite prepared");
+        };
+        begin(&sql);
+        assert!(matches!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &first,
+                "rewrite-1",
+                "begin-rewrite",
+                "rebased",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Committed(_)
+        ));
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        let fence = branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "another-parent.txt",
+            Some("parent-2"),
+            "parent-2",
+            "t8",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(second) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("second rewrite prepared");
+        };
+        assert_eq!(second.roots().len(), 1);
+        let fence = branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-rewrite-2".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some("rebased".into()),
+                        after_cut_id: "rebased-2".into(),
+                    },
+                    recorded_at: "t9".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            vcs.commit_prepared_disjoint_flowing_rebase(
+                &second,
+                "rewrite-2",
+                "begin-rewrite-2",
+                "rebased-2",
+                "s:author",
+                "t10",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingRewriteOutcome::Committed(_)
+        ));
+        let FlowingRewriteLineageOutcome::Verified(lineage) =
+            vcs.verify_flowing_rewrite_lineage("rebased-2").unwrap()
+        else {
+            panic!("hosted second rewrite must retain the first root");
+        };
+        assert_eq!(lineage.source_atoms().len(), 1);
+        assert_eq!(lineage.source_atoms()[0].cut_id, "cut-a");
+        sql.execute(
+            "DELETE FROM flowing_rewrites WHERE op_id = ?1",
+            &[text("rewrite-1")],
+        )
+        .unwrap();
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("rebased-2").unwrap(),
+            FlowingRewriteLineageOutcome::ReceiptMissing {
+                cut_id: "rebased".into()
+            }
+        );
+    }
+
+    #[test]
     fn hosted_current_rewrite_prefix_survives_a_later_write() {
         let (sql, mut vcs) = fixture();
         let FlowingDisjointRebaseOutcome::Prepared(plan) =

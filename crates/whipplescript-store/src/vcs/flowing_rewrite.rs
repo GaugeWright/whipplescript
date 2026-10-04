@@ -130,7 +130,9 @@ pub enum FlowingDisjointRebaseOutcome {
     Overlap { path: String },
 }
 
-impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> WorkspaceVcs<B, C> {
+impl<B: Branches + FlowingSources + FlowingAdmissions + FlowingRewrites, C: ContentBlobs>
+    WorkspaceVcs<B, C>
+{
     /// Derive a replayable result only when every old source atom belongs to
     /// exactly one still-owed bound unit and the new parent left all of those
     /// paths at the old branch-point value. No output cut is published here.
@@ -249,13 +251,26 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
             {
                 return Ok(R::CutMismatch { cut_id });
             }
-            if !cut
-                .origin
-                .as_deref()
-                .is_some_and(|origin| origin.starts_with("write:"))
-            {
-                return Ok(R::UnsupportedLineage { cut_id });
-            }
+            let inherited = match cut.origin.as_deref() {
+                Some(origin) if origin.starts_with("write:") => None,
+                Some("flowing:rebase") => {
+                    let FlowingRewriteLineageOutcome::Verified(lineage) =
+                        self.verify_flowing_rewrite_lineage(&cut_id)?
+                    else {
+                        return Ok(R::UnsupportedLineage { cut_id });
+                    };
+                    let prior = lineage.receipt();
+                    if prior.source_branch_id != source_branch_id
+                        || prior.source_incarnation_id != fence.incarnation_id
+                        || prior.parent_head_cut_id != source.branch_point_cut_id
+                        || prior.parent_head_manifest_hash != source.branch_point_manifest_hash
+                    {
+                        return Ok(R::UnsupportedLineage { cut_id });
+                    }
+                    Some(lineage.source_atoms().to_vec())
+                }
+                _ => return Ok(R::UnsupportedLineage { cut_id }),
+            };
             if self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none() {
                 return Ok(R::MissingContent {
                     content_id: cut.manifest_hash,
@@ -273,14 +288,18 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
                 None => None,
             };
             cursor = cut.parent_cut_id.clone();
-            reverse.push(cut);
+            reverse.push((cut, inherited));
         }
         if expected_manifest != source.branch_point_manifest_hash || reverse.is_empty() {
             return Ok(R::IncompleteRoots);
         }
         reverse.reverse();
         let mut old_atoms = Vec::new();
-        for cut in &reverse {
+        for (cut, inherited) in &reverse {
+            if let Some(inherited) = inherited {
+                old_atoms.extend(inherited.iter().cloned());
+                continue;
+            }
             let mut changes = Vec::new();
             self.push_units_for_cut(cut, &mut changes)?;
             if changes.is_empty() {
@@ -301,6 +320,11 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
             .cloned()
             .map(|atom| ((atom.cut_id.clone(), atom.path.clone()), atom))
             .collect();
+        if old_keys.len() != old_atoms.len() {
+            return Ok(R::IncompleteRoots);
+        }
+        let old_atom_cuts: BTreeSet<&str> =
+            old_atoms.iter().map(|atom| atom.cut_id.as_str()).collect();
         let mut owners = BTreeMap::new();
         let mut roots = Vec::new();
         for unit in self.branches.source_contributions(source_branch_id)? {
@@ -323,7 +347,7 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
                 || pin.twig_branch_id != source_branch_id
                 || pin.cut_id != unit.source_cut_id
                 || pin.manifest_hash != unit.source_manifest_hash
-                || !seen.contains(&unit.source_cut_id)
+                || !old_atom_cuts.contains(unit.source_cut_id.as_str())
             {
                 return Ok(R::UnitBasisMismatch {
                     unit_id: unit.unit_id,
@@ -690,6 +714,122 @@ mod tests {
             vcs.verify_flowing_rewrite_lineage("cut-a").unwrap(),
             FlowingRewriteLineageOutcome::ReceiptMissing {
                 cut_id: "cut-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_second_disjoint_rewrite_keeps_historical_and_later_units_owed() {
+        use crate::vcs::flowing_rewrite::CurrentFlowingRewriteRosterOutcome as R;
+
+        let (mut vcs, first) = committed_two_unit_rewrite();
+        finish_rewrite(&mut vcs);
+        bound_write(&mut vcs, "tail.txt", "tail", "tail-cut", "unit-tail");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "another-parent.txt",
+            Some("parent-2"),
+            "parent-2",
+            "t8",
+        )
+        .unwrap();
+        let FlowingDisjointRebaseOutcome::Prepared(plan) =
+            vcs.prepare_disjoint_flowing_rebase("twig").unwrap()
+        else {
+            panic!("the second disjoint parent must be replayable");
+        };
+        assert_eq!(
+            plan.roots()
+                .iter()
+                .map(FlowingRewriteRoot::unit_id)
+                .collect::<Vec<_>>(),
+            ["unit-a", "unit-b", "unit-tail"]
+        );
+        assert_eq!(plan.old_point_cut_id(), Some("parent-next"));
+        assert_eq!(plan.parent_head_cut_id(), Some("parent-2"));
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-rewrite-2".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: plan.source_incarnation_id().into(),
+                    expected_eligibility_epoch: plan.source_eligibility_epoch(),
+                    expected_owner_epoch: plan.source_owner_epoch(),
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some(plan.old_head_cut_id().into()),
+                        after_cut_id: "rebased-2".into(),
+                    },
+                    recorded_at: "t9".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        let FlowingRewriteOutcome::Committed(second) = vcs
+            .commit_prepared_disjoint_flowing_rebase(
+                &plan,
+                "rewrite-2",
+                "begin-rewrite-2",
+                "rebased-2",
+                "s:author",
+                "t10",
+                &mut || Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("second rewrite must commit");
+        };
+        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-rewrite-2".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-rewrite-2".into(),
+                    },
+                    recorded_at: "t11".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        let FlowingRewriteLineageOutcome::Verified(lineage) =
+            vcs.verify_flowing_rewrite_lineage("rebased-2").unwrap()
+        else {
+            panic!("second receipt must rederive the first receipt and later write");
+        };
+        assert_eq!(lineage.receipt(), &second);
+        assert_eq!(lineage.source_atoms().len(), 3);
+        assert_eq!(
+            lineage.source_atoms()[0].cut_id,
+            first.roots[0].atoms()[0].cut_id
+        );
+        assert_eq!(
+            lineage.source_atoms()[1].cut_id,
+            first.roots[1].atoms()[0].cut_id
+        );
+        assert_eq!(lineage.source_atoms()[2].cut_id, "tail-cut");
+        let R::Verified(roster) = vcs
+            .verify_current_flowing_rewrite_roster("twig", "rebased-2")
+            .unwrap()
+        else {
+            panic!("all three units must remain separately owed");
+        };
+        assert_eq!(roster.units().len(), 3);
+        assert!(roster.units().iter().all(|unit| unit.from_rewrite));
+
+        vcs.branches
+            .test_connection()
+            .execute("DELETE FROM flowing_rewrites WHERE op_id = 'rewrite-1'", [])
+            .unwrap();
+        assert_eq!(
+            vcs.verify_flowing_rewrite_lineage("rebased-2").unwrap(),
+            FlowingRewriteLineageOutcome::ReceiptMissing {
+                cut_id: "rebased".into()
             }
         );
     }
