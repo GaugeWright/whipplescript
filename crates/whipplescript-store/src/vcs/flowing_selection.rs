@@ -1693,6 +1693,36 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     pub fn verify_private_batch_source_order(
         &self,
         witness: &FlowingBatchTargetEffects,
+    ) -> StoreResult<FlowingBatchSourceOrderOutcome>
+    where
+        B: FlowingAdmissions,
+    {
+        use FlowingBatchSourceOrderOutcome as R;
+        let prior = if let Some(before_id) = witness.target_before_cut_id() {
+            let FlowingBranchLineageOutcome::Verified(lineage) =
+                self.inspect_flowing_branch_lineage(witness.target_branch_id())?
+            else {
+                return Ok(R::SourceUnproven);
+            };
+            if lineage.head_cut_id() != Some(before_id) {
+                return Ok(R::SourceUnproven);
+            }
+            lineage
+                .handoffs()
+                .iter()
+                .map(|receipt| (receipt.unit_id.clone(), receipt.source_basis_digest.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.verify_batch_source_order_with_prior(witness, &prior, None)
+    }
+
+    fn verify_batch_source_order_with_prior(
+        &self,
+        witness: &FlowingBatchTargetEffects,
+        branch_predecessors: &[(String, String)],
+        handed: Option<&[HandoffReceipt]>,
     ) -> StoreResult<FlowingBatchSourceOrderOutcome> {
         use FlowingBatchSourceOrderOutcome as R;
         let Some(first) = witness.units().first() else {
@@ -1710,7 +1740,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(source) = self.branches.get_branch(source_id)? else {
             return Ok(R::SourceUnproven);
         };
-        let wrong_source = source.status != BranchStatus::Active
+        let wrong_source = (handed.is_none() && source.status != BranchStatus::Active)
             || source.name.is_some()
             || source.parent_branch_id.as_deref() != Some(witness.target_branch_id())
             || source.branch_point_cut_id.as_deref() != witness.target_before_cut_id();
@@ -1735,30 +1765,32 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
 
         let selected_cut_id = witness.units().last().expect("nonempty").source_cut_id();
-        let mut cursor = source.head_cut_id.clone();
-        let mut seen = BTreeSet::new();
-        while let Some(id) = cursor {
-            if !seen.insert(id.clone()) {
+        if handed.is_none() {
+            let mut cursor = source.head_cut_id.clone();
+            let mut seen = BTreeSet::new();
+            while let Some(id) = cursor {
+                if !seen.insert(id.clone()) {
+                    return Ok(R::SourceUnproven);
+                }
+                let Some(cut) = self.branches.get_cut(&id)? else {
+                    return Ok(R::SourceUnproven);
+                };
+                if cut.branch_id != source_id
+                    || !cut
+                        .origin
+                        .as_deref()
+                        .is_some_and(|origin| origin.starts_with("write:"))
+                {
+                    return Ok(R::SourceUnproven);
+                }
+                if id == selected_cut_id {
+                    break;
+                }
+                cursor = cut.parent_cut_id;
+            }
+            if !seen.contains(selected_cut_id) {
                 return Ok(R::SourceUnproven);
             }
-            let Some(cut) = self.branches.get_cut(&id)? else {
-                return Ok(R::SourceUnproven);
-            };
-            if cut.branch_id != source_id
-                || !cut
-                    .origin
-                    .as_deref()
-                    .is_some_and(|origin| origin.starts_with("write:"))
-            {
-                return Ok(R::SourceUnproven);
-            }
-            if id == selected_cut_id {
-                break;
-            }
-            cursor = cut.parent_cut_id;
-        }
-        if !seen.contains(selected_cut_id) {
-            return Ok(R::SourceUnproven);
         }
         let mut cuts = Vec::new();
         let mut cursor = Some(selected_cut_id.to_owned());
@@ -1815,8 +1847,11 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         let mut next_cut = 0;
         let mut prior_cut_id = source.branch_point_cut_id.clone();
         let mut prior_manifest_hash = source.branch_point_manifest_hash.clone();
-        let mut predecessors: Vec<(String, String)> = Vec::new();
-        for selected in witness.units() {
+        let mut predecessors = branch_predecessors.to_vec();
+        if handed.is_some_and(|receipts| receipts.len() != witness.units().len()) {
+            return Ok(R::IncompletePrefix);
+        }
+        for (index, selected) in witness.units().iter().enumerate() {
             let Some(unit) = self.branches.contribution_declaration(selected.unit_id())? else {
                 return Ok(R::IncompletePrefix);
             };
@@ -1831,12 +1866,10 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 || unit.source_manifest_hash != pin.manifest_hash
                 || pin.twig_branch_id != source_id
                 || pin.cut_id != unit.source_cut_id
-                || pin.released_at.is_some()
+                || (handed.is_none() && pin.released_at.is_some())
                 || basis.basis_digest != selected.basis_digest()
-                || self
-                    .branches
-                    .contribution_handoff(selected.unit_id())?
-                    .is_some()
+                || self.branches.contribution_handoff(selected.unit_id())?
+                    != handed.map(|receipts| receipts[index].clone())
             {
                 return Ok(R::IncompletePrefix);
             }
@@ -1979,7 +2012,10 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         expected_witness_digest: &str,
         actor: &str,
         recorded_at: &str,
-    ) -> StoreResult<crate::branches::flowing_sources::HandoffBatchContributionOutcome> {
+    ) -> StoreResult<crate::branches::flowing_sources::HandoffBatchContributionOutcome>
+    where
+        B: FlowingAdmissions,
+    {
         use crate::branches::flowing_sources::{
             HandoffBatchContribution, HandoffBatchContributionOutcome as R,
         };
@@ -2378,7 +2414,7 @@ mod tests {
     use crate::branches::{BranchStore, CutRecord, MAINLINE_BRANCH_ID};
     use crate::content::ContentStore;
     use crate::source_review::{ReviewError, ReviewStore};
-    use crate::source_review_native::{NativeCandidateRequest, NativeUpload};
+    use crate::source_review_native::{NativeCandidateRequest, NativeUnitRef, NativeUpload};
     use crate::vcs::flowing_gate::{
         NativeGateCommand, NativeGateExecution, NativeGateExecutor, NativeGatePlan,
         NativeGatePlanAuthority, NativeGateRun,
@@ -5357,6 +5393,59 @@ mod tests {
         let prefix = lineage.prefix_through("batch-cut").unwrap();
         assert_eq!(prefix.selected_handoffs().len(), 2);
         assert!(prefix.later_handoffs().is_empty());
+        let revision = NativeRevision {
+            contribution_id: "review-batch".into(),
+            sequence: 1,
+            upload_id: "upload-batch".into(),
+            actor: "s:author".into(),
+            source_branch_id: "branch".into(),
+            source_incarnation_id: "branch-batch-inc".into(),
+            source_cut_id: "batch-cut".into(),
+            source_manifest_hash: manifest_hash.clone(),
+            units: receipt
+                .units
+                .iter()
+                .map(|unit| NativeUnitRef {
+                    unit_id: unit.unit_id.clone(),
+                    source_cut_id: unit.source_cut_id.clone(),
+                    pin_id: if unit.unit_id == "unit-a" {
+                        "pin-a".into()
+                    } else {
+                        "pin-b".into()
+                    },
+                    basis_digest: unit.source_basis_digest.clone(),
+                    principal: unit.original_principal.clone(),
+                    intent: vcs
+                        .branches
+                        .contribution_declaration(&unit.unit_id)
+                        .unwrap()
+                        .unwrap()
+                        .intent,
+                })
+                .collect(),
+        };
+        let NativeCandidateOutcome::Prepared(candidate) = vcs
+            .prepare_named_branch_candidate(&revision, None, "candidate-batch", "mediator", "t11")
+            .unwrap()
+        else {
+            panic!("complete batch can prepare one branch candidate")
+        };
+        assert_eq!(candidate.units.len(), 2);
+        assert_eq!(candidate.units[0].outcome, FlowingUnitOutcome::Neutralized);
+        assert_eq!(candidate.units[1].outcome, FlowingUnitOutcome::Applied);
+        let mut omitted = revision.clone();
+        omitted.units.remove(0);
+        assert_eq!(
+            vcs.prepare_named_branch_candidate(
+                &omitted,
+                None,
+                "candidate-omitted",
+                "mediator",
+                "t11"
+            )
+            .unwrap(),
+            NativeCandidateOutcome::IncompletePrefix
+        );
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

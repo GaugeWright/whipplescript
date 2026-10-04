@@ -9,7 +9,7 @@
 //! one transaction. A mixed cut can prepublish a content derivation while
 //! every unit remains owed. A complete same-twig prefix can then prove source
 //! order and move the head with every unit receipt in one transaction. Mixed
-//! source dependencies and branch-to-trunk accounting remain open.
+//! cross-source dependencies and branch-to-trunk admission remain open.
 //! The calling host authenticates and authorizes the principal on pin,
 //! declaration and release; the store binds those claims and prevents their
 //! later reinterpretation.

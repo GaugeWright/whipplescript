@@ -82,16 +82,6 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         {
             return Ok(R::IncompletePrefix);
         }
-        // One mixed target cut carries several ordered receipts. The simple
-        // candidate constructor below advances its predecessor once per cut,
-        // so it must wait for a batch-aware realized-basis proof.
-        if prefix
-            .selected_handoffs()
-            .windows(2)
-            .any(|pair| pair[0].target_after_cut_id == pair[1].target_after_cut_id)
-        {
-            return Ok(R::IncompletePrefix);
-        }
         let mut prior = Vec::new();
         let mut predecessor_cut_id = expected_trunk_cut_id.map(str::to_owned);
         let mut predecessor_manifest_hash = trunk.head_manifest_hash.clone();
@@ -99,74 +89,124 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         let mut last_substantive_owner = BTreeMap::new();
         let mut atoms = Vec::new();
         let mut basis_evidence = Vec::new();
-        for (receipt, selected) in prefix.selected_handoffs().iter().zip(&revision.units) {
-            if receipt.unit_id != selected.unit_id
-                || receipt.source_cut_id != selected.source_cut_id
-                || receipt.source_basis_digest != selected.basis_digest
-                || receipt.target_before_cut_id != predecessor_cut_id
-            {
+        let handoffs = prefix.selected_handoffs();
+        let mut start = 0;
+        while start < handoffs.len() {
+            let cut_id = &handoffs[start].target_after_cut_id;
+            let mut end = start + 1;
+            while end < handoffs.len() && handoffs[end].target_after_cut_id == *cut_id {
+                end += 1;
+            }
+            let group = &handoffs[start..end];
+            if group.iter().any(|receipt| {
+                receipt.target_before_cut_id != predecessor_cut_id
+                    || receipt.target_after_manifest_hash != group[0].target_after_manifest_hash
+            }) {
                 return Ok(R::IncompletePrefix);
             }
-            if self
-                .branches
-                .admitted_unit_operation(&selected.unit_id)?
-                .is_some()
-            {
-                return Ok(R::UnitAlreadyAdmitted {
-                    unit_id: selected.unit_id.clone(),
-                });
-            }
-            let Some(unit) = self.branches.contribution_declaration(&selected.unit_id)? else {
-                return Ok(R::IncompletePrefix);
-            };
-            let Some(basis) = self.branches.contribution_basis(&selected.unit_id)? else {
-                return Ok(R::IncompletePrefix);
-            };
-            let Some(source_twig) = self.branches.get_branch(&unit.source_branch_id)? else {
-                return Ok(R::SourceMismatch);
-            };
-            if unit.source_branch_id != receipt.source_branch_id
-                || unit.source_cut_id != selected.source_cut_id
-                || unit.pin_id != selected.pin_id
-                || unit.principal != selected.principal
-                || unit.intent != selected.intent
-                || unit.source_manifest_hash != receipt.source_manifest_hash
-                || basis.basis_digest != selected.basis_digest
-                || source_twig.parent_branch_id.as_deref()
-                    != Some(revision.source_branch_id.as_str())
-                || source_twig.branch_point_cut_id != predecessor_cut_id
-                || source_twig.branch_point_manifest_hash != predecessor_manifest_hash
-            {
-                return Ok(R::IncompletePrefix);
-            }
-            let read = native_read_basis_digest(
-                predecessor_cut_id.as_deref(),
-                predecessor_manifest_hash.as_deref(),
-            );
-            let deps = native_dependency_basis_digest(&prior);
-            if unit.read_basis_digest != read || unit.dependency_basis_digest != deps {
-                return Ok(R::UnprovenBasis {
-                    unit_id: unit.unit_id,
-                });
-            }
-            match self.net_source_paths(&basis)? {
-                Ok(_) => {}
-                Err(FlowingTargetEffectsOutcome::MissingContent { content_id }) => {
-                    return Ok(R::MissingContent { content_id });
+            let batch = self.branches.target_handoff_batch(cut_id)?;
+            if let Some(batch) = &batch {
+                if batch.units != group {
+                    return Ok(R::IncompletePrefix);
                 }
-                Err(_) => return Ok(R::IncompletePrefix),
-            }
-            for atom in basis.atoms {
-                if atom.before != atom.after {
-                    substantive_units.insert(selected.unit_id.clone());
-                    last_substantive_owner.insert(atom.path.clone(), selected.unit_id.clone());
+                let Some(derived) = self.branches.flowing_derived_cut(&batch.derivation_id)? else {
+                    return Ok(R::IncompletePrefix);
+                };
+                match self.verify_batch_source_order_with_prior(
+                    &derived.witness,
+                    &prior,
+                    Some(group),
+                )? {
+                    FlowingBatchSourceOrderOutcome::Verified => {}
+                    FlowingBatchSourceOrderOutcome::UnprovenBasis { unit_id } => {
+                        return Ok(R::UnprovenBasis { unit_id });
+                    }
+                    FlowingBatchSourceOrderOutcome::MissingContent { content_id } => {
+                        return Ok(R::MissingContent { content_id });
+                    }
+                    _ => return Ok(R::IncompletePrefix),
                 }
-                atoms.push((selected.unit_id.clone(), atom));
+            } else if group.len() != 1 {
+                return Ok(R::IncompletePrefix);
             }
-            basis_evidence.push((selected.unit_id.clone(), read, deps));
-            prior.push((selected.unit_id.clone(), selected.basis_digest.clone()));
-            predecessor_cut_id = Some(receipt.target_after_cut_id.clone());
-            predecessor_manifest_hash = Some(receipt.target_after_manifest_hash.clone());
+            for (receipt, selected) in group.iter().zip(&revision.units[start..end]) {
+                if receipt.unit_id != selected.unit_id
+                    || receipt.source_cut_id != selected.source_cut_id
+                    || receipt.source_basis_digest != selected.basis_digest
+                {
+                    return Ok(R::IncompletePrefix);
+                }
+                if self
+                    .branches
+                    .admitted_unit_operation(&selected.unit_id)?
+                    .is_some()
+                {
+                    return Ok(R::UnitAlreadyAdmitted {
+                        unit_id: selected.unit_id.clone(),
+                    });
+                }
+                let Some(unit) = self.branches.contribution_declaration(&selected.unit_id)? else {
+                    return Ok(R::IncompletePrefix);
+                };
+                let Some(basis) = self.branches.contribution_basis(&selected.unit_id)? else {
+                    return Ok(R::IncompletePrefix);
+                };
+                let Some(source_twig) = self.branches.get_branch(&unit.source_branch_id)? else {
+                    return Ok(R::SourceMismatch);
+                };
+                if unit.source_branch_id != receipt.source_branch_id
+                    || unit.source_cut_id != selected.source_cut_id
+                    || unit.pin_id != selected.pin_id
+                    || unit.principal != selected.principal
+                    || unit.intent != selected.intent
+                    || unit.source_manifest_hash != receipt.source_manifest_hash
+                    || basis.basis_digest != selected.basis_digest
+                    || source_twig.parent_branch_id.as_deref()
+                        != Some(revision.source_branch_id.as_str())
+                    || (batch.is_none()
+                        && (source_twig.branch_point_cut_id != predecessor_cut_id
+                            || source_twig.branch_point_manifest_hash != predecessor_manifest_hash))
+                {
+                    return Ok(R::IncompletePrefix);
+                }
+                let read = if batch.is_some() {
+                    unit.read_basis_digest.clone()
+                } else {
+                    native_read_basis_digest(
+                        predecessor_cut_id.as_deref(),
+                        predecessor_manifest_hash.as_deref(),
+                    )
+                };
+                let deps = if batch.is_some() {
+                    unit.dependency_basis_digest.clone()
+                } else {
+                    native_dependency_basis_digest(&prior)
+                };
+                if unit.read_basis_digest != read || unit.dependency_basis_digest != deps {
+                    return Ok(R::UnprovenBasis {
+                        unit_id: unit.unit_id,
+                    });
+                }
+                match self.net_source_paths(&basis)? {
+                    Ok(_) => {}
+                    Err(FlowingTargetEffectsOutcome::MissingContent { content_id }) => {
+                        return Ok(R::MissingContent { content_id });
+                    }
+                    Err(_) => return Ok(R::IncompletePrefix),
+                }
+                for atom in basis.atoms {
+                    if atom.before != atom.after {
+                        substantive_units.insert(selected.unit_id.clone());
+                        last_substantive_owner.insert(atom.path.clone(), selected.unit_id.clone());
+                    }
+                    atoms.push((selected.unit_id.clone(), atom));
+                }
+                basis_evidence.push((selected.unit_id.clone(), read, deps));
+                prior.push((selected.unit_id.clone(), selected.basis_digest.clone()));
+            }
+            predecessor_cut_id = Some(cut_id.clone());
+            predecessor_manifest_hash = Some(group[0].target_after_manifest_hash.clone());
+            start = end;
         }
         let selected_manifest = self.load_manifest(Some(prefix.selected_manifest_hash()))?;
         let base_manifest = self.load_manifest(trunk.head_manifest_hash.as_deref())?;
@@ -516,6 +556,179 @@ mod tests {
                 .unwrap(),
             HandoffContributionOutcome::Transferred(_)
         ));
+    }
+
+    #[test]
+    fn named_branch_batch_uses_the_prior_branch_roster_as_its_dependency_basis() {
+        use crate::branches::flowing_sources::{
+            HandoffBatchContributionOutcome, RecordFlowingDerivedCutOutcome,
+        };
+        let (mut vcs, mut revision) = handed_branch(None);
+        vcs.create_branch("twig-batch", None, "branch", "t8")
+            .unwrap();
+        assert!(matches!(
+            vcs.branches
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig-batch".into(),
+                    incarnation_id: "twig-batch-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t8".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        let mut prior_cut_id = Some("target-a".to_owned());
+        let mut prior_manifest = Some(revision.source_manifest_hash.clone());
+        let mut predecessors = vec![("unit-a".to_owned(), revision.units[0].basis_digest.clone())];
+        for (unit_id, pin_id, cut_id, body) in [
+            ("unit-b", "pin-b", "twig-b", "B"),
+            ("unit-c", "pin-c", "twig-c", "C"),
+        ] {
+            vcs.write("twig-batch", "b.txt", Some(body), cut_id, "t9")
+                .unwrap();
+            let cut = vcs.branches.get_cut(cut_id).unwrap().unwrap();
+            assert_eq!(
+                vcs.branches
+                    .pin_private_cut(PinPrivateCut {
+                        pin_id,
+                        twig_branch_id: "twig-batch",
+                        cut_id,
+                        manifest_hash: &cut.manifest_hash,
+                        principal: "s:author",
+                        retained_at: "t10",
+                    })
+                    .unwrap(),
+                PinPrivateCutOutcome::Pinned
+            );
+            let read = native_read_basis_digest(prior_cut_id.as_deref(), prior_manifest.as_deref());
+            let deps = native_dependency_basis_digest(&predecessors);
+            assert_eq!(
+                vcs.branches
+                    .declare_contribution(DeclareContribution {
+                        unit_id,
+                        pin_id,
+                        principal: "s:author",
+                        intent: "later mixed work",
+                        read_basis_digest: &read,
+                        dependency_basis_digest: &deps,
+                        scope_digest: "batch-scope",
+                        declared_at: "t10",
+                    })
+                    .unwrap(),
+                DeclareContributionOutcome::Declared
+            );
+            let FlowingSelectionOutcome::Selected(selection) = vcs
+                .select_private_changes(
+                    pin_id,
+                    &selection::parse(&format!("change({cut_id})")).unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("selected batch unit")
+            };
+            assert_eq!(
+                vcs.bind_private_selection(unit_id, &selection, "t11")
+                    .unwrap(),
+                BindContributionBasisOutcome::Bound
+            );
+            predecessors.push((unit_id.into(), selection.digest().into()));
+            prior_cut_id = Some(cut_id.into());
+            prior_manifest = Some(cut.manifest_hash);
+            revision.units.push(NativeUnitRef {
+                unit_id: unit_id.into(),
+                source_cut_id: cut_id.into(),
+                pin_id: pin_id.into(),
+                basis_digest: selection.digest().into(),
+                principal: "s:author".into(),
+                intent: "later mixed work".into(),
+            });
+        }
+        let manifest = prior_manifest.unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-batch",
+                change_id: "target-batch",
+                branch_id: "branch",
+                manifest_hash: &manifest,
+                parent_cut_id: Some("target-a"),
+                origin: Some("transport-batch:derive-batch"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t12",
+            })
+            .unwrap();
+        let FlowingBatchTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_batch_target_effects(&["unit-b", "unit-c"], "target-batch")
+            .unwrap()
+        else {
+            panic!("derived target batch")
+        };
+        assert_eq!(
+            vcs.verify_private_batch_source_order(&witness).unwrap(),
+            FlowingBatchSourceOrderOutcome::Verified
+        );
+        let RecordFlowingDerivedCutOutcome::Recorded(derived) = vcs
+            .record_private_batch_derivation("derive-batch", &witness, "mediator", "t12")
+            .unwrap()
+        else {
+            panic!("retained batch derivation")
+        };
+        assert!(matches!(
+            vcs.handoff_private_batch_derivation(
+                "derive-batch",
+                &derived.witness_digest,
+                "mediator",
+                "t13"
+            )
+            .unwrap(),
+            HandoffBatchContributionOutcome::Transferred(_)
+        ));
+        for pin_id in ["pin-b", "pin-c"] {
+            assert_eq!(
+                vcs.branches
+                    .release_private_cut(ReleasePrivateCut {
+                        pin_id,
+                        released_by: "mediator",
+                        reason: "handed to branch",
+                        released_at: "t13",
+                    })
+                    .unwrap(),
+                ReleasePrivateCutOutcome::Released
+            );
+        }
+        revision.source_cut_id = "target-batch".into();
+        revision.source_manifest_hash = manifest;
+        let NativeCandidateOutcome::Prepared(candidate) = vcs
+            .prepare_named_branch_candidate(&revision, None, "candidate-batch", "mediator", "t14")
+            .unwrap()
+        else {
+            panic!("batch must retain the earlier branch unit")
+        };
+        assert_eq!(candidate.units.len(), 3);
+        assert_eq!(candidate.units[0].outcome, FlowingUnitOutcome::Applied);
+        assert_eq!(candidate.units[1].outcome, FlowingUnitOutcome::Neutralized);
+        assert_eq!(candidate.units[2].outcome, FlowingUnitOutcome::Applied);
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contributions SET dependency_basis_digest = 'wrong' WHERE unit_id = 'unit-b'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.prepare_named_branch_candidate(
+                &revision,
+                None,
+                "candidate-stale",
+                "mediator",
+                "t14"
+            )
+            .unwrap(),
+            NativeCandidateOutcome::UnprovenBasis {
+                unit_id: "unit-b".into()
+            }
+        );
     }
 
     #[test]
