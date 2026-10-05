@@ -163,6 +163,13 @@ fn read_basis(connection: &Connection, unit_id: &str) -> StoreResult<Option<Cont
     .transpose()
 }
 
+pub(crate) fn lineage_unit(
+    connection: &Connection,
+    unit_id: &str,
+) -> StoreResult<Option<(ContributionDeclaration, ContributionBasis)>> {
+    Ok(read_declaration(connection, unit_id)?.zip(read_basis(connection, unit_id)?))
+}
+
 #[derive(Clone, Copy)]
 enum HandoffLookup {
     Operation,

@@ -15,7 +15,7 @@
 //! later reinterpretation.
 
 #[cfg(feature = "native")]
-mod native;
+pub(crate) mod native;
 
 pub const SCHEMA: [&str; 11] = [
     "CREATE TABLE IF NOT EXISTS flowing_private_pins (

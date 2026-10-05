@@ -924,6 +924,17 @@ impl FlowingAdmissions for BranchStore {
         if let Some(refusal) = certificate.admission_refusal() {
             return Ok(Refused(refusal));
         }
+        let Some(lineage) = crate::branches::flowing_lineage::native_capture(&tx, &witness)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(Refused(R::LineageChanged))
+            return Ok(Refused(R::LineageUnavailable));
+        };
+        if !crate::branches::flowing_lineage::matches_certificate(
+            &lineage,
+            &certificate,
+            &request.source_branch_id,
+        ) {
+            return Ok(Refused(R::LineageChanged));
+        }
         let Some(pin) = read_attempt_pin(&tx, &request.op_id)? else {
             return Ok(Refused(R::AttemptPinMissing));
         };
@@ -1189,8 +1200,8 @@ mod tests {
                     ('unit-b', 'pin', 'twig', 'source', 'source-manifest', \
                      'author', 'change', 'reads', 'deps', 'scope', 't2');
              INSERT INTO flowing_contribution_basis (unit_id, basis_digest, atoms_json, bound_at) \
-             VALUES ('unit-a', 'basis-a', '[]', 't2'),
-                    ('unit-b', 'basis-b', '[]', 't2');",
+             VALUES ('unit-a', 'basis-a', '[{\"cut_id\":\"source\",\"change_id\":\"change\",\"path\":\"a\",\"before\":null,\"after\":\"a\"}]', 't2'),
+                    ('unit-b', 'basis-b', '[{\"cut_id\":\"source\",\"change_id\":\"change\",\"path\":\"b\",\"before\":null,\"after\":\"b\"}]', 't2');",
             )
             .unwrap();
         for unit_id in ["unit-a", "unit-b"] {
@@ -1209,6 +1220,7 @@ mod tests {
             expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
             candidate_cut_id: request.candidate_cut_id.clone(),
             candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            lineage_fences: Vec::new(),
             source_eligibility_epoch: request.expected_eligibility_epoch,
             source_owner_epoch: request.expected_owner_epoch,
             coordinator: request.coordinator.clone(),
@@ -1222,6 +1234,167 @@ mod tests {
                 evidence_digest: "sha256:fixture-evidence".into(),
                 verdict: FlowingGateVerdict::Passed,
             }],
+        }
+    }
+
+    fn named_origin(store: &mut BranchStore) {
+        store
+            .create_branch(CreateBranch {
+                branch_id: "origin",
+                name: Some("Origin"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t1",
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "origin".into(),
+                incarnation_id: "origin-inc".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "origin-owner".into(),
+                opened_at: "t1".into(),
+            })
+            .unwrap();
+        store
+            .record_cut(CutRecord {
+                cut_id: "origin-cut",
+                change_id: "origin-change",
+                branch_id: "origin",
+                manifest_hash: "origin-manifest",
+                parent_cut_id: None,
+                origin: None,
+                actor: Some("author"),
+                intent: Some("change"),
+                recorded_at: "t2",
+            })
+            .unwrap();
+        // The trusted fixture supplies a retained cross-origin atom. Content
+        // derivation remains a separate prerequisite tested by candidate builders.
+        store.connection.execute(
+            "UPDATE flowing_contribution_basis SET atoms_json = ?1 WHERE unit_id = 'unit-a'",
+            [r#"[{"cut_id":"origin-cut","change_id":"origin-change","path":"a","before":null,"after":"a"}]"#],
+        ).unwrap();
+    }
+
+    #[test]
+    fn native_lineage_hold_release_invalidates_an_earlier_certificate() {
+        let mut store = fixture();
+        named_origin(&mut store);
+        let mut attempt = request("unit-a", "lineage-attempt");
+        pin_attempt(&mut store, &attempt);
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::LineageChanged)
+        );
+        let mut certificate = certificate_for(&attempt);
+        certificate.lineage_fences =
+            crate::branches::flowing_lineage::capture(&store, &witness_for(&attempt))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            certificate
+                .lineage_fences
+                .iter()
+                .map(|f| f.source_branch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["origin", "twig"]
+        );
+        attempt.certificate_handle = certificate.handle().unwrap();
+        insert_gate_certificate(&store, &certificate);
+        for (epoch, action, refusal) in [
+            (
+                0,
+                FlowingFenceAction::Hold,
+                FlowingAdmissionRefusal::LineageUnavailable,
+            ),
+            (
+                1,
+                FlowingFenceAction::ReleaseHold,
+                FlowingAdmissionRefusal::LineageChanged,
+            ),
+        ] {
+            assert!(matches!(
+                store
+                    .transition_flowing_source(&FlowingFenceTransition {
+                        op_id: format!("origin-transition-{epoch}"),
+                        source_branch_id: "origin".into(),
+                        incarnation_id: "origin-inc".into(),
+                        expected_eligibility_epoch: epoch,
+                        expected_owner_epoch: 0,
+                        actor: "origin-owner".into(),
+                        action,
+                        recorded_at: "t4".into(),
+                    })
+                    .unwrap(),
+                FlowingFenceOutcome::Applied(_)
+            ));
+            assert_eq!(
+                store.admit_flowing_prefix(&attempt).unwrap(),
+                FlowingAdmissionOutcome::Refused(refusal)
+            );
+        }
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store.admitted_unit_operation("unit-a").unwrap().is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+        certificate.lineage_fences =
+            crate::branches::flowing_lineage::capture(&store, &witness_for(&attempt))
+                .unwrap()
+                .unwrap();
+        attempt.certificate_handle = certificate.handle().unwrap();
+        insert_gate_certificate(&store, &certificate);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn native_lineage_missing_facts_and_cycles_cannot_authorize_cas() {
+        for sql in [
+            "DELETE FROM flowing_contribution_basis WHERE unit_id = 'unit-a'",
+            "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit-a'",
+            "UPDATE branches SET parent_branch_id = 'missing' WHERE branch_id = 'origin'",
+            "UPDATE branches SET parent_branch_id = 'origin' WHERE branch_id = 'origin'",
+            "DELETE FROM cuts WHERE cut_id = 'origin-cut'",
+            "DELETE FROM flowing_source_fences WHERE source_branch_id = 'origin'",
+        ] {
+            let mut store = fixture();
+            named_origin(&mut store);
+            let attempt = request("unit-a", "unknown-lineage");
+            pin_attempt(&mut store, &attempt);
+            store.connection.execute_batch(sql).unwrap();
+            assert!(
+                crate::branches::flowing_lineage::capture(&store, &witness_for(&attempt))
+                    .unwrap()
+                    .is_none(),
+                "{sql}"
+            );
+            let expected = if sql.starts_with("DELETE FROM flowing_contribution_basis") {
+                FlowingAdmissionRefusal::UnitBasisMissing {
+                    unit_id: "unit-a".into(),
+                }
+            } else {
+                FlowingAdmissionRefusal::LineageUnavailable
+            };
+            assert_eq!(
+                store.admit_flowing_prefix(&attempt).unwrap(),
+                FlowingAdmissionOutcome::Refused(expected),
+                "{sql}"
+            );
+            assert!(store
+                .flowing_admission_receipt(&attempt.op_id)
+                .unwrap()
+                .is_none());
         }
     }
 

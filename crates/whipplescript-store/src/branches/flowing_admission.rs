@@ -254,6 +254,8 @@ pub struct FlowingGateCertificate {
     pub expected_trunk_cut_id: Option<String>,
     pub candidate_cut_id: String,
     pub candidate_manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage_fences: Vec<super::flowing_fence::FlowingFenceState>,
     pub source_eligibility_epoch: i64,
     pub source_owner_epoch: i64,
     pub coordinator: String,
@@ -266,7 +268,12 @@ pub struct FlowingGateCertificate {
 
 impl FlowingGateCertificate {
     pub fn handle(&self) -> crate::StoreResult<String> {
-        let bytes = serde_json::to_vec(&("native-gate-certificate-v1", self))?;
+        let version = if self.lineage_fences.is_empty() {
+            "native-gate-certificate-v1"
+        } else {
+            "native-gate-certificate-v2"
+        };
+        let bytes = serde_json::to_vec(&(version, self))?;
         Ok(format!(
             "sha256:{}",
             crate::chunking::content_hash_hex(&bytes)
@@ -295,6 +302,23 @@ impl FlowingGateCertificate {
             || self.coordinator.trim().is_empty()
             || self.required_checks.is_empty()
             || self.required_checks.len() != self.checks.len()
+        {
+            return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
+        }
+        if self
+            .lineage_fences
+            .windows(2)
+            .any(|pair| pair[0].source_branch_id >= pair[1].source_branch_id)
+            || self.lineage_fences.iter().any(|fence| {
+                fence.source_branch_id.trim().is_empty()
+                    || fence.incarnation_id.trim().is_empty()
+                    || fence.owner.trim().is_empty()
+                    || fence.owner_epoch < 0
+                    || fence.eligibility_epoch < 0
+                    || fence.held
+                    || fence.revision.is_some()
+                    || !fence.admission_enabled
+            })
         {
             return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
         }
@@ -391,6 +415,8 @@ pub enum FlowingAdmissionRefusal {
     GateCertificateMissing,
     GateCertificateMismatch,
     GatePlanIncomplete,
+    LineageUnavailable,
+    LineageChanged,
     GateFailed,
     GateUnrun,
     UnitMissing { unit_id: String },
@@ -661,6 +687,7 @@ mod tests {
             expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
             candidate_cut_id: request.candidate_cut_id.clone(),
             candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            lineage_fences: Vec::new(),
             source_eligibility_epoch: request.expected_eligibility_epoch,
             source_owner_epoch: request.expected_owner_epoch,
             coordinator: request.coordinator.clone(),
@@ -675,6 +702,51 @@ mod tests {
                 verdict: FlowingGateVerdict::Passed,
             }],
         }
+    }
+
+    #[test]
+    fn lineage_certificate_keeps_legacy_identity_and_binds_new_vector() {
+        let legacy = gate_certificate(&request());
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("lineage_fences").is_none());
+        assert_eq!(
+            legacy.handle().unwrap(),
+            "sha256:336dadb2cec9f7aa99e7fbdc2cd0c597"
+        );
+        let restored: FlowingGateCertificate = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.handle().unwrap(), legacy.handle().unwrap());
+        let mut next = legacy.clone();
+        next.lineage_fences
+            .push(crate::branches::flowing_fence::FlowingFenceState {
+                source_branch_id: "twig".into(),
+                incarnation_id: "inc".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "coordinator".into(),
+                owner_epoch: 0,
+                eligibility_epoch: 0,
+                held: false,
+                revision: None,
+                admission_enabled: true,
+                opened_at: "t1".into(),
+            });
+        assert_eq!(next.admission_refusal(), None);
+        assert_ne!(next.handle().unwrap(), legacy.handle().unwrap());
+        let mut malformed = next.clone();
+        malformed
+            .lineage_fences
+            .push(next.lineage_fences[0].clone());
+        assert_eq!(
+            malformed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        malformed = next.clone();
+        malformed.lineage_fences[0].held = true;
+        assert_eq!(
+            malformed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        next.lineage_fences[0].eligibility_epoch += 1;
+        assert_ne!(next.handle().unwrap(), malformed.handle().unwrap());
     }
 
     #[test]

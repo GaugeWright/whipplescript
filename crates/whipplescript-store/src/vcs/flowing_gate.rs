@@ -139,6 +139,8 @@ impl NativeWorkspaceVcs {
         if fence.owner != plan.coordinator {
             return Err(invalid("source eligibility or coordinator changed"));
         }
+        let lineage_fences = crate::branches::flowing_lineage::capture(&self.branches, &witness)?
+            .ok_or_else(|| invalid("source lineage is unknown or ineligible"))?;
         let manifest = self.load_manifest(Some(&witness.candidate_manifest_hash))?;
         std::fs::create_dir(scratch).map_err(|error| {
             invalid(&format!(
@@ -153,7 +155,8 @@ impl NativeWorkspaceVcs {
             let check_scratch = scratch.join(format!("check-{index:04}"));
             materialize_manifest(&manifest, &self.content, &check_scratch, 0)?;
             let input = serde_json::to_vec(&(
-                "native-gate-check-input-v1",
+                "native-gate-check-input-v2",
+                &lineage_fences,
                 &plan.attempt_op_id,
                 witness_digest,
                 &witness.candidate_cut_id,
@@ -202,6 +205,11 @@ impl NativeWorkspaceVcs {
         {
             return Err(invalid("trunk or source changed during checks"));
         }
+        if crate::branches::flowing_lineage::capture(&self.branches, &witness)?.as_ref()
+            != Some(&lineage_fences)
+        {
+            return Err(invalid("source lineage changed during checks"));
+        }
         if authority.required_plan(self, &witness, attempt_op_id)? != plan {
             return Err(invalid("required plan changed during checks"));
         }
@@ -210,6 +218,7 @@ impl NativeWorkspaceVcs {
             expected_trunk_cut_id: witness.expected_trunk_cut_id,
             candidate_cut_id: witness.candidate_cut_id,
             candidate_manifest_hash: witness.candidate_manifest_hash,
+            lineage_fences,
             source_eligibility_epoch: fence.eligibility_epoch,
             source_owner_epoch: fence.owner_epoch,
             coordinator: plan.coordinator.clone(),

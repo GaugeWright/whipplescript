@@ -3161,6 +3161,186 @@ mod tests {
     }
 
     #[test]
+    fn native_gate_binds_lineage_and_refuses_unknown_or_changed_source_facts() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let NativeCandidateOutcome::Prepared(candidate) = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .unwrap()
+        else {
+            panic!("complete candidate")
+        };
+        vcs.retain_review_attempt("lineage-gate", &candidate.candidate_witness_digest, "t7")
+            .unwrap();
+        let plan = NativeGatePlan {
+            attempt_op_id: "lineage-gate".into(),
+            candidate_witness_digest: candidate.candidate_witness_digest.clone(),
+            coordinator: "coordinator".into(),
+            policy_digest: "policy".into(),
+            rules_digest: "rules".into(),
+            graph_coverage_digest: "coverage".into(),
+            checks: vec![NativeGateCommand {
+                check_id: "check".into(),
+                program: "sh".into(),
+                args: vec!["-c".into(), "true".into()],
+            }],
+        };
+        let root = std::env::temp_dir().join(format!(
+            "whip-lineage-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let scratch = root.join("projection");
+        let foreign_coordinator = NativeGatePlan {
+            coordinator: "foreign-coordinator".into(),
+            ..plan.clone()
+        };
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &foreign_coordinator,
+                &scratch,
+                &mut LocalProcessFixture,
+            ),
+            "source eligibility or coordinator changed",
+        );
+        assert!(!scratch.exists());
+        let gate = run_fixture_gate(
+            &mut vcs,
+            &candidate.candidate_witness_digest,
+            &plan,
+            &scratch,
+            &mut LocalProcessFixture,
+        )
+        .unwrap();
+        assert_eq!(
+            gate.certificate.lineage_fences,
+            crate::branches::flowing_lineage::capture(
+                &vcs.branches,
+                &vcs.branches
+                    .candidate_witness(&candidate.candidate_witness_digest)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+            .unwrap()
+        );
+        assert_eq!(gate.certificate.lineage_fences.len(), 1);
+        let input = serde_json::to_vec(&(
+            "native-gate-check-input-v2",
+            &gate.certificate.lineage_fences,
+            &plan.attempt_op_id,
+            &candidate.candidate_witness_digest,
+            &candidate.candidate_cut_id,
+            &candidate.candidate_manifest_hash,
+            &plan.policy_digest,
+            &plan.rules_digest,
+            &plan.graph_coverage_digest,
+            &plan.checks[0],
+        ))
+        .unwrap();
+        assert_eq!(
+            gate.certificate.checks[0].input_digest,
+            format!("sha256:{}", crate::chunking::content_hash_hex(&input))
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+        let atoms: String = vcs
+            .branches
+            .test_connection()
+            .query_row(
+                "SELECT atoms_json FROM flowing_contribution_basis WHERE unit_id = 'unit-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit-a'",
+                [],
+            )
+            .unwrap();
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut LocalProcessFixture,
+            ),
+            "source lineage is unknown or ineligible",
+        );
+        assert!(!scratch.exists());
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contribution_basis SET atoms_json = ?1 WHERE unit_id = 'unit-a'",
+                [&atoms],
+            )
+            .unwrap();
+        let db_path = root.join("branches.sqlite");
+        vcs.branches
+            .test_connection()
+            .execute("VACUUM INTO ?1", [db_path.to_str().unwrap()])
+            .unwrap();
+        vcs.branches = BranchStore::open(&db_path).unwrap();
+        struct LoseBasis(rusqlite::Connection);
+        impl NativeGateExecutor for LoseBasis {
+            fn run(
+                &mut self,
+                _check: &NativeGateCommand,
+                _root: &std::path::Path,
+            ) -> NativeGateExecution {
+                self.0
+                    .execute(
+                        "DELETE FROM flowing_contribution_basis WHERE unit_id = 'unit-a'",
+                        [],
+                    )
+                    .unwrap();
+                NativeGateExecution {
+                    exit_code: Some(0),
+                    started: true,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    run_error: None,
+                }
+            }
+        }
+        let count: i64 = vcs
+            .branches
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM flowing_gate_certificates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut LoseBasis(rusqlite::Connection::open(&db_path).unwrap()),
+            ),
+            "source lineage changed during checks",
+        );
+        let after: i64 = vcs
+            .branches
+            .test_connection()
+            .query_row("SELECT COUNT(*) FROM flowing_gate_certificates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, count);
+        drop(vcs);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn native_gate_subject_reader_refuses_missing_coordinates_and_witness() {
         let vcs = workspace();
         for (witness, attempt) in [("", "attempt"), ("witness", "")] {

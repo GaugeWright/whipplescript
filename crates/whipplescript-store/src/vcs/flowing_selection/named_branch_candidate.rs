@@ -758,6 +758,20 @@ mod tests {
                 .unwrap(),
             ReleasePrivateCutOutcome::Released
         );
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .unwrap()
+            .unwrap();
+        let fences = crate::branches::flowing_lineage::capture(&vcs.branches, &witness)
+            .unwrap()
+            .unwrap();
+        // This is the actual content-verified handoff, including a released
+        // origin pin. The receiving named branch supplies current policy;
+        // the transferred twig needs no separate eligibility grant.
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].source_branch_id, "branch");
+        assert_eq!(fences[0].incarnation_id, "branch-inc");
         assert!(matches!(
             vcs.branches
                 .retain_flowing_attempt("attempt-a", &candidate.candidate_witness_digest, "t9")
