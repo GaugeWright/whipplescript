@@ -5,35 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::flowing_admission::{FlowingCandidateWitness, FlowingGateCertificate};
 use super::flowing_fence::{FlowingFenceState, FlowingSourceKind};
-use super::flowing_sources::{ContributionBasis, ContributionDeclaration, FlowingSources};
-use super::{BranchRow, BranchStatus, Branches, CutRow, MAINLINE_BRANCH_ID};
+use super::flowing_sources::FlowingSources;
+use super::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
 use crate::StoreResult;
 
-trait Reader {
-    fn branch(&self, id: &str) -> StoreResult<Option<BranchRow>>;
-    fn cut(&self, id: &str) -> StoreResult<Option<CutRow>>;
-    fn fence(&self, id: &str) -> StoreResult<Option<FlowingFenceState>>;
-    fn unit(&self, id: &str) -> StoreResult<Option<(ContributionDeclaration, ContributionBasis)>>;
-}
-
-struct StoreReader<'a, B>(&'a B);
-impl<B: Branches + FlowingSources> Reader for StoreReader<'_, B> {
-    fn branch(&self, id: &str) -> StoreResult<Option<BranchRow>> {
-        self.0.get_branch(id)
-    }
-    fn cut(&self, id: &str) -> StoreResult<Option<CutRow>> {
-        self.0.get_cut(id)
-    }
-    fn fence(&self, id: &str) -> StoreResult<Option<FlowingFenceState>> {
-        self.0.flowing_source(id)
-    }
-    fn unit(&self, id: &str) -> StoreResult<Option<(ContributionDeclaration, ContributionBasis)>> {
-        Ok(self
-            .0
-            .contribution_declaration(id)?
-            .zip(self.0.contribution_basis(id)?))
-    }
-}
+use super::flowing_read::{Reader, StoreReader};
 
 /// Unknown lineage is distinct from an empty policy scope. Missing retained
 /// facts or ineligible applicable branches never produce a usable vector.
@@ -190,23 +166,6 @@ pub(crate) fn native_capture(
     connection: &rusqlite::Connection,
     witness: &FlowingCandidateWitness,
 ) -> StoreResult<Option<Vec<FlowingFenceState>>> {
-    struct NativeReader<'a>(&'a rusqlite::Connection);
-    impl Reader for NativeReader<'_> {
-        fn branch(&self, id: &str) -> StoreResult<Option<BranchRow>> {
-            super::BranchStore::row_by_id(self.0, id)
-        }
-        fn cut(&self, id: &str) -> StoreResult<Option<CutRow>> {
-            super::BranchStore::cut_by_id(self.0, id)
-        }
-        fn fence(&self, id: &str) -> StoreResult<Option<FlowingFenceState>> {
-            super::flowing_fence::native::read_state(self.0, id)
-        }
-        fn unit(
-            &self,
-            id: &str,
-        ) -> StoreResult<Option<(ContributionDeclaration, ContributionBasis)>> {
-            super::flowing_sources::native::lineage_unit(self.0, id)
-        }
-    }
+    use super::flowing_read::NativeReader;
     capture_from(&NativeReader(connection), witness)
 }

@@ -3232,7 +3232,8 @@ mod tests {
         );
         assert_eq!(gate.certificate.lineage_fences.len(), 1);
         let input = serde_json::to_vec(&(
-            "native-gate-check-input-v2",
+            "native-gate-check-input-v3",
+            &gate.certificate.unit_holders,
             &gate.certificate.lineage_fences,
             &plan.attempt_op_id,
             &candidate.candidate_witness_digest,
@@ -3249,6 +3250,41 @@ mod tests {
             format!("sha256:{}", crate::chunking::content_hash_hex(&input))
         );
         std::fs::remove_dir_all(&scratch).unwrap();
+        assert_eq!(gate.certificate.unit_holders.len(), 2);
+        let principal: String = vcs
+            .branches
+            .test_connection()
+            .query_row(
+                "SELECT principal FROM flowing_private_pins WHERE pin_id = 'pin-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_private_pins SET principal = 'foreign' WHERE pin_id = 'pin-a'",
+                [],
+            )
+            .unwrap();
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut LocalProcessFixture,
+            ),
+            "unit holder is unknown or changed",
+        );
+        assert!(!scratch.exists());
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_private_pins SET principal = ?1 WHERE pin_id = 'pin-a'",
+                [&principal],
+            )
+            .unwrap();
         let atoms: String = vcs
             .branches
             .test_connection()
@@ -3289,6 +3325,34 @@ mod tests {
             .execute("VACUUM INTO ?1", [db_path.to_str().unwrap()])
             .unwrap();
         vcs.branches = BranchStore::open(&db_path).unwrap();
+        struct ChangePin(rusqlite::Connection);
+        impl NativeGateExecutor for ChangePin {
+            fn run(
+                &mut self,
+                _check: &NativeGateCommand,
+                _root: &std::path::Path,
+            ) -> NativeGateExecution {
+                self.0.execute("UPDATE flowing_private_pins SET retained_at = 'changed' WHERE pin_id = 'pin-a'", []).unwrap();
+                NativeGateExecution {
+                    exit_code: Some(0),
+                    started: true,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    run_error: None,
+                }
+            }
+        }
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut ChangePin(rusqlite::Connection::open(&db_path).unwrap()),
+            ),
+            "unit holder changed during checks",
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
         struct LoseBasis(rusqlite::Connection);
         impl NativeGateExecutor for LoseBasis {
             fn run(
@@ -4417,6 +4481,121 @@ mod tests {
             BindContributionBasisOutcome::Bound
         );
         vcs
+    }
+
+    #[test]
+    fn native_flowing_holders_bind_real_handoff_after_origin_pin_release() {
+        let mut vcs = bound_unit_with_flowing_target(true);
+        let effects = prepare_target(&mut vcs, "target-a");
+        assert!(matches!(
+            vcs.handoff_private_selection("handoff-a", &effects, "mediator", "t5")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+        let basis = vcs.branches.contribution_basis("unit-a").unwrap().unwrap();
+        let declaration = vcs
+            .branches
+            .contribution_declaration("unit-a")
+            .unwrap()
+            .unwrap();
+        let witness = crate::branches::flowing_admission::FlowingCandidateWitness {
+            contribution_id: "review".into(),
+            revision_sequence: 1,
+            source_branch_id: "branch".into(),
+            source_incarnation_id: "branch-inc".into(),
+            source_cut_id: "target-a".into(),
+            source_manifest_hash: vcs
+                .branches
+                .get_cut("target-a")
+                .unwrap()
+                .unwrap()
+                .manifest_hash,
+            expected_trunk_cut_id: None,
+            candidate_cut_id: "candidate".into(),
+            candidate_manifest_hash: "candidate-manifest".into(),
+            source_atoms_digest: "atoms".into(),
+            units: vec![FlowingSelectedUnit {
+                unit_id: "unit-a".into(),
+                basis_digest: basis.basis_digest,
+                principal: declaration.principal,
+                intent: declaration.intent,
+                outcome: FlowingUnitOutcome::Applied,
+            }],
+        };
+        let before = crate::branches::flowing_holders::capture(&vcs.branches, &witness)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before[0].handoff_op_id.as_deref(), Some("handoff-a"));
+        vcs.branches.test_connection().execute("UPDATE flowing_private_pins SET released_at = 't6', released_by = 'author', release_reason = 'transferred' WHERE pin_id = 'pin-a'", []).unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE branches SET status = 'adopted' WHERE branch_id = 'twig'",
+                [],
+            )
+            .unwrap();
+        let mut changed = witness.clone();
+        changed.source_manifest_hash = "wrong".into();
+        assert!(
+            crate::branches::flowing_holders::capture(&vcs.branches, &changed)
+                .unwrap()
+                .is_none()
+        );
+        changed = witness.clone();
+        changed.units.push(changed.units[0].clone());
+        assert!(
+            crate::branches::flowing_holders::capture(&vcs.branches, &changed)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::branches::flowing_holders::capture(&vcs.branches, &witness).unwrap(),
+            Some(before.clone())
+        );
+        assert_eq!(
+            crate::branches::flowing_holders::native_capture(
+                vcs.branches.test_connection(),
+                &witness
+            )
+            .unwrap(),
+            Some(before)
+        );
+        for (field, value) in [
+            ("original_principal", "wrong"),
+            ("source_basis_digest", "wrong"),
+            ("target_after_manifest_hash", "wrong"),
+            ("target_after_cut_id", "twig-a"),
+        ] {
+            let original: String = vcs
+                .branches
+                .test_connection()
+                .query_row(
+                    &format!("SELECT {field} FROM flowing_handoffs WHERE unit_id = 'unit-a'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            vcs.branches
+                .test_connection()
+                .execute(
+                    &format!("UPDATE flowing_handoffs SET {field} = ?1 WHERE unit_id = 'unit-a'"),
+                    [value],
+                )
+                .unwrap();
+            assert!(
+                crate::branches::flowing_holders::capture(&vcs.branches, &witness)
+                    .unwrap()
+                    .is_none(),
+                "{field}"
+            );
+            vcs.branches
+                .test_connection()
+                .execute(
+                    &format!("UPDATE flowing_handoffs SET {field} = ?1 WHERE unit_id = 'unit-a'"),
+                    [&original],
+                )
+                .unwrap();
+        }
     }
 
     #[test]

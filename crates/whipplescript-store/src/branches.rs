@@ -17,7 +17,9 @@
 
 pub mod flowing_admission;
 pub mod flowing_fence;
+pub mod flowing_holders;
 pub mod flowing_lineage;
+mod flowing_read;
 pub mod flowing_rewrite;
 pub mod flowing_sources;
 #[cfg(feature = "native")]

@@ -935,6 +935,13 @@ impl FlowingAdmissions for BranchStore {
         ) {
             return Ok(Refused(R::LineageChanged));
         }
+        let Some(holders) = crate::branches::flowing_holders::native_capture(&tx, &witness)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(Refused(R::HolderChanged))
+            return Ok(Refused(R::HolderUnavailable));
+        };
+        if !crate::branches::flowing_holders::matches_certificate(&holders, &certificate) {
+            return Ok(Refused(R::HolderChanged));
+        }
         let Some(pin) = read_attempt_pin(&tx, &request.op_id)? else {
             return Ok(Refused(R::AttemptPinMissing));
         };
@@ -1220,6 +1227,7 @@ mod tests {
             expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
             candidate_cut_id: request.candidate_cut_id.clone(),
             candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            unit_holders: Vec::new(),
             lineage_fences: Vec::new(),
             source_eligibility_epoch: request.expected_eligibility_epoch,
             source_owner_epoch: request.expected_owner_epoch,
@@ -1356,6 +1364,59 @@ mod tests {
             store.admit_flowing_prefix(&attempt).unwrap(),
             FlowingAdmissionOutcome::Admitted(_)
         ));
+    }
+
+    #[test]
+    fn native_holder_evidence_is_rechecked_inside_admission() {
+        for (sql_text, refusal) in [
+            ("UPDATE flowing_private_pins SET principal = 'foreign' WHERE pin_id = 'pin'", FlowingAdmissionRefusal::HolderUnavailable),
+            ("UPDATE flowing_private_pins SET manifest_hash = 'wrong' WHERE pin_id = 'pin'", FlowingAdmissionRefusal::HolderUnavailable),
+            ("UPDATE flowing_contributions SET scope_digest = 'changed' WHERE unit_id = 'unit-a'", FlowingAdmissionRefusal::HolderChanged),
+            ("UPDATE flowing_private_pins SET retained_at = 'changed' WHERE pin_id = 'pin'", FlowingAdmissionRefusal::HolderChanged),
+        ] {
+            let mut store = fixture();
+            let mut attempt = request("unit-a", "holder-attempt");
+            pin_attempt(&mut store, &attempt);
+            let mut certificate = certificate_for(&attempt);
+            certificate.lineage_fences = crate::branches::flowing_lineage::capture(&store, &witness_for(&attempt)).unwrap().unwrap();
+            certificate.unit_holders = crate::branches::flowing_holders::capture(&store, &witness_for(&attempt)).unwrap().unwrap();
+            attempt.certificate_handle = certificate.handle().unwrap();
+            insert_gate_certificate(&store, &certificate);
+            store.connection.execute(sql_text, []).unwrap();
+            assert_eq!(store.admit_flowing_prefix(&attempt).unwrap(), FlowingAdmissionOutcome::Refused(refusal));
+            assert!(store.admitted_unit_operation("unit-a").unwrap().is_none());
+            assert!(store.flowing_admission_receipt(&attempt.op_id).unwrap().is_none());
+            assert!(store.get_branch(MAINLINE_BRANCH_ID).unwrap().unwrap().head_cut_id.is_none());
+            assert!(store.flowing_attempt_pin(&attempt.op_id).unwrap().unwrap().released_at.is_none());
+        }
+        let mut store = fixture();
+        let mut attempt = request("unit-a", "current-holder");
+        pin_attempt(&mut store, &attempt);
+        let mut certificate = certificate_for(&attempt);
+        certificate.lineage_fences =
+            crate::branches::flowing_lineage::capture(&store, &witness_for(&attempt))
+                .unwrap()
+                .unwrap();
+        certificate.unit_holders =
+            crate::branches::flowing_holders::capture(&store, &witness_for(&attempt))
+                .unwrap()
+                .unwrap();
+        attempt.certificate_handle = certificate.handle().unwrap();
+        insert_gate_certificate(&store, &certificate);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        // Legacy certificates keep their identity, but require a real matching pin.
+        let mut store = fixture();
+        let attempt = request("unit-a", "legacy-holder");
+        pin_attempt(&mut store, &attempt);
+        let sql_text = "UPDATE flowing_private_pins SET cut_id = 'candidate' WHERE pin_id = 'pin'";
+        store.connection.execute(sql_text, []).unwrap();
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::HolderUnavailable)
+        );
     }
 
     #[test]

@@ -256,6 +256,8 @@ pub struct FlowingGateCertificate {
     pub candidate_manifest_hash: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lineage_fences: Vec<super::flowing_fence::FlowingFenceState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unit_holders: Vec<super::flowing_holders::FlowingUnitHolder>,
     pub source_eligibility_epoch: i64,
     pub source_owner_epoch: i64,
     pub coordinator: String,
@@ -268,7 +270,9 @@ pub struct FlowingGateCertificate {
 
 impl FlowingGateCertificate {
     pub fn handle(&self) -> crate::StoreResult<String> {
-        let version = if self.lineage_fences.is_empty() {
+        let version = if !self.unit_holders.is_empty() {
+            "native-gate-certificate-v3"
+        } else if self.lineage_fences.is_empty() {
             "native-gate-certificate-v1"
         } else {
             "native-gate-certificate-v2"
@@ -288,6 +292,16 @@ impl FlowingGateCertificate {
             && self.source_eligibility_epoch == request.expected_eligibility_epoch
             && self.source_owner_epoch == request.expected_owner_epoch
             && self.coordinator == request.coordinator
+            && (self.unit_holders.is_empty()
+                || (self.unit_holders.len() == request.units.len()
+                    && self
+                        .unit_holders
+                        .iter()
+                        .zip(&request.units)
+                        .all(|(holder, selected)| {
+                            holder.unit_id == selected.unit_id
+                                && holder.holder_branch_id == request.source_branch_id
+                        })))
     }
 
     pub fn admission_refusal(&self) -> Option<FlowingAdmissionRefusal> {
@@ -318,6 +332,23 @@ impl FlowingGateCertificate {
                     || fence.held
                     || fence.revision.is_some()
                     || !fence.admission_enabled
+            })
+        {
+            return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
+        }
+        let mut holder_units = std::collections::BTreeSet::new();
+        if (!self.unit_holders.is_empty() && self.lineage_fences.is_empty())
+            || self.unit_holders.iter().any(|holder| {
+                holder.unit_id.trim().is_empty()
+                    || !holder_units.insert(&holder.unit_id)
+                    || holder.holder_branch_id.trim().is_empty()
+                    || holder.holder_cut_id.trim().is_empty()
+                    || holder.holder_manifest_hash.trim().is_empty()
+                    || holder.proof_digest.trim().is_empty()
+                    || holder
+                        .handoff_op_id
+                        .as_ref()
+                        .is_some_and(|op| op.trim().is_empty())
             })
         {
             return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
@@ -417,6 +448,8 @@ pub enum FlowingAdmissionRefusal {
     GatePlanIncomplete,
     LineageUnavailable,
     LineageChanged,
+    HolderUnavailable,
+    HolderChanged,
     GateFailed,
     GateUnrun,
     UnitMissing { unit_id: String },
@@ -687,6 +720,7 @@ mod tests {
             expected_trunk_cut_id: request.expected_trunk_cut_id.clone(),
             candidate_cut_id: request.candidate_cut_id.clone(),
             candidate_manifest_hash: request.candidate_manifest_hash.clone(),
+            unit_holders: Vec::new(),
             lineage_fences: Vec::new(),
             source_eligibility_epoch: request.expected_eligibility_epoch,
             source_owner_epoch: request.expected_owner_epoch,
@@ -747,6 +781,70 @@ mod tests {
         );
         next.lineage_fences[0].eligibility_epoch += 1;
         assert_ne!(next.handle().unwrap(), malformed.handle().unwrap());
+    }
+
+    #[test]
+    fn holder_certificate_binds_order_and_preserves_old_serialized_identity() {
+        let mut certificate = gate_certificate(&request());
+        assert!(serde_json::to_value(&certificate)
+            .unwrap()
+            .get("unit_holders")
+            .is_none());
+        certificate
+            .lineage_fences
+            .push(crate::branches::flowing_fence::FlowingFenceState {
+                source_branch_id: "twig".into(),
+                incarnation_id: "inc".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "coordinator".into(),
+                owner_epoch: 0,
+                eligibility_epoch: 0,
+                held: false,
+                revision: None,
+                admission_enabled: true,
+                opened_at: "t1".into(),
+            });
+        let old_value = serde_json::to_value(&certificate).unwrap();
+        assert!(old_value.get("unit_holders").is_none());
+        let restored: FlowingGateCertificate = serde_json::from_value(old_value).unwrap();
+        assert_eq!(certificate.handle().unwrap(), restored.handle().unwrap());
+        let old_handle = certificate.handle().unwrap();
+        certificate
+            .unit_holders
+            .push(crate::branches::flowing_holders::FlowingUnitHolder {
+                unit_id: request().units[0].unit_id.clone(),
+                holder_branch_id: request().source_branch_id,
+                holder_cut_id: "source".into(),
+                holder_manifest_hash: "source-manifest".into(),
+                handoff_op_id: None,
+                proof_digest: "proof".into(),
+            });
+        assert_eq!(certificate.admission_refusal(), None);
+        assert!(certificate.matches_request(&request()));
+        assert_ne!(certificate.handle().unwrap(), old_handle);
+        let mut changed = certificate.clone();
+        changed.unit_holders[0].proof_digest = "changed".into();
+        assert_ne!(changed.handle().unwrap(), certificate.handle().unwrap());
+        changed.unit_holders[0].unit_id = "wrong".into();
+        assert!(!changed.matches_request(&request()));
+        changed = certificate.clone();
+        changed.unit_holders.push(changed.unit_holders[0].clone());
+        assert_eq!(
+            changed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        changed = certificate.clone();
+        changed.unit_holders[0].handoff_op_id = Some(" ".into());
+        assert_eq!(
+            changed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        changed = certificate;
+        changed.lineage_fences.clear();
+        assert_eq!(
+            changed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
     }
 
     #[test]

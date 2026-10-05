@@ -170,6 +170,20 @@ pub(crate) fn lineage_unit(
     Ok(read_declaration(connection, unit_id)?.zip(read_basis(connection, unit_id)?))
 }
 
+pub(crate) fn holder_pin(
+    connection: &Connection,
+    pin_id: &str,
+) -> StoreResult<Option<PrivateCutPin>> {
+    read_pin(connection, pin_id)
+}
+
+pub(crate) fn holder_handoff(
+    connection: &Connection,
+    unit_id: &str,
+) -> StoreResult<Option<HandoffReceipt>> {
+    read_handoff(connection, HandoffLookup::Unit, unit_id)
+}
+
 #[derive(Clone, Copy)]
 enum HandoffLookup {
     Operation,
