@@ -15353,6 +15353,7 @@ pub(crate) mod tests {
                 constructs: None,
                 declarations: None,
                 package_calls: None,
+                provider_bindings: None,
             }
         };
         let mut store = store();
@@ -15719,6 +15720,7 @@ pub(crate) mod tests {
             constructs: None,
             declarations: None,
             package_calls: None,
+            provider_bindings: None,
         };
         let mut store = store();
         let accepted = store
@@ -15845,6 +15847,7 @@ pub(crate) mod tests {
             constructs: None,
             declarations: None,
             package_calls: None,
+            provider_bindings: None,
         };
         let mut store = store();
         let original = store

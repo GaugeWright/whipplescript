@@ -47,6 +47,92 @@ pub struct ProgramImportWitness {
     /// examined. It does not classify other provider or content handles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_calls: Option<ProgramPackageCallCapture>,
+    /// `None` on a legacy witness leaves provider-binding paths unknown.
+    /// `Some` inventories compiler-owned selectors, not resolved external
+    /// identities or live update edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bindings: Option<ProgramProviderBindingCapture>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramProviderBindingScope {
+    DeclarationsAndEffectsV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramProviderTargetResolution {
+    StaticDeclaration,
+    DynamicExpression,
+}
+
+/// A provider spelling is a local selector. `None` retains an omitted clause;
+/// its meaning depends on the site (for example a file store defaults to local,
+/// while a coercion may be chosen by the runtime selection ladder).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "site_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProgramProviderBindingSite {
+    Harness {
+        name: String,
+        kind: String,
+    },
+    Tracker {
+        name: String,
+        provider: String,
+    },
+    Channel {
+        name: String,
+        provider: String,
+    },
+    Vault {
+        name: String,
+        provider: Option<String>,
+    },
+    FileStore {
+        name: String,
+        provider: Option<String>,
+    },
+    Source {
+        name: String,
+        provider: String,
+    },
+    Agent {
+        name: String,
+        provider: Option<String>,
+        harness: Option<String>,
+    },
+    Coerce {
+        name: String,
+        provider: Option<String>,
+    },
+    AgentTell {
+        rule: String,
+        effect: String,
+        agent: String,
+        target_resolution: ProgramProviderTargetResolution,
+    },
+    SchemaCoerce {
+        rule: String,
+        effect: String,
+        declaration: Option<String>,
+        prompt_provider: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramProviderBindingUse {
+    pub occurrence: usize,
+    pub site: ProgramProviderBindingSite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramProviderBindingCapture {
+    pub scope: ProgramProviderBindingScope,
+    pub examined: Vec<ProgramProviderBindingUse>,
+    pub digest: String,
 }
 
 /// The fields of `IrPackageCall` have fixed, deliberately narrow meanings:
@@ -445,6 +531,72 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             ));
         }
     }
+    if let Some(bindings) = &witness.provider_bindings {
+        if !is_digest(&bindings.digest)
+            || bindings
+                .examined
+                .iter()
+                .enumerate()
+                .any(|(index, use_site)| {
+                    if use_site.occurrence != index {
+                        return true;
+                    }
+                    match &use_site.site {
+                        ProgramProviderBindingSite::Harness { name, kind } => {
+                            name.is_empty() || kind.is_empty()
+                        }
+                        ProgramProviderBindingSite::Tracker { name, provider }
+                        | ProgramProviderBindingSite::Channel { name, provider }
+                        | ProgramProviderBindingSite::Source { name, provider } => {
+                            name.is_empty() || provider.is_empty()
+                        }
+                        ProgramProviderBindingSite::Vault { name, provider }
+                        | ProgramProviderBindingSite::FileStore { name, provider }
+                        | ProgramProviderBindingSite::Coerce { name, provider } => {
+                            name.is_empty() || provider.as_ref().is_some_and(String::is_empty)
+                        }
+                        ProgramProviderBindingSite::Agent {
+                            name,
+                            provider,
+                            harness,
+                        } => {
+                            name.is_empty()
+                                || provider.as_ref().is_some_and(String::is_empty)
+                                || harness.as_ref().is_some_and(String::is_empty)
+                                || (provider.is_some() && harness.is_some())
+                        }
+                        ProgramProviderBindingSite::AgentTell {
+                            rule,
+                            effect,
+                            agent,
+                            target_resolution: _,
+                        } => rule.is_empty() || effect.is_empty() || agent.is_empty(),
+                        ProgramProviderBindingSite::SchemaCoerce {
+                            rule,
+                            effect,
+                            declaration,
+                            prompt_provider,
+                        } => {
+                            rule.is_empty()
+                                || effect.is_empty()
+                                || declaration.as_ref().is_some_and(String::is_empty)
+                                || prompt_provider.as_ref().is_some_and(String::is_empty)
+                                || (declaration.is_some() && prompt_provider.is_some())
+                        }
+                    }
+                })
+        {
+            return Err(StoreError::Conflict(
+                "provider-binding witness has incomplete or unordered uses".into(),
+            ));
+        }
+        let examined_json = serde_json::to_string(&bindings.examined)?;
+        if crate::items::sha256_hex(&examined_json) != bindings.digest {
+            return Err(StoreError::Conflict(
+                "provider-binding witness digest differs from its uses".into(),
+            ));
+        }
+    }
     let json = serde_json::to_string(witness)?;
     let digest = crate::items::sha256_hex(&json);
     Ok((digest, json))
@@ -543,6 +695,7 @@ mod tests {
             constructs: None,
             declarations: None,
             package_calls: None,
+            provider_bindings: None,
         }
     }
 
@@ -590,6 +743,75 @@ mod tests {
         assert!(matches!(
             encode(&checked),
             Err(StoreError::Conflict(message)) if message.contains("package-call witness digest differs")
+        ));
+    }
+
+    #[test]
+    fn provider_binding_witness_keeps_legacy_unknown_and_refuses_corrupt_capture() {
+        let legacy = witness(LOCK);
+        let (_, legacy_json) = encode(&legacy).unwrap();
+        assert!(!legacy_json.contains("provider_bindings"));
+
+        let examined = vec![
+            ProgramProviderBindingUse {
+                occurrence: 0,
+                site: ProgramProviderBindingSite::Agent {
+                    name: "worker".into(),
+                    provider: Some("codex".into()),
+                    harness: None,
+                },
+            },
+            ProgramProviderBindingUse {
+                occurrence: 1,
+                site: ProgramProviderBindingSite::AgentTell {
+                    rule: "ask".into(),
+                    effect: "effect1".into(),
+                    agent: "worker".into(),
+                    target_resolution: ProgramProviderTargetResolution::StaticDeclaration,
+                },
+            },
+        ];
+        let mut checked = legacy;
+        checked.provider_bindings = Some(ProgramProviderBindingCapture {
+            scope: ProgramProviderBindingScope::DeclarationsAndEffectsV1,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+
+        let mut malformed = checked.clone();
+        let bindings = malformed.provider_bindings.as_mut().unwrap();
+        bindings.examined[1].occurrence = 0;
+        bindings.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&bindings.examined).unwrap());
+        assert!(matches!(
+            encode(&malformed),
+            Err(StoreError::Conflict(message)) if message.contains("provider-binding witness has incomplete or unordered uses")
+        ));
+
+        let mut double_binding = checked.clone();
+        let bindings = double_binding.provider_bindings.as_mut().unwrap();
+        bindings.examined[0].site = ProgramProviderBindingSite::Agent {
+            name: "worker".into(),
+            provider: Some("codex".into()),
+            harness: Some("other".into()),
+        };
+        bindings.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&bindings.examined).unwrap());
+        assert!(matches!(
+            encode(&double_binding),
+            Err(StoreError::Conflict(message)) if message.contains("provider-binding witness has incomplete or unordered uses")
+        ));
+
+        let bindings = checked.provider_bindings.as_mut().unwrap();
+        bindings.examined[0].site = ProgramProviderBindingSite::Agent {
+            name: "worker".into(),
+            provider: Some("changed".into()),
+            harness: None,
+        };
+        assert!(matches!(
+            encode(&checked),
+            Err(StoreError::Conflict(message)) if message.contains("provider-binding witness digest differs from its uses")
         ));
     }
 

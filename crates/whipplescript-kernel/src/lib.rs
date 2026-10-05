@@ -73,6 +73,7 @@ pub mod package_registry;
 pub mod principal;
 pub mod program_artifact;
 pub mod provider;
+pub mod provider_coverage;
 pub mod provider_trust;
 pub mod resolution_recording;
 pub mod result_contract;

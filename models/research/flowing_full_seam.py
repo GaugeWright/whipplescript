@@ -13,13 +13,14 @@ gets a checked admission and per-unit receipt. Independent norm/ref outages
 block admission and require recovery of their own authority state; fail-open
 mutants reach an admission with one unavailable. A later tail retains its
 selected prefix in source ancestry; abandonment or rewrite removes it, so only
-the latter invalidate an already checked candidate. The model still abstracts
-real cut contents, semantic edge discovery, certificate authenticity, physical
+the latter invalidate an already checked candidate. Immutable retained cut
+records now supply the selected source atoms. The model still abstracts the
+real merge engine, semantic edge discovery, certificate authenticity, physical
 lock scheduling and cross-store crash transactions.
 The mixed-source mode additionally carries one unit through B, C and D, and
 checks each origin's Hold and policy epoch at the same norm/ref CAS. Transport
-and policy storage are abstract here; the source atoms and receipt must still
-be derived from real cuts in production.
+and policy storage are abstract here; production must derive the same evidence
+from its real cuts.
 """
 
 from collections import deque
@@ -48,6 +49,36 @@ ATOMS = (
 BRANCHES = ("B", "C", "D")
 
 
+@dataclass(frozen=True)
+class Cut:
+    line: str
+    identity: int
+    parent: tuple[str, int] | None
+    atoms: tuple[str, ...]
+
+
+GENESIS_CUTS = (
+    Cut("branch", 0, None, ()),
+    Cut("twig0", 0, None, ()),
+    Cut("twig1", 0, None, ()),
+)
+
+
+def exact_cut(cuts: tuple[Cut, ...], line: str, identity: int) -> Cut:
+    found = [cut for cut in cuts if cut.line == line and cut.identity == identity]
+    assert len(found) == 1, (line, identity, found)
+    return found[0]
+
+
+def append_cut(cuts: tuple[Cut, ...], cut: Cut) -> tuple[Cut, ...]:
+    assert not any(existing.line == cut.line and existing.identity == cut.identity
+                   for existing in cuts), "an immutable cut id was reused"
+    if cut.parent is not None:
+        parent = exact_cut(cuts, *cut.parent)
+        assert cut.atoms[:len(parent.atoms)] == parent.atoms, "cut lost its parent changes"
+    return cuts + (cut,)
+
+
 def holder_kind(source_kind: str) -> str:
     return "branch" if source_kind == "mixed" else source_kind
 
@@ -65,6 +96,7 @@ def policy_current(state, candidate, lineage: tuple[str, ...]) -> bool:
 @dataclass(frozen=True)
 class Candidate:
     selected: tuple[int, ...]
+    source_cut: Cut
     before: tuple[int, int]
     source_atoms: tuple[str, ...]
     certificate_atoms: tuple[str, ...]
@@ -82,6 +114,7 @@ def certificate_digest(candidate: Candidate) -> str:
     """Bind the candidate fields the gate verified and the ref must consume."""
     payload = {
         "selected": candidate.selected,
+        "source_cut": candidate.source_cut.__dict__,
         "before": candidate.before,
         "source_atoms": candidate.certificate_atoms,
         "output_atoms": candidate.output_atoms,
@@ -96,16 +129,22 @@ def certificate_digest(candidate: Candidate) -> str:
     return sha256(encoded).hexdigest()
 
 
-def source_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
+def declared_atoms(selected: tuple[int, ...]) -> tuple[str, ...]:
     return tuple(atom.identity for atom in ATOMS if atom.unit in selected)
 
 
-def candidate_for(selected: tuple[int, ...], cut: int,
+def source_atoms(source_cut: Cut, selected: tuple[int, ...]) -> tuple[str, ...]:
+    by_identity = {atom.identity: atom for atom in ATOMS}
+    return tuple(identity for identity in source_cut.atoms
+                 if identity in by_identity and by_identity[identity].unit in selected)
+
+
+def candidate_for(selected: tuple[int, ...], source_cut: Cut,
                   before: tuple[int, int], actual_lineage: tuple[str, ...],
                   recorded_lineage: tuple[str, ...],
                   policy_epochs: tuple[int, int, int], defect: str = "") -> Candidate:
-    roots = source_atoms(selected)
-    output_change_id = f"mixed-output:{cut}"
+    roots = source_atoms(source_cut, selected)
+    output_change_id = f"mixed-output:{source_cut.identity}"
     certificate = ((output_change_id,) if defect == "output_id_as_witness"
                    else roots[1:] if defect == "omit_source_atom" else roots)
     output = roots[1:] if defect == "omit_predecessor_effect" else roots
@@ -117,7 +156,7 @@ def candidate_for(selected: tuple[int, ...], cut: int,
     outcomes = (("applied", "applied") if defect == "misstate_neutralization"
                 else normal_outcomes)
     return Candidate(
-        selected, before, roots, certificate, output,
+        selected, source_cut, before, roots, certificate, output,
         (2 if defect == "stale_dependent_basis" else 1) if 1 in selected else None,
         (0, 1) if selected == (0, 1) else (1, before[1]),
         outcomes, output_change_id, actual_lineage, recorded_lineage,
@@ -126,7 +165,13 @@ def candidate_for(selected: tuple[int, ...], cut: int,
 
 
 def candidate_error(candidate: Candidate) -> str | None:
-    expected = source_atoms(candidate.selected)
+    expected = declared_atoms(candidate.selected)
+    known = {atom.identity for atom in ATOMS}
+    if any(identity not in known
+           for identity in candidate.source_cut.atoms):
+        return "retained source cut contains an unclassified source change"
+    if source_atoms(candidate.source_cut, candidate.selected) != expected:
+        return "retained source cut omitted a selected declared change"
     if candidate.source_atoms != expected or candidate.certificate_atoms != expected:
         return "certificate omitted a selected source atom"
     if candidate.output_atoms != expected:
@@ -158,10 +203,26 @@ def candidate_error(candidate: Candidate) -> str | None:
     return None
 
 
+def source_cut_error(cuts: tuple[Cut, ...], candidate: Candidate) -> str | None:
+    cut = candidate.source_cut
+    if cut != exact_cut(cuts, cut.line, cut.identity):
+        return "certificate names a different retained source cut"
+    if cut.line == "D":
+        for child_line, parent_line in (("D", "C"), ("C", "B")):
+            child = exact_cut(cuts, child_line, cut.identity)
+            if child.parent != (parent_line, cut.identity):
+                return "mixed transport cut omitted its source ancestry"
+            parent = exact_cut(cuts, parent_line, cut.identity)
+            if child.atoms[:len(parent.atoms)] != parent.atoms:
+                return "mixed transport cut omitted its source changes"
+    return None
+
+
 @dataclass(frozen=True)
 class State:
     source_kind: str = "branch"  # named branch, mixed transport, or direct twig
     trunk_content: tuple[int, int] = (0, 0)
+    cuts: tuple[Cut, ...] = GENESIS_CUTS
     admission: gate.State = field(default_factory=gate.State)
     obligations: work.State = field(default_factory=work.State)
     # Active-head ancestry, distinct from retained content bodies. A later
@@ -183,6 +244,7 @@ class State:
     candidate_available: bool = False
     frontier_reconciled: bool = False
     transport_stage: int = 0
+    transport_cut_id: int = -1
     actual_lineage: tuple[str, ...] = ("D",)
     recorded_lineage: tuple[str, ...] = ("D",)
     policy_epochs: tuple[int, int, int] = (0, 0, 0)
@@ -224,15 +286,28 @@ def steps(state: State, defect: str = ""):
         yield "ref_restore", replace(state, obligations=replace(w, ref_up=True))
     if state.source_kind == "mixed" and not a.admission:
         if state.transport_stage == 0 and w.units[0] == "branch":
+            source = exact_cut(state.cuts, "B", w.branch_cut)
             yield "transport_B_to_C", replace(
-                state, transport_stage=1, actual_lineage=("B", "C"),
+                state, transport_stage=1, transport_cut_id=source.identity,
+                actual_lineage=("B", "C"),
                 recorded_lineage=("B", "C"),
+                cuts=append_cut(state.cuts, Cut(
+                    "C", source.identity, ("B", source.identity), source.atoms,
+                )),
             )
         if state.transport_stage == 1:
+            source = exact_cut(state.cuts, "C", state.transport_cut_id)
+            transported = Cut("D", source.identity,
+                              None if defect == "transport_forgets_parent"
+                              else ("C", source.identity),
+                              () if defect == "transport_omits_atom" else source.atoms)
             yield "transport_C_to_D", replace(
                 state, transport_stage=2, actual_lineage=("B", "C", "D"),
                 recorded_lineage=(("C", "D") if defect == "lose_origin"
                                   else ("B", "C", "D")),
+                cuts=(state.cuts + (transported,)
+                      if defect == "transport_omits_atom" else
+                      append_cut(state.cuts, transported)),
             )
     if state.source_kind == "mixed" and state.transport_stage == 2 and not a.admission:
         if not state.hold_used:
@@ -262,8 +337,20 @@ def steps(state: State, defect: str = ""):
                      if state.source_kind == "twig" else
                      replace(w, branch_cut=next_cut,
                              epoch=w.epoch + 1))
+        rewritten_cuts = append_cut(state.cuts, Cut(
+            "twig0" if state.source_kind == "twig" else "branch",
+            next_cut, None,
+            exact_cut(state.cuts,
+                      "twig0" if state.source_kind == "twig" else "branch",
+                      source_head(state)).atoms,
+        ))
+        if state.source_kind == "mixed":
+            rewritten_cuts = append_cut(rewritten_cuts, Cut(
+                "B", next_cut, None, exact_cut(state.cuts, "B", source_head(state)).atoms,
+            ))
         yield "rewrite_selected_prefix", replace(
             state, obligations=rewritten,
+            cuts=rewritten_cuts,
             source_ancestry=(next_cut,),
             source_rewrite_used=True,
         )
@@ -282,17 +369,23 @@ def steps(state: State, defect: str = ""):
             if state.source_kind != "twig":
                 if w.units[0] != "branch" or not w.branch_pins[0]:
                     continue
-                source_cut = w.branch_cut
+                source_cut = (state.transport_cut_id if state.source_kind == "mixed"
+                              else w.branch_cut)
             else:
                 if w.units[0] != "twig" or not w.twig_pins[0]:
                     continue
                 source_cut = w.twig_cuts[0]
+            source_evidence = exact_cut(
+                state.cuts, ("twig0" if state.source_kind == "twig" else
+                             "D" if state.source_kind == "mixed" else "branch"),
+                source_cut,
+            )
             selections = ((0,),)
             if (state.source_kind == "branch" and
                     w.units[1] == "branch" and w.branch_pins[1]):
                 selections += ((0, 1),)
             for selected in selections:
-                candidate = candidate_for(selected, source_cut,
+                candidate = candidate_for(selected, source_evidence,
                                           state.trunk_content,
                                           state.actual_lineage,
                                           state.recorded_lineage,
@@ -303,6 +396,13 @@ def steps(state: State, defect: str = ""):
                     "omit_source_atom", "omit_predecessor_effect",
                     "stale_dependent_basis", "misstate_neutralization",
                     "output_id_as_witness",
+                    "handoff_omits_atom",
+                    "handoff_invents_atom",
+                    "transport_omits_atom",
+                ):
+                    continue
+                if source_cut_error(state.cuts, candidate) and defect not in (
+                    "transport_forgets_parent", "transport_omits_atom"
                 ):
                     continue
                 name = "gate_pass_both" if len(selected) == 2 else event
@@ -421,6 +521,38 @@ def steps(state: State, defect: str = ""):
                 yield event, replace(state, obligations=next_w)
         else:
             ancestry = state.source_ancestry
+            cuts = state.cuts
+            if event.startswith("write"):
+                unit = int(event.removeprefix("write"))
+                line = f"twig{unit}"
+                parent = exact_cut(cuts, line, w.twig_cuts[unit])
+                cuts = append_cut(cuts, Cut(
+                    line, next_w.twig_cuts[unit], (line, parent.identity),
+                    parent.atoms + declared_atoms((unit,)),
+                ))
+            elif event.startswith("handoff"):
+                unit = int(event.removeprefix("handoff"))
+                parent = exact_cut(cuts, "branch", w.branch_cut)
+                twig = exact_cut(cuts, f"twig{unit}", w.twig_cuts[unit])
+                moved = source_atoms(twig, (unit,))
+                if defect == "handoff_omits_atom":
+                    moved = ()
+                elif defect == "handoff_invents_atom":
+                    moved += (f"unclassified:{unit}",)
+                cuts = append_cut(cuts, Cut(
+                    "branch", next_w.branch_cut, ("branch", parent.identity),
+                    parent.atoms + moved,
+                ))
+                if state.source_kind == "mixed":
+                    cuts = append_cut(cuts, Cut(
+                        "B", next_w.branch_cut,
+                        ("B", w.branch_cut) if w.branch_cut else ("branch", w.branch_cut),
+                        parent.atoms + moved,
+                    ))
+            elif event == "abandon_dependent_closure":
+                cuts = append_cut(cuts, Cut("branch", next_w.branch_cut, None, ()))
+                if state.source_kind == "mixed":
+                    cuts = append_cut(cuts, Cut("B", next_w.branch_cut, None, ()))
             if state.source_kind == "twig":
                 if next_w.twig_cuts[0] != w.twig_cuts[0]:
                     ancestry += (next_w.twig_cuts[0],)
@@ -429,7 +561,7 @@ def steps(state: State, defect: str = ""):
                             if event == "abandon_dependent_closure" else
                             ancestry + (next_w.branch_cut,))
             yield event, replace(state, obligations=next_w,
-                                 source_ancestry=ancestry)
+                                 source_ancestry=ancestry, cuts=cuts)
 
     if state.candidate is not None:
         if not a.admission and not state.candidate_swapped:
@@ -485,6 +617,8 @@ def violation(state: State):
         candidate = state.admitted_candidate
         if candidate is None:
             return "trunk admission lacks its exact candidate"
+        if problem := source_cut_error(state.cuts, candidate):
+            return problem
         if certificate_digest(candidate) != state.admitted_certificate_digest:
             return "admitted candidate differs from verified certificate digest"
         if candidate.certificate_lineage != candidate.actual_lineage:
@@ -554,6 +688,9 @@ def scenarios():
     ))
     assert both.admitted_candidate is not None
     assert both.admitted_candidate.source_atoms == ("u0:x", "u1:x", "u1:y")
+    assert both.admitted_candidate.source_cut == Cut(
+        "branch", 2, ("branch", 1), ("u0:x", "u1:x", "u1:y")
+    )
     assert both.admitted_candidate.outcomes == ("neutralized", "applied")
     assert both.admitted_candidate.after == (0, 1)
     assert both.trunk_content == (0, 1)
@@ -618,6 +755,10 @@ def scenarios():
     ))
     assert tailed.admitted_source_cut == 1
     assert tailed.admitted_source_ancestry == (0, 1, 2)
+    assert tailed.admitted_candidate.source_cut == Cut(
+        "branch", 1, ("branch", 0), ("u0:x",)
+    )
+    assert exact_cut(tailed.cuts, "branch", 2).atoms == ("u0:x", "u1:x", "u1:y")
     assert tailed.obligations.units == ("accounted", "branch")
     assert tailed.obligations.trunk_receipts == (0,)
     tailed_after_lock = scenario(prefix + (
@@ -660,6 +801,9 @@ def scenarios():
                      State(source_kind="mixed"))
     assert mixed.admitted_candidate.actual_lineage == ("B", "C", "D")
     assert mixed.admitted_candidate.source_atoms == ("u0:x",)
+    assert mixed.admitted_candidate.source_cut == Cut("D", 1, ("C", 1), ("u0:x",))
+    assert exact_cut(mixed.cuts, "C", 1).parent == ("B", 1)
+    assert exact_cut(mixed.cuts, "B", 1).parent == ("branch", 0)
     held_origin = scenario(mixed_prefix + ("gate_pass", "hold_B",
                                            "lock_and_validate_owner0"),
                            State(source_kind="mixed"))
@@ -682,6 +826,10 @@ def lineage_mutants():
         ("ignore_origin_epoch", ("hold_B", "release_B",
                                   "lock_and_validate_owner0", "cas_owner0"),
          "stale origin policy epoch was admitted"),
+        ("transport_omits_atom", ("lock_and_validate_owner0", "cas_owner0"),
+         "mixed transport cut omitted its source changes"),
+        ("transport_forgets_parent", ("lock_and_validate_owner0", "cas_owner0"),
+         "mixed transport cut omitted its source ancestry"),
     ):
         state = State(source_kind="mixed")
         for event in prefix + tail:
@@ -699,6 +847,8 @@ def witness_mutants():
         "handoff1", "gate_pass_both", "lock_and_validate_owner0", "cas_owner0",
     )
     for defect, expected in (
+        ("handoff_omits_atom", "retained source cut omitted a selected declared change"),
+        ("handoff_invents_atom", "retained source cut contains an unclassified source change"),
         ("omit_source_atom", "certificate omitted a selected source atom"),
         ("output_id_as_witness", "certificate omitted a selected source atom"),
         ("omit_predecessor_effect", "candidate omitted a selected source effect"),
@@ -713,6 +863,28 @@ def witness_mutants():
             state = matches[0]
         assert violation(state) == expected, (defect, violation(state))
         print(f"{defect}: {expected}; " + " -> ".join(prefix))
+
+    # A cut id is immutable, and the certificate digest binds the exact cut
+    # record. Replacing that record after gate work cannot borrow its verdict.
+    try:
+        append_cut(GENESIS_CUTS, Cut("branch", 0, None, ("u0:x",)))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a source cut id was reused with changed content")
+    checked = scenario(("write0", "declare0", "handoff0", "gate_pass"))
+    changed = replace(checked, candidate=replace(
+        checked.candidate, source_cut=exact_cut(checked.cuts, "branch", 0)
+    ))
+    assert not any(name.startswith("cas_owner") for name, _ in steps(
+        scenario(("lock_and_validate_owner0",), changed)
+    ))
+    allowed = scenario(("lock_and_validate_owner0",), changed)
+    bypass = [next_state for name, next_state in
+              steps(allowed, "skip_certificate_digest_check")
+              if name == "cas_owner0"]
+    assert len(bypass) == 1
+    assert violation(bypass[0]) == "admitted candidate differs from verified certificate digest"
 
     no_op = State(trunk_content=(1, 0))
     no_op_trace = (

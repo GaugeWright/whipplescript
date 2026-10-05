@@ -1867,6 +1867,10 @@ rule finish
             .package_calls
             .as_ref()
             .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(witness
+            .provider_bindings
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
     }
 
     #[test]
@@ -1906,6 +1910,24 @@ rule finish
         assert_eq!(calls.examined.len(), 2);
         assert_eq!(calls.examined[0].target, "memory.query");
         assert_eq!(calls.examined[1].target, "memory.write");
+        let bindings = witness
+            .provider_bindings
+            .expect("provider selector class inventoried");
+        assert!(bindings.examined.iter().any(|entry| matches!(
+            &entry.site,
+            whipplescript_store::program_imports::ProgramProviderBindingSite::Agent {
+                name,
+                provider: Some(provider),
+                ..
+            } if name == "worker" && provider == "codex"
+        )));
+        assert!(bindings.examined.iter().any(|entry| matches!(
+            &entry.site,
+            whipplescript_store::program_imports::ProgramProviderBindingSite::AgentTell {
+                agent,
+                ..
+            } if agent == "worker"
+        )));
     }
 
     #[test]

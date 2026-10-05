@@ -113,6 +113,7 @@ pub fn capture(
         constructs: None,
         declarations: None,
         package_calls: Some(crate::construct_coverage::capture_package_calls(program)?),
+        provider_bindings: Some(crate::provider_coverage::capture(program)?),
     })
 }
 
@@ -294,6 +295,10 @@ mod tests {
         );
         assert!(stored
             .package_calls
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(stored
+            .provider_bindings
             .as_ref()
             .is_some_and(|capture| capture.examined.is_empty()));
         assert!(kernel

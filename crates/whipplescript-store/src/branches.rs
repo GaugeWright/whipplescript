@@ -23,6 +23,8 @@ mod flowing_read;
 pub mod flowing_rewrite;
 pub mod flowing_sources;
 #[cfg(feature = "native")]
+pub(crate) mod original_candidate;
+#[cfg(feature = "native")]
 mod recorded_merge;
 pub mod resolution_batch;
 pub mod resolution_origin;
