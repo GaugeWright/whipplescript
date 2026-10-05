@@ -225,6 +225,19 @@ pub struct WitnessedWrite {
     pub bytes: u64,
 }
 
+/// Exact proposed native bytes offered to embedding custody before a file
+/// effect. This is preparation, not evidence that the write succeeded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedWorkspaceWrite {
+    pub path: String,
+    pub kind: String,
+    pub content_hash: String,
+    pub bytes: u64,
+}
+
+type WorkspacePayloadRetention =
+    dyn Fn(&PreparedWorkspaceWrite, &[u8]) -> Result<(), String> + Send + Sync;
+
 /// The per-turn workspace witness a resolver hands back when the turn segment
 /// ends (DR-0036 §1; turn-witness.maude). The receipt claims a workspace cut
 /// only from a complete witness — a harness that cannot witness every
@@ -485,6 +498,8 @@ pub struct NativeWorkspaceResolver {
     /// The embedding host's admission of a presented-root rename. Without
     /// one, every rename is refused.
     rename_admission: Option<Box<RenameAdmission>>,
+    /// The embedding owns encrypted custody and original-command binding.
+    payload_retention: Option<Box<WorkspacePayloadRetention>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -600,7 +615,33 @@ impl NativeWorkspaceResolver {
             witness: std::sync::Mutex::new(WitnessState::default()),
             root_renames: std::sync::Mutex::new(Vec::new()),
             rename_admission: None,
+            payload_retention: None,
         })
+    }
+
+    /// Retain exact proposed bytes before applying native file mutations.
+    /// A refusal prevents the file effect and is redacted. This callback grants
+    /// no authority; saved successful workspace evidence remains necessary.
+    pub fn with_payload_retention(
+        mut self,
+        retain: impl Fn(&PreparedWorkspaceWrite, &[u8]) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.payload_retention = Some(Box::new(retain));
+        self
+    }
+
+    fn prepare_payload(&self, path: &str, kind: &str, body: &[u8]) -> Result<(), String> {
+        if let Some(retain) = &self.payload_retention {
+            let prepared = PreparedWorkspaceWrite {
+                path: path.to_owned(),
+                kind: kind.to_owned(),
+                content_hash: sha256_hex(body),
+                bytes: body.len() as u64,
+            };
+            retain(&prepared, body)
+                .map_err(|_| "native workspace payload retention refused".to_owned())?;
+        }
+        Ok(())
     }
 
     /// Admit or refuse each rename of a presented root that a `bash` command
@@ -815,12 +856,17 @@ impl NativeWorkspaceResolver {
         let path = string_argument(arguments, "path")?;
         let content = string_argument(arguments, "content")?;
         let (resolved, stored) = self.resolve_admitted(path, true, view)?;
+        let existed = resolved.exists();
+        self.prepare_payload(
+            &Self::record_path(view, path, &stored),
+            if existed { "modify" } else { "add" },
+            content.as_bytes(),
+        )?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
             reject_symlinks_between(&self.root, parent, path)?;
         }
-        let existed = resolved.exists();
         fs::write(&resolved, content)
             .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
         self.witness_write(
@@ -841,6 +887,11 @@ impl NativeWorkspaceResolver {
             .and_then(Value::as_array)
             .ok_or_else(|| "`edits` must be an array".to_owned())?;
         let (text, applied) = whipplescript_kernel::workspace_edit::apply_edits(text, path, edits)?;
+        self.prepare_payload(
+            &Self::record_path(view, path, &stored),
+            "modify",
+            text.as_bytes(),
+        )?;
         fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
         self.witness_write(
@@ -1293,6 +1344,25 @@ impl NativeWorkspaceResolver {
         for (presented, _) in &removed {
             self.resolve_admitted(presented, true, view)?;
         }
+        // Prepare the complete batch before any filesystem changes or retained
+        // root rename. Earlier prepared payloads are not successful-write facts.
+        let record = |presented: &str, stored: &str| Self::record_path(view, presented, stored);
+        for (presented, stored) in &removed {
+            self.prepare_payload(&record(presented, stored), "delete", &[])?;
+        }
+        for (stored, (path, content)) in &after {
+            if before_stored.get(stored).copied() != Some(*content) {
+                self.prepare_payload(
+                    &record(path, stored),
+                    if before_stored.contains_key(stored) {
+                        "modify"
+                    } else {
+                        "add"
+                    },
+                    content,
+                )?;
+            }
+        }
         for rename in &renames {
             match &self.rename_admission {
                 Some(admit) => admit(rename)?,
@@ -1309,7 +1379,6 @@ impl NativeWorkspaceResolver {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(renames);
 
-        let record = |presented: &str, stored: &str| Self::record_path(view, presented, stored);
         for (presented, stored) in &removed {
             let resolved = self.resolve_stored(stored, presented, true)?;
             fs::remove_file(&resolved).map_err(|error| {
@@ -9079,6 +9148,257 @@ workflow UnsafeHostChat {
             assert!(resolver.take_model_scan_witness(name).is_none(), "{name}");
         }
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn payload_test_resources() -> [ResourceRef; 2] {
+        [
+            ResourceRef {
+                handle: "project".into(),
+                kind: "file_store".into(),
+                selector: None,
+                writable: None,
+                presented_as: None,
+            },
+            ResourceRef {
+                handle: "command".into(),
+                kind: "command".into(),
+                selector: None,
+                writable: None,
+                presented_as: None,
+            },
+        ]
+    }
+
+    fn payload_tool(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "payload-fixture".into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn native_payload_retention_receives_original_bytes_before_effects() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("removed.txt"), "delete me").unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retained = captured.clone();
+        let location = root.path().to_owned();
+        let resolver = NativeWorkspaceResolver::new(root.path())
+            .unwrap()
+            .with_payload_retention(move |prepared, body| {
+                assert_eq!(prepared.content_hash, sha256_hex(body));
+                assert_eq!(prepared.bytes, body.len() as u64);
+                match (prepared.path.as_str(), prepared.kind.as_str()) {
+                    ("nested/result.txt", "add") => assert!(!location.join("nested").exists()),
+                    ("nested/result.txt", "modify") => assert_eq!(
+                        fs::read(location.join(&prepared.path)).unwrap(),
+                        b"original"
+                    ),
+                    ("removed.txt", "delete") => {
+                        assert!(body.is_empty());
+                        assert!(location.join(&prepared.path).exists());
+                    }
+                    ("binary.txt", "add") => assert!(!location.join(&prepared.path).exists()),
+                    ("binary.txt", "modify") => {
+                        assert_eq!(fs::read(location.join(&prepared.path)).unwrap(), b"a\0b")
+                    }
+                    _ => panic!("unexpected prepared native effect"),
+                }
+                retained
+                    .lock()
+                    .unwrap()
+                    .push((prepared.clone(), body.to_vec()));
+                Ok(())
+            });
+        let resources = payload_test_resources();
+        resolver
+            .execute_tool(
+                &resources,
+                &payload_tool(
+                    "write",
+                    json!({"path":"nested/result.txt", "content":"original"}),
+                ),
+            )
+            .unwrap();
+        resolver.execute_tool(&resources, &payload_tool("edit", json!({"path":"nested/result.txt", "edits":[{"oldText":"original", "newText":"edited"}]}))).unwrap();
+        resolver
+            .execute_tool(
+                &resources,
+                &payload_tool(
+                    "bash",
+                    json!({"command":"rm removed.txt; printf 'a\\000b' > binary.txt"}),
+                ),
+            )
+            .unwrap();
+        resolver
+            .execute_tool(
+                &resources,
+                &payload_tool("bash", json!({"command":"printf 'c\\000d' > binary.txt"})),
+            )
+            .unwrap();
+        let bodies = captured.lock().unwrap();
+        assert_eq!(bodies.len(), 5);
+        assert_eq!(bodies[0].1, b"original");
+        assert_eq!(bodies[1].1, b"edited");
+        let binary = bodies
+            .iter()
+            .find(|(prepared, _)| prepared.path == "binary.txt")
+            .unwrap();
+        assert_eq!(binary.1, b"a\0b");
+        assert_eq!(fs::read(root.path().join("binary.txt")).unwrap(), b"c\0d");
+        assert_eq!(bodies.last().unwrap().1, b"c\0d");
+        fs::write(
+            root.path().join("nested/result.txt"),
+            "later pending replacement",
+        )
+        .unwrap();
+        assert_eq!(bodies[0].1, b"original");
+        assert_eq!(bodies[1].1, b"edited");
+        let TurnWitness::Witnessed { writes, .. } = resolver.take_turn_witness() else {
+            panic!("successful owner witness required")
+        };
+        assert_eq!(writes.len(), 5);
+        for write in writes {
+            assert!(bodies
+                .iter()
+                .any(|(prepared, _)| prepared.path == write.path
+                    && prepared.kind == write.kind
+                    && prepared.content_hash == write.content_hash
+                    && prepared.bytes == write.bytes));
+        }
+    }
+
+    #[test]
+    fn native_payload_retention_refusal_prevents_write_edit_and_entire_bash_batch() {
+        for name in ["write", "edit", "bash"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("original.txt"), "original").unwrap();
+            fs::write(root.path().join("removed.txt"), "preserve deletion target").unwrap();
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let resolver = NativeWorkspaceResolver::new(root.path())
+                .unwrap()
+                .with_payload_retention(move |_, _| {
+                    let count = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if name == "bash" && count == 0 {
+                        Ok(())
+                    } else {
+                        Err("synthetic private storage diagnostic".into())
+                    }
+                });
+            let arguments = match name {
+                "write" => json!({"path":"nested/result.txt", "content":"refused"}),
+                "edit" => {
+                    json!({"path":"original.txt", "edits":[{"oldText":"original", "newText":"refused"}]})
+                }
+                _ => {
+                    json!({"command":"rm removed.txt; printf refused > original.txt; mkdir nested; printf refused > nested/result.txt"})
+                }
+            };
+            let error = resolver
+                .execute_tool(&payload_test_resources(), &payload_tool(name, arguments))
+                .unwrap_err();
+            assert_eq!(error, "native workspace payload retention refused");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if name == "bash" { 2 } else { 1 }
+            );
+            assert_eq!(
+                fs::read(root.path().join("original.txt")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                fs::read(root.path().join("removed.txt")).unwrap(),
+                b"preserve deletion target"
+            );
+            assert!(!root.path().join("nested").exists());
+            let TurnWitness::Witnessed { writes, .. } = resolver.take_turn_witness() else {
+                panic!("no unmediated effect")
+            };
+            assert!(writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_payload_retention_refusal_preserves_presented_roots() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("targets/a")).unwrap();
+        fs::write(root.path().join("targets/a/original.txt"), "preserved").unwrap();
+        let resolver = NativeWorkspaceResolver::new(root.path())
+            .unwrap()
+            .with_root_rename_admission(|_| panic!("retention refusal precedes rename admission"))
+            .with_payload_retention(|prepared, body| {
+                assert_eq!(prepared.path, "targets/a/new.txt");
+                assert_eq!(body, b"refused\n");
+                Err("private storage diagnostic".into())
+            });
+        let mut resources = payload_test_resources();
+        resources[0].selector = Some("targets/a".into());
+        resources[0].presented_as = Some("api".into());
+        resources[0].writable = Some(true);
+        assert_eq!(
+            resolver
+                .execute_tool(
+                    &resources,
+                    &payload_tool(
+                        "bash",
+                        json!({"command":"mv api backend && echo refused > backend/new.txt"})
+                    )
+                )
+                .unwrap_err(),
+            "native workspace payload retention refused"
+        );
+        assert!(resolver.root_renames.lock().unwrap().is_empty());
+        assert!(!root.path().join("targets/a/new.txt").exists());
+        assert_eq!(
+            fs::read(root.path().join("targets/a/original.txt")).unwrap(),
+            b"preserved"
+        );
+        resolver
+            .execute_tool(
+                &resources,
+                &payload_tool("read", json!({"path":"api/original.txt"})),
+            )
+            .unwrap();
+        assert!(resolver
+            .execute_tool(
+                &resources,
+                &payload_tool("read", json!({"path":"backend/original.txt"}))
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn native_payload_retention_preparation_is_not_a_successful_write_witness() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("directory.txt")).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retained = captured.clone();
+        let resolver = NativeWorkspaceResolver::new(root.path())
+            .unwrap()
+            .with_payload_retention(move |prepared, body| {
+                retained
+                    .lock()
+                    .unwrap()
+                    .push((prepared.clone(), body.to_vec()));
+                Ok(())
+            });
+        assert!(resolver
+            .execute_tool(
+                &payload_test_resources(),
+                &payload_tool(
+                    "write",
+                    json!({"path":"directory.txt", "content":"prepared but never written"})
+                )
+            )
+            .is_err());
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        assert!(root.path().join("directory.txt").is_dir());
+        let TurnWitness::Witnessed { writes, .. } = resolver.take_turn_witness() else {
+            panic!("no unmediated effect")
+        };
+        assert!(writes.is_empty());
     }
 
     #[test]

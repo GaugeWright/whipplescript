@@ -19,6 +19,11 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Native workspace embeddings can retain exact prepared file bytes through an
+  explicit callback before write, edit and virtual bash effects. Refusal prevents
+  the file changes; retained preparation still requires a successful saved owner
+  witness before result publication.
+
 - Version 2 effect reconciliation names the original action issuer separately
   from the current investigator's authority. Its signature and retry identity
   bind both coordinates; the target evidence keeps its own authority. Version 1
