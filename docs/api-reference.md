@@ -1724,6 +1724,12 @@ completed response whose verdict cannot be read. The gauge remains unscored.
 Their failed-turn spend events identify the gauge; unknown cost stops a
 capped campaign before more proposals are generated.
 
+Both campaign arms use the baseline gauge instruments. For a `judge via
+coerce`, this includes the baseline coerce's prompt and output schema. An edit
+to the grading coerce is recorded as a source change, but cannot improve its
+score merely by changing the evaluator. Candidate workflow execution uses
+the candidate program.
+
 A campaign that crosses its cap **parks**. The record then has a
 `campaign.parked` event, and the report has `"parked": true`. The
 `whip improve --resume <campaign-id>` command continues the campaign under a new

@@ -597,7 +597,7 @@ enum JudgeSpec {
     Exec(String),
     Labels(String),
     Prompt(String),
-    Coerce(String, Vec<String>),
+    Coerce(String, Vec<String>, std::sync::Arc<IrProgram>),
     Builtin,
 }
 
@@ -633,6 +633,9 @@ fn bar_from_ir(bar: &whipplescript_parser::IrGaugeBar) -> Option<BarSpec> {
 }
 
 fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
+    // Keep the instrument fixed when a candidate changes its own grading
+    // coerce. Share the baseline program for prompt and schema resolution.
+    let judge_ir = std::sync::Arc::new(ir.clone());
     let mut specs: Vec<GaugeSpec> = ir
         .gauges
         .iter()
@@ -645,7 +648,11 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
                     "exec" => JudgeSpec::Exec(gauge.judge_target.clone()),
                     "labels" => JudgeSpec::Labels(gauge.judge_target.clone()),
                     "prompt" => JudgeSpec::Prompt(gauge.judge_target.clone()),
-                    _ => JudgeSpec::Coerce(gauge.judge_target.clone(), gauge.judge_args.clone()),
+                    _ => JudgeSpec::Coerce(
+                        gauge.judge_target.clone(),
+                        gauge.judge_args.clone(),
+                        judge_ir.clone(),
+                    ),
                 },
                 bar,
                 inputs: gauge.inputs.clone(),
@@ -1314,7 +1321,6 @@ fn score_instance(
     specs: &[GaugeSpec],
     scenario: Option<&str>,
     ambient: bool,
-    ir: &IrProgram,
     prices: &PriceTable,
 ) -> RunObservation {
     let mut readings: BTreeMap<String, GaugeReading> = BTreeMap::new();
@@ -1444,7 +1450,6 @@ fn score_instance(
                 &judge_input,
                 scenario,
                 ambient,
-                ir,
                 &mut readings,
                 &mut skipped,
                 &mut judge_usage,
@@ -1472,7 +1477,6 @@ fn score_one_gauge(
     judge_input: &Value,
     scenario: Option<&str>,
     ambient: bool,
-    ir: &IrProgram,
     readings: &mut BTreeMap<String, GaugeReading>,
     skipped: &mut Vec<(String, String)>,
     judge_usage: &mut Vec<TurnUsage>,
@@ -1523,7 +1527,7 @@ fn score_one_gauge(
                     }
                 }
             }
-            JudgeSpec::Coerce(target, args) => {
+            JudgeSpec::Coerce(target, args, judge_ir) => {
                 if ambient {
                     skipped.push((
                         spec.name.clone(),
@@ -1531,7 +1535,7 @@ fn score_one_gauge(
                             .to_owned(),
                     ));
                 } else {
-                    match run_coerce_judge(target, args, &input, ir, spec) {
+                    match run_coerce_judge(target, args, &input, judge_ir, spec) {
                         Ok((reading, usage)) => {
                             readings.insert(spec.name.clone(), reading);
                             judge_usage.push(usage);
@@ -1789,7 +1793,7 @@ fn scorer_label(judge: &JudgeSpec) -> String {
         JudgeSpec::Exec(command) => format!("exec:{command}"),
         JudgeSpec::Labels(source) => format!("labels:{source}"),
         JudgeSpec::Prompt(_) => "prompt".to_owned(),
-        JudgeSpec::Coerce(name, _) => format!("coerce:{name}"),
+        JudgeSpec::Coerce(name, _, _) => format!("coerce:{name}"),
         JudgeSpec::Builtin => "builtin".to_owned(),
     }
 }
@@ -2341,7 +2345,6 @@ fn input_replay_scenario(
         specs,
         Some(&scenario.name),
         false,
-        ir,
         prices,
     );
     // A run that never settled (wedged effect, exhausted drive budget)
@@ -2690,7 +2693,6 @@ fn replay_drive_and_score(
         specs,
         Some(&scenario.name),
         false,
-        ir,
         prices,
     );
     // std.latency is unmeasurable under prefix replay: folded prefix runs
@@ -7016,7 +7018,6 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
                 &specs,
                 Some(&scenario.name),
                 false,
-                &ir,
                 &prices,
             )
         });
@@ -7691,7 +7692,7 @@ pub(crate) fn ambient_score_after_dev(
         }
         PriceTable::default()
     });
-    let observation = score_instance(&store, instance_id, &specs, None, true, ir, &prices);
+    let observation = score_instance(&store, instance_id, &specs, None, true, &prices);
     if observation.readings.is_empty() {
         return;
     }

@@ -2523,13 +2523,27 @@ fn mock_coerce_sequence_endpoint(
 fn mock_coerce_response_sequence_endpoint(
     replies: Vec<Value>,
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let mut response_index = 0usize;
+    mock_coerce_response_endpoint(move |_| {
+        let reply = replies
+            .get(response_index)
+            .or_else(|| replies.last())
+            .expect("mock endpoint has a response")
+            .clone();
+        response_index += 1;
+        reply
+    })
+}
+
+fn mock_coerce_response_endpoint(
+    mut response_for: impl FnMut(&str) -> Value + Send + 'static,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
     let base_url = format!("http://{}", listener.local_addr().expect("addr"));
     let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let collected = bodies.clone();
     std::thread::spawn(move || {
-        let mut response_index = 0usize;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let mut raw = Vec::new();
@@ -2568,13 +2582,9 @@ fn mock_coerce_response_sequence_endpoint(
                 raw.extend_from_slice(&buffer[..n]);
             }
             let body = String::from_utf8_lossy(&raw[body_start..]).into_owned();
-            collected.lock().expect("bodies lock").push(body);
-            let reply = replies
-                .get(response_index)
-                .or_else(|| replies.last())
-                .expect("mock endpoint has a response");
-            response_index += 1;
-            let reply = serde_json::to_string(reply).expect("encode response");
+            collected.lock().expect("bodies lock").push(body.clone());
+            let reply = response_for(&body);
+            let reply = serde_json::to_string(&reply).expect("encode response");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 reply.len(),
@@ -3065,6 +3075,136 @@ fn assert_failed_judge_usage(prompt: bool, output_limit: bool, missing_usage: bo
         .any(|event| event["type"] == "candidate.drafted"));
     assert!(!campaign.to_string().contains("PRIVATE_JUDGE_OUTPUT"));
     assert_eq!(bodies.lock().expect("requests").len(), 1);
+}
+
+#[test]
+fn candidate_cannot_improve_quality_by_rewriting_its_coerce_judge() {
+    assert_fixed_coerce_judge(false, false);
+}
+
+#[test]
+fn fixed_coerce_judge_also_scores_sealed_baselines_and_parallel_candidates() {
+    assert_fixed_coerce_judge(true, false);
+}
+
+#[test]
+fn fixed_coerce_judge_can_still_measure_a_real_workflow_gain() {
+    assert_fixed_coerce_judge(false, true);
+}
+
+fn assert_fixed_coerce_judge(sealed_parallel: bool, real_gain: bool) {
+    let env = Env::new("fixed-coerce-judge");
+    write_judges(&env.dir);
+    let baseline_source = if real_gain {
+        coerce_judge_program(&env.dir).replace("priority \"high\"", "priority \"low\"")
+    } else {
+        coerce_judge_program(&env.dir)
+    };
+    let candidate_source = if real_gain {
+        baseline_source.replace("priority \"low\"", "priority \"high\"")
+    } else {
+        baseline_source
+            .replace("Was ", "ALWAYS_PASS_REWRITTEN_JUDGE Was ")
+            .replace("  ok bool", "  ok bool\n  self_graded bool")
+    };
+    let program_path = env.dir.join("baseline.whip");
+    let candidate_path = env.dir.join("candidate.whip");
+    fs::write(&program_path, baseline_source).expect("baseline");
+    fs::write(&candidate_path, candidate_source).expect("candidate");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    if sealed_parallel {
+        for position in 2..=4 {
+            let input =
+                serde_json::json!({"ticket":{"id":format!("T-{position}"),"title":"Fix login"}})
+                    .to_string();
+            let run = env.run_json(
+                &[
+                    "--json",
+                    "--store",
+                    &env.store,
+                    "--input",
+                    &input,
+                    "run",
+                    &program_str,
+                    "--provider",
+                    "fixture",
+                ],
+                &[],
+            );
+            env.run_json(
+                &[
+                    "--json",
+                    "--store",
+                    &env.store,
+                    "pin",
+                    run["instance_id"].as_str().expect("instance"),
+                    "--as",
+                    &format!("case-{position}"),
+                ],
+                &[],
+            );
+        }
+    }
+    let (base_url, bodies) = mock_coerce_response_endpoint(move |body| {
+        let ok = if real_gain {
+            !body.contains("priority low")
+        } else {
+            body.contains("ALWAYS_PASS_REWRITTEN_JUDGE")
+        };
+        serde_json::json!({"choices":[{"message":{"content":serde_json::json!({"ok":ok}).to_string()}}],
+            "usage":{"input_tokens":3,"output_tokens":2}})
+    });
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "quality",
+            "--program",
+            &program_str,
+            "--provider",
+            "fixture",
+            "--proposer",
+            "fixture",
+            "--sacrifice",
+            "std.latency",
+        ],
+        &[
+            (
+                "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+                &candidate_path.to_string_lossy(),
+            ),
+            ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+            ("WHIPPLESCRIPT_COERCE_BASE_URL", &base_url),
+            ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+            ("OPENAI_API_KEY", "test-key"),
+            (
+                "WHIPPLESCRIPT_EVAL_CONCURRENCY",
+                if sealed_parallel { "2" } else { "1" },
+            ),
+        ],
+    );
+    assert_eq!(
+        report["proposed"], real_gain,
+        "only changed workflow behavior may create a gain: {report}"
+    );
+    let quality = report["cards"][0]["gauges"]
+        .as_array()
+        .expect("gauges")
+        .iter()
+        .find(|g| g["gauge"] == "quality")
+        .expect("quality");
+    assert_eq!(quality["baseline"], 0.0);
+    assert_eq!(quality["candidate"], if real_gain { 1.0 } else { 0.0 });
+    let requests = bodies.lock().expect("judge requests");
+    assert_eq!(requests.len(), if sealed_parallel { 6 } else { 2 });
+    assert_eq!(report["unheld_out"], !sealed_parallel);
+    assert!(
+        requests
+            .iter()
+            .all(|body| !body.contains("ALWAYS_PASS_REWRITTEN_JUDGE")
+                && !body.contains("self_graded"))
+    );
 }
 
 #[test]
