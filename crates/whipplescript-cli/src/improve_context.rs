@@ -24,6 +24,16 @@ pub(crate) struct ContextEdit {
     pub content: Option<String>,
 }
 
+/// Native proposal transport only. Stored candidates still carry complete
+/// ContextEdit contents against their admitted baseline snapshot.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextPatch {
+    pub path: String,
+    pub find: String,
+    pub replace: String,
+}
+
 pub(crate) fn checked_relative_path(raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() || raw.contains('\\') || raw.contains('\0') {
         return Err(format!("invalid context path `{raw}`"));
@@ -167,6 +177,54 @@ impl ContextSnapshot {
         Ok(result)
     }
 
+    pub fn resolve_patches(
+        &self,
+        mut edits: Vec<ContextEdit>,
+        patches: &[ContextPatch],
+    ) -> Result<Vec<ContextEdit>, String> {
+        let mut candidate = self.edited(&edits)?;
+        let replaced: std::collections::BTreeSet<_> =
+            edits.iter().map(|edit| edit.path.clone()).collect();
+        let mut patched = std::collections::BTreeSet::new();
+        for patch in patches {
+            checked_relative_path(&patch.path)?;
+            if replaced.contains(&patch.path) {
+                return Err(format!(
+                    "context path `{}` has both a replacement and a patch",
+                    patch.path
+                ));
+            }
+            if patch.find.is_empty() {
+                return Err(format!(
+                    "context patch for `{}` has an empty find string",
+                    patch.path
+                ));
+            }
+            let content = candidate.files.get_mut(&patch.path).ok_or_else(|| {
+                format!("cannot patch absent admitted context file `{}`", patch.path)
+            })?;
+            let start = content
+                .find(&patch.find)
+                .filter(|start| {
+                    // rfind also detects overlapping occurrences such as aa in aaa.
+                    Some(*start) == content.rfind(&patch.find)
+                })
+                .ok_or_else(|| {
+                    format!("context patch for `{}` must match exactly once", patch.path)
+                })?;
+            content.replace_range(start..start + patch.find.len(), &patch.replace);
+            patched.insert(patch.path.clone());
+        }
+        candidate.validate_limits()?;
+        for path in patched {
+            edits.push(ContextEdit {
+                content: candidate.files.get(&path).cloned(),
+                path,
+            });
+        }
+        Ok(edits)
+    }
+
     pub fn diff(&self, candidate: &Self) -> Vec<Value> {
         self.files
             .keys()
@@ -270,6 +328,100 @@ impl ContextSnapshot {
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_patches_materialize_complete_large_file_edits_in_order() {
+        let original = format!("Use every diagnostic.\n{}", "Catalog text.\n".repeat(3000));
+        let baseline = ContextSnapshot {
+            files: BTreeMap::from([
+                ("AGENTS.md".to_owned(), original.clone()),
+                (
+                    "reference.txt".to_owned(),
+                    "preserve this reference".to_owned(),
+                ),
+            ]),
+        };
+        let edits = baseline
+            .resolve_patches(
+                Vec::new(),
+                &[
+                    ContextPatch {
+                        path: "AGENTS.md".into(),
+                        find: "Use every diagnostic.".into(),
+                        replace: "Inspect first.".into(),
+                    },
+                    ContextPatch {
+                        path: "AGENTS.md".into(),
+                        find: "Inspect first.".into(),
+                        replace: "Inspect, act, and verify.".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].content.as_deref(),
+            Some(
+                original
+                    .replacen("Use every diagnostic.", "Inspect, act, and verify.", 1)
+                    .as_str()
+            )
+        );
+        let candidate = baseline.edited(&edits).unwrap();
+        assert_eq!(
+            candidate.files["reference.txt"],
+            baseline.files["reference.txt"]
+        );
+        assert_eq!(baseline.files["AGENTS.md"], original);
+        assert_ne!(
+            candidate.hash_with_program("p"),
+            baseline.hash_with_program("p")
+        );
+    }
+
+    #[test]
+    fn context_patches_refuse_ambiguous_absent_empty_and_conflicting_edits() {
+        let baseline = ContextSnapshot {
+            files: BTreeMap::from([("AGENTS.md".into(), "aaa".into())]),
+        };
+        let patch = |path: &str, find: &str| ContextPatch {
+            path: path.into(),
+            find: find.into(),
+            replace: "x".into(),
+        };
+        for find in ["", "missing", "a", "aa"] {
+            assert!(
+                baseline
+                    .resolve_patches(Vec::new(), &[patch("AGENTS.md", find)])
+                    .is_err(),
+                "find={find}"
+            );
+        }
+        assert!(baseline
+            .resolve_patches(Vec::new(), &[patch("missing.txt", "aaa")])
+            .is_err());
+        assert!(baseline
+            .resolve_patches(Vec::new(), &[patch("../outside", "aaa")])
+            .is_err());
+        assert!(baseline
+            .resolve_patches(
+                vec![ContextEdit {
+                    path: "AGENTS.md".into(),
+                    content: Some("aaa".into())
+                }],
+                &[patch("AGENTS.md", "aaa")]
+            )
+            .is_err());
+        assert!(baseline
+            .resolve_patches(
+                Vec::new(),
+                &[ContextPatch {
+                    path: "AGENTS.md".into(),
+                    find: "aaa".into(),
+                    replace: "x".repeat(MAX_FILE_BYTES + 1)
+                }]
+            )
+            .is_err());
+    }
     #[test]
     fn context_edits_are_path_bound_and_change_harness_identity() {
         let mut baseline = ContextSnapshot::default();

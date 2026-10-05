@@ -1015,11 +1015,31 @@ fn ambiguous_shortcut_finding_remains_reviewable_and_testable() {
 
 #[test]
 fn external_context_only_candidate_is_evaluated_and_adopted_against_exact_baseline() {
-    let env = Env::new("external-context");
+    exercise_external_context_candidate(false);
+}
+
+#[test]
+fn native_patches_to_large_context_are_evaluated_recorded_and_adopted_exactly() {
+    exercise_external_context_candidate(true);
+}
+
+fn exercise_external_context_candidate(native: bool) {
+    let env = Env::new(if native {
+        "native-context-patches"
+    } else {
+        "external-context"
+    });
     let context_root = env.dir.join("context");
     fs::create_dir_all(&context_root).expect("context root");
     let context_file = context_root.join("AGENTS.md");
-    fs::write(&context_file, "Use long answers.").expect("baseline context");
+    let padding = if native {
+        format!("\n{}", "Catalog reference text.\n".repeat(1700))
+    } else {
+        String::new()
+    };
+    let baseline_context = format!("Use long answers.{padding}");
+    let candidate_context = format!("Use short answers.{padding}");
+    fs::write(&context_file, &baseline_context).expect("baseline context");
     let skill_dir = context_root.join("skills/demo");
     fs::create_dir_all(&skill_dir).expect("skill directory");
     let skill_file = skill_dir.join("SKILL.md");
@@ -1079,7 +1099,7 @@ rule begin
     let proposal_path = env.dir.join("candidate.whip");
     fs::write(&proposal_path, &source).expect("context-only proposal");
     let edits = serde_json::json!([
-        {"path":"AGENTS.md","content":"Use short answers."},
+        {"path":"AGENTS.md","content":candidate_context},
         {"path":"skills/demo/SKILL.md","content":candidate_skill}
     ])
     .to_string();
@@ -1089,7 +1109,23 @@ rule begin
     let (base_url, requests) = mock_harness_context_endpoint();
     let proposal_str = proposal_path.to_string_lossy().into_owned();
     let root_str = context_root.to_string_lossy().into_owned();
-    let envs = [
+    let proposal = serde_json::json!({
+        "rationale": "shorter project guidance",
+        "source": source,
+        "edit_account": serde_json::from_str::<Value>(&account).expect("fixture account"),
+        "context_edits": [],
+        "context_patches": [
+            {"path":"AGENTS.md","find":"Use long answers.","replace":"Use short answers."},
+            {"path":"skills/demo/SKILL.md","find":"Context skill marker baseline.","replace":"Context skill marker candidate."}
+        ]
+    }).to_string();
+    let critic =
+        serde_json::json!({"classification":"none", "source_path":"AGENTS.md", "source_quote":null,
+        "reason":"general response length instruction"})
+        .to_string();
+    let (coerce_url, coerce_requests) =
+        mock_coerce_sequence_endpoint(vec![proposal.clone(), critic, proposal]);
+    let mut envs = vec![
         ("WHIPPLESCRIPT_IMPROVE_PROPOSALS", proposal_str.as_str()),
         ("WHIPPLESCRIPT_IMPROVE_CONTEXT_EDITS", edits.as_str()),
         ("WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT", account.as_str()),
@@ -1098,6 +1134,13 @@ rule begin
         ("WHIPPLESCRIPT_HARNESS_BASE_URL", base_url.as_str()),
         ("OPENAI_API_KEY", "test-key"),
     ];
+    if native {
+        envs.extend([
+            ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+            ("WHIPPLESCRIPT_COERCE_BASE_URL", coerce_url.as_str()),
+            ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+        ]);
+    }
     let report = env.run_json(
         &[
             "--json",
@@ -1108,7 +1151,7 @@ rule begin
             "--context-root",
             &root_str,
             "--proposer",
-            "fixture",
+            if native { "native" } else { "fixture" },
             "--provider",
             "owned",
         ],
@@ -1123,15 +1166,18 @@ rule begin
     );
     assert!(card["edit"]["changed_declarations"]
         .as_array()
-        .unwrap()
+        .expect("declaration changes")
         .is_empty());
     assert_eq!(
-        fs::read_to_string(&context_file).unwrap(),
-        "Use long answers.",
+        fs::read_to_string(&context_file).expect("live context"),
+        baseline_context,
         "evaluation must not change the live context"
     );
-    assert_eq!(fs::read_to_string(&skill_file).unwrap(), baseline_skill);
-    let seen = requests.lock().unwrap();
+    assert_eq!(
+        fs::read_to_string(&skill_file).expect("live skill"),
+        baseline_skill
+    );
+    let seen = requests.lock().expect("harness requests");
     assert!(
         seen.iter().any(|body| body.contains("Use long answers.")),
         "baseline request lacked context"
@@ -1148,14 +1194,14 @@ rule begin
         .any(|body| body.contains("Context skill marker candidate.")));
     drop(seen);
 
-    let target = format!("{}:K-1", report["campaign"].as_str().unwrap());
+    let target = format!("{}:K-1", report["campaign"].as_str().expect("campaign id"));
     fs::write(&context_file, "Human edit after campaign.").expect("human edit");
     let refusal = env.run_expect_failure(&["adopt", &target, "--program", &program_str]);
     assert!(
         refusal.contains("program or admitted context changed"),
         "{refusal}"
     );
-    fs::write(&context_file, "Use long answers.").expect("restore baseline");
+    fs::write(&context_file, &baseline_context).expect("restore baseline");
     let adopted = env.run_json(
         &["--json", "adopt", &target, "--program", &program_str],
         &[],
@@ -1163,10 +1209,37 @@ rule begin
     assert_eq!(adopted["changed_resources"][0], "AGENTS.md");
     assert_eq!(adopted["changed_resources"][1], "skills/demo/SKILL.md");
     assert_eq!(
-        fs::read_to_string(&context_file).unwrap(),
-        "Use short answers."
+        fs::read_to_string(&context_file).expect("adopted context"),
+        candidate_context
     );
-    assert_eq!(fs::read_to_string(&skill_file).unwrap(), candidate_skill);
+    assert_eq!(
+        fs::read_to_string(&skill_file).expect("adopted skill"),
+        candidate_skill
+    );
+    if native {
+        let detail = env.run_json(
+            &[
+                "--json",
+                "campaign",
+                report["campaign"].as_str().expect("campaign id"),
+            ],
+            &[],
+        );
+        let recorded = detail["events"]
+            .as_array()
+            .expect("campaign events")
+            .iter()
+            .find(|event| event["type"] == "candidate.recorded")
+            .expect("recorded candidate");
+        assert_eq!(
+            recorded["payload"]["context_edits"][0]["content"],
+            candidate_context
+        );
+        assert!(recorded["payload"].get("context_patches").is_none());
+        let sent = coerce_requests.lock().expect("coerce requests");
+        assert!(sent[0].contains("context_patches"));
+        assert!(sent[0].contains("Canonical declaration identities"));
+    }
 }
 
 #[test]
@@ -2513,6 +2586,23 @@ fn mock_coerce_response_sequence_endpoint(
         }
     });
     (base_url, bodies)
+}
+
+#[test]
+fn native_context_patches_without_admitted_snapshot_are_refused() {
+    let proposal = serde_json::json!({
+        "source": "", "rationale": "PRIVATE_PARTIAL_MODEL_OUTPUT",
+        "context_edits": [], "context_patches": [{"path":"AGENTS.md","find":"old","replace":"new"}],
+        "edit_account": {"mechanism":"edit guidance", "declarations":[], "resources":["AGENTS.md"], "expected_gauges":["priority_correct"]}
+    });
+    assert_failed_native_proposal_retains_usage(
+        serde_json::json!({
+            "status":"completed", "output_text":proposal.to_string(),
+            "usage":{"input_tokens":12,"output_tokens":4}
+        }),
+        "context patches without --context-root",
+        "native-context-without-snapshot",
+    );
 }
 
 #[test]

@@ -1743,6 +1743,15 @@ baseline. A configured global context directory or
 which instructions the evaluated agent sees. With no `--context-root`, improve
 retains its source-only behavior.
 
+For small changes to a large file, the native proposer can return
+`context_patches` with `path`, `find`, and `replace` strings. Each nonempty
+`find` must match exactly once in the admitted baseline file at that point;
+patches to one file run in order. A path cannot have both patches and a full
+replacement in one proposal. The runtime materializes full `context_edits`
+before evaluation and recording, so a patch receives the same snapshot,
+containment, critic, and adoption checks as a replacement. Additions and
+deletions use `context_edits`.
+
 If the workflow uses content-pinned `std.script` capabilities, set
 `WHIPPLESCRIPT_SCRIPT_MANIFEST` for `whip improve` as for `whip run`. Baseline
 and candidate regenerations load that manifest into their disposable stores;
