@@ -10667,12 +10667,13 @@ fn is_observer_only_schema(name: &str) -> bool {
 }
 
 fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
+    let code = code_scan_text(&rule.body.text);
     for (raw, offset) in body_line_offsets(&rule.body.text) {
-        let line = raw.trim();
+        let line = code[offset..offset + raw.len()].trim();
         let at = BodyAnchor::text(
             &rule.body,
             offset + (raw.len() - raw.trim_start().len()),
-            line,
+            raw.trim(),
         );
         if line.starts_with("then ") {
             diagnostics.push(Diagnostic {

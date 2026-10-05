@@ -17727,6 +17727,34 @@ rule finish
 }
 
 #[test]
+fn canonical_syntax_checks_ignore_prompt_prose_and_comments() {
+    let source = r#"
+workflow PromptWords
+
+class Task { topic string }
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+rule solve
+  when Task as task
+  when codex is available
+=> {
+  tell codex as turn """markdown
+    First inspect {{ task.topic }},
+    then choose the next useful action.
+    after an observation => reconsider the plan.
+  """
+  # then this comment is not sequencing
+  # after this comment => is not sequencing
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+}
+
+#[test]
 fn rejects_then_sequencing() {
     let source = r#"
 workflow NoThen
