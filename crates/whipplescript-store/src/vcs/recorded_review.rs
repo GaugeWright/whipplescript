@@ -49,6 +49,23 @@ impl PreparedRecordedMergeReview {
 }
 
 impl NativeWorkspaceVcs {
+    /// Keep original recorded metadata and selected content available through
+    /// an embedding reference commit. Authorize before opening existing stores.
+    /// The callback verifies exact original metadata while both native writers
+    /// are excluded and consumes the SAME original embedding writer, enforcing
+    /// its own final authority. It performs no native writes, preparation,
+    /// projection or external work. This boundary grants no authorization.
+    pub fn publish_retained_recorded_observation<T>(
+        &self,
+        retained: &[String],
+        observe_and_publish: impl FnOnce(&Self) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        self.content.publish_retained(retained, || {
+            self.branches
+                .with_fenced_observation(|| observe_and_publish(self))
+        })
+    }
+
     /// Authorize before opening. Only existing current-generation authorities
     /// are accepted; no creation, WAL conversion or migration occurs here.
     pub fn open_for_recorded_review(

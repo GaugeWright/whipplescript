@@ -27,6 +27,117 @@ fn setup() -> crate::vcs::tests::TempVcs {
 }
 
 #[test]
+fn retained_recorded_observation_fences_both_owners_and_preserves_later_heads() {
+    let mut vcs = setup();
+    let original = vcs.get_cut("office-1").unwrap().unwrap();
+    let operation = vcs.get_op("op-office-1").unwrap().unwrap();
+    let manifest = vcs.cut_manifest("office-1").unwrap().unwrap();
+    let mut retained: Vec<_> = manifest.values().cloned().collect();
+    retained.push(original.manifest_hash.clone());
+    vcs.write("office", "later.txt", Some("later work"), "office-2", "t4")
+        .unwrap();
+    let before = vcs.branches.list_branches(None).unwrap();
+    let blobs = blob_count(&vcs);
+    let result = vcs
+        .publish_retained_recorded_observation(&retained, |observed| {
+            assert_eq!(observed.get_cut("office-1")?.as_ref(), Some(&original));
+            assert_eq!(observed.get_op("op-office-1")?.as_ref(), Some(&operation));
+            assert_eq!(observed.cut_manifest("office-1")?.as_ref(), Some(&manifest));
+            for name in ["branches.sqlite", "content.sqlite"] {
+                let independent = rusqlite::Connection::open(vcs.dir.join(name)).unwrap();
+                independent.busy_timeout(std::time::Duration::ZERO).unwrap();
+                assert!(
+                    independent.execute_batch("BEGIN IMMEDIATE").is_err(),
+                    "{name} writer escaped original observation"
+                );
+            }
+            Ok("original published")
+        })
+        .unwrap();
+    assert_eq!(result, "original published");
+    assert_eq!(vcs.branches.list_branches(None).unwrap(), before);
+    assert_eq!(blob_count(&vcs), blobs);
+    for name in ["branches.sqlite", "content.sqlite"] {
+        let independent = rusqlite::Connection::open(vcs.dir.join(name)).unwrap();
+        independent.busy_timeout(std::time::Duration::ZERO).unwrap();
+        independent
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+    }
+}
+
+#[test]
+fn retained_recorded_observation_refuses_unavailable_content_before_callback() {
+    for erased in [false, true] {
+        let vcs = setup();
+        let id = if erased {
+            let id = vcs.cut_manifest("office-1").unwrap().unwrap()["patient.txt"].clone();
+            vcs.content.erase(&id, "t4").unwrap();
+            id
+        } else {
+            "missing-original-content".into()
+        };
+        let result: StoreResult<()> = vcs.publish_retained_recorded_observation(&[id], |_| {
+            panic!("unavailable original content published")
+        });
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn retained_recorded_observation_refuses_each_readonly_authority() {
+    for readonly_content in [false, true] {
+        let vcs = setup();
+        let branches = vcs.dir.join("branches.sqlite");
+        let content = vcs.dir.join("content.sqlite");
+        let reader = NativeWorkspaceVcs::from_parts(
+            if readonly_content {
+                BranchStore::open_for_fenced_observation(&branches).unwrap()
+            } else {
+                BranchStore::open_read_only(&branches).unwrap()
+            },
+            if readonly_content {
+                ContentStore::open_read_only(&content).unwrap()
+            } else {
+                ContentStore::open_for_retained_publication(&content).unwrap()
+            },
+        );
+        let result: StoreResult<()> = reader.publish_retained_recorded_observation(&[], |_| {
+            panic!("read-only authority published original reference")
+        });
+        let expected = if readonly_content {
+            "retained publication requires a writable content authority"
+        } else {
+            "recorded review requires a writable branch authority"
+        };
+        assert!(matches!(result, Err(StoreError::Conflict(reason)) if reason == expected));
+    }
+}
+
+#[test]
+fn retained_recorded_observation_releases_both_fences_on_original_commit_refusal() {
+    let vcs = setup();
+    let original = vcs.get_cut("office-1").unwrap().unwrap();
+    let before = vcs.branches.list_branches(None).unwrap();
+    let result: StoreResult<()> =
+        vcs.publish_retained_recorded_observation(&[original.manifest_hash], |_| {
+            Err(StoreError::Conflict(
+                "original embedding authority ended".into(),
+            ))
+        });
+    assert!(matches!(result, Err(StoreError::Conflict(reason))
+        if reason == "original embedding authority ended"));
+    assert_eq!(vcs.branches.list_branches(None).unwrap(), before);
+    for name in ["branches.sqlite", "content.sqlite"] {
+        let independent = rusqlite::Connection::open(vcs.dir.join(name)).unwrap();
+        independent.busy_timeout(std::time::Duration::ZERO).unwrap();
+        independent
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+    }
+}
+
+#[test]
 fn recorded_review_preserves_native_probe_and_writes_nothing() {
     let vcs = setup();
     let before = vcs.branches.list_branches(None).unwrap();
