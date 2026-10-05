@@ -9,11 +9,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use whipplescript_core::{ConstructRegistration, ContractRegistry};
-use whipplescript_parser::{IrConstructUse, IrDeclarationConstruct, IrProgram};
+use whipplescript_parser::{
+    IrConstructUse, IrDeclarationConstruct, IrEffectKind, IrPackageCall, IrProgram,
+};
 use whipplescript_store::program_imports::{
     ProgramConstructCapture, ProgramConstructEdge, ProgramConstructMeaning, ProgramConstructScope,
     ProgramConstructUse, ProgramDeclarationCapture, ProgramDeclarationEdge, ProgramDeclarationUse,
-    ProgramImportWitness,
+    ProgramImportWitness, ProgramPackageCallCapture, ProgramPackageCallScope,
+    ProgramPackageCallUse,
 };
 
 use crate::exec_http::sha256_hex;
@@ -97,6 +100,79 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Inventory the capability-call field family without interpreting its opaque
+/// argument as a reference or inferring a live dependency from a capability
+/// name. The exhaustive effect-kind match is intentional: adding a new effect
+/// must make its package-call classification an accepting-boundary choice.
+pub fn capture_package_calls(program: &IrProgram) -> Result<ProgramPackageCallCapture, String> {
+    let mut examined = Vec::new();
+    for (rule, effect) in program.rules.iter().flat_map(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .map(move |effect| (rule, effect))
+    }) {
+        let is_call = match &effect.kind {
+            IrEffectKind::CapabilityCall => true,
+            IrEffectKind::AgentTell
+            | IrEffectKind::SchemaCoerce
+            | IrEffectKind::EventEmit
+            | IrEffectKind::WorkflowInvoke
+            | IrEffectKind::TimerWait
+            | IrEffectKind::ExecCommand
+            | IrEffectKind::HttpRequest
+            | IrEffectKind::MintCredential
+            | IrEffectKind::RotateCredential
+            | IrEffectKind::RevokeCredential
+            | IrEffectKind::TrackerFile
+            | IrEffectKind::TrackerClaim
+            | IrEffectKind::TrackerRenew
+            | IrEffectKind::TrackerRelease
+            | IrEffectKind::TrackerFinish
+            | IrEffectKind::TrackerMembership
+            | IrEffectKind::TrackerInspect
+            | IrEffectKind::LeaseAcquire
+            | IrEffectKind::LeaseRenew
+            | IrEffectKind::LedgerAppend
+            | IrEffectKind::CounterConsume
+            | IrEffectKind::SignalEmit
+            | IrEffectKind::FileRead
+            | IrEffectKind::FileWrite
+            | IrEffectKind::FileImport
+            | IrEffectKind::FileExport => false,
+        };
+        if is_call != effect.package_call.is_some() {
+            return Err(format!(
+                "effect `{}` has an unclassified package-call field",
+                effect.id
+            ));
+        }
+        if let Some(call) = &effect.package_call {
+            // No `..`: a new reference-capable field cannot be silently
+            // omitted from this accepting witness.
+            let IrPackageCall {
+                target,
+                argument,
+                tracker_resources,
+            } = call;
+            examined.push(ProgramPackageCallUse {
+                occurrence: examined.len(),
+                rule_name: rule.name.clone(),
+                effect_id: effect.id.clone(),
+                target: target.clone(),
+                argument: argument.clone(),
+                tracker_resources: tracker_resources.clone(),
+            });
+        }
+    }
+    let json = serde_json::to_vec(&examined).map_err(|error| error.to_string())?;
+    Ok(ProgramPackageCallCapture {
+        scope: ProgramPackageCallScope::CapabilityCallV1,
+        examined,
+        digest: sha256_hex(&json),
+    })
 }
 
 pub fn capture(
@@ -319,6 +395,55 @@ rule notify
             compiled.diagnostics
         );
         compiled.ir.unwrap()
+    }
+
+    #[test]
+    fn package_call_inventory_covers_ordinary_calls_and_refuses_missing_metadata() {
+        let compiled = whipplescript_parser::compile_program(include_str!(
+            "../../../examples/package-memory.whip"
+        ));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let mut checked_program = compiled.ir.unwrap();
+        let captured =
+            capture_package_calls(&checked_program).expect("all capability calls inventoried");
+        assert_eq!(captured.scope, ProgramPackageCallScope::CapabilityCallV1);
+        assert_eq!(captured.examined.len(), 2);
+        assert_eq!(captured.examined[0].target, "memory.query");
+        assert_eq!(captured.examined[0].argument.as_deref(), Some("issue"));
+        assert_eq!(captured.examined[1].target, "memory.write");
+        assert_eq!(captured.examined[1].argument.as_deref(), Some("turn"));
+
+        let mut non_call = checked_program.clone();
+
+        let first_call = checked_program
+            .rules
+            .iter_mut()
+            .flat_map(|rule| &mut rule.metadata.effects)
+            .find(|effect| effect.kind == IrEffectKind::CapabilityCall)
+            .unwrap();
+        first_call.package_call = None;
+        assert!(capture_package_calls(&checked_program)
+            .unwrap_err()
+            .contains("unclassified package-call field"));
+
+        let effect = non_call
+            .rules
+            .iter_mut()
+            .flat_map(|rule| &mut rule.metadata.effects)
+            .find(|effect| effect.kind != IrEffectKind::CapabilityCall)
+            .unwrap();
+        effect.package_call = Some(IrPackageCall {
+            target: "invented.reference".into(),
+            argument: Some("opaque".into()),
+            tracker_resources: vec![],
+        });
+        assert!(capture_package_calls(&non_call)
+            .unwrap_err()
+            .contains("unclassified package-call field"));
     }
 
     fn registry() -> ContractRegistry {

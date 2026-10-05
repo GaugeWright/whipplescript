@@ -1863,6 +1863,49 @@ rule finish
             .declarations
             .as_ref()
             .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(witness
+            .package_calls
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+    }
+
+    #[test]
+    fn hosted_worker_persists_ordinary_package_calls_in_checked_admission() {
+        use crate::do_store::{as_text, SqlValue};
+
+        let sql = store().sql;
+        let instance = DurableInstance::create(
+            sql.clone(),
+            include_str!("../../../examples/package-memory.whip"),
+            "{}",
+            "local/PackageMemory",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some("d".repeat(64)),
+                ..test_ports()
+            },
+            &[],
+            &[],
+        )
+        .expect("hosted package-call source admits");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let version_id = &kernel.store().list_instances().unwrap()[0].version_id;
+        let rows = sql
+            .query(
+                "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+                &[SqlValue::Text(version_id.clone())],
+            )
+            .unwrap();
+        let witness = kernel
+            .store()
+            .program_import_witness(version_id, &as_text(&rows[0][0]))
+            .unwrap()
+            .unwrap();
+        let calls = witness
+            .package_calls
+            .expect("package-call class inventoried");
+        assert_eq!(calls.examined.len(), 2);
+        assert_eq!(calls.examined[0].target, "memory.query");
+        assert_eq!(calls.examined[1].target, "memory.write");
     }
 
     #[test]

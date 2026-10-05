@@ -15352,6 +15352,7 @@ pub(crate) mod tests {
                 edges,
                 constructs: None,
                 declarations: None,
+                package_calls: None,
             }
         };
         let mut store = store();
@@ -15717,6 +15718,7 @@ pub(crate) mod tests {
             edge_digest: whipplescript_store::items::sha256_hex("[]"),
             constructs: None,
             declarations: None,
+            package_calls: None,
         };
         let mut store = store();
         let accepted = store
@@ -15842,6 +15844,7 @@ pub(crate) mod tests {
             edge_digest: whipplescript_store::items::sha256_hex("[]"),
             constructs: None,
             declarations: None,
+            package_calls: None,
         };
         let mut store = store();
         let original = store

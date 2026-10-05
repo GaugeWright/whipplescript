@@ -112,6 +112,7 @@ pub fn capture(
         edge_digest: sha256_hex(&edge_json),
         constructs: None,
         declarations: None,
+        package_calls: Some(crate::construct_coverage::capture_package_calls(program)?),
     })
 }
 
@@ -291,6 +292,10 @@ mod tests {
             stored,
             capture(&ir, &program_source_digest, A, B, &packages).unwrap()
         );
+        assert!(stored
+            .package_calls
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
         assert!(kernel
             .store()
             .get_program_version(&admitted.version_id)

@@ -42,6 +42,41 @@ pub struct ProgramImportWitness {
     /// have no effect capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declarations: Option<ProgramDeclarationCapture>,
+    /// `None` is unknown for ordinary and construct capability calls in older
+    /// witnesses. `Some(empty)` proves this one compiler-inventoried class was
+    /// examined. It does not classify other provider or content handles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_calls: Option<ProgramPackageCallCapture>,
+}
+
+/// The fields of `IrPackageCall` have fixed, deliberately narrow meanings:
+/// `target` names a local capability binding, `tracker_resources` names local
+/// tracker scopes, and `argument` is opaque data. None alone asserts a live
+/// dependency on another package or Home. The scope version makes a future
+/// change to those meanings an explicit witness-format change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramPackageCallScope {
+    CapabilityCallV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramPackageCallUse {
+    pub occurrence: usize,
+    pub rule_name: String,
+    pub effect_id: String,
+    pub target: String,
+    pub argument: Option<String>,
+    pub tracker_resources: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramPackageCallCapture {
+    pub scope: ProgramPackageCallScope,
+    pub examined: Vec<ProgramPackageCallUse>,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -389,6 +424,27 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             ));
         }
     }
+    if let Some(calls) = &witness.package_calls {
+        if !is_digest(&calls.digest)
+            || calls.examined.iter().enumerate().any(|(index, call)| {
+                call.occurrence != index
+                    || call.rule_name.is_empty()
+                    || call.effect_id.is_empty()
+                    || call.target.is_empty()
+                    || call.tracker_resources.iter().any(String::is_empty)
+            })
+        {
+            return Err(StoreError::Conflict(
+                "package-call witness has incomplete or unordered uses".into(),
+            ));
+        }
+        let examined_json = serde_json::to_string(&calls.examined)?;
+        if crate::items::sha256_hex(&examined_json) != calls.digest {
+            return Err(StoreError::Conflict(
+                "package-call witness digest differs from its uses".into(),
+            ));
+        }
+    }
     let json = serde_json::to_string(witness)?;
     let digest = crate::items::sha256_hex(&json);
     Ok((digest, json))
@@ -486,7 +542,55 @@ mod tests {
             edges,
             constructs: None,
             declarations: None,
+            package_calls: None,
         }
+    }
+
+    #[test]
+    fn package_call_witness_keeps_legacy_unknown_and_refuses_incomplete_capture() {
+        let legacy = witness(LOCK);
+        let (_, legacy_json) = encode(&legacy).unwrap();
+        assert!(!legacy_json.contains("package_calls"));
+
+        let mut checked = legacy.clone();
+        let examined = vec![
+            ProgramPackageCallUse {
+                occurrence: 0,
+                rule_name: "ask".into(),
+                effect_id: "effect-one".into(),
+                target: "memory.query".into(),
+                argument: Some("opaque-input".into()),
+                tracker_resources: vec!["backlog".into()],
+            },
+            ProgramPackageCallUse {
+                occurrence: 1,
+                rule_name: "save".into(),
+                // Effect identifiers are local to rules, so this can repeat.
+                effect_id: "effect-one".into(),
+                target: "memory.write".into(),
+                argument: None,
+                tracker_resources: vec![],
+            },
+        ];
+        checked.package_calls = Some(ProgramPackageCallCapture {
+            scope: ProgramPackageCallScope::CapabilityCallV1,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+        let mut malformed = checked.clone();
+        let calls = malformed.package_calls.as_mut().unwrap();
+        calls.examined[1].occurrence = 0;
+        calls.digest = crate::items::sha256_hex(&serde_json::to_string(&calls.examined).unwrap());
+        assert!(matches!(
+            encode(&malformed),
+            Err(StoreError::Conflict(message)) if message.contains("package-call witness has incomplete or unordered uses")
+        ));
+        checked.package_calls.as_mut().unwrap().examined[0].target = "changed".into();
+        assert!(matches!(
+            encode(&checked),
+            Err(StoreError::Conflict(message)) if message.contains("package-call witness digest differs")
+        ));
     }
 
     #[test]
