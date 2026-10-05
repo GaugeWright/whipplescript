@@ -2071,6 +2071,37 @@ impl GovernedHostRuntime {
         })
     }
 
+    /// Observe an exact original terminal execution without admitting or
+    /// resuming work, resolving a provider or refreshing runtime evidence.
+    /// Absence supplies no execution grant. The embedding retains its original
+    /// command, bindings and starting coordinate; this projection replaces none.
+    pub fn recorded_turn_execution<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        resources: &R,
+    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
+        let observed = (|| {
+            let saved = self.stored_execution(command)?;
+            if let Some(receipt) = saved
+                .as_ref()
+                .and_then(|execution| execution.receipt.as_ref())
+            {
+                self.kernel
+                    .store()
+                    .chain_head_at(
+                        &command.instance_ref,
+                        receipt.terminal_position.sequence as i64,
+                    )
+                    .map_err(HostRuntimeError::Store)?;
+            }
+            Ok(saved)
+        })();
+        access.check()?;
+        observed
+    }
+
     /// The turn's guarantee report (DR-0036): the `host.turn.guarantee`
     /// evidence body for `command`'s run — the static admission set plus the
     /// dynamic per-turn section a host consumer matches **by name** (GaugeWright
@@ -6018,6 +6049,339 @@ workflow UnsafeHostChat {
         assert_eq!(driver.requests.borrow().len(), 1);
         drop(runtime);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn recorded_turn_execution_preserves_original_after_later_work_and_restart() {
+        let path = temp_store();
+        let policy = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "saved-execution-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let before = runtime.current_position(&instance.instance_ref).unwrap();
+        let effects = format!(
+            "{:?}",
+            runtime
+                .kernel
+                .store()
+                .list_effects(&instance.instance_ref)
+                .unwrap()
+        );
+        assert!(runtime
+            .recorded_turn_execution(&command, &resources)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            runtime.current_position(&instance.instance_ref).unwrap(),
+            before
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                runtime
+                    .kernel
+                    .store()
+                    .list_effects(&instance.instance_ref)
+                    .unwrap()
+            ),
+            effects
+        );
+        assert_eq!(secrets.calls.get(), 0);
+
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "original private answer",
+            "usage": { "input_tokens": 13, "output_tokens": 5 }
+        })]);
+        let original = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap();
+        let later = turn(&instance.instance_ref, &open.policy, 2);
+        runtime
+            .run_turn_with_driver(
+                &later,
+                &Packages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(vec![json!({"output_text":"later private answer"})]),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .current_position(&instance.instance_ref)
+                .unwrap()
+                .sequence
+                > original
+                    .receipt
+                    .as_ref()
+                    .unwrap()
+                    .terminal_position
+                    .sequence
+        );
+        let head = runtime.pinned_position(&instance.instance_ref).unwrap();
+        let events = format!(
+            "{:?}",
+            runtime
+                .kernel
+                .store()
+                .list_events(&instance.instance_ref)
+                .unwrap()
+        );
+        let effects = format!(
+            "{:?}",
+            runtime
+                .kernel
+                .store()
+                .list_effects(&instance.instance_ref)
+                .unwrap()
+        );
+        let provider_calls = secrets.calls.get();
+        assert_eq!(
+            runtime
+                .recorded_turn_execution(&command, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            runtime.pinned_position(&instance.instance_ref).unwrap(),
+            head
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                runtime
+                    .kernel
+                    .store()
+                    .list_events(&instance.instance_ref)
+                    .unwrap()
+            ),
+            events
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                runtime
+                    .kernel
+                    .store()
+                    .list_effects(&instance.instance_ref)
+                    .unwrap()
+            ),
+            effects
+        );
+        assert_eq!(secrets.calls.get(), provider_calls);
+        assert_eq!(driver.requests.borrow().len(), 1);
+        assert_eq!(resources.tool_calls.get(), 0);
+
+        for field in [
+            "input",
+            "actor",
+            "run",
+            "resources",
+            "credential",
+            "package",
+            "placement",
+        ] {
+            let mut changed = command.clone();
+            match field {
+                "input" => changed.input.text.push_str("changed"),
+                "actor" => changed.actor_ref.push_str("changed"),
+                "run" => changed.run_ref.push_str("changed"),
+                "resources" => changed.resources.clear(),
+                "credential" => changed
+                    .provider_binding
+                    .credential
+                    .credential_id
+                    .push_str("changed"),
+                "package" => changed.package_version_ref.push_str("changed"),
+                "placement" => changed.placement_ceiling_ref.push_str("changed"),
+                _ => unreachable!(),
+            }
+            assert!(
+                runtime
+                    .recorded_turn_execution(&changed, &resources)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            runtime.pinned_position(&instance.instance_ref).unwrap(),
+            head
+        );
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let lost = connection.execute(
+            "UPDATE events SET event_type='lost-original-checkpoint' WHERE event_type='agent.turn.brokered.transcript' AND json_extract(payload_json,'$.effect_id')=?1",
+            [&command.command_id],
+        ).unwrap();
+        assert!(lost > 0);
+        assert!(runtime
+            .recorded_turn_execution(&command, &resources)
+            .is_err());
+        connection.execute(
+            "UPDATE events SET event_type='agent.turn.brokered.transcript' WHERE event_type='lost-original-checkpoint' AND json_extract(payload_json,'$.effect_id')=?1",
+            [&command.command_id],
+        ).unwrap();
+        assert_eq!(
+            runtime
+                .recorded_turn_execution(&command, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        for (column, bad) in [
+            ("kind", "other"),
+            ("status", "queued"),
+            ("input_json", "{}"),
+        ] {
+            let old: String = connection
+                .query_row(
+                    &format!("SELECT {column} FROM effects WHERE effect_id=?1"),
+                    [&command.command_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE effects SET {column}=?1 WHERE effect_id=?2"),
+                    rusqlite::params![bad, &command.command_id],
+                )
+                .unwrap();
+            assert!(
+                runtime
+                    .recorded_turn_execution(&command, &resources)
+                    .is_err(),
+                "{column}"
+            );
+            connection
+                .execute(
+                    &format!("UPDATE effects SET {column}=?1 WHERE effect_id=?2"),
+                    rusqlite::params![old, &command.command_id],
+                )
+                .unwrap();
+        }
+        let (marker_id, marker_payload): (String, String) = connection.query_row(
+            "SELECT event_id,payload_json FROM events WHERE instance_id=?1 AND event_type='host.turn.receipt' AND correlation_id=?2",
+            rusqlite::params![&instance.instance_ref, &command.command_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let mut bad_receipt: Value = serde_json::from_str(&marker_payload).unwrap();
+        bad_receipt["run_ref"] = json!("another-original-run");
+        connection
+            .execute(
+                "UPDATE events SET payload_json=?1 WHERE event_id=?2",
+                rusqlite::params![bad_receipt.to_string(), &marker_id],
+            )
+            .unwrap();
+        assert!(runtime
+            .recorded_turn_execution(&command, &resources)
+            .is_err());
+        connection
+            .execute(
+                "UPDATE events SET payload_json=?1 WHERE event_id=?2",
+                rusqlite::params![marker_payload, &marker_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            runtime
+                .recorded_turn_execution(&command, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        drop(runtime);
+        let reopened = GovernedHostRuntime::open(&path, 7, &policy).unwrap();
+        assert_eq!(
+            reopened
+                .recorded_turn_execution(&command, &resources)
+                .unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            reopened.pinned_position(&instance.instance_ref).unwrap(),
+            head
+        );
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recorded_turn_execution_checks_access_before_and_after_observation() {
+        struct ReadAccess {
+            calls: Cell<usize>,
+            deny_at: usize,
+        }
+        impl ResourceResolver for ReadAccess {
+            fn check_live_access(&self) -> Result<(), String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.calls.get() >= self.deny_at {
+                    Err("private staff detail".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                unreachable!()
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "saved-access-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &ScriptedDriver::new(vec![json!({"output_text":"saved private answer"})]),
+            )
+            .unwrap();
+        let before = runtime.pinned_position(&instance.instance_ref).unwrap();
+        for deny_at in [1, 2] {
+            let access = ReadAccess {
+                calls: Cell::new(0),
+                deny_at,
+            };
+            let error = runtime
+                .recorded_turn_execution(&command, &access)
+                .unwrap_err();
+            assert!(error.to_string().contains(LIVE_ACCESS_REFUSED));
+            assert!(!error.to_string().contains("private staff detail"));
+            assert_eq!(access.calls.get(), deny_at);
+        }
+        assert_eq!(
+            runtime.pinned_position(&instance.instance_ref).unwrap(),
+            before
+        );
+        drop(runtime);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
