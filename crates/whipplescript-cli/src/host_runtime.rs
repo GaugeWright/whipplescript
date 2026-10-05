@@ -2394,6 +2394,18 @@ impl GovernedHostRuntime {
             },
         };
         result.validate_for(command)?;
+        if let Some(journal) = journal.as_mut() {
+            journal
+                .allow_retained_use(
+                    target_store_incarnation
+                        .as_deref()
+                        .expect("Home identity checked"),
+                    &command.request_id,
+                    &result.instance_ref,
+                    &version.version_id,
+                )
+                .map_err(home_journal_error)?;
+        }
         Ok(result)
     }
 
@@ -10047,17 +10059,26 @@ workflow Method {
             .expect("Home operation committed before completion");
         assert!(operation.witness_digest.is_some());
 
+        journal.fail_at = Some("retained");
+        let refused = runtime
+            .open_instance_with_home_journal(&open, &Packages, &mut journal)
+            .expect_err("fresh instance cannot return before its Home use check");
+        assert!(format!("{refused:?}").contains("Home retained use refused"));
+        assert_eq!(runtime.kernel.store().list_instances().unwrap().len(), 1);
+        assert_eq!(journal.completed, [HOME_OPEN_OPERATION]);
+        assert_eq!(journal.retained.len(), 1);
         journal.fail_at = None;
         let opened = runtime
             .open_instance_with_home_journal(&open, &Packages, &mut journal)
-            .expect("exact target retry completes and opens");
+            .expect("exact retry recovers the withheld instance");
         assert_eq!(journal.completed, [HOME_OPEN_OPERATION]);
         assert_eq!(runtime.kernel.store().list_instances().unwrap().len(), 1);
+        assert_eq!(journal.retained.len(), 2);
         let replayed = runtime
             .open_instance_with_home_journal(&open, &Packages, &mut journal)
             .expect("completed Home open can be reused");
         assert_eq!(replayed.instance_ref, opened.instance_ref);
-        assert_eq!(journal.retained.len(), 1);
+        assert_eq!(journal.retained.len(), 3);
         assert_eq!(
             runtime
                 .kernel

@@ -123,7 +123,8 @@ pub struct OpenInstanceOperationEvidence<'a> {
 /// registered request and operation; a missing legacy pin must refuse rather
 /// than infer an origin from a version. Registration, completion, and retained
 /// use must bind the same target-store incarnation; a reused path or DO name
-/// cannot inherit an older pointer.
+/// cannot inherit an older pointer. The use callback runs for a fresh open
+/// after its instance event is written and again for every exact replay.
 pub trait OpenInstanceHomeJournal {
     fn register(
         &mut self,
@@ -823,6 +824,16 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             },
         };
         opened.validate_for(command)?;
+        if let Some(journal) = journal.as_mut() {
+            journal.allow_retained_use(
+                target_store_incarnation
+                    .as_deref()
+                    .expect("Home identity checked"),
+                &command.request_id,
+                &opened.instance_ref,
+                &version.version_id,
+            )?;
+        }
         Ok(opened)
     }
 
@@ -1548,12 +1559,26 @@ workflow Method {
         assert_eq!(before.operations.len(), 1);
         assert_eq!(before.operations[0].operation_id, HOME_OPERATION);
 
-        let mut journal = TestOpenHomeJournal::default();
-        let opened = host
+        let mut journal = TestOpenHomeJournal {
+            fail_at: Some("retained"),
+            ..Default::default()
+        };
+        let refused = host
             .open_instance_with_home_journal(&open, &package, &mut journal)
-            .expect("exact retry completes");
+            .expect_err("fresh instance cannot return before its Home use check");
+        assert!(format!("{refused:?}").contains("Home retained use refused"));
         assert_eq!(journal.registered, 1);
         assert_eq!(journal.completed, 1);
+        assert_eq!(journal.retained, 1);
+        assert_eq!(host.kernel().store().list_instances().unwrap().len(), 1);
+        journal.fail_at = None;
+        let opened = host
+            .open_instance_with_home_journal(&open, &package, &mut journal)
+            .expect("exact retry recovers the withheld instance");
+        assert_eq!(journal.registered, 1);
+        assert_eq!(journal.completed, 1);
+        assert_eq!(journal.retained, 2);
+        assert_eq!(host.kernel().store().list_instances().unwrap().len(), 1);
         assert_eq!(
             host.kernel()
                 .store()
@@ -1566,14 +1591,14 @@ workflow Method {
         assert!(host
             .open_instance_with_home_journal(&open, &package, &mut journal)
             .is_err());
-        assert_eq!(journal.retained, 1);
+        assert_eq!(journal.retained, 3);
         journal.fail_at = None;
         assert_eq!(
             host.open_instance_with_home_journal(&open, &package, &mut journal)
                 .expect("exact retained use"),
             opened
         );
-        assert_eq!(journal.retained, 2);
+        assert_eq!(journal.retained, 4);
     }
 
     #[test]
@@ -1742,7 +1767,7 @@ workflow Method {
                 .unwrap(),
             before
         );
-        assert_eq!(journal.retained, 2);
+        assert_eq!(journal.retained, 3);
         journal.fail_at = Some("complete");
         assert!(host
             .open_instance_with_home_journal(&open, &package, &mut journal)
@@ -1767,7 +1792,7 @@ workflow Method {
                 .expect("retained use can recover exact pending target"),
             opened
         );
-        assert_eq!(journal.retained, 5);
+        assert_eq!(journal.retained, 6);
         assert_eq!(
             host.kernel()
                 .store()
