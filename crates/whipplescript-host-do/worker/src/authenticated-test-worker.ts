@@ -32,6 +32,19 @@ if (!projectedTestHomeGovernanceKey) {
   throw new Error("test Home key did not project to a governance key");
 }
 const testHomeGovernanceKey: string = projectedTestHomeGovernanceKey;
+const testProjectKeys = await crypto.subtle.generateKey(
+  { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+) as CryptoKeyPair;
+const testProjectJwk = await crypto.subtle.exportKey("jwk", testProjectKeys.publicKey);
+if (testProjectJwk instanceof ArrayBuffer) throw new Error("project test key is not JWK");
+const testProjectKey = p256JwkToGovernanceHex(testProjectJwk);
+if (!testProjectKey) throw new Error("project test key is not P-256");
+const testProjectSigner = "project:private-policy-test";
+const testProjectAdmissionBindings = JSON.stringify([{
+  home_id: "home:project-policy-test", tenant_id: "tenant:project-policy-test",
+  project_id: "project:project-policy-test", governance_signer: testProjectSigner,
+  key_id: testProjectKey, public_key: testProjectJwk,
+}]);
 const testNormWorkerKeys = await crypto.subtle.generateKey(
   { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
 ) as CryptoKeyPair;
@@ -61,10 +74,11 @@ function base64(bytes: ArrayBuffer | Uint8Array): string {
 
 async function signTestHomeGrant(
   grant: DurableWorkflowGrant,
+  project = false,
 ): Promise<Response> {
   const signature = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
-    testHomeKeys.privateKey,
+    project ? testProjectKeys.privateKey : testHomeKeys.privateKey,
     new TextEncoder().encode(canonicalJson(grant)),
   );
   const encoded = base64(
@@ -89,22 +103,22 @@ function governanceSigningBytes(
   envelopeHash: string,
   signer: string,
   keyId: string,
+  legacy = false,
 ): Uint8Array {
-  let value = "whipplescript-governance-envelope:v2;";
+  let value = legacy ? "whipplescript-governance-envelope:v1;" : "whipplescript-governance-envelope:v2;";
   for (const item of [
     envelopeHash,
     signer,
     "p256-sha256",
     keyId,
-    String(TEST_HOME_EPOCH),
-    TEST_HOME_AUTHORITY,
+    ...(legacy ? [] : [String(TEST_HOME_EPOCH), TEST_HOME_AUTHORITY]),
   ]) {
     value += `${new TextEncoder().encode(item).byteLength}:${item};`;
   }
   return new TextEncoder().encode(value);
 }
 
-async function testHomePolicy(): Promise<Response> {
+async function testHomePolicy(legacy = false): Promise<Response> {
   const unsigned = {
     bindings: {
       do: "placement:do",
@@ -144,6 +158,7 @@ async function testHomePolicy(): Promise<Response> {
       envelopeHash,
       TEST_HOME_SIGNER,
       testHomeGovernanceKey,
+      legacy,
     ),
   );
   return Response.json({
@@ -155,9 +170,8 @@ async function testHomePolicy(): Promise<Response> {
       ...unsigned,
       attestation: {
         algorithm: "p256-sha256",
-        authority: TEST_HOME_AUTHORITY,
         envelope_hash: envelopeHash,
-        epoch: TEST_HOME_EPOCH,
+        ...(legacy ? {} : { authority: TEST_HOME_AUTHORITY, epoch: TEST_HOME_EPOCH }),
         key_id: testHomeGovernanceKey,
         signature: [...new Uint8Array(signature)]
           .map((byte) => byte.toString(16).padStart(2, "0"))
@@ -177,6 +191,8 @@ export class WorkflowInstance extends RuntimeWorkflowInstance {
   constructor(ctx: DurableObjectState, env: Env) {
     const configured = {
       ...env,
+      HOME_ADMISSION_BINDINGS: testProjectAdmissionBindings,
+      HOME_ADMISSION_KEYS: JSON.stringify({ [TEST_HOME_KEY_ID]: exportedTestHomePublicKey }),
       WHIP_NORM_TRUST: JSON.stringify({
         bindings: [
           { principal: "norm-owner", algorithm: "p256-sha256", key_id: testHomeGovernanceKey },
@@ -279,7 +295,13 @@ export default {
       request.method === "GET" &&
       url.pathname === "/__test/private-home/policy"
     ) {
-      return testHomePolicy();
+      return testHomePolicy(url.searchParams.get("legacy") === "1");
+    }
+    if (request.method === "GET" && url.pathname === "/__test/project-home/identity") {
+      return Response.json({ key_id: testProjectKey, signer: testProjectSigner });
+    }
+    if (request.method === "POST" && url.pathname === "/__test/project-home/sign") {
+      return signTestHomeGrant(await request.json<DurableWorkflowGrant>(), true);
     }
     if (
       request.method === "POST" &&
@@ -307,6 +329,7 @@ export default {
           HOME_ADMISSION_KEYS: JSON.stringify({
             [TEST_HOME_KEY_ID]: exportedTestHomePublicKey,
           }),
+          HOME_ADMISSION_BINDINGS: testProjectAdmissionBindings,
         },
         ctx,
       );

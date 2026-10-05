@@ -73,10 +73,15 @@ import { LiveModelContext, type ModelRequestProvenance } from "./live-model-cont
 import {
   canonicalJson,
   decodeGrant,
+  durableWorkflowObjectName,
+  homeAdmissionKey,
+  projectHomeAddress,
+  p256JwkToGovernanceHex,
   parsePrivateRetirementReceipt,
   privateObjectStorageKey,
   sha256Hex,
   validateDurableWorkflowGrant,
+  verifyP256GrantSignature,
   verifyPinnedP256GrantSignature,
   type DurableWorkflowGrant,
   type PrivateRetirementReceipt,
@@ -115,6 +120,7 @@ function privateAttemptBasis(grant: DurableWorkflowGrant): string {
     max_spend_nanos_usd: grant.max_spend_nanos_usd,
     retention_seconds: grant.retention_seconds,
     callback_ref: grant.callback_ref,
+    ...(grant.original_policy ? { original_policy: grant.original_policy } : {}),
   });
 }
 
@@ -132,6 +138,7 @@ const verifyHostPolicy = (
       signedEnvelope: string,
       expectedSigner: string,
       publicKeyHex: string,
+      retainedPolicyJson?: string,
     ) => string;
   }
 ).verify_host_policy;
@@ -175,6 +182,7 @@ const hostFunctions = bindings as unknown as {
     systemPrompt: string,
     projectContext: string | undefined,
     compilerArtifactDigest: string,
+    retainedPolicyJson?: string,
   ) => string;
   host_discard_instance: (
     bridge: unknown,
@@ -182,6 +190,7 @@ const hostFunctions = bindings as unknown as {
     expectedSigner: string,
     publicKeyHex: string,
     commandJson: string,
+    retainedPolicyJson?: string,
   ) => string;
   host_validate_turn: (
     bridge: unknown,
@@ -193,6 +202,7 @@ const hostFunctions = bindings as unknown as {
     packageSource: string,
     systemPrompt: string,
     projectContext?: string,
+    retainedPolicyJson?: string,
   ) => string;
   host_begin_turn: (
     bridge: unknown,
@@ -207,6 +217,7 @@ const hostFunctions = bindings as unknown as {
     provider: string,
     model: string,
     baseUrl: string,
+    retainedPolicyJson?: string,
   ) => boolean;
   host_cancel_turn: (
     bridge: unknown,
@@ -259,6 +270,7 @@ const hostFunctions = bindings as unknown as {
     packageSource: string,
     systemPrompt: string,
     projectContext?: string,
+    retainedPolicyJson?: string,
   ) => string;
   host_import_fork: (
     bridge: unknown,
@@ -272,6 +284,7 @@ const hostFunctions = bindings as unknown as {
     systemPrompt: string,
     projectContext: string | undefined,
     compilerArtifactDigest: string,
+    retainedPolicyJson?: string,
   ) => string;
 };
 
@@ -287,6 +300,10 @@ import { handleObjectPlane } from "./object-store";
 
 export interface Env {
   WORKFLOW_INSTANCE: DurableObjectNamespace;
+  /** Independent project Home trust, also checked inside the object. */
+  HOME_ADMISSION_BINDINGS?: string;
+  /** Legacy installation lane; never authenticates a V2 project grant. */
+  HOME_ADMISSION_KEYS?: string;
   // The external byte tier (DR-0113). Optional: a deployment without it keeps
   // the text-only behaviour and says so rather than pretending otherwise.
   WHIP_OBJECTS?: R2Bucket;
@@ -1665,7 +1682,7 @@ export class WorkflowInstance implements DurableObject {
       }
       return Response.json({ error: "private command has been retired" }, { status: 410 });
     }
-    const privateRootError = this.pinPrivateGovernanceRoot(request);
+    const privateRootError = await this.pinPrivateGovernanceRoot(request);
     if (privateRootError) {
       return privateRootError;
     }
@@ -4699,7 +4716,7 @@ export class WorkflowInstance implements DurableObject {
     return Response.json({ acknowledged: true }, { headers: { "cache-control": "no-store" } });
   }
 
-  private pinPrivateGovernanceRoot(request: Request): Response | undefined {
+  private async pinPrivateGovernanceRoot(request: Request): Promise<Response | undefined> {
     const signer = request.headers
       .get("x-gaugewright-private-governance-signer")
       ?.trim();
@@ -4753,6 +4770,39 @@ export class WorkflowInstance implements DurableObject {
         { error: "private Home callback authorization is invalid" },
         { status: 403 },
       );
+    }
+    const candidate = decodeGrant(executionGrant);
+    if (!candidate || validateDurableWorkflowGrant(candidate, Math.floor(Date.now() / 1000))) {
+      return Response.json({ error: "private Home object grant is invalid" }, { status: 403 });
+    }
+    let admittedKey: JsonWebKey | undefined;
+    try {
+      if (candidate.version === 1 && projectHomeAddress(this.env.HOME_ADMISSION_BINDINGS, candidate)) {
+        return Response.json({ error: "legacy installation authority cannot address a project Home" }, { status: 403 });
+      }
+      admittedKey = candidate.version === 2
+        ? homeAdmissionKey(this.env.HOME_ADMISSION_BINDINGS, candidate)
+        : (JSON.parse(this.env.HOME_ADMISSION_KEYS ?? "{}") as Record<string, JsonWebKey>)[candidate.key_id];
+    } catch {
+      return Response.json({ error: "private Home object admission is unavailable" }, { status: 503 });
+    }
+    const expectedObject = this.env.WORKFLOW_INSTANCE.idFromName(durableWorkflowObjectName(candidate));
+    if (!admittedKey || candidate.governance_signer !== signer
+      || p256JwkToGovernanceHex(admittedKey) !== key
+      || expectedObject.toString() !== this.ctx.id.toString()
+      || !(await verifyP256GrantSignature(candidate, executionSignature, admittedKey))) {
+      return Response.json({ error: "private Home object admission is invalid" }, { status: 403 });
+    }
+    const addressed = new URL(request.url);
+    // Streaming object registration carries verified placement metadata rather
+    // than the original byte body. Its own mediated door checks that binding.
+    const objectRegistration = addressed.pathname === "/host/objects/register"
+      && /^\/host\/objects\/[0-9a-f]{32}$/.test(candidate.request_path);
+    if (addressed.pathname.startsWith("/host/") && !objectRegistration
+      && (candidate.request_method !== request.method
+        || candidate.request_path !== `${addressed.pathname}${addressed.search}`
+        || candidate.request_body_sha256 !== await sha256Hex(await request.clone().arrayBuffer()))) {
+      return Response.json({ error: "private Home object request differs from its grant" }, { status: 403 });
     }
     ensureSchema(this.ctx.storage.sql);
     this.ctx.storage.sql.exec(
@@ -4880,7 +4930,7 @@ export class WorkflowInstance implements DurableObject {
     };
   }
 
-  private pinnedGovernanceRoot(): { signer: string; key: string } | Response {
+  private pinnedGovernanceRoot(policy?: HostPolicyBootstrap): { signer: string; key: string; retainedPolicyJson?: string } | Response {
     ensureSchema(this.ctx.storage.sql);
     const publicRoot = this.ctx.storage.sql
       .exec(
@@ -4905,6 +4955,18 @@ export class WorkflowInstance implements DurableObject {
       )
       .toArray() as { signer: string; key: string }[];
     if (privateRoot.length === 1) {
+      const context = this.privateModelBrokerConfig();
+      const admitted = context?.executionGrant ? decodeGrant(context.executionGrant) : undefined;
+      if (!admitted) {
+        return Response.json({ error: "private Home policy admission is unavailable" }, { status: 403 });
+      }
+      if (admitted.version === 2) {
+        const original = admitted.original_policy;
+        if (!original || (policy && canonicalJson(original) !== canonicalJson(policy.policy))) {
+          return Response.json({ error: "private Home original policy reference differs" }, { status: 403 });
+        }
+        return { signer: original.signer, key: original.key_id, retainedPolicyJson: JSON.stringify(original) };
+      }
       return privateRoot[0];
     }
     const signer = this.env.GAUGEDESK_GOVERNANCE_SIGNER?.trim();
@@ -5292,7 +5354,7 @@ export class WorkflowInstance implements DurableObject {
     if (request instanceof Response) return request;
     const policy = await this.hostPolicy(request.command);
     if (policy instanceof Response) return policy;
-    const root = this.pinnedGovernanceRoot();
+    const root = this.pinnedGovernanceRoot(policy);
     if (root instanceof Response) return root;
     ensureSchema(this.ctx.storage.sql);
     try {
@@ -5308,6 +5370,7 @@ export class WorkflowInstance implements DurableObject {
           request.package.system_prompt,
           request.package.project_context,
           wasmArtifactDigest,
+          root.retainedPolicyJson,
         ),
       );
       await this.ctx.storage.put(
@@ -5388,7 +5451,7 @@ export class WorkflowInstance implements DurableObject {
     if (request instanceof Response) return request;
     const policy = await this.hostPolicy(request.command);
     if (policy instanceof Response) return policy;
-    const root = this.pinnedGovernanceRoot();
+    const root = this.pinnedGovernanceRoot(policy);
     if (root instanceof Response) return root;
     ensureSchema(this.ctx.storage.sql);
     const common = [
@@ -5405,7 +5468,7 @@ export class WorkflowInstance implements DurableObject {
       // Phase 1 crosses no credential boundary. Only after WhippleScript has
       // returned these exact opaque ids may this Worker invoke the broker.
       const admission = JSON.parse(
-        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage), ...common),
+        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage), ...common, root.retainedPolicyJson),
       ) as HostTurnAdmission;
       const admittedBinding = this.resolveAdmittedProvider(
         admission,
@@ -5441,6 +5504,7 @@ export class WorkflowInstance implements DurableObject {
         binding.provider,
         binding.model,
         binding.base_url,
+        root.retainedPolicyJson,
       );
       const instanceId = String(request.command.instance_ref ?? "");
       if (!instanceId) {
@@ -5656,7 +5720,7 @@ export class WorkflowInstance implements DurableObject {
       `host-policy:${String(epoch)}:${envelopeHash}`,
     );
     if (!policy) return Response.json({ error: "source policy bootstrap not found" }, { status: 409 });
-    const root = this.pinnedGovernanceRoot();
+    const root = this.pinnedGovernanceRoot(policy);
     if (root instanceof Response) return root;
     try {
       return Response.json(JSON.parse(hostFunctions.host_export_thread(
@@ -5669,6 +5733,7 @@ export class WorkflowInstance implements DurableObject {
         packageDocs.source,
         packageDocs.system_prompt,
         packageDocs.project_context,
+        root.retainedPolicyJson,
       )));
     } catch (error) {
       return Response.json({ error: `fork export rejected: ${String(error)}` }, { status: 409 });
@@ -5684,7 +5749,7 @@ export class WorkflowInstance implements DurableObject {
     }
     const policy = await this.hostPolicy(request.command);
     if (policy instanceof Response) return policy;
-    const root = this.pinnedGovernanceRoot();
+    const root = this.pinnedGovernanceRoot(policy);
     if (root instanceof Response) return root;
     ensureSchema(this.ctx.storage.sql);
     try {
@@ -5700,6 +5765,7 @@ export class WorkflowInstance implements DurableObject {
         request.package.system_prompt,
         request.package.project_context,
         wasmArtifactDigest,
+        root.retainedPolicyJson,
       ));
       await this.ctx.storage.put(
         `host-package:${String(forked.target?.instance_ref ?? "")}`,
@@ -5725,7 +5791,7 @@ export class WorkflowInstance implements DurableObject {
     }
     const policy = await this.hostPolicy(record);
     if (policy instanceof Response) return policy;
-    const root = this.pinnedGovernanceRoot();
+    const root = this.pinnedGovernanceRoot(policy);
     if (root instanceof Response) return root;
     ensureSchema(this.ctx.storage.sql);
     try {
@@ -5735,6 +5801,7 @@ export class WorkflowInstance implements DurableObject {
         root.signer,
         root.key,
         JSON.stringify(record),
+        root.retainedPolicyJson,
       ));
       return Response.json(discarded, { status: 200 });
     } catch (error) {
@@ -5759,13 +5826,16 @@ export class WorkflowInstance implements DurableObject {
     let policy: HostPolicyBootstrap["policy"];
     try {
       policy = JSON.parse(
-        verifyHostPolicy(signedEnvelope, root.signer, root.key),
+        verifyHostPolicy(signedEnvelope, root.signer, root.key, root.retainedPolicyJson),
       ) as HostPolicyBootstrap["policy"];
     } catch (error) {
       return Response.json(
         { error: `policy rejected: ${error instanceof Error ? error.message : String(error)}` },
         { status: 403 },
       );
+    }
+    if (policy.epoch !== epoch) {
+      return Response.json({ error: "requested policy epoch differs from its authenticated binding" }, { status: 403 });
     }
     const key = `host-policy:${epoch}:${policy.envelope_hash}`;
     const existing = await this.ctx.storage.get<HostPolicyBootstrap>(key);

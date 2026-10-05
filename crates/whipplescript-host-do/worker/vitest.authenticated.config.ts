@@ -24,6 +24,7 @@ export default defineConfig({
       "src/norm-impact.integration.test.ts",
       "src/norm-promotion.integration.test.ts",
       "src/private-home-objects.integration.test.ts",
+      "src/project-home-policy.integration.test.ts",
     ],
     // Bounds a hang, not the machine's load. See `src/test-bounds.ts`.
     testTimeout: WORKERD_TEST_TIMEOUT_MS,

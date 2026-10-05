@@ -1,5 +1,5 @@
 export interface DurableWorkflowGrant {
-  version: 1;
+  version: 1 | 2;
   key_id: string;
   governance_signer: string;
   home_id: string;
@@ -20,10 +20,29 @@ export interface DurableWorkflowGrant {
   request_method: string;
   request_path: string;
   request_body_sha256: string;
+  /** Exact original policy independently verified by the current Home. */
+  original_policy?: OriginalPolicyRef;
   /** Only a Home terminal-command signer may set this for /host/private/retire. */
   retirement_authorized?: true;
   issued_at: number;
   expires_at: number;
+}
+
+export interface OriginalPolicyRef {
+  epoch: number;
+  envelope_hash: string;
+  signer: string;
+  key_id: string;
+}
+
+/** Independently configured authority for one exact project Home. */
+export interface HomeAdmissionBinding {
+  home_id: string;
+  tenant_id: string;
+  project_id: string;
+  governance_signer: string;
+  key_id: string;
+  public_key: JsonWebKey;
 }
 
 export interface PrivateRetirementReceipt {
@@ -83,8 +102,69 @@ export async function privateObjectStorageKey(
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const SEC1 = /^(?:04[0-9a-f]{128}|0[23][0-9a-f]{64})$/;
 const FORBIDDEN_CAPABILITY =
   /^(?:bash|build|command|container|docker|exec|filesystem|network|posix|process|shell|test|workspace)(?:[.:/]|$)/;
+
+export function validOriginalPolicyRef(value: unknown): value is OriginalPolicyRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Partial<OriginalPolicyRef>;
+  return Number.isSafeInteger(policy.epoch) && (policy.epoch ?? 0) > 0
+    && typeof policy.envelope_hash === "string" && SHA256.test(policy.envelope_hash)
+    && typeof policy.signer === "string" && ID.test(policy.signer)
+    && typeof policy.key_id === "string" && SEC1.test(policy.key_id)
+    && Object.keys(policy).every((field) => ["epoch", "envelope_hash", "signer", "key_id"].includes(field));
+}
+
+function configuredHomeBindings(configuration: string | undefined): HomeAdmissionBinding[] {
+  const bindings: unknown = JSON.parse(configuration ?? "null");
+  if (!Array.isArray(bindings) || bindings.length === 0) {
+    throw new Error("project Home admission bindings are unavailable");
+  }
+  const homes = new Set<string>();
+  const projects = new Set<string>();
+  const publicKeys = new Set<string>();
+  for (const value of bindings) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("project Home admission binding is invalid");
+    }
+    const binding = value as HomeAdmissionBinding;
+    if ([binding.home_id, binding.tenant_id, binding.project_id, binding.governance_signer, binding.key_id]
+      .some((id) => typeof id !== "string" || !ID.test(id))) {
+      throw new Error("project Home admission identity is invalid");
+    }
+    const key = binding.public_key;
+    const point = key && p256JwkToGovernanceHex(key);
+    if (!point || key.d !== undefined || homes.has(binding.home_id)
+      || projects.has(binding.project_id) || publicKeys.has(point)) {
+      throw new Error("project Home admission binding is ambiguous or invalid");
+    }
+    homes.add(binding.home_id);
+    projects.add(binding.project_id);
+    publicKeys.add(point);
+  }
+  return bindings as HomeAdmissionBinding[];
+}
+
+/** Missing or ambiguous configuration is a refusal; no unscoped-key fallback. */
+export function homeAdmissionKey(
+  configuration: string | undefined,
+  grant: DurableWorkflowGrant,
+): JsonWebKey | undefined {
+  return configuredHomeBindings(configuration).find((binding) =>
+    binding.home_id === grant.home_id && binding.tenant_id === grant.tenant_id
+    && binding.project_id === grant.project_id && binding.governance_signer === grant.governance_signer
+    && binding.key_id === grant.key_id)?.public_key;
+}
+
+/** A legacy installation signer cannot initialize or act at a registered Home. */
+export function projectHomeAddress(
+  configuration: string | undefined,
+  grant: Pick<DurableWorkflowGrant, "home_id" | "project_id">,
+): boolean {
+  return configuration !== undefined && configuredHomeBindings(configuration)
+    .some((binding) => binding.home_id === grant.home_id || binding.project_id === grant.project_id);
+}
 
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -185,7 +265,7 @@ export function validateDurableWorkflowGrant(
   grant: DurableWorkflowGrant,
   nowSeconds: number,
 ): string | undefined {
-  if (grant.version !== 1 || grant.profile !== "durable_workflow") {
+  if (![1, 2].includes(grant.version) || grant.profile !== "durable_workflow") {
     return "unsupported execution profile or grant version";
   }
   const identities = [
@@ -202,8 +282,14 @@ export function validateDurableWorkflowGrant(
     grant.credential_class,
     grant.callback_ref,
   ];
-  if (identities.some((identity) => !ID.test(identity))) {
+  if (identities.some((identity) => typeof identity !== "string" || !ID.test(identity))) {
     return "invalid execution identity";
+  }
+  if ((grant.original_policy !== undefined && !validOriginalPolicyRef(grant.original_policy))
+    || (grant.version === 1 && grant.original_policy !== undefined)
+    || (grant.version === 2 && grant.request_path !== "/host/private/retire"
+      && !validOriginalPolicyRef(grant.original_policy))) {
+    return "execution grant has no valid original policy reference";
   }
   try {
     const callback = new URL(grant.callback_ref);
@@ -239,6 +325,7 @@ export function validateDurableWorkflowGrant(
   }
   if (
     !["GET", "POST"].includes(grant.request_method) ||
+    typeof grant.request_path !== "string" ||
     !grant.request_path.startsWith("/host/") ||
     grant.request_path.includes("#") ||
     grant.request_path.includes("://") ||

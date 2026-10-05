@@ -301,10 +301,15 @@ pub fn verify_host_policy(
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
-        .verify(signed_envelope)
-        .map_err(|error| JsValue::from_str(&error))?;
+    let verified = hosted_root(
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .verify(signed_envelope)
+    .map_err(|error| JsValue::from_str(&error))?;
     serde_json::to_string(&verified.policy).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -496,17 +501,37 @@ pub fn host_norm_provision(
     .map_err(|error| JsValue::from_str(&error))
 }
 
+/// The shell supplies this reference only from independently authenticated
+/// Home admission. Public request metadata must never populate this capability.
+fn hosted_root(
+    expected_signer: &str,
+    public_key_hex: &str,
+    retained_policy_json: Option<&str>,
+) -> Result<GaugeDeskGovernanceRoot, JsValue> {
+    let root = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex);
+    match retained_policy_json {
+        Some(json) => {
+            let policy: PolicyEpochRef = serde_json::from_str(json)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            Ok(root.with_retained_policy(policy))
+        }
+        None => Ok(root),
+    }
+}
+
 fn hosted_facade(
     bridge: DoSqlBridge,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
+    retained_policy_json: Option<&str>,
 ) -> Result<GovernedHostFacade<crate::do_store::DoSqliteStore<JsDoSql>>, JsValue> {
-    let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
+    let verified = hosted_root(expected_signer, public_key_hex, retained_policy_json)?
         .verify(signed_envelope)
         .map_err(|error| JsValue::from_str(&error))?;
-    // The epoch the facade runs under is the one the signature covers, so
-    // there is no second source for it to disagree with.
+    // The verified epoch comes from the V2 signature or the complete original
+    // reference independently admitted by the Home. Verification compares both
+    // bindings when present before any facade/store admission.
     let epoch = verified.policy.epoch;
     GovernedHostFacade::from_verified_store(
         crate::do_store::DoSqliteStore::new(JsDoSql { bridge }),
@@ -547,9 +572,16 @@ pub fn host_open_instance(
     system_prompt: &str,
     project_context: Option<String>,
     compiler_artifact_digest: &str,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?
-        .with_compiler_artifact_digest(compiler_artifact_digest);
+    let mut facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .with_compiler_artifact_digest(compiler_artifact_digest);
     let command: OpenInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(
@@ -573,8 +605,15 @@ pub fn host_discard_instance(
     expected_signer: &str,
     public_key_hex: &str,
     command_json: &str,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let mut facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
     let command: DiscardInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     command
@@ -681,8 +720,15 @@ pub fn host_validate_turn(
     package_source: &str,
     system_prompt: &str,
     project_context: Option<String>,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(
@@ -715,8 +761,15 @@ pub fn host_begin_turn(
     provider: &str,
     model: &str,
     base_url: &str,
+    retained_policy_json: Option<String>,
 ) -> Result<bool, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let mut facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(
@@ -946,8 +999,15 @@ pub fn host_export_thread(
     package_source: &str,
     system_prompt: &str,
     project_context: Option<String>,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
     let package = authored_package(
         package_manifest,
         package_source,
@@ -1031,9 +1091,16 @@ pub fn host_import_fork(
     system_prompt: &str,
     project_context: Option<String>,
     compiler_artifact_digest: &str,
+    retained_policy_json: Option<String>,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?
-        .with_compiler_artifact_digest(compiler_artifact_digest);
+    let mut facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .with_compiler_artifact_digest(compiler_artifact_digest);
     let package = authored_package(
         package_manifest,
         package_source,

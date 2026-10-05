@@ -20,6 +20,7 @@ pub const GAUGEDESK_ATTESTATION_ALGORITHM: &str = "p256-sha256";
 pub struct GaugeDeskGovernanceRoot {
     expected_signer: String,
     public_key_hex: String,
+    retained_policy: Option<PolicyEpochRef>,
 }
 
 impl GaugeDeskGovernanceRoot {
@@ -27,18 +28,27 @@ impl GaugeDeskGovernanceRoot {
         Self {
             expected_signer: expected_signer.into(),
             public_key_hex: public_key_hex.into(),
+            retained_policy: None,
         }
+    }
+
+    /// Bind an exact original policy reference authenticated independently by
+    /// the owning Home. The embedding must select both this reference and the
+    /// public root from admitted authority, never from the incoming envelope.
+    /// This verifies retained meaning; it grants no current execution standing.
+    pub fn with_retained_policy(mut self, policy: PolicyEpochRef) -> Self {
+        self.retained_policy = Some(policy);
+        self
     }
 
     /// Verify the signed policy and bind it to an immutable epoch reference.
     /// Signer, key, and now the **epoch** are all pinned by the signature;
     /// none may be selected by the request being verified (DR-0063 §5).
     ///
-    /// The epoch is read from the attestation rather than taken as an argument,
-    /// so the hosted path requires a `:v2` envelope. A `:v1` signature does not
-    /// reach the epoch, and this path is exactly where an unauthenticated one
-    /// would matter: a composition record cites the epoch per constituent, and
-    /// a caller that can name it can present a policy as a version it is not.
+    /// Ordinary admission reads the epoch from a `:v2` attestation. Retained
+    /// replay may instead use the independently authenticated complete reference
+    /// selected by `with_retained_policy`; a V2 signed epoch must still agree.
+    /// A caller-selected epoch without either binding is never sufficient.
     pub fn verify(&self, signed_envelope: &str) -> Result<VerifiedHostedPolicy, String> {
         if self.expected_signer.trim().is_empty() || self.public_key_hex.trim().is_empty() {
             return Err("hosted placement has no pinned GaugeDesk governance root".to_owned());
@@ -52,16 +62,34 @@ impl GaugeDeskGovernanceRoot {
                 "governance signer does not match the placement's pinned authority".to_owned(),
             );
         }
-        if attestation.key_id.as_deref() != Some(self.public_key_hex.as_str()) {
-            return Err(
-                "governance key does not match the placement's pinned authority".to_owned(),
-            );
-        }
-        let epoch = attestation.epoch.ok_or(
-            "hosted policy requires a :v2 governance attestation, whose signature covers the epoch",
-        )?;
+        // The attestation's key was compared with this pinned root by our
+        // cryptographic verifier before VerifiedEnvelope was constructed.
+        let epoch = match &self.retained_policy {
+            Some(retained) => {
+                if attestation
+                    .epoch
+                    .is_some_and(|signed_epoch| signed_epoch != retained.epoch)
+                {
+                    return Err("signed policy epoch differs from the admitted original reference"
+                        .to_owned());
+                }
+                retained.epoch
+            }
+            None => attestation.epoch.ok_or(
+                "hosted policy requires a :v2 governance attestation, whose signature covers the epoch",
+            )?,
+        };
         let policy =
             PolicyEpochRef::from_verified(epoch, &envelope).map_err(|error| error.to_string())?;
+        if self
+            .retained_policy
+            .as_ref()
+            .is_some_and(|retained| *retained != policy)
+        {
+            return Err(
+                "verified policy differs from the complete admitted original reference".to_owned(),
+            );
+        }
         Ok(VerifiedHostedPolicy { policy, envelope })
     }
 }
@@ -253,6 +281,80 @@ mod tests {
     }
 
     #[test]
+    fn original_v1_policy_replays_only_under_its_complete_admitted_reference() {
+        let (key, signed) = signed_policy(7, "authority:original");
+        let original_root = GaugeDeskGovernanceRoot::new("authority:original", key.clone());
+        let envelope = VerifiedEnvelope::verify_signed_text_with(&signed, &original_root)
+            .expect("original external signature");
+        let original = PolicyEpochRef::from_verified(12, &envelope).unwrap();
+        let replay = original_root
+            .clone()
+            .with_retained_policy(original.clone())
+            .verify(&signed)
+            .expect("the Home authenticated the complete original reference");
+        assert_eq!(replay.policy, original);
+        assert_eq!(
+            replay.envelope.attestation().unwrap().epoch,
+            None,
+            "replay must not manufacture a V2 signature",
+        );
+        assert!(original_root.verify(&signed).is_err());
+
+        let mut wrong_hash = original.clone();
+        wrong_hash.envelope_hash = "0".repeat(64);
+        let mut wrong_signer = original.clone();
+        wrong_signer.signer = "authority:substituted".into();
+        let mut wrong_key = original.clone();
+        wrong_key.key_id = Some("substituted-key".into());
+        let mut zero_epoch = original;
+        zero_epoch.epoch = 0;
+        for changed in [wrong_hash, wrong_signer, wrong_key, zero_epoch] {
+            assert!(
+                GaugeDeskGovernanceRoot::new("authority:original", key.clone())
+                    .with_retained_policy(changed)
+                    .verify(&signed)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn retained_v2_reference_cannot_substitute_its_signed_epoch() {
+        let (key, signed) = signed_policy_v2(7, "authority:original", 12, "project:one");
+        let root = GaugeDeskGovernanceRoot::new("authority:original", key);
+        let original = root.verify(&signed).unwrap().policy;
+        assert_eq!(
+            root.clone()
+                .with_retained_policy(original.clone())
+                .verify(&signed)
+                .unwrap()
+                .policy,
+            original,
+        );
+        let mut changed = original;
+        changed.epoch = 13;
+        let error = match root.with_retained_policy(changed).verify(&signed) {
+            Ok(_) => panic!("an admitted reference cannot relabel a V2 signature"),
+            Err(error) => error,
+        };
+        assert!(error.contains("signed policy epoch"), "{error}");
+    }
+
+    #[test]
+    fn admitted_reference_does_not_replace_original_signature_verification() {
+        let (key, signed) = signed_policy(7, "authority:original");
+        let root = GaugeDeskGovernanceRoot::new("authority:original", key);
+        let envelope = VerifiedEnvelope::verify_signed_text_with(&signed, &root).unwrap();
+        let original = PolicyEpochRef::from_verified(12, &envelope).unwrap();
+        let altered = signed.replace("gpt-5", "substituted-model");
+        assert_ne!(altered, signed, "the actual signed policy was changed");
+        assert!(root
+            .with_retained_policy(original)
+            .verify(&altered)
+            .is_err());
+    }
+
+    #[test]
     fn a_v2_signature_does_not_verify_as_v1() {
         // Domain separation. The tag differs, so bytes signed under one
         // preimage cannot be replayed as the other — which is what lets both
@@ -275,7 +377,14 @@ mod tests {
 
         let (wrong_key, _) = signed_policy_v2(9, "authority:gaugedesk", 12, "acme");
         let wrong_root = GaugeDeskGovernanceRoot::new("authority:gaugedesk", wrong_key);
-        assert!(wrong_root.verify(&signed).is_err());
+        let error = match wrong_root.verify(&signed) {
+            Ok(_) => panic!("the original signature cannot select another verification root"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("key does not match the pinned root"),
+            "{error}"
+        );
     }
 
     /// A policy carrying DR-0074 §2's type-narrowed unwrap grant, signed the

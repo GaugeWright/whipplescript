@@ -171,6 +171,23 @@ Set `WHIP_CONTROL_TOKEN` (internal Worker-to-object authentication),
 the private model-broker configuration before running
 `npm run deploy:private-staging`.
 
+Project authority uses version 2 grants and `HOME_ADMISSION_BINDINGS`: an
+independently provisioned JSON array of exact `home_id`, `tenant_id`, `project_id`,
+`governance_signer`, `key_id` and `public_key` (public P-256 JWK) bindings.
+Ambiguous Home/project/key bindings refuse. The unscoped `HOME_ADMISSION_KEYS`
+setting serves only the legacy version 1 installation lane; it cannot admit a
+version 2 project request or address a registered project Home. The object also
+verifies the grant independently before accepting forwarded trust headers.
+Registry provisioning must use independently admitted
+project/Home authority, never a key supplied by an execution request.
+
+Each non-retirement version 2 grant binds `original_policy`, the complete
+retained `PolicyEpochRef`. The runtime verifies its original signature and exact
+reference separately from current Home standing. An unchanged original V1
+external envelope can replay through that authenticated reference without
+re-signing. The ordinary hosted policy door still requires V2. Current attempt
+identity includes the original reference; it cannot change within that attempt.
+
 `npm run test:private-staging` proves unauthorized, tampered, and correctly
 signed-but-invalid policy handling. To prove real Durable Object persistence
 across an isolate replacement, run `test:private-staging:open -- <state-file>`,

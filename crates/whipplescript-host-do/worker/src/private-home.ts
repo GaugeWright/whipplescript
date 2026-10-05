@@ -3,6 +3,8 @@ import { declaredLength } from "./object-store";
 import {
   decodeGrant,
   durableWorkflowObjectName,
+  homeAdmissionKey,
+  projectHomeAddress,
   privateObjectStorageKey,
   p256JwkToGovernanceHex,
   parsePrivateRetirementReceipt,
@@ -13,6 +15,8 @@ import {
 } from "./private-home-protocol";
 
 interface PrivateHomeEnv extends RuntimeEnv {
+  HOME_ADMISSION_BINDINGS?: string;
+  /** Legacy install-authority lane; never authenticates a V2 project grant. */
   HOME_ADMISSION_KEYS?: string;
   /** The external byte tier (DR-0113). Absent is a refusal, not a crash. */
   WHIP_OBJECTS?: R2Bucket;
@@ -150,13 +154,17 @@ async function verifyGrantEnvelope(
   ) {
     return jsonError("execution grant does not match the addressed command", 403);
   }
-  let keys: Record<string, JsonWebKey>;
+  let key: JsonWebKey | undefined;
   try {
-    keys = JSON.parse(env.HOME_ADMISSION_KEYS ?? "{}") as Record<string, JsonWebKey>;
+    if (grant.version === 1 && projectHomeAddress(env.HOME_ADMISSION_BINDINGS, grant)) {
+      return jsonError("legacy installation authority cannot address a project Home", 403);
+    }
+    key = grant.version === 2
+      ? homeAdmissionKey(env.HOME_ADMISSION_BINDINGS, grant)
+      : (JSON.parse(env.HOME_ADMISSION_KEYS ?? "{}") as Record<string, JsonWebKey>)[grant.key_id];
   } catch {
-    return jsonError("Home admission keys are unavailable", 503);
+    return jsonError("Home admission configuration is unavailable or invalid", 503);
   }
-  const key = keys[grant.key_id];
   if (!key || !(await verifyP256GrantSignature(grant, signature, key))) {
     return jsonError("Home execution signature is invalid", 403);
   }
