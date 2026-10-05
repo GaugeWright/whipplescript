@@ -1790,6 +1790,32 @@ fn native_coerce_turn(
     codex_label: &str,
     wrapped: bool,
 ) -> Result<(Value, TurnUsage), String> {
+    native_coerce_turn_with_usage(purpose, prompt, schema, schema_name, codex_label, wrapped)
+        .map_err(|failure| failure.message)
+}
+
+struct NativeTurnFailure {
+    message: String,
+    usage: Option<Box<TurnUsage>>,
+}
+
+impl From<String> for NativeTurnFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            usage: None,
+        }
+    }
+}
+
+fn native_coerce_turn_with_usage(
+    purpose: &str,
+    prompt: String,
+    schema: Value,
+    schema_name: &str,
+    codex_label: &str,
+    wrapped: bool,
+) -> Result<(Value, TurnUsage), NativeTurnFailure> {
     let config = crate::coerce_runtime::resolve_native_coerce_config()
         .map_err(|error| format!("{purpose} provider: {error}"))?
         .ok_or_else(|| {
@@ -1820,6 +1846,15 @@ fn native_coerce_turn(
         transport: &transport,
     };
     let result = whipplescript_kernel::coerce::CoerceClient::coerce(&client, &judge_request());
+    let usage_json: Value = serde_json::from_str(&result.usage_json).unwrap_or(Value::Null);
+    // Price-table names match the configured provider, including its wire.
+    let provider_name = match client.provider {
+        whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
+        whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => "openai-generic",
+        whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+        whipplescript_kernel::coerce_native::CoerceProvider::Xai => "xai",
+    };
+    let usage = TurnUsage::from_usage_json(provider_name, &client.model, &usage_json);
     if !matches!(
         result.status,
         whipplescript_kernel::coerce::CoerceStatus::Succeeded
@@ -1837,27 +1872,35 @@ fn native_coerce_turn(
             .and_then(|value| value["http_status"].as_u64())
             .map(|status| format!(", HTTP {status}"))
             .unwrap_or_default();
-        return Err(format!(
-            "{purpose} failed: {} ({class}{status})",
-            result.summary
-        ));
+        // Only known static parser reasons reach this diagnostic. Provider
+        // messages and returned output may contain private prompt content.
+        let detail = safe_native_failure_detail(failure.as_ref());
+        return Err(NativeTurnFailure {
+            message: format!(
+                "{purpose} failed: {} ({class}{status}){detail}",
+                result.summary
+            ),
+            usage: (usage.total_tokens > 0).then(|| Box::new(usage)),
+        });
     }
-    let usage_json: Value = serde_json::from_str(&result.usage_json).unwrap_or(Value::Null);
-    // Price-table provider names match what the operator configures in
-    // WHIPPLESCRIPT_COERCE_PROVIDER (`openai-generic`, not a synonym).
-    let provider_name = match client.provider {
-        whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
-        whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => "openai-generic",
-        whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
-        whipplescript_kernel::coerce_native::CoerceProvider::Xai => "xai",
-    };
-    let usage = TurnUsage::from_usage_json(provider_name, &client.model, &usage_json);
     let value: Value = result
         .value_json
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())
         .ok_or_else(|| format!("{purpose} returned no value"))?;
     Ok((value, usage))
+}
+
+fn safe_native_failure_detail(failure: Option<&Value>) -> &'static str {
+    match failure.and_then(|value| value["reason"].as_str()) {
+        Some("provider output reached its token limit") => ": output token limit reached; increase WHIPPLESCRIPT_COERCE_MAX_TOKENS or reduce the requested edit",
+        Some("provider response was incomplete") => ": provider response was incomplete",
+        Some("provider response contained no output text") => ": provider response contained no output text",
+        Some("provider response contained no message content") => ": provider response contained no message content",
+        Some("provider response contained no tool_use block") => ": provider response contained no structured tool output",
+        Some("structured output missing wrapped `value`") => ": structured output missing its value envelope",
+        _ => "",
+    }
 }
 
 /// LLM prompt judge via the native coerce path; requires a configured
@@ -3214,6 +3257,9 @@ fn seal_scenarios<'a>(
 trait Proposer {
     fn propose(&mut self, reflection: &str) -> Result<Option<Proposal>, String>;
     fn name(&self) -> &'static str;
+    fn take_failed_usage(&mut self) -> Option<TurnUsage> {
+        None
+    }
 }
 
 struct Proposal {
@@ -3446,7 +3492,10 @@ impl Proposer for FixtureProposer {
 /// reflection material (never sealed traces — the caller builds the
 /// reflection holdout-blind). Propose-don't-apply: its output is a
 /// candidate, never a write.
-struct NativeProposer;
+#[derive(Default)]
+struct NativeProposer {
+    failed_usage: Option<TurnUsage>,
+}
 
 impl NativeProposer {
     fn refine(
@@ -3484,7 +3533,7 @@ impl NativeProposer {
             candidate_context,
             observation,
         );
-        NativeProposer.propose(&prompt)
+        NativeProposer::default().propose(&prompt)
     }
 
     fn generalize(
@@ -3518,7 +3567,7 @@ impl NativeProposer {
             candidate_context,
             observation,
         );
-        NativeProposer.propose(&prompt)
+        NativeProposer::default().propose(&prompt)
     }
 }
 
@@ -3877,6 +3926,7 @@ fn record_shortcut_assessment(
 
 impl Proposer for NativeProposer {
     fn propose(&mut self, reflection: &str) -> Result<Option<Proposal>, String> {
+        self.failed_usage = None;
         let schema = json!({
             "type": "object",
             "properties": {
@@ -3909,7 +3959,7 @@ impl Proposer for NativeProposer {
             "required": ["rationale", "source", "edit_account", "context_edits"],
             "additionalProperties": false,
         });
-        let (value, usage) = native_coerce_turn(
+        let (value, usage) = native_coerce_turn_with_usage(
             "the native proposer",
             reflection.to_owned(),
             schema,
@@ -3917,7 +3967,12 @@ impl Proposer for NativeProposer {
             "improve-proposer",
             false,
         )
-        .map_err(|error| format!("{error}, or use --proposer fixture"))?;
+        .map_err(|failure| {
+            self.failed_usage = failure.usage.map(|usage| *usage);
+            failure.message
+        })?;
+        // Malformed proposal fields can fail after transport succeeded too.
+        self.failed_usage = (usage.total_tokens > 0).then(|| usage.clone());
         let source = value
             .get("source")
             .and_then(Value::as_str)
@@ -3942,6 +3997,7 @@ impl Proposer for NativeProposer {
                 .ok_or("proposer returned no edit account")?,
         )
         .map_err(|error| format!("proposer returned an invalid edit account: {error}"))?;
+        self.failed_usage = None;
         Ok(Some(Proposal {
             source,
             context_edits,
@@ -3953,6 +4009,9 @@ impl Proposer for NativeProposer {
     }
     fn name(&self) -> &'static str {
         "native"
+    }
+    fn take_failed_usage(&mut self) -> Option<TurnUsage> {
+        self.failed_usage.take()
     }
 }
 
@@ -4950,7 +5009,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
 
             let mut proposer: Box<dyn Proposer> = match proposer_name.as_str() {
                 "fixture" => Box::new(FixtureProposer::from_env()),
-                "native" => Box::new(NativeProposer),
+                "native" => Box::new(NativeProposer::default()),
                 other => return Err(format!("unknown proposer `{other}` (fixture|native)")),
             };
             // Answered tradeoffs from every prior campaign: the only source of
@@ -5000,7 +5059,31 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         .push_str(&serde_json::to_string(&snapshot.files).unwrap_or_default());
                     reflection.push('\n');
                 }
-                let Some(mut proposal) = proposer.propose(&reflection)? else {
+                let proposal_result = proposer.propose(&reflection);
+                if proposal_result.is_err() {
+                    if let Some(usage) = proposer.take_failed_usage() {
+                        let cost_micros = prices.cost_micros(&usage);
+                        store
+                            .append_campaign_event(
+                                &campaign_id,
+                                "campaign.spend",
+                                &json!({
+                                    "cost_micros": cost_micros.unwrap_or(0),
+                                    "priced": cost_micros.is_some(),
+                                    "tokens": usage.total_tokens,
+                                    "input_tokens": usage.input_tokens,
+                                    "output_tokens": usage.output_tokens,
+                                    "provider": usage.provider,
+                                    "model": usage.model,
+                                    "what": "proposer turn (failed)",
+                                }),
+                            )
+                            .map_err(|error| {
+                                format!("failed to record failed proposer spend: {error:?}")
+                            })?;
+                    }
+                }
+                let Some(mut proposal) = proposal_result? else {
                     break;
                 };
                 if proposal.tokens > 0 {
@@ -7489,6 +7572,20 @@ pub(crate) fn ambient_score_after_dev(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_failure_details_never_echo_unknown_provider_content() {
+        assert!(safe_native_failure_detail(Some(&json!({
+            "reason": "provider output reached its token limit"
+        })))
+        .contains("WHIPPLESCRIPT_COERCE_MAX_TOKENS"));
+        for failure in [
+            json!({"reason": "private input copied by provider", "provider_error": "secret"}),
+            json!({"error_class": "invalid_output", "provider_error": "secret"}),
+        ] {
+            assert_eq!(safe_native_failure_detail(Some(&failure)), "");
+        }
+    }
 
     #[test]
     fn shortcut_claim_requires_a_new_exact_source_excerpt() {

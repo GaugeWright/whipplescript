@@ -2436,6 +2436,22 @@ fn mock_harness_context_endpoint() -> (String, std::sync::Arc<std::sync::Mutex<V
 fn mock_coerce_sequence_endpoint(
     verdicts: Vec<String>,
 ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    mock_coerce_response_sequence_endpoint(
+        verdicts
+            .into_iter()
+            .map(|content| {
+                serde_json::json!({
+                    "choices": [{"message": {"content": content}}],
+                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                })
+            })
+            .collect(),
+    )
+}
+
+fn mock_coerce_response_sequence_endpoint(
+    replies: Vec<Value>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
     let base_url = format!("http://{}", listener.local_addr().expect("addr"));
@@ -2482,15 +2498,12 @@ fn mock_coerce_sequence_endpoint(
             }
             let body = String::from_utf8_lossy(&raw[body_start..]).into_owned();
             collected.lock().expect("bodies lock").push(body);
-            let verdict = verdicts
+            let reply = replies
                 .get(response_index)
-                .or_else(|| verdicts.last())
+                .or_else(|| replies.last())
                 .expect("mock endpoint has a response");
             response_index += 1;
-            let content = serde_json::to_string(verdict).expect("encode content");
-            let reply = format!(
-                r#"{{"choices":[{{"message":{{"content":{content}}}}}],"usage":{{"input_tokens":3,"output_tokens":2}}}}"#
-            );
+            let reply = serde_json::to_string(reply).expect("encode response");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 reply.len(),
@@ -2500,6 +2513,99 @@ fn mock_coerce_sequence_endpoint(
         }
     });
     (base_url, bodies)
+}
+
+#[test]
+fn native_proposer_output_limit_preserves_failure_and_priced_usage() {
+    assert_failed_native_proposal_retains_usage(
+        serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output_text": "PRIVATE_PARTIAL_MODEL_OUTPUT",
+            "usage": {"input_tokens": 12, "output_tokens": 4}
+        }),
+        "WHIPPLESCRIPT_COERCE_MAX_TOKENS",
+        "native-proposal-output-limit",
+    );
+}
+
+#[test]
+fn native_proposer_missing_source_retains_priced_usage() {
+    assert_failed_native_proposal_retains_usage(
+        serde_json::json!({
+            "status": "completed",
+            "output_text": "{\"rationale\":\"PRIVATE_PARTIAL_MODEL_OUTPUT\"}",
+            "usage": {"input_tokens": 12, "output_tokens": 4}
+        }),
+        "proposer returned no source",
+        "native-proposal-missing-source",
+    );
+}
+
+fn assert_failed_native_proposal_retains_usage(response: Value, diagnostic: &str, label: &str) {
+    let env = Env::new(label);
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("high", "ticket.id", &env.dir)).expect("program");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    let (base_url, _) = mock_coerce_response_sequence_endpoint(vec![response]);
+    let prices_path = env.dir.join("providers.json");
+    fs::write(
+        &prices_path,
+        r#"{"providers": [], "prices": [
+        {"provider":"openai", "model":"test-model",
+         "input_micros_per_mtok":1000000000000,
+         "output_micros_per_mtok":1000000000000}
+    ]}"#,
+    )
+    .expect("prices");
+    let output = env
+        .command()
+        .args([
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "native",
+            "--provider",
+            "fixture",
+            "--provider-config",
+            &prices_path.to_string_lossy(),
+        ])
+        .env("WHIPPLESCRIPT_COERCE_PROVIDER", "openai")
+        .env("OPENAI_API_KEY", "test-key")
+        .env("WHIPPLESCRIPT_COERCE_BASE_URL", base_url)
+        .env("WHIPPLESCRIPT_COERCE_MODEL", "test-model")
+        .output()
+        .expect("improve");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(diagnostic), "{stderr}");
+    assert!(!stderr.contains("PRIVATE_PARTIAL_MODEL_OUTPUT"));
+    let campaign = env.run_json(&["--json", "campaign", "C-1"], &[]);
+    let events = campaign["events"].as_array().expect("events");
+    let spend = events
+        .iter()
+        .find(|event| {
+            event["type"] == "campaign.spend"
+                && event["payload"]["what"] == "proposer turn (failed)"
+        })
+        .expect("failed turn usage");
+    assert_eq!(spend["payload"]["tokens"], 16);
+    assert_eq!(spend["payload"]["cost_micros"], 16_000_000);
+    assert_eq!(spend["payload"]["priced"], true);
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "campaign.failed"));
+    assert!(!campaign
+        .to_string()
+        .contains("PRIVATE_PARTIAL_MODEL_OUTPUT"));
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "candidate.recorded"));
 }
 
 fn coerce_judge_program(judge_dir: &std::path::Path) -> String {

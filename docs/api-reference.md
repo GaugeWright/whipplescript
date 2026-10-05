@@ -1839,6 +1839,14 @@ do not run a native critic turn.
 The terminal state is one card of evidence for each candidate. The command
 proposes. The command does not apply.
 
+A failed native proposal stops the campaign and preserves its prior evidence.
+When the provider reports an output token limit, the diagnostic names that
+limit; increase `WHIPPLESCRIPT_COERCE_MAX_TOKENS` or reduce the requested edit
+before a new attempt. Known response-shape failures receive a specific
+diagnostic without exposing returned model text. Reported usage from a failed
+proposal is retained as a `campaign.spend` event with `what` equal to
+`proposer turn (failed)` and is priced when a matching price table exists.
+
 ### `campaigns` / `campaign`
 
 ```

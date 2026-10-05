@@ -811,20 +811,53 @@ pub fn parse_response(
     response: &HttpResponse,
     wrapped: bool,
 ) -> CoerceResult {
-    if !(200..300).contains(&response.status) {
-        return failed_result_classified(
+    let mut result = if !(200..300).contains(&response.status) {
+        failed_result_classified(
             format!("provider returned HTTP {}", response.status),
             provider_error_excerpt(&response.body),
             "provider_error",
             Some(response.status),
-        );
-    }
-    match provider {
-        CoerceProvider::OpenAi => parse_openai_response(response, wrapped),
-        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
-            parse_openai_compat_response(response, wrapped)
+        )
+    } else if let Some(reason) = incomplete_output_reason(provider, &response.body) {
+        // Even parseable JSON is not a completed structured response when the
+        // provider says it stopped early. Do not publish a partial value.
+        failed_result(reason.to_owned(), None)
+    } else {
+        match provider {
+            CoerceProvider::OpenAi => parse_openai_response(response, wrapped),
+            CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+                parse_openai_compat_response(response, wrapped)
+            }
+            CoerceProvider::Anthropic => parse_anthropic_response(response, wrapped),
         }
-        CoerceProvider::Anthropic => parse_anthropic_response(response, wrapped),
+    };
+    // A response can report billable usage without yielding a usable value.
+    // Retain the provider's usage on every response path, including failure.
+    result.usage_json = match provider {
+        CoerceProvider::Anthropic => anthropic_usage(&response.body),
+        _ => openai_usage(&response.body),
+    }
+    .to_string();
+    result
+}
+
+fn incomplete_output_reason(provider: CoerceProvider, body: &Value) -> Option<&'static str> {
+    let limited = match provider {
+        CoerceProvider::OpenAi => {
+            body["status"] == "incomplete"
+                && body["incomplete_details"]["reason"] == "max_output_tokens"
+        }
+        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+            body["choices"][0]["finish_reason"] == "length"
+        }
+        CoerceProvider::Anthropic => body["stop_reason"] == "max_tokens",
+    };
+    if limited {
+        Some("provider output reached its token limit")
+    } else if provider == CoerceProvider::OpenAi && body["status"] == "incomplete" {
+        Some("provider response was incomplete")
+    } else {
+        None
     }
 }
 
@@ -2148,6 +2181,72 @@ rule go
         let result = parse_response(CoerceProvider::Anthropic, &response, true);
         assert_eq!(result.status, CoerceStatus::Succeeded);
         assert_eq!(result.value_json.as_deref(), Some("\"Accepted\""));
+    }
+
+    #[test]
+    fn output_limit_fails_even_parseable_json_and_retains_usage() {
+        for (provider, body) in [
+            (
+                CoerceProvider::OpenAi,
+                json!({
+                    "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                    "output_text": "{\"ok\":true}",
+                    "usage": {"input_tokens": 12, "output_tokens": 4}
+                }),
+            ),
+            (
+                CoerceProvider::OpenAiCompat,
+                json!({
+                    "choices": [{"finish_reason": "length", "message": {"content": "{\"ok\":true}"}}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 4}
+                }),
+            ),
+            (
+                CoerceProvider::Xai,
+                json!({
+                    "choices": [{"finish_reason": "length", "message": {"content": "{\"ok\":true}"}}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 4}
+                }),
+            ),
+            (
+                CoerceProvider::Anthropic,
+                json!({
+                    "stop_reason": "max_tokens", "content": [{"type": "tool_use", "input": {"ok": true}}],
+                    "usage": {"input_tokens": 12, "output_tokens": 4}
+                }),
+            ),
+        ] {
+            let result = parse_response(provider, &HttpResponse { status: 200, body }, false);
+            assert_eq!(result.status, CoerceStatus::Failed, "{provider:?}");
+            assert!(result.value_json.is_none());
+            let error: Value = serde_json::from_str(result.error_json.as_deref().unwrap()).unwrap();
+            assert_eq!(error["reason"], "provider output reached its token limit");
+            assert_eq!(error["error_class"], "invalid_output");
+            assert!(error.get("provider_error").is_none());
+            let usage: Value = serde_json::from_str(&result.usage_json).unwrap();
+            assert_eq!(usage["input_tokens"], 12);
+            assert_eq!(usage["output_tokens"], 4);
+        }
+    }
+
+    #[test]
+    fn missing_output_and_missing_envelope_retain_reported_usage() {
+        for body in [
+            json!({"usage": {"input_tokens": 9, "output_tokens": 2}}),
+            json!({"output_text": "{}", "usage": {"input_tokens": 9, "output_tokens": 2}}),
+            json!({"status": "incomplete", "incomplete_details": {"reason": "content_filter"},
+                "output_text": "{}", "usage": {"input_tokens": 9, "output_tokens": 2}}),
+        ] {
+            let result = parse_response(
+                CoerceProvider::OpenAi,
+                &HttpResponse { status: 200, body },
+                true,
+            );
+            assert_eq!(result.status, CoerceStatus::Failed);
+            let usage: Value = serde_json::from_str(&result.usage_json).unwrap();
+            assert_eq!(usage["input_tokens"], 9);
+            assert_eq!(usage["output_tokens"], 2);
+        }
     }
 
     #[test]
