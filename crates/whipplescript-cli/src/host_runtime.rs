@@ -1875,6 +1875,182 @@ pub struct GovernedHostRuntime {
     envelope: VerifiedEnvelope,
 }
 
+/// Read-only original-runtime observation. No execution or writable-runtime
+/// conversion is exposed; every observation needs current embedding access.
+pub struct RecordedHostRuntime {
+    runtime: GovernedHostRuntime,
+}
+
+impl RecordedHostRuntime {
+    pub fn open<R: ResourceResolver + ?Sized>(
+        path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        resources: &R,
+    ) -> Result<Self, HostRuntimeError> {
+        Self::open_using(path, epoch, resources, || {
+            VerifiedEnvelope::verify_signed_text(signed_envelope)
+        })
+    }
+
+    pub fn open_with_verifier<
+        V: crate::gov::GovernanceAttestationVerifier + ?Sized,
+        R: ResourceResolver + ?Sized,
+    >(
+        path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        verifier: &V,
+        resources: &R,
+    ) -> Result<Self, HostRuntimeError> {
+        Self::open_using(path, epoch, resources, || {
+            VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
+        })
+    }
+
+    fn open_using<R: ResourceResolver + ?Sized>(
+        path: impl AsRef<Path>,
+        epoch: u64,
+        resources: &R,
+        verify: impl FnOnce() -> Result<VerifiedEnvelope, String>,
+    ) -> Result<Self, HostRuntimeError> {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
+        let observed = (|| {
+            let envelope = verify().map_err(HostRuntimeError::PolicyRejected)?;
+            let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
+            let path = path.as_ref().to_path_buf();
+            let store = SqliteStore::open_read_only(&path).map_err(HostRuntimeError::Store)?;
+            require_recorded_schema(&store)?;
+            Ok(Self {
+                runtime: GovernedHostRuntime {
+                    kernel: RuntimeKernel::new(store),
+                    store_path: path,
+                    policy,
+                    envelope,
+                },
+            })
+        })();
+        access.check()?;
+        observed
+    }
+
+    fn observe<R: ResourceResolver + ?Sized, T>(
+        &self,
+        command: &StartTurnCommand,
+        start: &PinnedPosition,
+        resources: &R,
+        read: impl FnOnce(&GovernedHostRuntime) -> Result<T, HostRuntimeError>,
+    ) -> Result<T, HostRuntimeError> {
+        let access = LiveTurnAccess::new(resources);
+        access.check()?;
+        let observed = (|| {
+            require_recorded_schema(self.runtime.kernel.store())?;
+            if command.policy != self.runtime.policy || start.instance_ref != command.instance_ref {
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "original runtime policy or starting instance changed",
+                )));
+            }
+            let store = self.runtime.kernel.store();
+            if store
+                .get_instance(&start.instance_ref)
+                .map_err(HostRuntimeError::Store)?
+                .is_none()
+            {
+                return Err(HostRuntimeError::UnknownInstance(
+                    start.instance_ref.clone(),
+                ));
+            }
+            let sequence = i64::try_from(start.sequence).map_err(|_| {
+                HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "original runtime starting sequence is unsupported",
+                ))
+            })?;
+            let pin = whipplescript_store::event_chain::ChainHead {
+                sequence: if sequence == 0 { None } else { Some(sequence) },
+                digest: start.head_digest.clone(),
+            };
+            store
+                .list_events_pinned(&start.instance_ref, &pin)
+                .map_err(HostRuntimeError::Store)?;
+            let value = read(&self.runtime)?;
+            require_recorded_schema(store)?;
+            Ok(value)
+        })();
+        access.check()?;
+        observed
+    }
+
+    pub fn recorded_turn_execution<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        start: &PinnedPosition,
+        resources: &R,
+    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
+        self.observe(command, start, resources, |runtime| {
+            let execution = runtime.recorded_turn_execution(command, resources)?;
+            if execution
+                .as_ref()
+                .and_then(|value| value.receipt.as_ref())
+                .is_some_and(|receipt| start.sequence > receipt.terminal_position.sequence)
+            {
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "original runtime start follows its terminal receipt",
+                )));
+            }
+            Ok(execution)
+        })
+    }
+
+    pub fn turn_workspace_witness<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        start: &PinnedPosition,
+        resources: &R,
+    ) -> Result<Option<RecordedWorkspaceWitness>, HostRuntimeError> {
+        self.observe(command, start, resources, |runtime| {
+            if self
+                .recorded_turn_execution(command, start, resources)?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            runtime.turn_workspace_witness(command, resources)
+        })
+    }
+
+    pub fn turn_guarantee_report<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        start: &PinnedPosition,
+        resources: &R,
+    ) -> Result<Option<Value>, HostRuntimeError> {
+        self.observe(command, start, resources, |runtime| {
+            if self
+                .recorded_turn_execution(command, start, resources)?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            runtime.turn_guarantee_report(command)
+        })
+    }
+}
+
+fn require_recorded_schema(store: &SqliteStore) -> Result<(), HostRuntimeError> {
+    let version = store.schema_version().map_err(HostRuntimeError::Store)?;
+    if version != whipplescript_store::SUPPORTED_SCHEMA_VERSION {
+        return Err(HostRuntimeError::Store(
+            whipplescript_store::StoreError::UnsupportedVersion {
+                subject: "recorded runtime schema".into(),
+                found: version,
+                supported: whipplescript_store::SUPPORTED_SCHEMA_VERSION,
+            },
+        ));
+    }
+    Ok(())
+}
+
 impl GovernedHostRuntime {
     /// Open or reopen a native runtime store and bind this facade to one signed,
     /// immutable policy epoch.
@@ -6072,6 +6248,7 @@ workflow UnsafeHostChat {
         let secrets = Secrets {
             calls: Cell::new(0),
         };
+        let original_start = runtime.pinned_position(&instance.instance_ref).unwrap();
         let before = runtime.current_position(&instance.instance_ref).unwrap();
         let effects = format!(
             "{:?}",
@@ -6085,6 +6262,21 @@ workflow UnsafeHostChat {
             .recorded_turn_execution(&command, &resources)
             .unwrap()
             .is_none());
+        let absent_reader = RecordedHostRuntime::open(&path, 7, &policy, &resources).unwrap();
+        assert!(absent_reader
+            .recorded_turn_execution(&command, &original_start, &resources)
+            .unwrap()
+            .is_none());
+        assert!(absent_reader
+            .turn_workspace_witness(&command, &original_start, &resources)
+            .unwrap()
+            .is_none());
+        assert!(absent_reader
+            .turn_guarantee_report(&command, &original_start, &resources)
+            .unwrap()
+            .is_none());
+        drop(absent_reader);
+
         assert_eq!(
             runtime.current_position(&instance.instance_ref).unwrap(),
             before
@@ -6149,6 +6341,224 @@ workflow UnsafeHostChat {
                 .unwrap()
         );
         let provider_calls = secrets.calls.get();
+        let alternate = runtime
+            .open_instance(
+                &OpenInstanceCommand {
+                    protocol: HOST_PROTOCOL.into(),
+                    request_id: "another-existing-recorded-instance".into(),
+                    package_version_ref: "package:v1".into(),
+                    policy: open.policy.clone(),
+                },
+                &Packages,
+            )
+            .unwrap();
+        let alternate_start = runtime.pinned_position(&alternate.instance_ref).unwrap();
+
+        let journal_mode = || {
+            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        let journal_mode_before = journal_mode();
+        let database_before = fs::read(&path).unwrap();
+        let permissions_before = fs::metadata(&path).unwrap().permissions();
+        let reader = RecordedHostRuntime::open(&path, 7, &policy, &resources).unwrap();
+        let changed_policy_reader =
+            RecordedHostRuntime::open(&path, 8, &policy, &resources).unwrap();
+        assert!(changed_policy_reader
+            .recorded_turn_execution(&command, &original_start, &resources)
+            .is_err());
+        drop(changed_policy_reader);
+
+        assert_eq!(
+            reader
+                .recorded_turn_execution(&command, &original_start, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert!(reader
+            .turn_workspace_witness(&command, &original_start, &resources)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reader
+                .turn_guarantee_report(&command, &original_start, &resources)
+                .unwrap(),
+            runtime.turn_guarantee_report(&command).unwrap()
+        );
+        for field in [
+            "digest",
+            "sequence",
+            "overflow",
+            "instance",
+            "mismatched-instance",
+            "policy",
+            "after-terminal",
+        ] {
+            let mut changed_start = original_start.clone();
+            let mut changed_command = command.clone();
+            match field {
+                "digest" => changed_start.head_digest.push('0'),
+                "sequence" => changed_start.sequence += 1,
+                "overflow" => changed_start.sequence = u64::MAX,
+                "instance" => {
+                    changed_start.instance_ref = "unknown-original-instance".into();
+                    changed_command.instance_ref = changed_start.instance_ref.clone();
+                    changed_start.sequence = 0;
+                    changed_start.head_digest = whipplescript_store::event_chain::genesis_digest(
+                        &changed_start.instance_ref,
+                    );
+                }
+                "mismatched-instance" => changed_start = alternate_start.clone(),
+                "policy" => changed_command.policy.epoch += 1,
+                "after-terminal" => changed_start = head.clone(),
+                _ => unreachable!(),
+            }
+            assert!(
+                reader
+                    .recorded_turn_execution(&changed_command, &changed_start, &resources)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut unknown_command = command.clone();
+        unknown_command.instance_ref = "unknown-original-instance".into();
+        let unknown_start = PinnedPosition {
+            instance_ref: unknown_command.instance_ref.clone(),
+            sequence: 0,
+            head_digest: whipplescript_store::event_chain::genesis_digest(
+                &unknown_command.instance_ref,
+            ),
+        };
+        let unknown_projection = Cell::new(false);
+        assert!(reader
+            .observe(&unknown_command, &unknown_start, &resources, |_| {
+                unknown_projection.set(true);
+                Ok("original projection")
+            })
+            .is_err());
+        assert!(
+            !unknown_projection.get(),
+            "unknown runtime entered an original observation"
+        );
+        let genesis = PinnedPosition {
+            instance_ref: instance.instance_ref.clone(),
+            sequence: 0,
+            head_digest: whipplescript_store::event_chain::genesis_digest(&instance.instance_ref),
+        };
+        assert_eq!(
+            reader
+                .recorded_turn_execution(&command, &genesis, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert!(
+            reader
+                .runtime
+                .kernel
+                .store()
+                .append_event(NewEvent {
+                    instance_id: &instance.instance_ref,
+                    event_type: "host.synthetic.forbidden",
+                    payload_json: "{}",
+                    source: "qualification",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: None,
+                })
+                .is_err(),
+            "recorded connection accepted a write"
+        );
+        assert_eq!(fs::read(&path).unwrap(), database_before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            permissions_before
+        );
+        assert_eq!(journal_mode(), journal_mode_before);
+        drop(reader);
+        assert_eq!(journal_mode(), journal_mode_before);
+        let missing = path.with_extension("missing-runtime");
+        assert!(!missing.exists());
+        assert!(RecordedHostRuntime::open(&missing, 7, &policy, &resources).is_err());
+        assert!(
+            !missing.exists(),
+            "recorded open initialized a missing database"
+        );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let schema_rows = db
+            .prepare("SELECT version,name,applied_at FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let schema = schema_rows.last().unwrap().0;
+        let existing_reader = RecordedHostRuntime::open(&path, 7, &policy, &resources).unwrap();
+        for version in [0, schema - 1, schema + 1] {
+            db.execute("DELETE FROM schema_migrations", []).unwrap();
+            db.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES(?1,'synthetic-schema','synthetic-time')", [version]).unwrap();
+            assert!(
+                RecordedHostRuntime::open(&path, 7, &policy, &resources).is_err(),
+                "schema {version}"
+            );
+            assert!(existing_reader
+                .recorded_turn_execution(&command, &original_start, &resources)
+                .is_err());
+            assert_eq!(
+                db.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+                version
+            );
+        }
+        db.execute("DELETE FROM schema_migrations", []).unwrap();
+        assert!(
+            RecordedHostRuntime::open(&path, 7, &policy, &resources).is_err(),
+            "missing schema stamp"
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for (version, name, applied_at) in &schema_rows {
+            db.execute(
+                "INSERT INTO schema_migrations(version,name,applied_at) VALUES(?1,?2,?3)",
+                rusqlite::params![version, name, applied_at],
+            )
+            .unwrap();
+        }
+
+        let changed_during_read = existing_reader.observe(&command, &original_start, &resources, |_| {
+            db.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES(?1,'synthetic-new-schema','synthetic-time')", [schema + 1]).unwrap();
+            Ok("private original projection")
+        });
+        assert!(
+            changed_during_read.is_err(),
+            "reader released a result across schema replacement"
+        );
+        db.execute(
+            "DELETE FROM schema_migrations WHERE version=?1",
+            [schema + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            existing_reader
+                .recorded_turn_execution(&command, &original_start, &resources)
+                .unwrap(),
+            Some(original.clone())
+        );
+        drop(existing_reader);
         assert_eq!(
             runtime
                 .recorded_turn_execution(&command, &resources)
@@ -6316,6 +6726,112 @@ workflow UnsafeHostChat {
     }
 
     #[test]
+    fn recorded_runtime_reopens_with_exact_external_policy_verifier() {
+        struct Root {
+            allow: bool,
+            calls: Cell<usize>,
+        }
+        impl crate::gov::GovernanceAttestationVerifier for Root {
+            fn verify(&self, _: &[u8], _: &crate::gov::ExternalAttestation) -> Result<(), String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.allow {
+                    Ok(())
+                } else {
+                    Err("synthetic untrusted policy root".into())
+                }
+            }
+        }
+        let mut policy: Value = serde_json::from_str(&signed_policy()).unwrap();
+        policy.as_object_mut().unwrap().remove("attestation");
+        let external = SignedEnvelope::from_external_signature_v2(
+            &policy.to_string(),
+            "office-policy-root",
+            "fixture",
+            "fixture-key",
+            "fixture-proof",
+            7,
+            "office",
+        )
+        .unwrap()
+        .to_json();
+        let root = Root {
+            allow: true,
+            calls: Cell::new(0),
+        };
+        let path = temp_store();
+        let mut runtime =
+            GovernedHostRuntime::open_with_verifier(&path, 7, &external, &root).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "external-recorded-runtime".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let start = runtime.pinned_position(&instance.instance_ref).unwrap();
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let original = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &ScriptedDriver::new(vec![
+                    json!({"output_text":"original external-policy answer"}),
+                ]),
+            )
+            .unwrap();
+        let head = runtime.pinned_position(&instance.instance_ref).unwrap();
+        let before = fs::read(&path).unwrap();
+        let calls = root.calls.get();
+        let reader =
+            RecordedHostRuntime::open_with_verifier(&path, 7, &external, &root, &resources)
+                .unwrap();
+        assert_eq!(root.calls.get(), calls + 1);
+        assert_eq!(
+            reader
+                .recorded_turn_execution(&command, &start, &resources)
+                .unwrap(),
+            Some(original)
+        );
+        let denied = Root {
+            allow: false,
+            calls: Cell::new(0),
+        };
+        assert!(
+            RecordedHostRuntime::open_with_verifier(&path, 7, &external, &denied, &resources)
+                .is_err()
+        );
+        assert_eq!(denied.calls.get(), 1);
+        resources.allowed.set(false);
+        let calls = root.calls.get();
+        assert!(
+            RecordedHostRuntime::open_with_verifier(&path, 7, &external, &root, &resources)
+                .is_err()
+        );
+        assert_eq!(
+            root.calls.get(),
+            calls,
+            "revoked open reached signature verification"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            runtime.pinned_position(&instance.instance_ref).unwrap(),
+            head
+        );
+        drop(reader);
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn recorded_turn_execution_checks_access_before_and_after_observation() {
         struct ReadAccess {
             calls: Cell<usize>,
@@ -6352,6 +6868,7 @@ workflow UnsafeHostChat {
             tool_calls: Cell::new(0),
             revoke_on_tool: false,
         };
+        let original_start = runtime.pinned_position(&instance.instance_ref).unwrap();
         runtime
             .run_turn_with_driver(
                 &command,
@@ -6363,6 +6880,63 @@ workflow UnsafeHostChat {
                 &ScriptedDriver::new(vec![json!({"output_text":"saved private answer"})]),
             )
             .unwrap();
+        let reader = RecordedHostRuntime::open(&path, 7, &signed_policy(), &resources).unwrap();
+        for deny_at in [1, 2] {
+            let access = ReadAccess {
+                calls: Cell::new(0),
+                deny_at,
+            };
+            let error = match RecordedHostRuntime::open(&path, 7, &signed_policy(), &access) {
+                Err(error) => error,
+                Ok(_) => panic!("recorded open ignored current access"),
+            };
+            assert!(error.to_string().contains(LIVE_ACCESS_REFUSED));
+            assert!(!error.to_string().contains("private staff detail"));
+            assert_eq!(access.calls.get(), deny_at);
+        }
+        for (operation, calls) in [("execution", 4), ("witness", 8), ("guarantee", 6)] {
+            for deny_at in 1..=calls {
+                let access = ReadAccess {
+                    calls: Cell::new(0),
+                    deny_at,
+                };
+                let error = match operation {
+                    "execution" => reader
+                        .recorded_turn_execution(&command, &original_start, &access)
+                        .unwrap_err(),
+                    "witness" => reader
+                        .turn_workspace_witness(&command, &original_start, &access)
+                        .unwrap_err(),
+                    "guarantee" => reader
+                        .turn_guarantee_report(&command, &original_start, &access)
+                        .unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    error.to_string().contains(LIVE_ACCESS_REFUSED),
+                    "{operation} {deny_at}: {error}"
+                );
+                assert!(!error.to_string().contains("private staff detail"));
+                assert!(access.calls.get() >= deny_at);
+            }
+        }
+        for deny_at in [1, 2] {
+            let access = ReadAccess {
+                calls: Cell::new(0),
+                deny_at,
+            };
+            let observed = Cell::new(false);
+            let error = reader
+                .observe(&command, &original_start, &access, |_| {
+                    observed.set(true);
+                    Ok("private original projection")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(LIVE_ACCESS_REFUSED));
+            assert_eq!(observed.get(), deny_at == 2);
+            assert_eq!(access.calls.get(), deny_at);
+        }
+        drop(reader);
         let before = runtime.pinned_position(&instance.instance_ref).unwrap();
         for deny_at in [1, 2] {
             let access = ReadAccess {
@@ -9514,6 +10088,7 @@ workflow HostChat {
         // Turn 1: one mediated write inside the declared scope. The receipt
         // references the complete witnessed cut; writes_within holds.
         let command1 = turn(&instance.instance_ref, &open.policy, 1);
+        let original_start = runtime.pinned_position(&instance.instance_ref).unwrap();
         let turn1 = runtime
             .run_turn_with_driver(
                 &command1,
@@ -9549,6 +10124,15 @@ workflow HostChat {
             .turn_workspace_witness(&command1, &resources)
             .unwrap()
             .unwrap();
+        let reader = RecordedHostRuntime::open(&path, 21, &policy_text, &resources).unwrap();
+        assert_eq!(
+            reader
+                .turn_workspace_witness(&command1, &original_start, &resources)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        drop(reader);
         assert_eq!(original.receipt, receipt1);
         assert_eq!(original.writes.len(), 1);
         assert_eq!(original.writes[0].path, "src/out.md");
