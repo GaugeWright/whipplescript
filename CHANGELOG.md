@@ -141,6 +141,8 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Fixed
 
+- Keep hosted WASM declarations as keyed authored inputs and admit only the generated Worker build directories.
+
 - **A `mint` exchange was invisible to the information-flow checker.** It
   shipped two days after `request` and repeated that gap exactly: no
   `resource_for_body` arm, so the token exchange — an egress under the parent

@@ -1,6 +1,4 @@
 pkg/*
-!pkg/
-!pkg/whipplescript_host_do_bg.d.ts
 # The same wasm built for the *nodejs* target, which `mint-canary-governance-root`
 # loads to prove an envelope against the runtime's real verifier before writing
 # it. Separate from `pkg/` on purpose: that holds the bundler target the Worker

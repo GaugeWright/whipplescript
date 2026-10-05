@@ -2,16 +2,28 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STORE="$ROOT/.whipplescript/docs-quickstart-smoke.sqlite"
-REPORT="$ROOT/target/docs-quickstart-smoke.json"
-
+SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/whip-docs.XXXXXX")"
 cleanup() {
-  rm -f "$STORE" "$STORE-shm" "$STORE-wal"
+  rm -rf "$SMOKE_ROOT"
 }
 trap cleanup EXIT
 
-mkdir -p "$ROOT/.whipplescript" "$ROOT/target"
-cleanup
+STORE="$SMOKE_ROOT/docs-quickstart-smoke.sqlite"
+REPORT="$ROOT/target/docs-quickstart-smoke.json"
+# Every workspace store belongs to this invocation, including stores inherited
+# from the caller's environment. Explicit --store arguments still take priority.
+export WHIPPLESCRIPT_STORE="$STORE"
+export WHIPPLESCRIPT_COORDINATION_STORE="$SMOKE_ROOT/coordination.sqlite"
+export WHIPPLESCRIPT_ITEMS_STORE="$SMOKE_ROOT/items.sqlite"
+export WHIPPLESCRIPT_CONTENT_STORE="$SMOKE_ROOT/harness-content.sqlite"
+export WHIPPLESCRIPT_IMPROVE_STORE="$SMOKE_ROOT/improve.sqlite"
+export WHIPPLESCRIPT_INCIDENTS_STORE="$SMOKE_ROOT/incidents.sqlite"
+export WHIPPLESCRIPT_WORKSTREAM_STORE="$SMOKE_ROOT/workstreams.sqlite"
+export WHIPPLESCRIPT_BRANCH_STORE="$SMOKE_ROOT/branches.sqlite"
+export WHIPPLESCRIPT_VCS_CONTENT_STORE="$SMOKE_ROOT/vcs-content.sqlite"
+export WHIPPLESCRIPT_MEMORY_STORE="$SMOKE_ROOT/memory.sqlite"
+
+mkdir -p "$ROOT/target"
 
 WHIP=(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --)
 

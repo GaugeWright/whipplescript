@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const nodeTarget = process.argv.includes("--node");
@@ -8,6 +8,12 @@ const workspaceDirectory = resolve(workerDirectory, "../../..");
 const targetDirectory = process.env.CARGO_TARGET_DIR
   ? resolve(process.env.CARGO_TARGET_DIR)
   : resolve(workspaceDirectory, "target");
+
+// Authored declarations are a read-only keyed source, not a generated pkg input.
+// Read before either producer can mutate output, including on warm builds.
+const authoredBindings = nodeTarget ? null : readFileSync(
+  resolve(workerDirectory, "bindings/whipplescript_host_do_bg.d.ts"),
+);
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {
@@ -52,6 +58,10 @@ run(
   ],
   workerDirectory,
 );
+
+if (!nodeTarget) {
+  writeFileSync(resolve(workerDirectory, "pkg/whipplescript_host_do_bg.d.ts"), authoredBindings);
+}
 
 if (nodeTarget) {
   writeFileSync(resolve(workerDirectory, "pkg-node/package.json"), '{"type":"commonjs"}\n');

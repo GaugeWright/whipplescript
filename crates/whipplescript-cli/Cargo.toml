@@ -38,8 +38,8 @@ url = "2"
 prctl = "1"
 htmd = "0.5"
 # The pinned reactor is verified before any guest execution.
-wasmtime = { version = "=48.0.3", default-features = false, features = ["runtime", "cranelift", "std"] }
-wasmtime-wasi = { version = "=48.0.3", default-features = false, features = ["p1"] }
+wasmtime = { version = "=48.0.5", default-features = false, features = ["runtime", "cranelift", "std"] }
+wasmtime-wasi = { version = "=48.0.5", default-features = false, features = ["p1"] }
 
 [features]
 # Codex/Claude delegating providers are optional (DR-0024); the owned harness is

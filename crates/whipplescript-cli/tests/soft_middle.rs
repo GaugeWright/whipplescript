@@ -5,14 +5,17 @@
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::Value;
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::{side_store_dir, whip_command};
+
 fn run_json(bin: &str, args: &[&str]) -> Value {
-    let output = Command::new(bin).args(args).output().expect("command runs");
+    let output = whip_command(bin).args(args).output().expect("command runs");
     assert!(
         output.status.success(),
         "command failed\nstdout:\n{}\nstderr:\n{}",
@@ -604,7 +607,7 @@ rule pipeline
     .expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
-    let check = Command::new(bin)
+    let check = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -668,7 +671,7 @@ fn then_chains_a_prompt_and_a_read_through_whip_check() {
     let check = |source_text: &str, tag: &str| -> String {
         let source = temp_path(tag, "whip");
         fs::write(&source, source_text).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args([
                 "--store",
                 store_str.as_str(),
@@ -1688,7 +1691,7 @@ fn send_via_stdio_channel_writes_marker_to_stdout() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/messaging-stdio-demo.whip");
     let store_str = store.to_str().expect("utf-8");
 
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -1796,7 +1799,7 @@ fn send_via_desktop_channel_spawns_notifier_and_completes() {
     }
 
     let store_str = store.to_str().expect("utf-8");
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
         .args([
             "--store",
@@ -1890,7 +1893,7 @@ fn desktop_notifier_failure_settles_capability_call_failed() {
     }
 
     let store_str = store.to_str().expect("utf-8");
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
         .args([
             "--store",
@@ -1997,7 +2000,7 @@ class Seen { text string }
 
     // The SAME text, twice.
     for _ in 0..2 {
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args([
                 "--store",
                 store_str,
@@ -2214,7 +2217,7 @@ rule observe
 }
 
 fn run_text(bin: &str, args: &[&str]) {
-    let output = Command::new(bin).args(args).output().expect("command runs");
+    let output = whip_command(bin).args(args).output().expect("command runs");
     assert!(
         output.status.success(),
         "command failed\nstdout:\n{}\nstderr:\n{}",
@@ -2344,7 +2347,7 @@ fn exec_is_gated_by_operator_grants() {
         let store = temp_path("exec-gate", "sqlite");
         let source = temp_path("exec-gate", "whip");
         fs::write(&source, EXEC_FLOW).expect("write source");
-        let mut command = Command::new(bin);
+        let mut command = whip_command(bin);
         command.args([
             "--store",
             store.to_str().expect("utf-8"),
@@ -2479,7 +2482,7 @@ rule go
 "#,
     )
     .expect("write source");
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args([
             "check",
             "--exec-profile",
@@ -2530,7 +2533,7 @@ fn authority_packages_require_their_import() {
             ),
         )
         .expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("check runs");
@@ -2561,7 +2564,7 @@ fn exec_is_hard_off_without_use_std_script() {
 
     let without = temp_path("hardoff-without", "whip");
     fs::write(&without, body("")).expect("write");
-    let out = Command::new(bin)
+    let out = whip_command(bin)
         .args(["check", without.to_str().expect("utf-8")])
         .output()
         .expect("runs");
@@ -2577,7 +2580,7 @@ fn exec_is_hard_off_without_use_std_script() {
 
     let with = temp_path("hardoff-with", "whip");
     fs::write(&with, body("use std.script\n")).expect("write");
-    let out = Command::new(bin)
+    let out = whip_command(bin)
         .args(["check", with.to_str().expect("utf-8")])
         .output()
         .expect("runs");
@@ -2893,7 +2896,7 @@ rule go
             ),
         )
         .expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -3307,7 +3310,7 @@ workflow Child {
     .expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -3355,7 +3358,7 @@ workflow Child {
 }
 
 fn dev_with_exec_allow(bin: &str, store: &str, source: &str, allow: &str) -> Value {
-    let mut command = Command::new(bin);
+    let mut command = whip_command(bin);
     command
         .args([
             "--store",
@@ -3642,7 +3645,7 @@ fn exec_parse_static_checks_reject_bad_targets() {
     ] {
         let source = temp_path(label, "whip");
         fs::write(&source, source_text).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -3759,7 +3762,7 @@ rule grab
 "#;
 
 fn dev_with_coordination(bin: &str, store: &str, source: &str, coordination: &str) -> Value {
-    let mut command = Command::new(bin);
+    let mut command = whip_command(bin);
     command
         .args([
             "--store",
@@ -3809,7 +3812,7 @@ fn lease_acquire_held_release_completes() {
     assert_eq!(instance_status(bin, store_str, instance), "completed");
 
     let leases = {
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["--json", "leases"])
             .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_str)
             .output()
@@ -3915,7 +3918,7 @@ fn coordination_leases_are_partitioned_by_workflow_owner() {
         .expect("second instance");
     assert_eq!(instance_status(bin, store_str, second_instance), "running");
 
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args(["--json", "leases"])
         .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_str)
         .output()
@@ -3990,7 +3993,7 @@ fn shared_coordination_lease_opts_into_cross_workflow_contention() {
         .expect("second instance");
     assert_eq!(instance_status(bin, store_str, second_instance), "failed");
 
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args(["--json", "leases"])
         .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_str)
         .output()
@@ -4160,7 +4163,7 @@ fn coordination_static_checks() {
     ] {
         let source = temp_path(label, "whip");
         fs::write(&source, source_text).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -4287,7 +4290,7 @@ fn otel_export_posts_to_collector_then_status_and_reset() {
         }
     });
 
-    let export = Command::new(bin)
+    let export = whip_command(bin)
         .args(["--store", &store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4493,7 +4496,7 @@ fn otel_export_rejects_unsupported_protocol() {
     let store_str = store.to_str().expect("utf-8");
 
     // `--dry-run` runs the same config validation, so no endpoint is needed.
-    let out = Command::new(bin)
+    let out = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
         .output()
@@ -4509,7 +4512,7 @@ fn otel_export_rejects_unsupported_protocol() {
     );
 
     // The shipped protocol is accepted.
-    let ok = Command::new(bin)
+    let ok = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .output()
@@ -4531,7 +4534,7 @@ fn otel_export_refuses_headers_over_plaintext_without_optin() {
     let store_str = store.to_str().expect("utf-8");
     let secret = "Bearer super-secret-token";
 
-    let refused = Command::new(bin)
+    let refused = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4556,7 +4559,7 @@ fn otel_export_refuses_headers_over_plaintext_without_optin() {
 
     // The documented opt-in re-enables plaintext headers; dry-run then succeeds
     // and still never prints the secret value.
-    let allowed = Command::new(bin)
+    let allowed = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4600,7 +4603,7 @@ fn otel_export_loopback_exemption_is_an_address_not_a_name_prefix() {
     let store_str = store.to_str().expect("utf-8");
     let secret = "super-secret-team-key";
     let dry_run = |endpoint: &str| {
-        Command::new(bin)
+        whip_command(bin)
             .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
             .env(
@@ -4653,7 +4656,7 @@ fn otel_export_merges_resource_attributes() {
     let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-res");
     let store_str = store.to_str().expect("utf-8");
 
-    let out = Command::new(bin)
+    let out = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env("OTEL_SERVICE_NAME", "checkout")
         .env(
@@ -4706,7 +4709,7 @@ fn otel_export_attaches_parsed_headers_to_post() {
     let store_str = store.to_str().expect("utf-8");
     let (port, rx, collector) = spawn_otel_collector();
 
-    let export = Command::new(bin)
+    let export = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4760,7 +4763,7 @@ fn otel_export_refuses_a_redirecting_collector_and_replays_no_headers() {
     let target_url = format!("http://127.0.0.1:{target_port}/v1/traces");
     let (port, rx, redirector) = spawn_otel_redirector(target_url.clone());
 
-    let export = Command::new(bin)
+    let export = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4874,7 +4877,7 @@ fn otel_export_reports_the_collector_status_it_was_refused_with() {
     let store_str = store.to_str().expect("utf-8");
     let (port, listener) = spawn_otel_status_collector("503 Service Unavailable");
 
-    let export = Command::new(bin)
+    let export = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4896,7 +4899,7 @@ fn otel_export_reports_the_collector_status_it_was_refused_with() {
     // The accepting case, so a arm that refused EVERY response could not pass:
     // a 200 collector exports without error.
     let (ok_port, _ok_rx, ok_listener) = spawn_otel_collector();
-    let accepted = Command::new(bin)
+    let accepted = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4930,7 +4933,7 @@ fn otel_export_names_the_url_when_the_transport_fails() {
         listener.local_addr().expect("addr").port()
     };
 
-    let export = Command::new(bin)
+    let export = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4971,7 +4974,7 @@ fn otel_export_rekeys_cursor_per_endpoint() {
 
     // First endpoint exports the history.
     let (port_a, rx_a, collector_a) = spawn_otel_collector();
-    let export_a = Command::new(bin)
+    let export_a = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4992,7 +4995,7 @@ fn otel_export_rekeys_cursor_per_endpoint() {
 
     // A second endpoint is a new scope: full history re-exports exactly once.
     let (port_b, rx_b, collector_b) = spawn_otel_collector();
-    let export_b = Command::new(bin)
+    let export_b = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance])
         .env(
             "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -5143,7 +5146,7 @@ fn otel_export_allowlisted_field_exports_as_attribute() {
     let (store, source, instance) = otel_allowlist_fixture(bin, "otel-allow");
     let store_str = store.to_str().expect("utf-8");
 
-    let flagged = Command::new(bin)
+    let flagged = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -5169,7 +5172,7 @@ fn otel_export_allowlisted_field_exports_as_attribute() {
     );
 
     // The env variable is the second carrier.
-    let from_env = Command::new(bin)
+    let from_env = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST", "Verdict.score")
         .output()
@@ -5179,7 +5182,7 @@ fn otel_export_allowlisted_field_exports_as_attribute() {
     assert_eq!(fields[0].0, "whipplescript.field.Verdict.score");
 
     // The flag wins over the env.
-    let both = Command::new(bin)
+    let both = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -5208,7 +5211,7 @@ fn otel_export_non_allowlisted_field_never_exports() {
     let (store, source, instance) = otel_allowlist_fixture(bin, "otel-deny");
     let store_str = store.to_str().expect("utf-8");
 
-    let partial = Command::new(bin)
+    let partial = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -5231,7 +5234,7 @@ fn otel_export_non_allowlisted_field_never_exports() {
     );
     assert_eq!(keys, ["whipplescript.field.Verdict.label"]);
 
-    let structural = Command::new(bin)
+    let structural = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
         .output()
@@ -5263,7 +5266,7 @@ fn otel_export_rejects_bad_allowlist_entries() {
         ("Verdict.label", "no-such-instance", "refused"),
     ];
     for (entry, target, expected) in cases {
-        let out = Command::new(bin)
+        let out = whip_command(bin)
             .args([
                 "--store",
                 store_str,
@@ -5305,14 +5308,14 @@ fn otel_export_no_allowlist_is_byte_identical_structural() {
     let (store, source, instance) = otel_allowlist_fixture(bin, "otel-ident");
     let store_str = store.to_str().expect("utf-8");
 
-    let structural = Command::new(bin)
+    let structural = whip_command(bin)
         .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
         .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
         .output()
         .expect("otel-export runs");
     let structural_payload = otel_dry_run_payload(&structural);
 
-    let allowlisted = Command::new(bin)
+    let allowlisted = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -5466,7 +5469,7 @@ fn whip_signal_refuses_external_injection_of_an_internal_signal() {
     let source_str = source.to_str().expect("utf-8");
 
     // Governed + internal: the external injection is refused.
-    let refused = Command::new(bin)
+    let refused = whip_command(bin)
         .args([
             "signal",
             "inst-x",
@@ -5494,7 +5497,7 @@ fn whip_signal_refuses_external_injection_of_an_internal_signal() {
     );
 
     // Ungoverned (no envelope): the same delivery is NOT refused for being internal.
-    let dev = Command::new(bin)
+    let dev = whip_command(bin)
         .args([
             "signal",
             "inst-x",
@@ -5544,7 +5547,7 @@ fn signal_rejects_bad_payload_and_unknown_signal() {
         ),
         ("unknown-signal", "deploy.nope", "{}", "is not declared"),
     ] {
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args([
                 "--store",
                 store_str,
@@ -5685,7 +5688,7 @@ fn signal_enforces_conditional_field_presence() {
 
     // Applicable but missing: kind == "deploy" requires `region`; rejected at the
     // boundary so no ill-typed fact lands and the instance keeps running.
-    let rejected = Command::new(bin)
+    let rejected = whip_command(bin)
         .args([
             "--store",
             store_str,
@@ -5753,7 +5756,7 @@ fn signal_static_checks() {
     ] {
         let source = temp_path(label, "whip");
         fs::write(&source, source_text).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -5995,7 +5998,7 @@ fn sum_type_static_checks() {
     ] {
         let source = temp_path(label, "whip");
         fs::write(&source, source_text).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -6033,7 +6036,7 @@ fn timer_until_static_checks_reject_bad_operands() {
     ] {
         let source = temp_path(label, "whip");
         fs::write(&source, timer_until_source(deadline, operand)).expect("write source");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args(["check", source.to_str().expect("utf-8")])
             .output()
             .expect("command runs");
@@ -6068,7 +6071,7 @@ fn std_image_generates_an_artifact_on_the_fixture_provider() {
 
     let run = |theme: &str| -> String {
         let store = temp_path("std-image-run", "sqlite");
-        let output = Command::new(bin)
+        let output = whip_command(bin)
             .args([
                 "--store",
                 store.to_str().expect("utf-8"),
@@ -6098,7 +6101,7 @@ fn std_image_generates_an_artifact_on_the_fixture_provider() {
             .find(|word| word.starts_with("ins_"))
             .expect("run prints an instance id")
             .to_owned();
-        let facts = Command::new(bin)
+        let facts = whip_command(bin)
             .args([
                 "--store",
                 store.to_str().expect("utf-8"),
@@ -6165,7 +6168,7 @@ fn cross_package_tool_grant_resolves_and_runs() {
     let coordination = temp_path("xpkg-tool-coord", "sqlite");
     fs::create_dir_all(&workspace).expect("workspace dir");
 
-    let output = Command::new(bin)
+    let output = whip_command(bin)
         .args([
             "--store",
             store.to_str().expect("utf-8"),
@@ -6364,7 +6367,7 @@ fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
     fs::write(&envelope, IFC_CEILING_POLICY).expect("write envelope");
 
     // a low-clearance principal (Requester) reading Operator data is refused.
-    let bob = Command::new(bin)
+    let bob = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8")])
         .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
         .env("WHIPPLESCRIPT_PRINCIPAL", "bob@acme.com")
@@ -6377,7 +6380,7 @@ fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
     );
 
     // the cleared principal (Operator) is allowed.
-    let alice = Command::new(bin)
+    let alice = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8")])
         .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
         .env("WHIPPLESCRIPT_PRINCIPAL", "alice@acme.com")
@@ -6405,7 +6408,7 @@ fn ifc_runtime_admission_refuses_a_violating_whip() {
     fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
     fs::write(&envelope, IFC_ENVELOPE).expect("write envelope");
 
-    let governed = Command::new(bin)
+    let governed = whip_command(bin)
         .args([
             "--store",
             store.to_str().expect("utf-8"),
@@ -6460,7 +6463,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     )
     .expect("env");
 
-    let lock_out = Command::new(bin)
+    let lock_out = whip_command(bin)
         .args([
             "package",
             "lock",
@@ -6477,7 +6480,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     );
 
     // governed, but `secretz` is uncovered -> cross-package violation.
-    let governed = Command::new(bin)
+    let governed = whip_command(bin)
         .args([
             "check",
             consumer.to_str().expect("utf-8"),
@@ -6503,7 +6506,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
          grant file_store secretz -> file:/srv/s readable by Operator\n",
     )
     .expect("env2");
-    let missing_invoke = Command::new(bin)
+    let missing_invoke = whip_command(bin)
         .args([
             "check",
             consumer.to_str().expect("utf-8"),
@@ -6529,7 +6532,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
          grant invoke LeakyTool -> invoke:package-leaky/LeakyTool public\n",
     )
     .expect("env3");
-    let cleared = Command::new(bin)
+    let cleared = whip_command(bin)
         .args([
             "check",
             consumer.to_str().expect("utf-8"),
@@ -6559,7 +6562,7 @@ fn ifc_check_rejects_confidential_to_uncleared_flow_under_envelope() {
     fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
     fs::write(&envelope, IFC_ENVELOPE).expect("write envelope");
 
-    let governed = Command::new(bin)
+    let governed = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8 path")])
         .env("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope)
         .output()
@@ -6574,7 +6577,7 @@ fn ifc_check_rejects_confidential_to_uncleared_flow_under_envelope() {
         "expected an IFC violation\nstderr:\n{governed_stderr}"
     );
 
-    let dev = Command::new(bin)
+    let dev = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8 path")])
         .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
         .output()
@@ -6604,7 +6607,7 @@ fn ifc_two_agent_sign_requires_governance_privilege() {
     let config_arg = config.to_str().expect("utf-8 path");
 
     // whip agent (no privilege): sign refused (G4)
-    let unprivileged = Command::new(bin)
+    let unprivileged = whip_command(bin)
         .args(["gov", "sign", config_arg])
         .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
         .output()
@@ -6620,7 +6623,7 @@ fn ifc_two_agent_sign_requires_governance_privilege() {
     );
 
     // governance agent (privileged, sudo proxy): sign succeeds
-    let signed = Command::new(bin)
+    let signed = whip_command(bin)
         .args(["gov", "sign", config_arg])
         .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
         .output()
@@ -6636,7 +6639,7 @@ fn ifc_two_agent_sign_requires_governance_privilege() {
     // whip agent (unprivileged) verifies the signed envelope
     let signed_file = temp_path("gov-signed", "json");
     fs::write(&signed_file, &signed_json).expect("write signed");
-    let verify = Command::new(bin)
+    let verify = whip_command(bin)
         .args(["gov", "verify", signed_file.to_str().expect("utf-8 path")])
         .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
         .output()
@@ -6665,7 +6668,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     .expect("write config");
 
     // governance agent signs
-    let signed = Command::new(bin)
+    let signed = whip_command(bin)
         .args(["gov", "sign", config.to_str().expect("utf-8 path")])
         .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
         .output()
@@ -6679,7 +6682,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     fs::write(&whip, IFC_BAD_WHIP).expect("write whip");
 
     // a verified signed envelope enforces: the bad flow is rejected
-    let enforced = Command::new(bin)
+    let enforced = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8 path")])
         .env("WHIPPLESCRIPT_IFC_ENVELOPE", &signed_file)
         .output()
@@ -6695,7 +6698,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
     let tampered = signed_json.replace("\"reader\":[\"Operator\"]", "\"reader\":[]");
     assert_ne!(tampered, signed_json, "tamper must change the content");
     fs::write(&signed_file, &tampered).expect("write tampered");
-    let rejected = Command::new(bin)
+    let rejected = whip_command(bin)
         .args(["check", whip.to_str().expect("utf-8 path")])
         .env("WHIPPLESCRIPT_IFC_ENVELOPE", &signed_file)
         .output()
@@ -6725,7 +6728,7 @@ fn ifc_escalation_channel_whip_files_gov_reviews() {
     let log_arg = log.to_str().expect("utf-8 path");
 
     // whip side (unprivileged) files a request
-    let filed = Command::new(bin)
+    let filed = whip_command(bin)
         .args(["gov", "escalate", "need declassify ledger to Auditor"])
         .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
         .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
@@ -6738,7 +6741,7 @@ fn ifc_escalation_channel_whip_files_gov_reviews() {
     );
 
     // whip side (unprivileged) cannot review
-    let denied = Command::new(bin)
+    let denied = whip_command(bin)
         .args(["gov", "escalations"])
         .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
         .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
@@ -6750,7 +6753,7 @@ fn ifc_escalation_channel_whip_files_gov_reviews() {
     );
 
     // governance agent (privileged) reviews the pending request
-    let reviewed = Command::new(bin)
+    let reviewed = whip_command(bin)
         .args(["gov", "escalations"])
         .env("WHIPPLESCRIPT_GOV_ESCALATIONS", log_arg)
         .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
@@ -6782,7 +6785,7 @@ fn ifc_governance_agent_loop_drafts_and_signs() {
         format!("grant file_store ledger -> file:/x readable by Operator\nsign {out_arg}\nquit\n");
 
     // privileged: the agent loop drafts and signs
-    let mut child = Command::new(bin)
+    let mut child = whip_command(bin)
         .args(["gov", "agent"])
         .env("WHIPPLESCRIPT_GOV_ADMIN", "1")
         .stdin(std::process::Stdio::piped())
@@ -6801,7 +6804,7 @@ fn ifc_governance_agent_loop_drafts_and_signs() {
     assert!(signed.contains("attestation"), "got: {signed}");
 
     // unprivileged: the agent refuses to start
-    let denied = Command::new(bin)
+    let denied = whip_command(bin)
         .args(["gov", "agent"])
         .env_remove("WHIPPLESCRIPT_GOV_ADMIN")
         .stdin(std::process::Stdio::null())
@@ -6827,7 +6830,7 @@ fn ifc_whip_infoflow_loop_checks_and_refuses_to_sign() {
     let whip_arg = whip.to_str().expect("utf-8 path");
     let script = format!("check {whip_arg}\nsign anything\nquit\n");
 
-    let mut child = Command::new(bin)
+    let mut child = whip_command(bin)
         .args(["infoflow"])
         .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
         .stdin(std::process::Stdio::piped())
@@ -6861,7 +6864,7 @@ fn ifc_whip_infoflow_loop_checks_and_refuses_to_sign() {
 #[test]
 fn whip_agent_errors_with_infoflow_pointer() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let output = Command::new(bin).args(["agent"]).output().expect("run");
+    let output = whip_command(bin).args(["agent"]).output().expect("run");
     assert!(
         !output.status.success(),
         "`whip agent` must fail after the infoflow rename"
@@ -6895,7 +6898,7 @@ fn whip_script_list_and_verify_recheck_manifest_pins() {
     };
     fs::write(&manifest, manifest_with(&"0".repeat(64))).expect("write manifest");
 
-    let mismatch = Command::new(bin)
+    let mismatch = whip_command(bin)
         .args([
             "--json",
             "script",
@@ -6929,7 +6932,7 @@ fn whip_script_list_and_verify_recheck_manifest_pins() {
     assert_eq!(actual.len(), 64);
 
     fs::write(&manifest, manifest_with(&actual)).expect("re-pin manifest");
-    let verified = Command::new(bin)
+    let verified = whip_command(bin)
         .args([
             "--json",
             "script",
@@ -6945,7 +6948,7 @@ fn whip_script_list_and_verify_recheck_manifest_pins() {
         String::from_utf8_lossy(&verified.stdout)
     );
 
-    let listed = Command::new(bin)
+    let listed = whip_command(bin)
         .args([
             "--json",
             "script",
@@ -7087,4 +7090,48 @@ rule go
     let _ = fs::remove_file(&source);
     let _ = fs::remove_file(&script);
     let _ = fs::remove_file(&manifest);
+}
+
+#[test]
+fn whip_opens_this_tests_own_workspace_stores() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let run = || {
+        // The run store and source live in the directory too, so the test
+        // leaves nothing behind when its threads end.
+        let dir = side_store_dir();
+        let store = dir.join("run.sqlite");
+        let source = dir.join("side-stores.whip");
+        fs::write(
+            &source,
+            "workflow SideStores\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\n\
+             rule finish\n  when started\n=> {\n  complete result {\n    ok 1\n  }\n}\n",
+        )
+        .expect("write source");
+        let store_str = store.to_str().expect("utf-8");
+        let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+        let instance = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id");
+        assert_eq!(instance_status(bin, store_str, instance), "completed");
+        dir
+    };
+
+    // The two stores a step opens every time are where this thread's
+    // directory says, not under the working directory or an operator's
+    // WHIPPLESCRIPT_ITEMS_STORE.
+    let mine = run();
+    for file in ["coordination.sqlite", "items.sqlite"] {
+        assert!(
+            mine.join(file).is_file(),
+            "{} was not opened",
+            mine.join(file).display()
+        );
+    }
+
+    // Another thread -- another test -- is given a directory of its own, and
+    // the directory is removed when that thread ends.
+    let theirs = std::thread::spawn(run).join().expect("thread runs");
+    assert_ne!(mine, theirs);
+    assert!(!theirs.exists(), "{} outlived its thread", theirs.display());
 }
