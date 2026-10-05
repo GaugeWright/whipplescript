@@ -29,6 +29,8 @@ struct NativeFixture {
     branches: BranchStore,
     reviews: ReviewStore,
     witness: String,
+    source_branch: &'static str,
+    source_cut: &'static str,
 }
 impl Drop for NativeFixture {
     fn drop(&mut self) {
@@ -42,7 +44,13 @@ impl NativeFixture {
     fn with_path(path: &str) -> Self {
         Self::with_change(path, false)
     }
+    fn named() -> Self {
+        Self::with_source("main.py", false, true)
+    }
     fn with_change(path: &str, deleted: bool) -> Self {
+        Self::with_source(path, deleted, false)
+    }
+    fn with_source(path: &str, deleted: bool, named: bool) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "whip-source-plan-{}-{}-{}",
@@ -67,8 +75,27 @@ impl NativeFixture {
             )
             .expect("write deleted subject base");
         }
-        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
-            .expect("create fixture twig");
+        if named {
+            vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+                .expect("construct checked named-source fixture");
+            BranchStore::open(root.join("branches.db"))
+                .expect("construct checked named-source fixture")
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .expect("construct checked named-source fixture");
+        }
+        vcs.create_branch(
+            "twig",
+            None,
+            if named { "branch" } else { MAINLINE_BRANCH_ID },
+            "t1",
+        )
+        .expect("create fixture twig");
         let mut branches =
             BranchStore::open(root.join("branches.db")).expect("open fixture branch store");
         let base = branches
@@ -137,33 +164,65 @@ impl NativeFixture {
         };
         vcs.bind_private_selection("unit", &selection, "t3")
             .expect("bind fixture selection");
+        if named {
+            let whipplescript_store::vcs::FlowingTargetEffectsOutcome::Verified(target) = vcs
+                .prepare_private_handoff_target("unit", "target", "coordinator", "t4")
+                .expect("construct checked named-source fixture")
+            else {
+                panic!("real content-verified target")
+            };
+            assert!(matches!(vcs.handoff_private_selection("handoff", &target, "coordinator", "t4").expect("construct checked named-source fixture"),
+                whipplescript_store::branches::flowing_sources::HandoffContributionOutcome::Transferred(_)));
+            let released = branches
+                .release_private_cut(
+                    whipplescript_store::branches::flowing_sources::ReleasePrivateCut {
+                        pin_id: "pin",
+                        released_by: "author",
+                        reason: "transferred",
+                        released_at: "t4",
+                    },
+                )
+                .expect("construct checked named-source fixture");
+            assert_eq!(
+                released,
+                whipplescript_store::branches::flowing_sources::ReleasePrivateCutOutcome::Released
+            );
+        }
         let mut fixture = Self {
             root,
             vcs,
             branches,
             reviews: ReviewStore::open(":memory:").expect("open fixture review store"),
             witness: String::new(),
+            source_branch: if named { "branch" } else { "twig" },
+            source_cut: if named { "target" } else { "source" },
         };
         fixture.witness = fixture.review("review", "candidate", "attempt");
         fixture
     }
     fn review(&mut self, review: &str, candidate: &str, attempt: &str) -> String {
+        let actor = if self.source_branch == "branch" {
+            "coordinator"
+        } else {
+            "author"
+        };
         self.reviews
-            .create_native_contribution(review, "author", "change", MAINLINE_BRANCH_ID, &[])
+            .create_native_contribution(review, actor, "change", MAINLINE_BRANCH_ID, &[])
             .expect("create fixture review contribution");
-        self.reviews
-            .upload_native_revision(
-                &self.branches,
-                NativeUpload {
-                    contribution_id: review,
-                    upload_id: review,
-                    actor: "author",
-                    source_branch_id: "twig",
-                    source_cut_id: "source",
-                    unit_ids: &["unit"],
-                },
-            )
-            .expect("upload fixture review revision");
+        let upload = NativeUpload {
+            contribution_id: review,
+            upload_id: review,
+            actor,
+            source_branch_id: self.source_branch,
+            source_cut_id: self.source_cut,
+            unit_ids: &["unit"],
+        };
+        if self.source_branch == "branch" {
+            self.reviews.upload_named_branch_revision(&self.vcs, upload)
+        } else {
+            self.reviews.upload_native_revision(&self.branches, upload)
+        }
+        .expect("upload fixture review revision");
         let base = self
             .vcs
             .get_branch(MAINLINE_BRANCH_ID)
@@ -253,6 +312,10 @@ fn native_derivation_is_read_only_and_does_not_promote_local_coverage() {
     assert_eq!(store.export_events().unwrap(), before);
     assert!(runtime.list_instances().unwrap().is_empty());
     let judgment = first.judgment();
+    assert_eq!(judgment.subject.lineage_fences.len(), 1);
+    assert_eq!(judgment.subject.unit_holders.len(), 1);
+    assert_eq!(judgment.subject.unit_holders[0].unit_id, "unit");
+
     assert!(judgment
         .blockers
         .iter()
@@ -282,6 +345,180 @@ fn native_derivation_is_read_only_and_does_not_promote_local_coverage() {
     let third = plan_native(&native.vcs, &store, host, &native.witness, "attempt").unwrap();
     assert_eq!(third.identity(), first.identity());
     assert!(third.judgment().norm["method_gaps"].get(&record).is_some());
+}
+
+#[test]
+fn source_plan_binds_the_named_holder_after_transfer_and_pin_release() {
+    use whipplescript_store::branches::flowing_fence::{
+        FlowingFenceAction, FlowingFenceTransition,
+    };
+    let mut native = NativeFixture::named();
+    let runtime = SqliteStore::open_in_memory().unwrap();
+    let (store, record) = f::fixture(Some(f::template()), true);
+    let configuration = configuration(&store, &record);
+    let policy = policy();
+    let verify = |_: &PythonRuntime| Ok(());
+    let host = AdmissionHost {
+        now: None,
+        verifier: &Boundary,
+        configuration: &configuration,
+        runtime: &runtime,
+        policy: &policy,
+        verify_runtime: &verify,
+    };
+    let first = plan_native(&native.vcs, &store, host, &native.witness, "attempt").unwrap();
+    assert_eq!(first.judgment().subject.lineage_fences.len(), 1);
+    assert_eq!(
+        first.judgment().subject.lineage_fences[0].source_branch_id,
+        "branch"
+    );
+    assert_eq!(first.judgment().subject.unit_holders.len(), 1);
+    assert_eq!(
+        first.judgment().subject.unit_holders[0].holder_branch_id,
+        "branch"
+    );
+    assert_eq!(
+        first.judgment().subject.unit_holders[0]
+            .handoff_op_id
+            .as_deref(),
+        Some("handoff")
+    );
+    // The original twig is provenance after transfer; its Hold does not hold the receiving branch.
+    let transition = |source: &str, incarnation: &str, op: &str| FlowingFenceTransition {
+        op_id: op.into(),
+        source_branch_id: source.into(),
+        incarnation_id: incarnation.into(),
+        expected_owner_epoch: 0,
+        expected_eligibility_epoch: 0,
+        actor: "coordinator".into(),
+        action: FlowingFenceAction::Hold,
+        recorded_at: "t5".into(),
+    };
+    native
+        .branches
+        .transition_flowing_source(&transition("twig", "inc-1", "twig-hold"))
+        .unwrap();
+    assert!(
+        native
+            .branches
+            .flowing_source("twig")
+            .unwrap()
+            .unwrap()
+            .held
+    );
+    assert!(native
+        .branches
+        .private_cut_pin("pin")
+        .unwrap()
+        .unwrap()
+        .released_at
+        .is_some());
+    let second = plan_native(&native.vcs, &store, host, &native.witness, "attempt").unwrap();
+    assert_eq!(first.identity(), second.identity());
+    native
+        .branches
+        .transition_flowing_source(&transition("branch", "branch-inc", "branch-hold"))
+        .unwrap();
+    assert!(
+        plan_native(&native.vcs, &store, host, &native.witness, "attempt")
+            .unwrap_err()
+            .contains("source eligibility or coordinator changed")
+    );
+}
+
+#[test]
+fn source_holder_changes_during_norm_capture_refuse_the_judgment() {
+    use std::cell::Cell;
+    use whipplescript_store::items::TrackerEvent;
+    use whipplescript_store::norm::{NormVerifier, NormView};
+    use whipplescript_store::vcs::GateCommit;
+    use whipplescript_store::StoreResult;
+    struct ChangingLedger {
+        store: WorkItemStore,
+        branches: rusqlite::Connection,
+        mutation: &'static str,
+        reads: Cell<usize>,
+        mutate_at: usize,
+    }
+    impl AdmissionLedger for ChangingLedger {
+        fn bootstrapped(&self) -> StoreResult<bool> {
+            Ok(self.store.norm_checkpoint()?.is_some())
+        }
+        fn capture(
+            &self,
+            verifier: &dyn NormVerifier,
+        ) -> StoreResult<(NormView, Vec<TrackerEvent>)> {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() == self.mutate_at {
+                self.branches.execute(self.mutation, [])?;
+            }
+            self.store.norm_admission_capture(verifier)
+        }
+        fn exclusively(
+            &self,
+            f: &mut dyn FnMut() -> StoreResult<GateCommit>,
+        ) -> StoreResult<GateCommit> {
+            f()
+        }
+    }
+    for (mutation, mutate_at, reason) in [
+        (
+            "UPDATE flowing_contributions SET scope_digest = 'changed' WHERE unit_id = 'unit'",
+            1,
+            "source-admission premises changed during derivation",
+        ),
+        (
+            "UPDATE flowing_private_pins SET principal = 'foreign' WHERE pin_id = 'pin'",
+            1,
+            "unit holder is unknown or changed",
+        ),
+        (
+            "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit'",
+            1,
+            "source lineage is unknown or ineligible",
+        ),
+        (
+            "UPDATE flowing_contributions SET scope_digest = 'changed' WHERE unit_id = 'unit'",
+            2,
+            "source-admission premises changed during derivation",
+        ),
+    ] {
+        let native = NativeFixture::new();
+        let runtime = SqliteStore::open_in_memory().unwrap();
+        let (store, record) = f::fixture(Some(f::template()), true);
+        let configuration = configuration(&store, &record);
+        let policy = policy();
+        let verify = |_: &PythonRuntime| Ok(());
+        let host = AdmissionHost {
+            now: None,
+            verifier: &Boundary,
+            configuration: &configuration,
+            runtime: &runtime,
+            policy: &policy,
+            verify_runtime: &verify,
+        };
+        let ledger = ChangingLedger {
+            store,
+            branches: rusqlite::Connection::open(native.root.join("branches.db")).unwrap(),
+            mutation,
+            reads: Cell::new(0),
+            mutate_at,
+        };
+        let before = ledger.store.export_events().unwrap();
+        assert!(
+            plan_native(&native.vcs, &ledger, host, &native.witness, "attempt")
+                .unwrap_err()
+                .contains(reason),
+            "{reason}"
+        );
+        assert_eq!(ledger.store.export_events().unwrap(), before);
+        assert!(runtime.list_instances().unwrap().is_empty());
+        assert!(native
+            .branches
+            .flowing_admission_receipt("attempt")
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[test]

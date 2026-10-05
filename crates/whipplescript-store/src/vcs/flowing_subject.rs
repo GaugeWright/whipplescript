@@ -4,6 +4,8 @@ use crate::branches::flowing_admission::{
     FlowingAdmissions, FlowingAttemptPin, FlowingCandidateWitness,
 };
 use crate::branches::flowing_fence::{FlowingFence, FlowingFenceState};
+use crate::branches::flowing_holders::FlowingUnitHolder;
+use crate::branches::flowing_sources::FlowingSources;
 use crate::branches::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
 use crate::content::ContentBlobs;
 use crate::{StoreError, StoreResult};
@@ -16,6 +18,8 @@ pub struct CapturedGateSubject {
     pub(super) witness: FlowingCandidateWitness,
     pub(super) pin: FlowingAttemptPin,
     pub(super) fence: FlowingFenceState,
+    pub(super) lineage_fences: Vec<FlowingFenceState>,
+    pub(super) unit_holders: Vec<FlowingUnitHolder>,
 }
 
 impl CapturedGateSubject {
@@ -28,13 +32,21 @@ impl CapturedGateSubject {
     pub fn fence(&self) -> &FlowingFenceState {
         &self.fence
     }
+    pub fn lineage_fences(&self) -> &[FlowingFenceState] {
+        &self.lineage_fences
+    }
+    pub fn unit_holders(&self) -> &[FlowingUnitHolder] {
+        &self.unit_holders
+    }
 }
 
 fn invalid(reason: &str) -> StoreError {
     StoreError::Conflict(format!("candidate gate refuses: {reason}"))
 }
 
-impl<B: Branches + FlowingAdmissions + FlowingFence, C: ContentBlobs> WorkspaceVcs<B, C> {
+impl<B: Branches + FlowingAdmissions + FlowingFence + FlowingSources, C: ContentBlobs>
+    WorkspaceVcs<B, C>
+{
     /// Capture a live retained candidate without executing or creating work.
     /// A source tail may advance; the immutable selected prefix stays exact.
     pub fn capture_gate_subject(
@@ -93,10 +105,16 @@ impl<B: Branches + FlowingAdmissions + FlowingFence, C: ContentBlobs> WorkspaceV
         {
             return Err(invalid("candidate cut differs from retained witness"));
         }
+        let lineage_fences = crate::branches::flowing_lineage::capture(&self.branches, &witness)?
+            .ok_or_else(|| invalid("source lineage is unknown or ineligible"))?;
+        let unit_holders = crate::branches::flowing_holders::capture(&self.branches, &witness)?
+            .ok_or_else(|| invalid("unit holder is unknown or changed"))?;
         Ok(CapturedGateSubject {
             witness,
             pin,
             fence,
+            lineage_fences,
+            unit_holders,
         })
     }
 }

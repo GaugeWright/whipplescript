@@ -14,6 +14,8 @@ use whipplescript_store::branches::flowing_admission::FlowingAdmissions;
 use whipplescript_store::branches::flowing_admission::FlowingCandidateWitness;
 use whipplescript_store::branches::flowing_fence::FlowingFence;
 use whipplescript_store::branches::flowing_fence::FlowingFenceState;
+use whipplescript_store::branches::flowing_holders::FlowingUnitHolder;
+use whipplescript_store::branches::flowing_sources::FlowingSources;
 use whipplescript_store::branches::Branches;
 use whipplescript_store::content::ContentBlobs;
 use whipplescript_store::norm_artifact::ArtifactLimits;
@@ -40,6 +42,8 @@ pub struct SourceAdmissionSubject {
     pub witness_digest: String,
     pub witness: FlowingCandidateWitness,
     pub source_fence: FlowingFenceState,
+    pub lineage_fences: Vec<FlowingFenceState>,
+    pub unit_holders: Vec<FlowingUnitHolder>,
 }
 
 /// Located gaps are part of the judgment, including gaps outside the locally
@@ -319,7 +323,7 @@ pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
 /// The same domain process over any owning VCS implementation. Hosted
 /// readers do not substitute serialized manifests or replayed subjects.
 pub fn plan<
-    B: Branches + FlowingAdmissions + FlowingFence,
+    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -334,7 +338,7 @@ pub fn plan<
 }
 
 pub fn plan_with_authority<
-    B: Branches + FlowingAdmissions + FlowingFence,
+    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -357,7 +361,7 @@ pub fn plan_with_authority<
 }
 
 fn derive<
-    B: Branches + FlowingAdmissions + FlowingFence,
+    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -622,6 +626,8 @@ fn derive<
             witness_digest: witness_digest.into(),
             witness: witness.clone(),
             source_fence: captured.fence().clone(),
+            lineage_fences: captured.lineage_fences().to_vec(),
+            unit_holders: captured.unit_holders().to_vec(),
         },
         interpretation: host.configuration.identity().clone(),
         norm: planned.to_json(),
@@ -632,23 +638,6 @@ fn derive<
         dependency_judgments,
         blockers,
     };
-    // Detect change during derivation. This is not the final publication fence.
-    let current = vcs
-        .capture_gate_subject(witness_digest, attempt_id)
-        .map_err(|error| format!("{error:?}"))?;
-    let (current_view, current_events) = ledger
-        .capture(host.verifier)
-        .map_err(|error| format!("{error:?}"))?;
-    let current_history = CapturedNormHistory::capture(
-        &current_view,
-        &current_events,
-        host.verifier,
-        NormHistoryLimits::default(),
-    )
-    .map_err(|error| format!("{error:?}"))?;
-    if current != captured || current_history.anchor() != planned.anchor {
-        return Err("source-admission premises changed during derivation".into());
-    }
     if let (Some(authority), Some(impact)) = (authority, &judgment.dependencies) {
         for (consumer, validation, captured) in validation_bindings {
             if authority.validation_requirement(&impact.basis, &consumer, &validation) != captured {
@@ -674,6 +663,25 @@ fn derive<
     planned
         .method_installation
         .revalidate(host.runtime, host.verify_runtime)?;
+    // Recapture after every Home and installation callback. These callbacks
+    // may race a source or ledger change; this remains a query, not the final
+    // publication exclusion. Read the source after the ledger callback too.
+    let (current_view, current_events) = ledger
+        .capture(host.verifier)
+        .map_err(|error| format!("{error:?}"))?;
+    let current_history = CapturedNormHistory::capture(
+        &current_view,
+        &current_events,
+        host.verifier,
+        NormHistoryLimits::default(),
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    let current = vcs
+        .capture_gate_subject(witness_digest, attempt_id)
+        .map_err(|error| format!("{error:?}"))?;
+    if current != captured || current_history.anchor() != planned.anchor {
+        return Err("source-admission premises changed during derivation".into());
+    }
     Ok(SourceAdmissionPlan {
         identity: identity(&judgment)?,
         judgment,

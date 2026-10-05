@@ -1212,6 +1212,89 @@ mod tests {
     }
 
     #[test]
+    fn hosted_source_subject_reads_current_lineage_and_holder_evidence() {
+        let (sql, mut store) = fixture();
+        named_origin(&sql, &mut store);
+        let attempt = request("unit-a", "subject-attempt");
+        pin_attempt(&mut store, &attempt);
+        let vcs = crate::do_branches::observe_vcs(&sql);
+        let captured = vcs
+            .capture_gate_subject(&attempt.candidate_witness_digest, &attempt.op_id)
+            .unwrap();
+        assert_eq!(
+            captured
+                .lineage_fences()
+                .iter()
+                .map(|f| f.source_branch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["origin", "twig"]
+        );
+        assert_eq!(captured.unit_holders().len(), 1);
+        assert_eq!(captured.unit_holders()[0].unit_id, "unit-a");
+        let transition = FlowingFenceTransition {
+            op_id: "origin-hold-subject".into(),
+            source_branch_id: "origin".into(),
+            incarnation_id: "origin-inc".into(),
+            expected_owner_epoch: 0,
+            expected_eligibility_epoch: 0,
+            actor: "origin-owner".into(),
+            action: FlowingFenceAction::Hold,
+            recorded_at: "t4".into(),
+        };
+        store.transition_flowing_source(&transition).unwrap();
+        assert!(format!(
+            "{:?}",
+            vcs.capture_gate_subject(&attempt.candidate_witness_digest, &attempt.op_id)
+                .unwrap_err()
+        )
+        .contains("source lineage is unknown or ineligible"));
+        store
+            .transition_flowing_source(&FlowingFenceTransition {
+                op_id: "origin-release-subject".into(),
+                expected_eligibility_epoch: 1,
+                action: FlowingFenceAction::ReleaseHold,
+                ..transition
+            })
+            .unwrap();
+        let released = vcs
+            .capture_gate_subject(&attempt.candidate_witness_digest, &attempt.op_id)
+            .unwrap();
+        assert_eq!(captured.fence(), released.fence());
+        assert_ne!(captured, released);
+        sql.execute(
+            "UPDATE flowing_private_pins SET principal = 'foreign' WHERE pin_id = 'pin'",
+            &[],
+        )
+        .unwrap();
+        assert!(format!(
+            "{:?}",
+            vcs.capture_gate_subject(&attempt.candidate_witness_digest, &attempt.op_id)
+                .unwrap_err()
+        )
+        .contains("unit holder is unknown or changed"));
+        sql.execute(
+            "UPDATE flowing_private_pins SET principal = 'author' WHERE pin_id = 'pin'",
+            &[],
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit-a'",
+            &[],
+        )
+        .unwrap();
+        assert!(format!(
+            "{:?}",
+            vcs.capture_gate_subject(&attempt.candidate_witness_digest, &attempt.op_id)
+                .unwrap_err()
+        )
+        .contains("source lineage is unknown or ineligible"));
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn hosted_holder_evidence_is_rechecked_inside_admission() {
         for (sql_text, refusal) in [
             ("UPDATE flowing_private_pins SET principal = 'foreign' WHERE pin_id = 'pin'", FlowingAdmissionRefusal::HolderUnavailable),
