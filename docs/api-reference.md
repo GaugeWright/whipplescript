@@ -1855,6 +1855,12 @@ before a new attempt. Known response-shape failures receive a specific
 diagnostic without exposing returned model text. Reported usage from a failed
 proposal is retained as a `campaign.spend` event with `what` equal to
 `proposer turn (failed)` and is priced when a matching price table exists.
+Failed critic and revision turns likewise record reported usage. Their spend
+events use `shortcut critic turn (failed)`, `scope refinement turn (failed)`,
+or `shortcut generalization turn (failed)`. When the failed turn's cost is
+unknown, `unaccounted: true` records the gap. A campaign with `--spend-cap`
+then stops; an uncapped campaign may continue with an unassessed critic or
+the original candidate.
 
 ### `campaigns` / `campaign`
 

@@ -2698,6 +2698,191 @@ fn assert_failed_native_proposal_retains_usage(response: Value, diagnostic: &str
         .any(|event| event["type"] == "candidate.recorded"));
 }
 
+#[test]
+fn failed_native_critic_retains_priced_usage_without_vetoing_candidate() {
+    assert_failed_auxiliary_turn(false, false, false, false);
+}
+
+#[test]
+fn failed_native_generalization_retains_priced_usage_and_original_candidate() {
+    assert_failed_auxiliary_turn(true, false, false, false);
+}
+
+#[test]
+fn capped_campaign_stops_after_unpriced_failed_critic() {
+    assert_failed_auxiliary_turn(false, true, false, true);
+}
+
+#[test]
+fn capped_campaign_stops_after_revision_failure_without_usage() {
+    assert_failed_auxiliary_turn(true, true, true, true);
+}
+
+#[test]
+fn uncapped_campaign_keeps_unknown_failed_critic_cost_visible() {
+    assert_failed_auxiliary_turn(false, true, false, false);
+}
+
+fn assert_failed_auxiliary_turn(
+    generalization: bool,
+    unknown_cost: bool,
+    missing_usage: bool,
+    capped: bool,
+) {
+    let stopped = capped && unknown_cost;
+    let env = Env::new(if generalization {
+        "failed-generalization"
+    } else {
+        "failed-critic"
+    });
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir))
+        .expect("failed native turn fixture");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    let candidate = program(
+        "high",
+        if generalization {
+            "\"T-1\""
+        } else {
+            "ticket.id"
+        },
+        &env.dir,
+    );
+    let proposal = serde_json::json!({"rationale":"repair priority", "source":candidate,
+        "edit_account":{"mechanism":"repair priority", "declarations":["rule triage"],
+                        "expected_gauges":["priority_correct"]}});
+    let envelope = |content: String| {
+        serde_json::json!({
+            "output":[{"type":"message","content":[{"type":"output_text","text":content}]}],
+            "usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}
+        })
+    };
+    let mut replies = vec![envelope(proposal.to_string())];
+    if generalization {
+        replies.push(envelope(
+            serde_json::json!({"classification":"clear",
+            "source_quote":"ticket \"T-1\"", "reason":"copies one pinned case id"})
+            .to_string(),
+        ));
+    }
+    let mut failed = envelope("PRIVATE_PARTIAL_MODEL_OUTPUT".to_owned());
+    failed["status"] = serde_json::json!("incomplete");
+    failed["incomplete_details"] = serde_json::json!({"reason":"max_output_tokens"});
+    if missing_usage {
+        failed
+            .as_object_mut()
+            .expect("response object")
+            .remove("usage");
+    }
+    replies.push(failed);
+    let expected_calls = replies.len();
+    let (base_url, bodies) = mock_coerce_response_sequence_endpoint(replies);
+    let prices_path = env.dir.join("providers.json");
+    fs::write(
+        &prices_path,
+        if unknown_cost {
+            r#"{"providers":[],"prices":[]}"#
+        } else {
+            r#"{"providers":[],"prices":[{"provider":"openai","model":"test-model",
+        "input_micros_per_mtok":1000000000000,"output_micros_per_mtok":1000000000000}]}"#
+        },
+    )
+    .expect("failed native turn fixture");
+    let mut command = env.command();
+    command
+        .args([
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "native",
+            "--provider-config",
+            &prices_path.to_string_lossy(),
+        ])
+        .env("WHIPPLESCRIPT_COERCE_PROVIDER", "openai")
+        .env("OPENAI_API_KEY", "test-key")
+        .env("WHIPPLESCRIPT_COERCE_BASE_URL", base_url)
+        .env("WHIPPLESCRIPT_COERCE_MODEL", "test-model");
+    if capped {
+        command.args(["--spend-cap", "$100"]);
+    }
+    let output = command.output().expect("failed native turn fixture");
+    if stopped {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unaccounted provider use"));
+    } else {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value =
+            serde_json::from_slice(&output.stdout).expect("failed native turn fixture");
+        assert_eq!(report["proposed"], true, "{report}");
+    }
+    let campaign = env.run_json(&["--json", "campaign", "C-1"], &[]);
+    let events = campaign["events"]
+        .as_array()
+        .expect("failed native turn fixture");
+    let what = if generalization {
+        "shortcut generalization turn (failed)"
+    } else {
+        "shortcut critic turn (failed)"
+    };
+    let failed_spend = events
+        .iter()
+        .find(|event| event["type"] == "campaign.spend" && event["payload"]["what"] == what)
+        .expect("failed native turn fixture");
+    assert_eq!(
+        failed_spend["payload"]["tokens"],
+        if missing_usage {
+            Value::Null
+        } else {
+            serde_json::json!(16)
+        }
+    );
+    assert_eq!(failed_spend["payload"]["priced"], !unknown_cost);
+    assert_eq!(failed_spend["payload"]["unaccounted"], unknown_cost);
+    assert_eq!(
+        failed_spend["payload"]["cost_micros"],
+        if unknown_cost { 0 } else { 16_000_000 }
+    );
+    assert!(!campaign
+        .to_string()
+        .contains("PRIVATE_PARTIAL_MODEL_OUTPUT"));
+    if generalization {
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "candidate.refinement"
+                && event["payload"]["status"] == "turn-failed"));
+    } else {
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "candidate.shortcut_assessed"
+                && event["payload"]["status"] == "failed"));
+    }
+    assert_eq!(
+        events
+            .iter()
+            .any(|event| event["type"] == "campaign.failed"),
+        stopped
+    );
+    if !stopped {
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "candidate.recorded"
+                && event["payload"]["source"] == candidate));
+    }
+    assert_eq!(
+        bodies.lock().expect("failed native turn fixture").len(),
+        expected_calls
+    );
+}
+
 fn coerce_judge_program(judge_dir: &std::path::Path) -> String {
     let echo_judge = judge_dir.join("judge_echo.py");
     format!(

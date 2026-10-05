@@ -3511,7 +3511,7 @@ impl NativeProposer {
         observation: &EditObservation,
         baseline_context: Option<&ContextSnapshot>,
         candidate_context: Option<&ContextSnapshot>,
-    ) -> Result<Option<Proposal>, String> {
+    ) -> Result<Option<Proposal>, NativeTurnFailure> {
         let mut prompt = format!(
             "You are refining a proposed WhippleScript harness change before evaluation. \
              Keep ONE independently testable mechanism that targets the stated gauges. \
@@ -3541,7 +3541,7 @@ impl NativeProposer {
             observation,
         );
         append_declaration_identities(&mut prompt, baseline);
-        Self::new(baseline_context).propose(&prompt)
+        Self::revision_proposal(baseline_context, &prompt)
     }
 
     fn generalize(
@@ -3551,7 +3551,7 @@ impl NativeProposer {
         finding: &ShortcutAssessment,
         baseline_context: Option<&ContextSnapshot>,
         candidate_context: Option<&ContextSnapshot>,
-    ) -> Result<Option<Proposal>, String> {
+    ) -> Result<Option<Proposal>, NativeTurnFailure> {
         let mut prompt = format!(
             "A shortcut critic found a possible case-specific dependency in this proposed \
              WhippleScript harness change. Produce ONE generalizing revision: remove the \
@@ -3576,7 +3576,20 @@ impl NativeProposer {
             observation,
         );
         append_declaration_identities(&mut prompt, baseline);
-        Self::new(baseline_context).propose(&prompt)
+        Self::revision_proposal(baseline_context, &prompt)
+    }
+
+    fn revision_proposal(
+        baseline_context: Option<&ContextSnapshot>,
+        prompt: &str,
+    ) -> Result<Option<Proposal>, NativeTurnFailure> {
+        let mut proposer = Self::new(baseline_context);
+        proposer
+            .propose(prompt)
+            .map_err(|message| NativeTurnFailure {
+                message,
+                usage: proposer.take_failed_usage().map(Box::new),
+            })
     }
 }
 
@@ -3885,7 +3898,7 @@ fn assess_shortcut(
         "required": ["classification", "source_path", "source_quote", "reason"],
         "additionalProperties": false,
     });
-    match native_coerce_turn(
+    match native_coerce_turn_with_usage(
         "improve shortcut critic",
         prompt,
         schema,
@@ -3903,10 +3916,53 @@ fn assess_shortcut(
             open_cases_shown,
             redacted,
         ),
-        Err(reason) => ShortcutAssessment::unassessed("failed", reason, redacted),
+        Err(failure) => {
+            let mut assessment =
+                ShortcutAssessment::unassessed("failed", failure.message, redacted);
+            assessment.usage = failure.usage.map(|usage| *usage);
+            assessment.open_cases_shown = open_cases_shown;
+            assessment
+        }
     }
 }
 
+fn record_failed_native_turn(
+    store: &mut ImproveStore,
+    campaign_id: &str,
+    usage: Option<&TurnUsage>,
+    what: &str,
+    prices: &PriceTable,
+    spent_micros: &mut i64,
+    spend_cap: Option<i64>,
+) -> Result<(), String> {
+    let cost = usage.and_then(|usage| prices.cost_micros(usage));
+    store
+        .append_campaign_event(
+            campaign_id,
+            "campaign.spend",
+            &json!({
+                "what": what,
+                "cost_micros": cost.unwrap_or(0),
+                "priced": cost.is_some(),
+                "unaccounted": cost.is_none(),
+                "tokens": usage.map(|usage| usage.total_tokens),
+                "input_tokens": usage.map(|usage| usage.input_tokens),
+                "output_tokens": usage.map(|usage| usage.output_tokens),
+                "provider": usage.map(|usage| &usage.provider),
+                "model": usage.map(|usage| &usage.model),
+            }),
+        )
+        .map_err(|error| format!("failed to record failed native turn spend: {error:?}"))?;
+    *spent_micros += cost.unwrap_or(0);
+    if spend_cap.is_some() && cost.is_none() {
+        return Err(format!(
+            "{what} has unaccounted provider use under --spend-cap; campaign stopped"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_shortcut_assessment(
     store: &mut ImproveStore,
     campaign_id: &str,
@@ -3915,7 +3971,26 @@ fn record_shortcut_assessment(
     assessment: &ShortcutAssessment,
     prices: &PriceTable,
     spent_micros: &mut i64,
+    spend_cap: Option<i64>,
 ) -> Result<(), String> {
+    store
+        .append_campaign_event(
+            campaign_id,
+            "candidate.shortcut_assessed",
+            &assessment.payload(candidate_id, hash),
+        )
+        .map_err(|error| format!("failed to record shortcut finding: {error:?}"))?;
+    if assessment.status == "failed" {
+        return record_failed_native_turn(
+            store,
+            campaign_id,
+            assessment.usage.as_ref(),
+            "shortcut critic turn (failed)",
+            prices,
+            spent_micros,
+            spend_cap,
+        );
+    }
     if let Some(usage) = &assessment.usage {
         let cost_micros = prices.cost_micros(usage);
         store
@@ -3936,13 +4011,6 @@ fn record_shortcut_assessment(
             .map_err(|error| format!("failed to record critic spend: {error:?}"))?;
         *spent_micros += cost_micros.unwrap_or(0);
     }
-    store
-        .append_campaign_event(
-            campaign_id,
-            "candidate.shortcut_assessed",
-            &assessment.payload(candidate_id, hash),
-        )
-        .map_err(|error| format!("failed to record shortcut finding: {error:?}"))?;
     Ok(())
 }
 
@@ -5114,28 +5182,19 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     reflection.push('\n');
                 }
                 let proposal_result = proposer.propose(&reflection);
-                if proposal_result.is_err() {
-                    if let Some(usage) = proposer.take_failed_usage() {
-                        let cost_micros = prices.cost_micros(&usage);
-                        store
-                            .append_campaign_event(
-                                &campaign_id,
-                                "campaign.spend",
-                                &json!({
-                                    "cost_micros": cost_micros.unwrap_or(0),
-                                    "priced": cost_micros.is_some(),
-                                    "tokens": usage.total_tokens,
-                                    "input_tokens": usage.input_tokens,
-                                    "output_tokens": usage.output_tokens,
-                                    "provider": usage.provider,
-                                    "model": usage.model,
-                                    "what": "proposer turn (failed)",
-                                }),
-                            )
-                            .map_err(|error| {
-                                format!("failed to record failed proposer spend: {error:?}")
-                            })?;
-                    }
+                if proposal_result.is_err() && proposer.name() == "native" {
+                    let usage = proposer.take_failed_usage();
+                    // This failure already ends the campaign below; keep its
+                    // specific diagnostic while recording any unknown cost.
+                    record_failed_native_turn(
+                        store,
+                        &campaign_id,
+                        usage.as_ref(),
+                        "proposer turn (failed)",
+                        &prices,
+                        &mut spent_micros,
+                        None,
+                    )?;
                 }
                 let Some(mut proposal) = proposal_result? else {
                     break;
@@ -5303,6 +5362,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     &shortcut,
                     &prices,
                     &mut spent_micros,
+                    spec_active.spend_cap_micros,
                 )?;
                 let clear_quote = shortcut.clear_quote().map(str::to_owned);
                 let mut shortcut_mitigated = false;
@@ -5334,12 +5394,25 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         )
                     };
                     match revision {
-                        Err(reason) => {
+                        Err(failure) => {
                             store.append_campaign_event(
                                 &campaign_id,
                                 "candidate.refinement",
-                                &json!({"candidate": candidate_id, "kind": if clear_quote.is_some() { "shortcut-generalization" } else { "scope-refinement" }, "status": "turn-failed", "reason": reason}),
+                                &json!({"candidate": candidate_id, "kind": if clear_quote.is_some() { "shortcut-generalization" } else { "scope-refinement" }, "status": "turn-failed", "reason": failure.message}),
                             ).map_err(|error| format!("failed to record refinement: {error:?}"))?;
+                            record_failed_native_turn(
+                                store,
+                                &campaign_id,
+                                failure.usage.as_deref(),
+                                if clear_quote.is_some() {
+                                    "shortcut generalization turn (failed)"
+                                } else {
+                                    "scope refinement turn (failed)"
+                                },
+                                &prices,
+                                &mut spent_micros,
+                                spec_active.spend_cap_micros,
+                            )?;
                         }
                         Ok(Some(refinement)) => {
                             if refinement.tokens > 0 {
@@ -5481,6 +5554,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                                             &refined_shortcut,
                                             &prices,
                                             &mut spent_micros,
+                                            spec_active.spend_cap_micros,
                                         )?;
                                         match accounted_evaluate_all(
                                             store,
