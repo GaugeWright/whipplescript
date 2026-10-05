@@ -108,6 +108,14 @@ its frozen prefix might already have read the old context; the evidence says
 flag. See the [`improve` reference](../api-reference.md#improve) for the exact
 limits and refusals.
 
+For a separate transfer check, verify the instructions the Agent actually
+loads. Ordinary `whip run` reads `AGENTS.md` from the workspace and its
+ancestors; an admitted-context improve evaluation reads only the snapshot's
+root instructions. A test workspace inside your repository can therefore
+include extra instructions. Use a standalone workspace with no ancestor
+instruction files, copy the recorded context bytes, and use the same provider
+and execution limits before comparing the candidate with its baseline.
+
 Each native proposal states one testable mechanism, the declarations and
 resource paths it expects to change, and the gauges it expects to improve.
 The campaign card shows the actual changed declarations and files beside that

@@ -1748,6 +1748,12 @@ baseline. A configured global context directory or
 which instructions the evaluated agent sees. With no `--context-root`, improve
 retains its source-only behavior.
 
+The admitted snapshot is also the boundary for project-instruction discovery:
+evaluations load its root `AGENTS.md`, without walking temporary ancestors.
+Ordinary `whip run` retains hierarchical discovery. A standalone comparison
+must account for that difference; putting a transfer workspace beneath a
+repository `AGENTS.md` adds instructions absent from the campaign snapshot.
+
 For small changes to a large file, the native proposer can return
 `context_patches` with `path`, `find`, and `replace` strings. Each nonempty
 `find` must match exactly once in the admitted baseline file at that point;
