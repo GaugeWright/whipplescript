@@ -1719,6 +1719,11 @@ an invocation with `--spend-cap` stops instead of continuing under an
 incomplete total. Its `campaign.spend` event names the failed evaluation and
 the unaccounted runs.
 
+Failed prompt/coerce gauge judges also retain reported use, including a
+completed response whose verdict cannot be read. The gauge remains unscored.
+Their failed-turn spend events identify the gauge; unknown cost stops a
+capped campaign before more proposals are generated.
+
 A campaign that crosses its cap **parks**. The record then has a
 `campaign.parked` event, and the report has `"parked": true`. The
 `whip improve --resume <campaign-id>` command continues the campaign under a new

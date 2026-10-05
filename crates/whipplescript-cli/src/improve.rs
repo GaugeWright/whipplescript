@@ -1145,6 +1145,8 @@ struct RunObservation {
     /// (prompt/coerce judges): priced into spend accounting by the
     /// caller that holds the campaign record.
     judge_usage: Vec<TurnUsage>,
+    /// Gauge name and reported usage for a failed native judgment.
+    failed_judge_usage: Vec<(String, Option<TurnUsage>)>,
 }
 
 struct EvaluationBatch {
@@ -1318,6 +1320,7 @@ fn score_instance(
     let mut readings: BTreeMap<String, GaugeReading> = BTreeMap::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut judge_usage: Vec<TurnUsage> = Vec::new();
+    let mut failed_judge_usage = Vec::new();
     let instance = store.get_instance(instance_id).ok().flatten();
     // Consumed facts are still facts the run produced; judges must see
     // the whole record, not the un-consumed residue.
@@ -1445,6 +1448,7 @@ fn score_instance(
                 &mut readings,
                 &mut skipped,
                 &mut judge_usage,
+                &mut failed_judge_usage,
             );
         }
     }
@@ -1456,6 +1460,7 @@ fn score_instance(
         readings,
         skipped,
         judge_usage,
+        failed_judge_usage,
     }
 }
 
@@ -1471,6 +1476,7 @@ fn score_one_gauge(
     readings: &mut BTreeMap<String, GaugeReading>,
     skipped: &mut Vec<(String, String)>,
     judge_usage: &mut Vec<TurnUsage>,
+    failed_judge_usage: &mut Vec<(String, Option<TurnUsage>)>,
 ) {
     {
         let mut input = judge_input.clone();
@@ -1509,7 +1515,11 @@ fn score_one_gauge(
                             readings.insert(spec.name.clone(), reading);
                             judge_usage.push(usage);
                         }
-                        Err(reason) => skipped.push((spec.name.clone(), reason)),
+                        Err(failure) => {
+                            skipped.push((spec.name.clone(), failure.message));
+                            failed_judge_usage
+                                .push((spec.name.clone(), failure.usage.map(|usage| *usage)));
+                        }
                     }
                 }
             }
@@ -1526,7 +1536,11 @@ fn score_one_gauge(
                             readings.insert(spec.name.clone(), reading);
                             judge_usage.push(usage);
                         }
-                        Err(reason) => skipped.push((spec.name.clone(), reason)),
+                        Err(failure) => {
+                            skipped.push((spec.name.clone(), failure.message));
+                            failed_judge_usage
+                                .push((spec.name.clone(), failure.usage.map(|usage| *usage)));
+                        }
                     }
                 }
             }
@@ -1780,20 +1794,7 @@ fn scorer_label(judge: &JudgeSpec) -> String {
     }
 }
 
-/// One structured native-coerce turn (the judge/proposer transport shell):
-/// prompt + object schema in, parsed value + total token usage out.
-fn native_coerce_turn(
-    purpose: &str,
-    prompt: String,
-    schema: Value,
-    schema_name: &str,
-    codex_label: &str,
-    wrapped: bool,
-) -> Result<(Value, TurnUsage), String> {
-    native_coerce_turn_with_usage(purpose, prompt, schema, schema_name, codex_label, wrapped)
-        .map_err(|failure| failure.message)
-}
-
+/// A failed native turn may still have consumed reported provider usage.
 struct NativeTurnFailure {
     message: String,
     usage: Option<Box<TurnUsage>>,
@@ -1946,12 +1947,13 @@ fn run_coerce_judge(
     input: &Value,
     ir: &IrProgram,
     spec: &GaugeSpec,
-) -> Result<(GaugeReading, TurnUsage), String> {
+) -> Result<(GaugeReading, TurnUsage), NativeTurnFailure> {
     if args.is_empty() {
         return Err(format!(
             "coerce judge `{name}` declares no arguments; bind its parameters \
              (`judge via coerce {name}(input.…, facts.<Class>.<field>)`, or `{name}(record)`)"
-        ));
+        )
+        .into());
     }
     let mut arguments = serde_json::Map::new();
     for (index, arg) in args.iter().enumerate() {
@@ -1965,7 +1967,7 @@ fn run_coerce_judge(
             name,
             &Value::Object(arguments),
         )?;
-    let (value, usage) = native_coerce_turn(
+    let (value, usage) = native_coerce_turn_with_usage(
         "coerce judge",
         prompt,
         schema,
@@ -1973,7 +1975,11 @@ fn run_coerce_judge(
         &format!("improve-judge-{}", spec.name),
         wrapped,
     )?;
-    let mut reading = reading_from_judge_output(&value, spec)?;
+    let mut reading =
+        reading_from_judge_output(&value, spec).map_err(|message| NativeTurnFailure {
+            message,
+            usage: Some(Box::new(usage.clone())),
+        })?;
     reading.tags.push("judge-unanchored".to_owned());
     Ok((reading, usage))
 }
@@ -1982,7 +1988,7 @@ fn run_prompt_judge(
     template: &str,
     input: &Value,
     spec: &GaugeSpec,
-) -> Result<(GaugeReading, TurnUsage), String> {
+) -> Result<(GaugeReading, TurnUsage), NativeTurnFailure> {
     let prompt = format!(
         "{template}\n\nJudge the following run record. Respond with the JSON schema \
          provided.\n\n{input}"
@@ -1997,7 +2003,7 @@ fn run_prompt_judge(
         "required": ["passed", "score", "rationale"],
         "additionalProperties": false,
     });
-    let (value, usage) = native_coerce_turn(
+    let (value, usage) = native_coerce_turn_with_usage(
         "prompt judge",
         prompt,
         schema,
@@ -2005,7 +2011,11 @@ fn run_prompt_judge(
         &format!("improve-judge-{}", spec.name),
         false,
     )?;
-    let mut reading = reading_from_judge_output(&value, spec)?;
+    let mut reading =
+        reading_from_judge_output(&value, spec).map_err(|message| NativeTurnFailure {
+            message,
+            usage: Some(Box::new(usage.clone())),
+        })?;
     reading.tags.push("judge-unanchored".to_owned());
     Ok((reading, usage))
 }
@@ -4948,6 +4958,25 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     spent,
                 )?;
                 let mut unaccounted = false;
+                for observation in &batch.observations {
+                    for (gauge, usage) in &observation.failed_judge_usage {
+                        // Record every failed judge even if an earlier one has
+                        // unknown cost, then stop a capped batch before continuing.
+                        unaccounted |= usage
+                            .as_ref()
+                            .and_then(|usage| prices.cost_micros(usage))
+                            .is_none();
+                        record_failed_native_turn(
+                            store,
+                            &campaign_id,
+                            usage.as_ref(),
+                            &format!("judge turns ({what}, failed {gauge})"),
+                            &prices,
+                            spent,
+                            None,
+                        )?;
+                    }
+                }
                 for failed_seq in batch.failed_seqs {
                     if let Some(mut usage) = failed_evaluation_spend(failed_seq, &prices)? {
                         unaccounted |= usage["priced"] == false;
@@ -4964,7 +4993,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 }
                 if unaccounted && evaluation_spend_cap.is_some() {
                     return Err(format!(
-                        "failed evaluation in {what} has unaccounted provider use under --spend-cap; campaign stopped: {}",
+                        "failed evaluation in {what} has unaccounted provider use under --spend-cap; campaign stopped (workflow or gauge judge): {}",
                         batch.failure.as_deref().unwrap_or("unknown evaluation failure")
                     ));
                 }
@@ -7301,6 +7330,12 @@ fn run_settle(options: &CliOptions) -> Result<ExitCode, String> {
             spent_micros += observation
                 .judge_usage
                 .iter()
+                .chain(
+                    observation
+                        .failed_judge_usage
+                        .iter()
+                        .filter_map(|(_, usage)| usage.as_ref()),
+                )
                 .filter_map(|turn| prices.cost_micros(turn))
                 .sum::<i64>();
             let verdict = observation
@@ -8025,6 +8060,7 @@ mod tests {
                 )]),
                 skipped: Vec::new(),
                 judge_usage: Vec::new(),
+                failed_judge_usage: Vec::new(),
             })
             .collect()
     }
@@ -8046,6 +8082,7 @@ mod tests {
                 )]),
                 skipped: Vec::new(),
                 judge_usage: Vec::new(),
+                failed_judge_usage: Vec::new(),
             })
             .collect()
     }
@@ -8157,6 +8194,7 @@ mod tests {
             .collect(),
             skipped: Vec::new(),
             judge_usage: Vec::new(),
+            failed_judge_usage: Vec::new(),
         };
         let base = vec![observation(200.0, Some(0.0)); 6];
         let zero = vec![observation(0.0, None); 6];
@@ -8395,6 +8433,7 @@ mod tests {
             readings: BTreeMap::from([("focus".to_owned(), reading)]),
             skipped: Vec::new(),
             judge_usage: Vec::new(),
+            failed_judge_usage: Vec::new(),
         }];
         let reflection = build_reflection(
             "workflow X",
@@ -8433,6 +8472,7 @@ mod tests {
             )]),
             skipped: Vec::new(),
             judge_usage: Vec::new(),
+            failed_judge_usage: Vec::new(),
         }];
         let reflection = build_reflection(
             "workflow X",
@@ -8534,6 +8574,7 @@ mod tests {
             )]),
             skipped: Vec::new(),
             judge_usage: Vec::new(),
+            failed_judge_usage: Vec::new(),
         }];
         let row = ScenarioRow {
             name: "acme-outage-email".to_owned(),

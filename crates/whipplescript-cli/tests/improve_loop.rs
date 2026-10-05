@@ -15,16 +15,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "whip-improve-test-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    tempfile::Builder::new()
+        .prefix(&format!("whip-improve-test-{label}-"))
+        .tempdir()
+        .expect("create unique test directory")
+        .keep()
 }
 
 struct Env {
@@ -364,6 +359,9 @@ rule evaluate
             "--json",
             "improve",
             "script_quality",
+            // This verifies script transport, not subsecond wall-clock timing.
+            "--sacrifice",
+            "std.latency",
             "--program",
             &baseline,
             "--provider",
@@ -2813,7 +2811,11 @@ fn assert_failed_auxiliary_turn(
     let output = command.output().expect("failed native turn fixture");
     if stopped {
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unaccounted provider use"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unaccounted provider use"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     } else {
         assert!(
             output.status.success(),
@@ -2932,6 +2934,137 @@ rule triage
 "#,
         echo_judge = echo_judge.display(),
     )
+}
+
+#[test]
+fn failed_prompt_judge_retains_priced_output_limit_usage() {
+    assert_failed_judge_usage(true, true, false);
+}
+
+#[test]
+fn failed_coerce_judge_retains_priced_output_limit_usage() {
+    assert_failed_judge_usage(false, true, false);
+}
+
+#[test]
+fn unusable_prompt_verdict_retains_completed_response_usage() {
+    assert_failed_judge_usage(true, false, false);
+}
+
+#[test]
+fn unusable_coerce_verdict_retains_completed_response_usage() {
+    assert_failed_judge_usage(false, false, false);
+}
+
+#[test]
+fn capped_failed_prompt_judge_records_unknown_usage_before_stopping() {
+    assert_failed_judge_usage(true, true, true);
+}
+
+#[test]
+fn capped_failed_coerce_judge_records_unknown_usage_before_stopping() {
+    assert_failed_judge_usage(false, true, true);
+}
+
+fn assert_failed_judge_usage(prompt: bool, output_limit: bool, missing_usage: bool) {
+    let env = Env::new("failed-gauge-judge");
+    write_judges(&env.dir);
+    let mut source = coerce_judge_program(&env.dir);
+    if prompt {
+        source = source
+            .replace(
+                "judge via coerce AssessQuality(input.ticket.title, facts.Assessment.priority)",
+                "judge via prompt \"Review this run.\"",
+            )
+            .replace("expect P(ok)", "expect P(passed)");
+    }
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, source).expect("judge fixture");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+    let invalid_verdict = if prompt {
+        serde_json::json!({"passed":"bad", "score":"bad", "rationale":"PRIVATE_JUDGE_OUTPUT"})
+    } else {
+        serde_json::json!({"ok":"PRIVATE_JUDGE_OUTPUT"})
+    };
+    let mut response = serde_json::json!({
+        "choices":[{"finish_reason":if output_limit {"length"} else {"stop"},
+            "message":{"content":invalid_verdict.to_string()}}],
+        "usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}
+    });
+    if missing_usage {
+        response.as_object_mut().expect("response").remove("usage");
+    }
+    let (base_url, bodies) = mock_coerce_response_sequence_endpoint(vec![response]);
+    let prices_path = env.dir.join("prices.json");
+    fs::write(
+        &prices_path,
+        r#"{"providers":[],"prices":[{
+        "provider":"openai-generic","model":"test-model",
+        "input_micros_per_mtok":1000000000000,
+        "output_micros_per_mtok":1000000000000}]}"#,
+    )
+    .expect("prices");
+    let output = env
+        .command()
+        .args([
+            "--json",
+            "improve",
+            "quality",
+            "--program",
+            &program_str,
+            "--provider",
+            "fixture",
+            "--provider-config",
+            &prices_path.to_string_lossy(),
+            "--spend-cap",
+            "$20",
+        ])
+        .env("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic")
+        .env("WHIPPLESCRIPT_COERCE_BASE_URL", base_url)
+        .env("WHIPPLESCRIPT_COERCE_MODEL", "test-model")
+        .env("OPENAI_API_KEY", "test-key")
+        .output()
+        .expect("improve");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(if missing_usage {
+            "unaccounted provider use"
+        } else {
+            "baseline gauge unscored"
+        }),
+        "{stderr}"
+    );
+    if output_limit && !missing_usage {
+        assert!(stderr.contains("output token limit reached"), "{stderr}");
+    }
+    assert!(!stderr.contains("PRIVATE_JUDGE_OUTPUT"));
+    let campaign = env.run_json(&["--json", "campaign", "C-1"], &[]);
+    let events = campaign["events"].as_array().expect("events");
+    let spend = events
+        .iter()
+        .find(|event| {
+            event["type"] == "campaign.spend"
+                && event["payload"]["what"] == "judge turns (baseline, failed quality)"
+        })
+        .expect("failed judge spend");
+    assert_eq!(spend["payload"]["priced"], !missing_usage);
+    assert_eq!(spend["payload"]["unaccounted"], missing_usage);
+    if missing_usage {
+        assert!(spend["payload"]["tokens"].is_null());
+    } else {
+        assert_eq!(spend["payload"]["tokens"], 16);
+        assert_eq!(spend["payload"]["cost_micros"], 16_000_000);
+    }
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "campaign.failed"));
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "candidate.drafted"));
+    assert!(!campaign.to_string().contains("PRIVATE_JUDGE_OUTPUT"));
+    assert_eq!(bodies.lock().expect("requests").len(), 1);
 }
 
 #[test]
