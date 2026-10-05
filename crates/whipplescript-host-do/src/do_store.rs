@@ -10438,6 +10438,16 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         )
     }
 
+    pub fn norm_observed_admission_edges(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm_reference_inventory::NormObservedAdmissionEdges>
+    {
+        whipplescript_store::norm_reference_inventory::observed_admission_edges_at(
+            &self.norm_view(verifier)?,
+        )
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &whipplescript_store::norm::SignedNormEvent,
@@ -21626,6 +21636,7 @@ mod norm_admission_tests {
         admitted_charter.activation = Some(AdmissionPredicate::Authority {
             scope: "accept".into(),
         });
+        admitted_charter.vocabularies[0].editing = Some(AdmissionPredicate::Public {});
         for (name, form) in [
             (
                 "basis",
@@ -21671,6 +21682,13 @@ mod norm_admission_tests {
             hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
             ledger
         );
+        let empty = native.norm_observed_admission_edges(&verifier).unwrap();
+        assert_eq!(
+            empty,
+            hosted.norm_observed_admission_edges(&verifier).unwrap()
+        );
+        assert!(empty.admissions.is_empty() && empty.references.is_empty());
+        assert!(empty.has_unclassified);
         let vocabulary = Vocabulary::new(admitted_charter.vocabularies[0].definition.clone())
             .unwrap()
             .reference()
@@ -21691,21 +21709,65 @@ mod norm_admission_tests {
             hosted.append_norm_event(&creation, &verifier).unwrap(),
             record
         );
+        let linked = signed_with(
+            worker.clone(),
+            &worker_key,
+            "linked",
+            NormAct::Create {
+                authority: None,
+                ledger: ledger.clone(),
+                vocabulary: vocabulary.clone(),
+                fields_json: serde_json::json!({
+                    "title": "linked",
+                    "basis": record,
+                    "later": record,
+                })
+                .to_string(),
+            },
+            Some(NormPremises {
+                family_basis: None,
+                references: vec![record.clone()],
+                inventory_frontier: Vec::new(),
+            }),
+        );
+        let linked_id = native.append_norm_event(&linked, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&linked, &verifier).unwrap(),
+            linked_id
+        );
         let action = NormAct::Transition {
             authority: None,
             ledger: ledger.clone(),
-            vocabulary,
+            vocabulary: vocabulary.clone(),
             record: record.clone(),
             previous: record.clone(),
             status: "accepted".into(),
         };
-        let denied = signed(worker, &worker_key, "denied", action.clone());
+        let denied = signed(worker.clone(), &worker_key, "denied", action.clone());
         assert!(native.append_norm_event(&denied, &verifier).is_err());
         assert!(hosted.append_norm_event(&denied, &verifier).is_err());
         let accepted = signed(owner.clone(), &owner_key, "accepted", action);
         assert_eq!(
             native.append_norm_event(&accepted, &verifier).unwrap(),
             hosted.append_norm_event(&accepted, &verifier).unwrap()
+        );
+        let edited = signed(
+            worker.clone(),
+            &worker_key,
+            "linked-edited",
+            NormAct::Edit {
+                authority: None,
+                ledger: ledger.clone(),
+                vocabulary: vocabulary.clone(),
+                record: linked_id.clone(),
+                previous: linked_id.clone(),
+                fields_json: r#"{"title":"linked without references"}"#.into(),
+            },
+        );
+        let edited_id = native.append_norm_event(&edited, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&edited, &verifier).unwrap(),
+            edited_id
         );
         let native_inventory = native.norm_reference_inventory(&verifier).unwrap();
         assert_eq!(
@@ -21744,6 +21806,10 @@ mod norm_admission_tests {
                     whipplescript_store::norm_reference_inventory::NormReferenceMeaning::Authority,
             },
         );
+        let successor_vocabulary = Vocabulary::new(successor.vocabularies[0].definition.clone())
+            .unwrap()
+            .reference()
+            .clone();
         let before_activation = native.norm_view(&verifier).unwrap();
         let activate = signed(
             owner,
@@ -21753,7 +21819,16 @@ mod norm_admission_tests {
                 ledger: ledger.clone(),
                 previous: before_activation.authority_head,
                 charter: successor,
-                migration: vec![],
+                migration: vec![whipplescript_store::norm_activation::VocabularyMigration {
+                    from: vocabulary,
+                    plan: whipplescript_store::norm_activation::MigrationPlan::Successor {
+                        vocabulary: successor_vocabulary,
+                        statuses: BTreeMap::from([
+                            ("proposed".into(), "proposed".into()),
+                            ("accepted".into(), "accepted".into()),
+                        ]),
+                    },
+                }],
                 changes: vec![],
                 frontier: before_activation.frontier.into_iter().collect(),
             },
@@ -21779,13 +21854,55 @@ mod norm_admission_tests {
             observed,
             hosted.norm_observed_reference_acts(&verifier).unwrap()
         );
-        assert_eq!(observed.admissions.len(), 2);
-        assert!(observed.admissions.iter().all(|act| {
-            act.record == record
-                && act.content_head == record
-                && act.charter_event == ledger
-                && act.vocabulary.version == "1"
+        assert_eq!(observed.admissions.len(), 5);
+        assert!(observed
+            .admissions
+            .iter()
+            .filter(|act| act.record == record)
+            .all(|act| {
+                act.record == record
+                    && act.content_head == record
+                    && act.charter_event == ledger
+                    && act.vocabulary.version == "1"
+            }));
+        let historical = native.norm_observed_admission_edges(&verifier).unwrap();
+        assert_eq!(
+            historical,
+            hosted.norm_observed_admission_edges(&verifier).unwrap()
+        );
+        assert_eq!(historical.admissions, observed.admissions);
+        let old: Vec<_> = historical
+            .references
+            .iter()
+            .filter(|edge| edge.consumer == linked_id)
+            .collect();
+        assert_eq!(old.len(), 2);
+        assert!(old.iter().all(|edge| edge.admission_event == linked_id
+            && edge.charter_event == ledger
+            && edge.consumer_revision == linked_id
+            && edge.vocabulary.version == "1"));
+        assert!(old.iter().any(|edge| {
+            edge.field == "basis"
+            && edge.provider == record
+            && edge.resolution == whipplescript_store::norm_reference_inventory::NormHistoricalResolution::ExactRevision(record.clone())
+            && edge.meaning == Some(
+                whipplescript_store::norm_reference_inventory::NormReferenceMeaning::HistoricalPin
+            )
         }));
+        assert!(old.iter().any(|edge| edge.field == "later"
+            && edge.provider == record
+            && edge.resolution == whipplescript_store::norm_reference_inventory::NormHistoricalResolution::IdentityRevisionUnknown
+            && edge.meaning.is_none()));
+        assert!(historical.has_unclassified);
+        assert!(historical
+            .references
+            .iter()
+            .all(|edge| edge.admission_event != edited_id));
+        let current = whipplescript_store::norm_reference_inventory::observed_edges_at(
+            &native.norm_view(&verifier).unwrap(),
+        )
+        .unwrap();
+        assert!(current.references.is_empty());
         assert_eq!(
             native.norm_view(&verifier).unwrap().records,
             hosted.norm_view(&verifier).unwrap().records
@@ -21812,7 +21929,7 @@ mod norm_admission_tests {
         assert!(restored.norm_view(&verifier).is_err());
         let mut history = hosted.export_events().unwrap();
         history.reverse();
-        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 4);
+        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 6);
         assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 0);
         let mut foreign = creation.tracker_event().unwrap();
         foreign.kind = "issue.created".into();
@@ -21822,7 +21939,7 @@ mod norm_admission_tests {
             hosted.norm_view(&verifier).unwrap().records
         );
         let mut legacy = test_support::store();
-        assert_eq!(legacy.import_events(&history).unwrap().rejected, 4);
+        assert_eq!(legacy.import_events(&history).unwrap().rejected, 6);
         assert!(legacy.export_events().unwrap().is_empty());
     }
 

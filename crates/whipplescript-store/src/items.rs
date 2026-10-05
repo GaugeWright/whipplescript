@@ -2012,6 +2012,13 @@ impl WorkItemStore {
         ))
     }
 
+    pub fn norm_observed_admission_edges(
+        &self,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<crate::norm_reference_inventory::NormObservedAdmissionEdges> {
+        crate::norm_reference_inventory::observed_admission_edges_at(&self.norm_view(verifier)?)
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &crate::norm::SignedNormEvent,

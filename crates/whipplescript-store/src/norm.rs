@@ -1240,6 +1240,27 @@ impl NormView {
         admissions
     }
 
+    /// Retain each act's own content and interpretation for read-only
+    /// reference extraction. Looking up `records` here would replace older
+    /// accepted content with the record's current revision.
+    pub(crate) fn observed_reference_snapshots(&self) -> Vec<(String, String, NormRecord)> {
+        let mut snapshots = self
+            .record_acts
+            .values()
+            .flat_map(|acts| {
+                acts.iter().map(|act| {
+                    (
+                        act.event.clone(),
+                        act.charter_event.clone(),
+                        act.record.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| (&left.0, &left.2.id).cmp(&(&right.0, &right.2.id)));
+        snapshots
+    }
+
     /// Move the ledger onto an admitted activation's charter: live records
     /// migrate or retire as planned, and every declaration the new charter
     /// drops stays behind to interpret what its records were.
@@ -2369,4 +2390,124 @@ pub fn admit_norm(
             .map_err(refused)?;
     }
     Ok(view)
+}
+
+#[cfg(test)]
+mod reference_projection_tests {
+    use super::*;
+
+    struct TrustedFixture;
+
+    impl NormVerifier for TrustedFixture {
+        fn verify(
+            &self,
+            _actor: &NormActor,
+            _signing_bytes: &[u8],
+            _signature: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn authorize_creation(&self, _creator: &str, _owner: &NormActor) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn historical_edge_projection_refuses_corrupt_observed_acts() {
+        let signed = SignedNormEvent {
+            statement: NormStatement {
+                protocol: "whipplescript.norm/v1".into(),
+                actor: NormActor {
+                    principal: "owner".into(),
+                    algorithm: "p256-sha256".into(),
+                    key_id: "fixture".into(),
+                },
+                nonce: "genesis".into(),
+                created_at: "2026-09-05T00:00:00Z".into(),
+                action: NormAct::Bootstrap {
+                    creator: "worker".into(),
+                    charter: NormCharter::bundled().unwrap(),
+                },
+                premises: None,
+            },
+            signature: "fixture".into(),
+            successor_signature: None,
+        };
+        let genesis = signed.tracker_event().unwrap();
+        let mut view = NormView::bootstrap(&genesis, &TrustedFixture).unwrap();
+        let vocabulary = Vocabulary::new(
+            view.charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "refines")
+                .unwrap()
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone();
+        let record = NormRecord {
+            id: "relation".into(),
+            vocabulary,
+            fields: serde_json::json!({"source":"missing", "target":"missing"}),
+            content_head: "revision".into(),
+            status: "proposed".into(),
+            head: "act".into(),
+        };
+        let act = RecordAct {
+            event: "act".into(),
+            charter_event: genesis.event_id,
+            record: record.clone(),
+            effective: None,
+        };
+        view.record_acts.insert(record.id.clone(), vec![act]);
+        let historical = crate::norm_reference_inventory::observed_admission_edges_at(&view)
+            .expect("historical identity references do not require a current provider");
+        assert_eq!(historical.references.len(), 2);
+        assert!(historical.references.iter().all(|reference| {
+            reference.provider == "missing"
+                && reference.resolution
+                    == crate::norm_reference_inventory::NormHistoricalResolution::IdentityRevisionUnknown
+        }));
+        let refuses = |view: &NormView, message: &str| {
+            let error = crate::norm_reference_inventory::observed_admission_edges_at(view)
+                .expect_err("corrupt historical act must refuse");
+            assert!(format!("{error:?}").contains(message), "{error:?}");
+        };
+        let mut unknown = view.clone();
+        unknown.record_acts.get_mut("relation").unwrap()[0]
+            .record
+            .vocabulary
+            .name = "unadmitted".into();
+        refuses(
+            &unknown,
+            "historical norm act has no admitted vocabulary interpretation",
+        );
+        let mut non_object = view.clone();
+        non_object.record_acts.get_mut("relation").unwrap()[0]
+            .record
+            .fields = serde_json::json!(42);
+        refuses(
+            &non_object,
+            "historical norm record fields are not an object",
+        );
+        let mut missing_required = view.clone();
+        missing_required.record_acts.get_mut("relation").unwrap()[0]
+            .record
+            .fields = serde_json::json!({"target":"missing"});
+        refuses(
+            &missing_required,
+            "historical norm record lacks a required declared field",
+        );
+
+        view.records.insert(record.id.clone(), record);
+        let error = crate::norm_reference_inventory::observed_edges_at(&view)
+            .expect_err("current identity target is missing");
+        assert!(
+            format!("{error:?}").contains("norm identity reference does not resolve"),
+            "{error:?}"
+        );
+    }
 }

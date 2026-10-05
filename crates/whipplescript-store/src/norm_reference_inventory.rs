@@ -146,6 +146,150 @@ pub struct NormObservedReferenceEdges {
     pub historical_population_unknown: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NormHistoricalResolution {
+    /// The admission-time provider revision is not reconstructed by this
+    /// projection; a current revision would be the wrong answer.
+    IdentityRevisionUnknown,
+    ExactRevision(String),
+}
+
+/// An edge observed in the record content admitted at this exact act.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormObservedAdmissionReference {
+    pub admission_event: String,
+    pub charter_event: String,
+    pub consumer: String,
+    pub consumer_revision: String,
+    pub consumer_status: String,
+    pub vocabulary: VocabularyRef,
+    pub field: String,
+    pub occurrence: String,
+    pub form: ReferenceForm,
+    pub target: String,
+    pub provider: String,
+    pub resolution: NormHistoricalResolution,
+    pub role: NormReferenceRole,
+    pub meaning: Option<NormReferenceMeaning>,
+}
+
+/// Historical local replay evidence. This includes repeated lifecycle acts
+/// and old charter versions; it is not a closed Home operation population.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormObservedAdmissionEdges {
+    pub ledger: String,
+    pub authority_head: String,
+    pub frontier: Vec<String>,
+    pub charter_events: Vec<String>,
+    /// Includes acts with no reference value, so an empty edge list cannot
+    /// masquerade as proof that no admission was observed.
+    pub admissions: Vec<NormReferenceAdmission>,
+    pub references: Vec<NormObservedAdmissionReference>,
+    pub has_unclassified: bool,
+}
+
+pub fn observed_admission_edges_at(view: &NormView) -> StoreResult<NormObservedAdmissionEdges> {
+    let mut references = Vec::new();
+    let mut has_unclassified = false;
+    for vocabulary in view.interpreted_vocabularies() {
+        let classes = view.reference_meaning_history.get(&(
+            vocabulary.definition.name.clone(),
+            vocabulary.definition.version.clone(),
+        ));
+        let mut fields = Vec::new();
+        for field in &vocabulary.definition.fields {
+            visit_field(vocabulary, &field.name, &field.value_type, &mut fields);
+        }
+        has_unclassified |= fields
+            .iter()
+            .any(|field| !classes.is_some_and(|classes| classes.contains_key(&field.path)));
+    }
+    for (event, charter_event, record) in view.observed_reference_snapshots() {
+        let vocabulary = view.interpretation(&record.vocabulary).ok_or_else(|| {
+            StoreError::Conflict(
+                "historical norm act has no admitted vocabulary interpretation".into(),
+            )
+        })?;
+        let classes = view.reference_meaning_history.get(&(
+            vocabulary.definition.name.clone(),
+            vocabulary.definition.version.clone(),
+        ));
+        let fields = record.fields.as_object().ok_or_else(|| {
+            StoreError::Conflict("historical norm record fields are not an object".into())
+        })?;
+        for field in &vocabulary.definition.fields {
+            let Some(value) = fields.get(&field.name) else {
+                if field.required {
+                    return Err(StoreError::Conflict(
+                        "historical norm record lacks a required declared field".into(),
+                    ));
+                }
+                continue;
+            };
+            let mut observed = Vec::new();
+            project_value(
+                view,
+                &record,
+                vocabulary,
+                &field.value_type,
+                value,
+                &field.name,
+                &field.name,
+                classes,
+                true,
+                &mut observed,
+            )?;
+            references.extend(observed.into_iter().map(|reference| {
+                let resolution = match reference.form {
+                    ReferenceForm::Identity => NormHistoricalResolution::IdentityRevisionUnknown,
+                    ReferenceForm::Revision => {
+                        NormHistoricalResolution::ExactRevision(reference.target.clone())
+                    }
+                };
+                NormObservedAdmissionReference {
+                    admission_event: event.clone(),
+                    charter_event: charter_event.clone(),
+                    consumer: reference.consumer,
+                    consumer_revision: reference.consumer_revision,
+                    consumer_status: reference.consumer_status,
+                    vocabulary: reference.vocabulary,
+                    field: reference.field,
+                    occurrence: reference.occurrence,
+                    form: reference.form,
+                    target: reference.target,
+                    provider: reference.provider,
+                    resolution,
+                    role: reference.role,
+                    meaning: reference.meaning,
+                }
+            }));
+        }
+    }
+    references.sort_by(|left, right| {
+        (
+            &left.admission_event,
+            &left.consumer,
+            &left.occurrence,
+            &left.target,
+        )
+            .cmp(&(
+                &right.admission_event,
+                &right.consumer,
+                &right.occurrence,
+                &right.target,
+            ))
+    });
+    Ok(NormObservedAdmissionEdges {
+        ledger: view.ledger.clone(),
+        authority_head: view.authority_head.clone(),
+        frontier: view.frontier.iter().cloned().collect(),
+        charter_events: view.charter_events.clone(),
+        admissions: view.observed_reference_admissions(),
+        references,
+        has_unclassified,
+    })
+}
+
 /// Project every typed reference of each record's current admitted content.
 /// An absent optional field contributes no value; a present malformed field
 /// or dangling reference refuses the projection instead of shrinking it.
@@ -195,6 +339,7 @@ pub fn observed_edges_at(view: &NormView) -> StoreResult<NormObservedReferenceEd
                 &field.name,
                 &field.name,
                 classes,
+                false,
                 &mut references,
             )?;
         }
@@ -229,6 +374,7 @@ fn project_value(
     field: &str,
     occurrence: &str,
     classes: Option<&BTreeMap<String, NormReferenceMeaning>>,
+    historical: bool,
     output: &mut Vec<NormObservedReference>,
 ) -> StoreResult<()> {
     match kind {
@@ -238,14 +384,18 @@ fn project_value(
             })?;
             let (provider, resolved_revision) = match form {
                 ReferenceForm::Identity => {
-                    let named = view.records.get(target).ok_or_else(|| {
-                        StoreError::Conflict("norm identity reference does not resolve".into())
-                    })?;
-                    let current = match view.effective_revision(named) {
-                        EffectiveRevision::Active { record, .. } => Some(record.content_head),
-                        EffectiveRevision::Inactive | EffectiveRevision::Unspecified => None,
-                    };
-                    (named.id.clone(), current)
+                    if historical {
+                        (target.to_owned(), None)
+                    } else {
+                        let named = view.records.get(target).ok_or_else(|| {
+                            StoreError::Conflict("norm identity reference does not resolve".into())
+                        })?;
+                        let current = match view.effective_revision(named) {
+                            EffectiveRevision::Active { record, .. } => Some(record.content_head),
+                            EffectiveRevision::Inactive | EffectiveRevision::Unspecified => None,
+                        };
+                        (named.id.clone(), current)
+                    }
                 }
                 ReferenceForm::Revision => {
                     let named = view.revision(target).ok_or_else(|| {
@@ -283,6 +433,7 @@ fn project_value(
                     &format!("{field}[]"),
                     &format!("{occurrence}[{index}]"),
                     classes,
+                    historical,
                     output,
                 )?;
             }
@@ -309,6 +460,7 @@ fn project_value(
                     &format!("{field}.{}", nested.name),
                     &format!("{occurrence}.{}", nested.name),
                     classes,
+                    historical,
                     output,
                 )?;
             }
