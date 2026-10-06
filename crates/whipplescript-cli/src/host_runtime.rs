@@ -5,6 +5,10 @@
 //! provide only opaque-reference resolvers. Secrets and resource bodies are
 //! resolved after admission and never enter the host command or receipt.
 
+#[path = "native_provider_transport.rs"]
+mod native_provider_transport;
+pub use native_provider_transport::NativeProviderTransport;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
@@ -101,6 +105,7 @@ pub struct ResolvedProviderBinding {
     timeout: Duration,
     codex_account_id: Option<String>,
     codex_session_id: Option<String>,
+    transport: Option<NativeProviderTransport>,
 }
 
 impl ResolvedProviderBinding {
@@ -121,6 +126,7 @@ impl ResolvedProviderBinding {
             timeout,
             codex_account_id: None,
             codex_session_id: None,
+            transport: None,
         }
     }
 
@@ -143,7 +149,14 @@ impl ResolvedProviderBinding {
             timeout,
             codex_account_id: Some(account_id.into()),
             codex_session_id: Some(session_id.into()),
+            transport: None,
         }
+    }
+
+    /// Attach independently admitted transport custody. This is not a task grant.
+    pub fn with_admitted_transport(mut self, transport: NativeProviderTransport) -> Self {
+        self.transport = Some(transport);
+        self
     }
 
     fn validate(&self) -> Result<(), HostRuntimeError> {
@@ -3659,7 +3672,7 @@ impl GovernedHostRuntime {
         );
         let observed = || access.check().is_err() || probe.observed();
         let released = || access.refused.get() || probe.released();
-        let driver = NativeHttpDriver::new(binding.timeout)
+        let driver = NativeHttpDriver::for_binding(&binding)?
             .with_delta_sink(&sink)
             .with_cancel_probe(&observed)
             .with_request_observer(observe_request);
@@ -4996,6 +5009,7 @@ struct TurnRunInspection<'a> {
 
 struct NativeHttpDriver<'a> {
     agent: ureq::Agent,
+    admitted_request_url: Option<String>,
     /// Live `streaming_output` projection out of an active turn (the
     /// `ResourceResolver::observe_text_delta` seam). `None` observes nothing
     /// and reads the body exactly as before.
@@ -5022,10 +5036,22 @@ impl<'a> NativeHttpDriver<'a> {
                 .redirects(0)
                 .user_agent("whipplescript-host-runtime")
                 .build(),
+            admitted_request_url: None,
             delta_sink: None,
             cancel_probe: None,
             request_observer: None,
         }
+    }
+
+    fn for_binding(binding: &ResolvedProviderBinding) -> Result<Self, HostRuntimeError> {
+        let mut driver = Self::new(binding.timeout);
+        if let Some(transport) = &binding.transport {
+            let (agent, request_url) =
+                transport.agent(binding.provider, &binding.base_url, binding.timeout)?;
+            driver.agent = agent;
+            driver.admitted_request_url = Some(request_url);
+        }
+        Ok(driver)
     }
 
     fn with_delta_sink(mut self, sink: &'a dyn Fn(&str)) -> Self {
@@ -5120,6 +5146,15 @@ fn sse_output_text_delta(line: &str) -> Option<String> {
 impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
+        if self
+            .admitted_request_url
+            .as_ref()
+            .is_some_and(|url| url != &request.url)
+        {
+            return IoResult::Http(Err(TransportError::Transport(
+                "admitted provider request refused".into(),
+            )));
+        }
         if let Some(observer) = self.request_observer {
             observer(&request.body, request.model_provenance.as_ref());
         }
@@ -7264,113 +7299,187 @@ workflow UnsafeHostChat {
     }
 
     #[test]
-    fn live_native_turn_releases_stream_when_first_delta_revokes_access() {
-        use std::io::{Read, Write};
-        struct LocalSecrets(String);
-        impl SecretResolver for LocalSecrets {
+    fn native_governed_turn_refuses_changed_admitted_transport_before_receiver() {
+        struct ChangedTransport(String, std::net::SocketAddr);
+        impl SecretResolver for ChangedTransport {
             fn resolve_provider(
                 &self,
                 _: &ProviderBindingRef,
                 _: &str,
             ) -> Result<ResolvedProviderBinding, String> {
+                let transport = NativeProviderTransport::loopback_http(
+                    &format!("{}/changed", self.0),
+                    vec![self.1],
+                )
+                .unwrap();
                 Ok(ResolvedProviderBinding::new(
                     ModelProvider::OpenAi,
                     "synthetic",
                     "gpt-test",
                     &self.0,
                     256,
-                    Duration::from_secs(5),
-                ))
-            }
-        }
-        struct StreamResources {
-            live: LiveResources,
-            deltas: RefCell<Vec<String>>,
-        }
-        impl ResourceResolver for StreamResources {
-            fn check_live_access(&self) -> Result<(), String> {
-                self.live.check_live_access()
-            }
-            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
-                unreachable!()
-            }
-            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
-                unreachable!()
-            }
-            fn observe_text_delta(&self, delta: &str) {
-                self.deltas.borrow_mut().push(delta.into());
-                self.live.allowed.set(false);
+                    Duration::from_secs(1),
+                )
+                .with_admitted_transport(transport))
             }
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0; 4096];
-            let header_end = loop {
-                let n = socket.read(&mut chunk).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if let Some(start) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break start + 4;
-                }
-            };
-            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .expect("model request has a bounded JSON body");
-            while bytes.len() < header_end + length {
-                let n = socket.read(&mut chunk).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-            }
-            let body = concat!(
-                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"private later delta\"}\n\n",
-                "data: [DONE]\n\n");
-            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
-        });
+        let endpoint = format!("http://{address}");
         let path = temp_store();
         let mut runtime =
-            GovernedHostRuntime::open(&path, 7, &signed_policy_at(&format!("http://{address}")))
-                .unwrap();
+            GovernedHostRuntime::open(&path, 7, &signed_policy_at(&endpoint)).unwrap();
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.into(),
-            request_id: "stream-open".into(),
+            request_id: "transport-open".into(),
             package_version_ref: "package:v1".into(),
             policy: runtime.policy_ref().clone(),
         };
         let instance = runtime.open_instance(&open, &Packages).unwrap();
-        let resources = StreamResources {
-            live: LiveResources {
-                allowed: Cell::new(true),
-                tool_calls: Cell::new(0),
-                revoke_on_tool: false,
-            },
-            deltas: RefCell::new(vec![]),
-        };
-        let err = runtime
+        let error = runtime
             .run_turn(
                 &turn(&instance.instance_ref, &open.policy, 1),
                 &Packages,
-                &LocalSecrets(format!("http://{address}")),
-                &resources,
+                &ChangedTransport(endpoint, address),
+                &Resources {
+                    calls: Cell::new(0),
+                },
             )
             .unwrap_err();
-        assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
-        assert_eq!(&*resources.deltas.borrow(), &["first"]);
-        server.join().unwrap();
+        assert!(error
+            .to_string()
+            .contains("admitted provider transport refused"));
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(runtime);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_native_turn_releases_stream_when_first_delta_revokes_access() {
+        for pinned in [false, true] {
+            use std::io::{Read, Write};
+            struct LocalSecrets(String, bool);
+            impl SecretResolver for LocalSecrets {
+                fn resolve_provider(
+                    &self,
+                    _: &ProviderBindingRef,
+                    _: &str,
+                ) -> Result<ResolvedProviderBinding, String> {
+                    let binding = ResolvedProviderBinding::new(
+                        ModelProvider::OpenAi,
+                        "synthetic",
+                        "gpt-test",
+                        &self.0,
+                        256,
+                        Duration::from_secs(5),
+                    );
+                    if self.1 {
+                        let address = self.0.strip_prefix("http://").unwrap().parse().unwrap();
+                        let transport =
+                            NativeProviderTransport::loopback_http(&self.0, vec![address])
+                                .map_err(|_| "synthetic transport refused".to_owned())?;
+                        Ok(binding.with_admitted_transport(transport))
+                    } else {
+                        Ok(binding)
+                    }
+                }
+            }
+            struct StreamResources {
+                live: LiveResources,
+                deltas: RefCell<Vec<String>>,
+            }
+            impl ResourceResolver for StreamResources {
+                fn check_live_access(&self) -> Result<(), String> {
+                    self.live.check_live_access()
+                }
+                fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                    unreachable!()
+                }
+                fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                    unreachable!()
+                }
+                fn observe_text_delta(&self, delta: &str) {
+                    self.deltas.borrow_mut().push(delta.into());
+                    self.live.allowed.set(false);
+                }
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(start) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break start + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .expect("model request has a bounded JSON body");
+                while bytes.len() < header_end + length {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"private later delta\"}\n\n",
+                "data: [DONE]\n\n");
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            });
+            let path = temp_store();
+            let mut runtime = GovernedHostRuntime::open(
+                &path,
+                7,
+                &signed_policy_at(&format!("http://{address}")),
+            )
+            .unwrap();
+            let open = OpenInstanceCommand {
+                protocol: HOST_PROTOCOL.into(),
+                request_id: "stream-open".into(),
+                package_version_ref: "package:v1".into(),
+                policy: runtime.policy_ref().clone(),
+            };
+            let instance = runtime.open_instance(&open, &Packages).unwrap();
+            let resources = StreamResources {
+                live: LiveResources {
+                    allowed: Cell::new(true),
+                    tool_calls: Cell::new(0),
+                    revoke_on_tool: false,
+                },
+                deltas: RefCell::new(vec![]),
+            };
+            let err = runtime
+                .run_turn(
+                    &turn(&instance.instance_ref, &open.policy, 1),
+                    &Packages,
+                    &LocalSecrets(format!("http://{address}"), pinned),
+                    &resources,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains(LIVE_ACCESS_REFUSED), "{err:?}");
+            assert_eq!(&*resources.deltas.borrow(), &["first"]);
+            server.join().unwrap();
+            drop(runtime);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

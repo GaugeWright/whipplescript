@@ -149,7 +149,7 @@ function configuredHomeBindings(configuration: string | undefined): HomeAdmissio
 /** Missing or ambiguous configuration is a refusal; no unscoped-key fallback. */
 export function homeAdmissionKey(
   configuration: string | undefined,
-  grant: DurableWorkflowGrant,
+  grant: Pick<DurableWorkflowGrant, "home_id" | "tenant_id" | "project_id" | "governance_signer" | "key_id">,
 ): JsonWebKey | undefined {
   return configuredHomeBindings(configuration).find((binding) =>
     binding.home_id === grant.home_id && binding.tenant_id === grant.tenant_id
@@ -177,9 +177,7 @@ export function canonicalJson(value: unknown): string {
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array): Promise<string> {
   const bytes =
-    value instanceof Uint8Array
-      ? value
-      : new Uint8Array(value);
+    Uint8Array.from(value instanceof Uint8Array ? value : new Uint8Array(value));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)]
     .map((part) => part.toString(16).padStart(2, "0"))

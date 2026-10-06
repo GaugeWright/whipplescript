@@ -19,6 +19,10 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Embedding hosts may explicitly bind owned provider HTTP transport to approved
+  socket addresses and TLS certificate identities. The selected transport
+  refuses destination changes and redirects; it grants no task or reader access.
+
 ## [0.9.0] — 2026-10-05
 
 A minor release, because a tracker store this version enrolls cannot be

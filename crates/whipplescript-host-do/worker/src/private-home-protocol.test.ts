@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   canonicalJson,
+  sha256Hex,
   durableWorkflowObjectName,
   homeAdmissionKey,
   projectHomeAddress,
@@ -113,6 +114,12 @@ test("deployment admission binds an exact Home, tenant, project, signer and key"
   };
   const configuration = JSON.stringify([binding]);
   assert.deepEqual(homeAdmissionKey(configuration, admitted), publicKey);
+  // This selector also accepts the exact public coordinates of another profile;
+  // it neither needs a fabricated Durable grant nor verifies execution authority.
+  assert.deepEqual(homeAdmissionKey(configuration, {
+    home_id: admitted.home_id, tenant_id: admitted.tenant_id, project_id: admitted.project_id,
+    governance_signer: admitted.governance_signer, key_id: admitted.key_id,
+  }), publicKey);
   assert.equal(projectHomeAddress(configuration, admitted), true);
   assert.equal(projectHomeAddress(configuration, { ...admitted, project_id: "other-project" }), true);
   assert.equal(projectHomeAddress(configuration, { ...admitted, home_id: "other-home" }), true);
@@ -237,4 +244,15 @@ test("private Home object names are collision-free structured tuples", () => {
     durableWorkflowObjectName(first),
     durableWorkflowObjectName(second),
   );
+});
+
+
+test("hash helper supplies owned ArrayBuffer bytes to WebCrypto", async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const expected = await sha256Hex(bytes.buffer);
+  assert.equal(await sha256Hex(bytes), expected);
+  const shared = new SharedArrayBuffer(3);
+  const view = new Uint8Array(shared);
+  view.set(bytes);
+  assert.equal(await sha256Hex(view), expected);
 });

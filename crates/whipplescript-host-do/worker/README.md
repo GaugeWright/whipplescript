@@ -180,6 +180,12 @@ version 2 project request or address a registered project Home. The object also
 verifies the grant independently before accepting forwarded trust headers.
 Registry provisioning must use independently admitted
 project/Home authority, never a key supplied by an execution request.
+The public root selector consumes only the exact Home, tenant, project, signer
+and key coordinates. Selecting a configured public key supplies no execution
+authority: each execution profile separately validates its complete grant,
+verifies its canonical signature and enforces its bounds. Other private execution
+adapters may consume this same selector without fabricating Durable workflow
+fields or duplicating the registry rules.
 
 Each non-retirement version 2 grant binds `original_policy`, the complete
 retained `PolicyEpochRef`. The runtime verifies its original signature and exact

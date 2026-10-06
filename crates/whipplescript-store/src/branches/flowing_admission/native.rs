@@ -2755,6 +2755,16 @@ mod tests {
         let FlowingAdmissionOutcome::Admitted(receipt) = admitted else {
             panic!("admission should land")
         };
+        let host_evidence =
+            crate::branches::flowing_host::read_admission_evidence(&store, "admission-a")
+                .unwrap()
+                .expect("landed ref operation has host evidence");
+        assert_eq!(host_evidence.operation_id, receipt.request.op_id);
+        assert_eq!(
+            host_evidence.resulting_trunk_cut_id,
+            receipt.request.candidate_cut_id
+        );
+        assert_eq!(host_evidence.units.len(), receipt.request.units.len());
         assert_eq!(
             store
                 .cancel_flowing_attempt(&cancel("admission-a", "cancel-a"))
@@ -2765,6 +2775,27 @@ mod tests {
             .flowing_cancellation_for_attempt("admission-a")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn host_evidence_refuses_an_admitted_ref_with_a_missing_candidate_witness() {
+        let mut store = fixture();
+        let admission = request("unit-a", "admission-a");
+        pin_attempt(&mut store, &admission);
+        assert!(matches!(
+            store.admit_flowing_prefix(&admission).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_candidate_witnesses WHERE digest = ?1",
+                [&admission.candidate_witness_digest],
+            )
+            .unwrap();
+        assert!(
+            crate::branches::flowing_host::read_admission_evidence(&store, "admission-a").is_err()
+        );
     }
 
     #[test]
