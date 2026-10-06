@@ -274,7 +274,7 @@ fn a_denied_host_never_reaches_the_network_and_is_recorded() {
 /// A deliberately hostile endpoint: it reflects the request's `Authorization`
 /// header and body back in its response, the way an auth-debug route or a
 /// misconfigured mirror does.
-fn echoing_server() -> (u16, std::thread::JoinHandle<()>) {
+fn echoing_server(binary_body: bool) -> (u16, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let handle = std::thread::spawn(move || {
@@ -301,13 +301,16 @@ fn echoing_server() -> (u16, std::thread::JoinHandle<()>) {
             })
             .unwrap_or_default();
         // Echo it in a header AND the body, since either surface persists.
-        let body = format!("{{\"saw\":\"{auth}\"}}");
-        let reply = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-echoed-auth: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        let mut body = format!("{{\"saw\":\"{auth}\"}}").into_bytes();
+        if binary_body {
+            body.insert(0, 0xff);
+        }
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nx-echoed-auth: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len(),
-            body
         );
-        let _ = stream.write_all(reply.as_bytes());
+        let _ = stream.write_all(headers.as_bytes());
+        let _ = stream.write_all(&body);
     });
     (port, handle)
 }
@@ -321,7 +324,7 @@ fn echoing_server() -> (u16, std::thread::JoinHandle<()>) {
 /// credential land in whip's run record.
 #[test]
 fn an_echoed_credential_is_redacted_out_of_the_response() {
-    let (port, server) = echoing_server();
+    let (port, server) = echoing_server(false);
 
     let mut store = SealedStore::create(None, "pw").expect("store");
     store
@@ -378,6 +381,57 @@ fn an_echoed_credential_is_redacted_out_of_the_response() {
     // marker does not add one.
     assert!(body.contains("[redacted echo_api]"), "{body}");
     assert!(headers.contains("[redacted echo_api]"), "{headers}");
+}
+
+#[test]
+fn binary_response_cannot_echo_credential_into_the_run_record() {
+    let (port, server) = echoing_server(true);
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("binary_api"),
+            CredentialKind::Bearer,
+            Zeroizing::new(b"tok-binary-echo-987".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    let custodian = Custodian::new(store, Box::new(UreqEgress::new(vec!["127.0.0.1".into()])));
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "binary-echo-test".into(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Request {
+            credential: name("binary_api"),
+            slots: 1,
+            request: EgressRequest {
+                method: "GET".into(),
+                url: format!("http://127.0.0.1:{port}/whoami"),
+                headers: vec![(
+                    "Authorization".into(),
+                    Sentinel::new(name("binary_api"), PresentationForm::Bearer).render(),
+                )],
+                body_b64: None,
+            },
+        },
+    ));
+    server.join().expect("server");
+    let CustodyOk::Requested { response } = reply.outcome.expect("request succeeds") else {
+        panic!("wrong variant");
+    };
+    let body = B64
+        .decode(response.body_b64.expect("body"))
+        .expect("base64");
+    assert_eq!(body.first(), Some(&0xff));
+    assert!(!body
+        .windows(b"tok-binary-echo-987".len())
+        .any(|window| { window == b"tok-binary-echo-987" }));
+    assert!(body
+        .windows(b"[redacted binary_api]".len())
+        .any(|window| { window == b"[redacted binary_api]" }));
+    assert!(!format!("{:?}", response.headers).contains("tok-binary-echo-987"));
 }
 
 /// `deliver` hands the credential over as the PAYLOAD, and records that it

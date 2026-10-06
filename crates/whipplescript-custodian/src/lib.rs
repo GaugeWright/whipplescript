@@ -1371,12 +1371,34 @@ impl WireSecrets {
         out
     }
 
+    /// An invalid UTF-8 byte elsewhere in a response does not make an echoed
+    /// UTF-8 credential safe. Replace known wire fragments in the raw bytes,
+    /// preserving unrelated binary data around them.
+    fn scrub_body(&self, body: Vec<u8>, name: &CredentialName) -> Vec<u8> {
+        let mut out = Zeroizing::new(body);
+        let replacement = format!("[redacted {}]", name.as_str());
+        for fragment in &self.fragments {
+            let needle = fragment.as_bytes();
+            let mut replaced = Zeroizing::new(Vec::with_capacity(out.len()));
+            let mut at = 0;
+            for start in memchr::memmem::find_iter(&out, needle) {
+                replaced.extend_from_slice(&out[at..start]);
+                replaced.extend_from_slice(replacement.as_bytes());
+                at = start + needle.len();
+            }
+            if at != 0 {
+                replaced.extend_from_slice(&out[at..]);
+                out = replaced;
+            }
+        }
+        std::mem::take(&mut *out)
+    }
+
     /// Redact from a whole response: header values and a textual body.
     ///
     /// Header NAMES are not scrubbed — a name is not material, and rewriting
-    /// one would corrupt the response shape for no gain. A binary body passes
-    /// through: it cannot carry the textual form that was substituted in, and
-    /// re-encoding it would be a lie about what arrived.
+    /// one would corrupt the response shape for no gain. A binary body may
+    /// still contain an exact textual fragment, so scrub decoded bytes too.
     fn scrub_response(&self, response: EgressResponse, name: &CredentialName) -> EgressResponse {
         if self.fragments.is_empty() {
             return response;
@@ -1388,14 +1410,9 @@ impl WireSecrets {
                 .into_iter()
                 .map(|(key, value)| (key, self.scrub(&value, name)))
                 .collect(),
-            body_b64: response.body_b64.map(|encoded| {
-                match decode_b64(&encoded)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                {
-                    Some(text) => B64.encode(self.scrub(&text, name)),
-                    None => encoded,
-                }
+            body_b64: response.body_b64.map(|encoded| match decode_b64(&encoded) {
+                Ok(bytes) => B64.encode(self.scrub_body(bytes, name)),
+                Err(_) => encoded,
             }),
         }
     }
