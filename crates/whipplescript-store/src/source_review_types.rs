@@ -25,3 +25,23 @@ pub struct NativeRevision {
     pub source_manifest_hash: String,
     pub units: Vec<NativeUnitRef>,
 }
+
+/// An installed owning reader, separate from methodology and Home coverage.
+/// Implementations validate the native contribution's exact trunk target and
+/// predecessor receipt contract before returning its original immutable upload.
+/// Authentication, standing and Home namespace selection belong to the embedder.
+pub trait NativeReviewReader {
+    fn capture_native_revision(
+        &self,
+        contribution_id: &str,
+        sequence: i64,
+    ) -> Result<NativeRevision, NativeReviewReadError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeReviewReadError {
+    /// Missing or inaccessible authority is a located planning gap.
+    Unavailable(String),
+    /// Present but invalid authority refuses the query.
+    Invalid(String),
+}

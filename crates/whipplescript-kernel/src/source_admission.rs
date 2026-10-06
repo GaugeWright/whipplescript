@@ -24,6 +24,7 @@ use whipplescript_store::norm_reference_inventory::{
     inventory_at, observed_acts_at, observed_edges_at, NormReferenceMeaning,
 };
 use whipplescript_store::norm_resources::RequirementResources;
+use whipplescript_store::source_review_types::{NativeReviewReadError, NativeReviewReader};
 #[cfg(feature = "native")]
 use whipplescript_store::vcs::NativeWorkspaceVcs;
 use whipplescript_store::vcs::WorkspaceVcs;
@@ -123,11 +124,28 @@ pub struct LocalReferenceObservation {
     pub historical_population_unknown: bool,
 }
 
+/// Source verification is an observation derived by the owning VCS reader.
+/// The judgment binds this original revision identity to its exact subject;
+/// serialization cannot supply a proof or authorize admission.
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceCandidateVerification {
+    pub review_revision: EvidenceVersion,
+}
+
+/// Trusted embedding inputs. A process package cannot install its own review
+/// record or substitute Home coverage for source verification.
+#[derive(Clone, Copy, Default)]
+pub struct SourceAdmissionCapture<'a> {
+    pub home: Option<&'a dyn ProcessCaptureAuthority>,
+    pub review: Option<&'a dyn NativeReviewReader>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceAdmissionJudgment {
     pub protocol: &'static str,
     pub process: EvidenceVersion,
     pub subject: SourceAdmissionSubject,
+    pub source_verification: Option<SourceCandidateVerification>,
     pub interpretation: EvidenceVersion,
     /// The complete typed norm result, including its read anchors, requirement
     /// inventories, selected evidence, resource and discovery gaps.
@@ -316,7 +334,10 @@ pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
         host,
         witness_digest,
         attempt_id,
-        Some(authority),
+        SourceAdmissionCapture {
+            home: Some(authority),
+            review: None,
+        },
     )
 }
 
@@ -334,7 +355,14 @@ pub fn plan<
     witness_digest: &str,
     attempt_id: &str,
 ) -> Result<SourceAdmissionPlan, String> {
-    derive(vcs, ledger, host, witness_digest, attempt_id, None)
+    derive(
+        vcs,
+        ledger,
+        host,
+        witness_digest,
+        attempt_id,
+        SourceAdmissionCapture::default(),
+    )
 }
 
 pub fn plan_with_authority<
@@ -356,8 +384,29 @@ pub fn plan_with_authority<
         host,
         witness_digest,
         attempt_id,
-        Some(authority),
+        SourceAdmissionCapture {
+            home: Some(authority),
+            review: None,
+        },
     )
+}
+
+/// Compose independently installed Home and native review readers. The request
+/// continues to select only retained witness and attempt coordinates.
+pub fn plan_with_capture<
+    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
+    C: ContentBlobs,
+    L: AdmissionLedger,
+    S: RuntimeStore,
+>(
+    vcs: &WorkspaceVcs<B, C>,
+    ledger: &L,
+    host: AdmissionHost<'_, S>,
+    witness_digest: &str,
+    attempt_id: &str,
+    capture: SourceAdmissionCapture<'_>,
+) -> Result<SourceAdmissionPlan, String> {
+    derive(vcs, ledger, host, witness_digest, attempt_id, capture)
 }
 
 fn derive<
@@ -371,12 +420,38 @@ fn derive<
     host: AdmissionHost<'_, S>,
     witness_digest: &str,
     attempt_id: &str,
-    authority: Option<&dyn ProcessCaptureAuthority>,
+    readers: SourceAdmissionCapture<'_>,
 ) -> Result<SourceAdmissionPlan, String> {
+    let authority = readers.home;
     let process = process_identity()?;
-    let captured = vcs
+    let mut captured = vcs
         .capture_gate_subject(witness_digest, attempt_id)
         .map_err(|error| format!("{error:?}"))?;
+    let review_read = readers.review.map(|reader| {
+        reader.capture_native_revision(
+            &captured.witness().contribution_id,
+            captured.witness().revision_sequence,
+        )
+    });
+    let source_verification = match &review_read {
+        Some(Ok(revision)) => {
+            let verified = vcs
+                .verify_retained_native_candidate(revision, witness_digest, attempt_id)
+                .map_err(|error| format!("{error:?}"))?;
+            captured = verified.subject().clone();
+            Some(SourceCandidateVerification {
+                review_revision: EvidenceVersion {
+                    name: "whipplescript.native-review-revision".into(),
+                    version: "1".into(),
+                    digest: identity(&("native-review-revision-v1", revision))?,
+                },
+            })
+        }
+        // Invalid authority must refuse, rather than continuing with a gap.
+        // MUTATION-SUCCESS-EXPR: None
+        Some(Err(NativeReviewReadError::Invalid(reason))) => return Err(reason.clone()),
+        _ => None,
+    };
     if !ledger
         .bootstrapped()
         .map_err(|error| format!("{error:?}"))?
@@ -458,6 +533,15 @@ fn derive<
         historical_population_unknown: inventory.historical_population_unknown,
     };
     let mut blockers = BTreeSet::new();
+    if source_verification.is_none() {
+        blockers.insert(LocatedBlocker {
+            scope: "source/review-record".into(),
+            reason: match &review_read {
+                Some(Err(NativeReviewReadError::Unavailable(reason))) => reason.clone(),
+                _ => "no independently installed original native review reader was captured".into(),
+            },
+        });
+    }
     let mut process_installation = None;
     let mut norm_binding = None;
     let dependencies = match authority {
@@ -629,6 +713,7 @@ fn derive<
             lineage_fences: captured.lineage_fences().to_vec(),
             unit_holders: captured.unit_holders().to_vec(),
         },
+        source_verification,
         interpretation: host.configuration.identity().clone(),
         norm: planned.to_json(),
         obligations,
@@ -676,6 +761,21 @@ fn derive<
         NormHistoryLimits::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
+    let current_review = readers.review.map(|reader| {
+        reader.capture_native_revision(
+            &captured.witness().contribution_id,
+            captured.witness().revision_sequence,
+        )
+    });
+    if current_review != review_read {
+        return Err("source review record changed during derivation".into());
+    }
+    // Re-run content and closure proof after the final ledger and review reads.
+    // This is read-only recapture, not the production publication exclusion.
+    if let Some(Ok(revision)) = &current_review {
+        vcs.verify_retained_native_candidate(revision, witness_digest, attempt_id)
+            .map_err(|error| format!("{error:?}"))?;
+    }
     let current = vcs
         .capture_gate_subject(witness_digest, attempt_id)
         .map_err(|error| format!("{error:?}"))?;

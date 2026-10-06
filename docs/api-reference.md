@@ -93,6 +93,13 @@ located blockers. It uses `WHIPPLESCRIPT_BRANCH_STORE`,
 and native runtime configuration. The request supplies no policy or coverage
 assertion. Missing stores refuse; the query creates and repairs no database.
 
+The optional host configuration `WHIPPLESCRIPT_SOURCE_REVIEW_STORE` selects an
+existing immutable review-record database, opened read-only. With it, the query
+loads the original revision and repeats the owning VCS's prefix/content proof.
+A missing or inaccessible configured file refuses without creating it. Without
+an installed review reader, `source/review-record` remains a located blocker
+and `source_verification` is absent. Review verification grants no Home coverage.
+
 A successful exit means the query returned a judgment. Read its `blockers`
 before treating it as actionable. The command runs no checks, files no tracker
 work and advances no ref. Home population authority is currently an explicit

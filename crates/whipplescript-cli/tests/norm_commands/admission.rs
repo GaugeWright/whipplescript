@@ -27,6 +27,13 @@ pub(super) fn whip(
     args: &[&str],
     host: Option<(&Value, &std::path::Path)>,
 ) -> Output {
+    command(fixture, host)
+        .args(args)
+        .output()
+        .expect("whip process")
+}
+
+pub(super) fn command(fixture: &Fixture, host: Option<(&Value, &std::path::Path)>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_whip"));
     command
         .current_dir(&fixture.root)
@@ -62,7 +69,7 @@ pub(super) fn whip(
             .env("WHIPPLESCRIPT_NORM_PLANNING", planning.to_string())
             .env("WHIPPLESCRIPT_NATIVE_NORM_RUNTIME", runtime_host);
     }
-    command.args(args).output().expect("whip process")
+    command
 }
 
 /// A door's structured refusal of a mainline move, with the mainline unmoved.

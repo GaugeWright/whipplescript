@@ -64,6 +64,7 @@ pub mod projection_prefix;
 pub mod read_through;
 pub mod reconcile;
 pub mod ref_authority;
+pub mod runtime_file_reference_inventory;
 #[cfg(feature = "native")]
 mod runtime_protection;
 pub mod runtime_registry_basis;

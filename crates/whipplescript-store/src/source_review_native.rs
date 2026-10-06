@@ -126,17 +126,8 @@ impl ReviewStore {
     ) -> ReviewResult<VerifiedNativeCandidate> {
         let retained = vcs.capture_gate_subject(witness_digest, attempt_id)?;
         let witness = retained.witness();
-        let contribution = self.contribution(&witness.contribution_id)?;
-        if contribution.source_kind != SourceKind::Native
-            || contribution.target_scope != crate::branches::MAINLINE_BRANCH_ID
-            || !contribution.predecessors.is_empty()
-        {
-            return Err(ReviewError::Invalid(
-                "native candidate needs the exact trunk contribution and predecessor receipts"
-                    .into(),
-            ));
-        }
-        let revision = self.native_revision(&witness.contribution_id, witness.revision_sequence)?;
+        let revision = self
+            .capture_native_review_revision(&witness.contribution_id, witness.revision_sequence)?;
         Ok(vcs.verify_retained_native_candidate(&revision, witness_digest, attempt_id)?)
     }
 
@@ -562,4 +553,41 @@ fn decode_revision(
         ));
     }
     Ok(revision)
+}
+
+impl crate::source_review_types::NativeReviewReader for ReviewStore {
+    fn capture_native_revision(
+        &self,
+        contribution_id: &str,
+        sequence: i64,
+    ) -> Result<NativeRevision, crate::source_review_types::NativeReviewReadError> {
+        use crate::source_review_types::NativeReviewReadError;
+        self.capture_native_review_revision(contribution_id, sequence)
+            .map_err(|error| match error {
+                ReviewError::Missing(_) | ReviewError::Sqlite(_) | ReviewError::Io(_) => {
+                    NativeReviewReadError::Unavailable(format!("{error:?}"))
+                }
+                _ => NativeReviewReadError::Invalid(format!("{error:?}")),
+            })
+    }
+}
+
+impl ReviewStore {
+    fn capture_native_review_revision(
+        &self,
+        contribution_id: &str,
+        sequence: i64,
+    ) -> ReviewResult<NativeRevision> {
+        let contribution = self.contribution(contribution_id)?;
+        if contribution.source_kind != SourceKind::Native
+            || contribution.target_scope != crate::branches::MAINLINE_BRANCH_ID
+            || !contribution.predecessors.is_empty()
+        {
+            return Err(ReviewError::Invalid(
+                "native candidate needs the exact trunk contribution and predecessor receipts"
+                    .into(),
+            ));
+        }
+        self.native_revision(contribution_id, sequence)
+    }
 }

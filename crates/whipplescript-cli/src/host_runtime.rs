@@ -498,6 +498,7 @@ pub struct NativeWorkspaceResolver {
     /// The embedding host's admission of a presented-root rename. Without
     /// one, every rename is refused.
     rename_admission: Option<Box<RenameAdmission>>,
+    call_rename_admission: Option<Box<CallRenameAdmission>>,
     /// The embedding owns encrypted custody and original-command binding.
     payload_retention: Option<Box<WorkspacePayloadRetention>>,
 }
@@ -539,6 +540,8 @@ enum Walked {
 }
 
 type RenameAdmission = dyn Fn(&RootRename) -> Result<(), String> + Send + Sync;
+type CallRenameAdmission =
+    dyn Fn(&ToolCall, usize, &RootRename) -> Result<(), String> + Send + Sync;
 
 impl NativeWorkspaceResolver {
     pub fn take_model_read_witness(&self, call_id: &str) -> Option<ModelReadWitness> {
@@ -615,6 +618,7 @@ impl NativeWorkspaceResolver {
             witness: std::sync::Mutex::new(WitnessState::default()),
             root_renames: std::sync::Mutex::new(Vec::new()),
             rename_admission: None,
+            call_rename_admission: None,
             payload_retention: None,
         })
     }
@@ -652,6 +656,20 @@ impl NativeWorkspaceResolver {
         admit: impl Fn(&RootRename) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         self.rename_admission = Some(Box::new(admit));
+        self.call_rename_admission = None;
+        self
+    }
+
+    /// Exact original call and rename ordinal for embedding-owned phases.
+    /// These values correlate intent; the embedding still supplies current
+    /// authority, durable effect evidence and final publication checks.
+    /// Selecting this boundary clears legacy admission, with no failure fallback.
+    pub fn with_root_rename_call_admission(
+        mut self,
+        admit: impl Fn(&ToolCall, usize, &RootRename) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.call_rename_admission = Some(Box::new(admit));
+        self.rename_admission = None;
         self
     }
 
@@ -1203,7 +1221,17 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(matches.join("\n")))
     }
 
+    #[cfg(test)]
     fn bash(&self, arguments: &Value, view: &FileView) -> Result<String, String> {
+        self.bash_for_call(arguments, view, None)
+    }
+
+    fn bash_for_call(
+        &self,
+        arguments: &Value,
+        view: &FileView,
+        call: Option<&ToolCall>,
+    ) -> Result<String, String> {
         let command = string_argument(arguments, "command")?.trim();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
@@ -1344,6 +1372,19 @@ impl NativeWorkspaceResolver {
         for (presented, _) in &removed {
             self.resolve_admitted(presented, true, view)?;
         }
+        let call_bound = if let Some(admit) = self
+            .call_rename_admission
+            .as_ref()
+            .filter(|_| !renames.is_empty())
+        {
+            let call = call.ok_or_else(|| "root rename has no original tool call".to_owned())?;
+            if call.id.trim().is_empty() {
+                return Err("root rename has no original tool call ID".to_owned());
+            }
+            Some((admit, call))
+        } else {
+            None
+        };
         // Prepare the complete batch before any filesystem changes or retained
         // root rename. Earlier prepared payloads are not successful-write facts.
         let record = |presented: &str, stored: &str| Self::record_path(view, presented, stored);
@@ -1363,7 +1404,11 @@ impl NativeWorkspaceResolver {
                 )?;
             }
         }
-        for rename in &renames {
+        for (ordinal, rename) in renames.iter().enumerate() {
+            if let Some((admit, call)) = call_bound {
+                admit(call, ordinal, rename)?;
+                continue;
+            }
             match &self.rename_admission {
                 Some(admit) => admit(rename)?,
                 None => {
@@ -1499,7 +1544,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
                 {
                     return Err("turn has no admitted command capability".to_owned());
                 }
-                self.bash(&call.arguments, view)
+                self.bash_for_call(&call.arguments, view, Some(call))
             }
             _ => Err("tool has no native workspace implementation".to_owned()),
         }
@@ -9178,6 +9223,152 @@ workflow UnsafeHostChat {
     }
 
     #[test]
+    fn native_call_bound_root_rename_carries_exact_call_and_order() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("targets/a")).unwrap();
+        fs::write(root.path().join("targets/a/original.txt"), "preserved").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let resolver = NativeWorkspaceResolver::new(root.path())
+            .unwrap()
+            .with_root_rename_admission(|_| panic!("call-bound admission must clear legacy"))
+            .with_root_rename_call_admission(move |call, ordinal, rename| {
+                capture.lock().unwrap().push((
+                    call.id.clone(),
+                    call.name.clone(),
+                    call.arguments.clone(),
+                    ordinal,
+                    rename.clone(),
+                ));
+                Ok(())
+            });
+        let mut resources = payload_test_resources();
+        resources[0].selector = Some("targets/a".into());
+        resources[0].presented_as = Some("api".into());
+        resources[0].writable = Some(true);
+        let mut call = payload_tool(
+            "bash",
+            json!({"command":"mv api backend && mv backend core && echo first > core/new.txt", "timeout_ms": 1000}),
+        );
+        call.id = "original-call-1".into();
+        resolver.execute_tool(&resources, &call).unwrap();
+        let records = seen.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        for (ordinal, record) in records.iter().enumerate() {
+            assert_eq!(
+                (&record.0, &record.1, &record.2, record.3),
+                (&call.id, &call.name, &call.arguments, ordinal)
+            );
+            assert_eq!(record.4.selector, "targets/a");
+        }
+        assert_eq!(
+            (&records[0].4.from, &records[0].4.to),
+            (&"api".to_owned(), &"backend".to_owned())
+        );
+        assert_eq!(
+            (&records[1].4.from, &records[1].4.to),
+            (&"backend".to_owned(), &"core".to_owned())
+        );
+        assert_eq!(
+            fs::read(root.path().join("targets/a/new.txt")).unwrap(),
+            b"first\n"
+        );
+        assert!(
+            resolver.execute_tool(&resources, &call).is_err(),
+            "an old presented name cannot replay a mutable effect"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let mut later = payload_tool(
+            "bash",
+            json!({"command":"mv core final && echo later > final/next.txt"}),
+        );
+        later.id = "original-call-2".into();
+        resolver.execute_tool(&resources, &later).unwrap();
+        let records = seen.lock().unwrap();
+        assert_eq!(
+            (&records[2].0, &records[2].2, records[2].3),
+            (&later.id, &later.arguments, 0)
+        );
+        assert_eq!(records[2].4.to, "final");
+        assert_eq!(
+            fs::read(root.path().join("targets/a/next.txt")).unwrap(),
+            b"later\n"
+        );
+    }
+
+    #[test]
+    fn native_call_bound_root_rename_refuses_missing_identity_and_ended_host_before_effects() {
+        for case in ["missing", "empty", "ended"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("targets/a")).unwrap();
+            fs::write(root.path().join("targets/a/original.txt"), "preserved").unwrap();
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let capture = calls.clone();
+            let resolver = NativeWorkspaceResolver::new(root.path())
+                .unwrap()
+                .with_root_rename_admission(|_| panic!("refusal must not fall back to legacy"))
+                .with_root_rename_call_admission(move |_, _, _| {
+                    capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if case == "ended" {
+                        Err("original office authority ended".into())
+                    } else {
+                        Ok(())
+                    }
+                });
+            let mut resources = payload_test_resources();
+            resources[0].selector = Some("targets/a".into());
+            resources[0].presented_as = Some("api".into());
+            resources[0].writable = Some(true);
+            let mut call = payload_tool(
+                "bash",
+                json!({"command":"mv api backend && echo changed > backend/original.txt && echo new > backend/new.txt"}),
+            );
+            if case == "empty" {
+                call.id = " ".into();
+            }
+            let result = if case == "missing" {
+                resolver.bash(
+                    &call.arguments,
+                    &resolver.admitted_view(&resources).unwrap(),
+                )
+            } else {
+                resolver.execute_tool(&resources, &call)
+            };
+            let error = result.expect_err(case);
+            assert_eq!(
+                error,
+                match case {
+                    "missing" => "root rename has no original tool call",
+                    "empty" => "root rename has no original tool call ID",
+                    _ => "original office authority ended",
+                }
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(case == "ended")
+            );
+            assert!(resolver.root_renames.lock().unwrap().is_empty());
+            assert_eq!(
+                fs::read(root.path().join("targets/a/original.txt")).unwrap(),
+                b"preserved"
+            );
+            assert!(!root.path().join("targets/a/new.txt").exists());
+            resolver
+                .execute_tool(
+                    &resources,
+                    &payload_tool("read", json!({"path":"api/original.txt"})),
+                )
+                .unwrap();
+            assert!(resolver
+                .execute_tool(
+                    &resources,
+                    &payload_tool("read", json!({"path":"backend/original.txt"}))
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
     fn native_payload_retention_receives_original_bytes_before_effects() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("removed.txt"), "delete me").unwrap();
@@ -10202,6 +10393,12 @@ workflow UnsafeHostChat {
         assert!(resolver
             .execute_tool(&project_only, &call("date +%s"))
             .is_err());
+        for command in ["", " \t\n "] {
+            assert_eq!(
+                resolver.execute_tool(&admitted, &call(command)),
+                Err("command must not be empty".to_owned()),
+            );
+        }
         assert_eq!(
             resolver
                 .execute_tool(&admitted, &call("date +%s"))

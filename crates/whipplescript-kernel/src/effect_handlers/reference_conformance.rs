@@ -223,7 +223,32 @@ fn execute<S: RuntimeStore + LogAppend>(
         .get_content(&reference().content_hash)
         .expect("query runtime content")
         .is_none());
-    let result = serde_json::from_str(&terminal.payload_json).expect("decode reference terminal");
+    let result: Value =
+        serde_json::from_str(&terminal.payload_json).expect("decode reference terminal");
+    let inventory = whipplescript_store::runtime_file_reference_inventory::capture(&events);
+    if result["status"] == "completed" {
+        use whipplescript_store::runtime_file_reference_inventory::RuntimeFileReferenceSite;
+        assert!(inventory.has_no_observed_gaps(), "{:?}", inventory.gaps);
+        let sites: Vec<_> = inventory
+            .uses
+            .iter()
+            .map(|use_site| use_site.site)
+            .collect();
+        assert_eq!(
+            sites,
+            if kind == "file.read" {
+                vec![
+                    RuntimeFileReferenceSite::ReadRequest,
+                    RuntimeFileReferenceSite::ReadResult,
+                ]
+            } else {
+                vec![
+                    RuntimeFileReferenceSite::WriteInput,
+                    RuntimeFileReferenceSite::WriteResult,
+                ]
+            }
+        );
+    }
     if kind == "file.write" {
         // A body already present in legacy CAS does not grant target authority.
         assert_eq!(
@@ -325,6 +350,12 @@ pub fn check<S: RuntimeStore + LogAppend>(make: impl Fn() -> S) {
                 policy_refused: case == "host-policy",
             };
             let mut input = input.clone();
+            if kind == "file.read" {
+                input
+                    .as_object_mut()
+                    .expect("reference input is an object")
+                    .remove("body_ref");
+            }
             if case == "escape" {
                 input["path"] = json!("../outside");
             }

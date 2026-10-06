@@ -188,11 +188,12 @@ impl NativeFixture {
                 whipplescript_store::branches::flowing_sources::ReleasePrivateCutOutcome::Released
             );
         }
+        let reviews = ReviewStore::open(root.join("review.db")).expect("open fixture review store");
         let mut fixture = Self {
             root,
             vcs,
             branches,
-            reviews: ReviewStore::open(":memory:").expect("open fixture review store"),
+            reviews,
             witness: String::new(),
             source_branch: if named { "branch" } else { "twig" },
             source_cut: if named { "target" } else { "source" },
@@ -1078,3 +1079,6 @@ fn a_home_capture_cannot_omit_the_norm_readers_required_reference_classes() {
     .unwrap_err()
     .contains("Home source-admission basis changed during derivation"));
 }
+
+#[path = "source_candidate_capture_tests.rs"]
+mod candidate_capture;

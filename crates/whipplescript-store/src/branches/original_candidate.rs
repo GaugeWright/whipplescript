@@ -7,7 +7,7 @@ fn refuse(message: &str) -> StoreError {
     StoreError::Conflict(format!("original candidate: {message}"))
 }
 
-fn eligible(tx: &rusqlite::Transaction<'_>, id: &str) -> StoreResult<BranchRow> {
+fn eligible(tx: &rusqlite::Connection, id: &str) -> StoreResult<BranchRow> {
     let row = BranchStore::row_by_id(tx, id)?.ok_or_else(|| refuse("custody missing"))?;
     if row.status == BranchStatus::Discarded {
         return Err(refuse("custody discarded"));
@@ -23,7 +23,7 @@ fn eligible(tx: &rusqlite::Transaction<'_>, id: &str) -> StoreResult<BranchRow> 
     Ok(row)
 }
 
-fn original_cut(tx: &rusqlite::Transaction<'_>, id: &str, hash: &str) -> StoreResult<CutRow> {
+fn original_cut(tx: &rusqlite::Connection, id: &str, hash: &str) -> StoreResult<CutRow> {
     let cut = BranchStore::cut_by_id(tx, id)?.ok_or_else(|| refuse("original cut missing"))?;
     if cut.manifest_hash != hash {
         return Err(refuse("original cut identity differs"));
@@ -31,24 +31,13 @@ fn original_cut(tx: &rusqlite::Transaction<'_>, id: &str, hash: &str) -> StoreRe
     Ok(cut)
 }
 
-/// All original metadata is checked in the same transaction that publishes.
-pub(crate) fn commit(
-    store: &mut BranchStore,
-    original: &BranchRow,
-    proposed: &OriginalWorkspaceCandidate,
-    meaning: &str,
-    check: &mut dyn FnMut() -> StoreResult<()>,
-) -> StoreResult<OriginalWorkspaceCandidate> {
-    let tx = store
-        .connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    check()?;
-    let source = eligible(&tx, &original.branch_id)?;
+fn validate_custody(tx: &rusqlite::Connection, original: &BranchRow) -> StoreResult<()> {
+    let source = eligible(tx, &original.branch_id)?;
     let parent_id = original
         .parent_branch_id
         .as_deref()
         .ok_or_else(|| refuse("original parent missing"))?;
-    let parent = eligible(&tx, parent_id)?;
+    let parent = eligible(tx, parent_id)?;
     if original.status != BranchStatus::Active
         || source.status != BranchStatus::Active
         || parent.status != BranchStatus::Active
@@ -60,7 +49,7 @@ pub(crate) fn commit(
     else {
         return Err(refuse("original base missing"));
     };
-    if original_cut(&tx, base_id, base_hash)?.branch_id != original.branch_id {
+    if original_cut(tx, base_id, base_hash)?.branch_id != original.branch_id {
         return Err(refuse("original base belongs to another source"));
     }
     match (
@@ -68,13 +57,21 @@ pub(crate) fn commit(
         &original.branch_point_manifest_hash,
     ) {
         (Some(id), Some(hash)) => {
-            original_cut(&tx, id, hash)?;
+            original_cut(tx, id, hash)?;
         }
         (None, None) => {}
         _ => return Err(refuse("incomplete original divergence")),
     }
-    let branch = BranchStore::row_by_id(&tx, &proposed.branch.branch_id)?;
-    let cut = BranchStore::cut_by_id(&tx, &proposed.cut.cut_id)?;
+    Ok(())
+}
+
+fn recorded(
+    tx: &rusqlite::Connection,
+    proposed: &OriginalWorkspaceCandidate,
+    meaning: &str,
+) -> StoreResult<Option<OriginalWorkspaceCandidate>> {
+    let branch = BranchStore::row_by_id(tx, &proposed.branch.branch_id)?;
+    let cut = BranchStore::cut_by_id(tx, &proposed.cut.cut_id)?;
     let op = tx
         .prepare_cached(
             "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops WHERE op_id = ?1",
@@ -92,8 +89,73 @@ pub(crate) fn commit(
             })
         })
         .optional()?;
-    let result = match (branch, cut, op, evidence) {
-        (None, None, None, None) => {
+    match (branch, cut, op, evidence) {
+        (None, None, None, None) => Ok(None),
+        (Some(_), Some(cut), Some(op), Some(evidence)) => {
+            eligible(tx, &proposed.branch.branch_id)?;
+            let mut expected_cut = proposed.cut.clone();
+            expected_cut.recorded_at = cut.recorded_at.clone();
+            let mut expected_op = proposed.operation.clone();
+            expected_op.seq = op.seq;
+            expected_op.recorded_at = cut.recorded_at.clone();
+            if cut != expected_cut
+                || op != expected_op
+                || op.origin.as_deref() != Some(meaning)
+                || evidence != proposed.evidence
+            {
+                return Err(refuse("retry changes original meaning"));
+            }
+            let mut branch = proposed.branch.clone();
+            branch.created_at = cut.recorded_at.clone();
+            branch.updated_at = cut.recorded_at.clone();
+            Ok(Some(OriginalWorkspaceCandidate {
+                branch,
+                cut,
+                operation: op,
+                evidence,
+            }))
+        }
+        _ => Err(refuse("partial original receipt")),
+    }
+}
+
+/// Observe immutable receipt metadata only. An enclosing retained-observation
+/// fence may already own the transaction; otherwise keep these reads together.
+pub(crate) fn observe(
+    store: &BranchStore,
+    original: &BranchRow,
+    proposed: &OriginalWorkspaceCandidate,
+    meaning: &str,
+) -> StoreResult<OriginalWorkspaceCandidate> {
+    let read = |conn: &rusqlite::Connection| {
+        validate_custody(conn, original)?;
+        recorded(conn, proposed, meaning)?.ok_or_else(|| refuse("original receipt missing"))
+    };
+    if store.connection.is_autocommit() {
+        let tx = store.connection.unchecked_transaction()?;
+        let result = read(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    } else {
+        read(&store.connection)
+    }
+}
+
+/// All original metadata is checked in the same transaction that publishes.
+pub(crate) fn commit(
+    store: &mut BranchStore,
+    original: &BranchRow,
+    proposed: &OriginalWorkspaceCandidate,
+    meaning: &str,
+    check: &mut dyn FnMut() -> StoreResult<()>,
+) -> StoreResult<OriginalWorkspaceCandidate> {
+    let tx = store
+        .connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    check()?;
+    validate_custody(&tx, original)?;
+    let result = match recorded(&tx, proposed, meaning)? {
+        None => {
             let row = &proposed.branch;
             tx.execute("INSERT INTO branches (branch_id, name, parent_branch_id, branch_point_cut_id, branch_point_manifest_hash, head_cut_id, head_manifest_hash, adopted_merge_cut_id, status, created_at, updated_at) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, NULL, 'active', ?7, ?7)",
                 params![row.branch_id, row.parent_branch_id, row.branch_point_cut_id, row.branch_point_manifest_hash, row.head_cut_id, row.head_manifest_hash, row.created_at])?;
@@ -141,31 +203,7 @@ pub(crate) fn commit(
                 })?;
             result
         }
-        (Some(_), Some(cut), Some(op), Some(evidence)) => {
-            eligible(&tx, &proposed.branch.branch_id)?;
-            let mut expected_cut = proposed.cut.clone();
-            expected_cut.recorded_at = cut.recorded_at.clone();
-            let mut expected_op = proposed.operation.clone();
-            expected_op.seq = op.seq;
-            expected_op.recorded_at = cut.recorded_at.clone();
-            if cut != expected_cut
-                || op != expected_op
-                || op.origin.as_deref() != Some(meaning)
-                || evidence != proposed.evidence
-            {
-                return Err(refuse("retry changes original meaning"));
-            }
-            let mut branch = proposed.branch.clone();
-            branch.created_at = cut.recorded_at.clone();
-            branch.updated_at = cut.recorded_at.clone();
-            OriginalWorkspaceCandidate {
-                branch,
-                cut,
-                operation: op,
-                evidence,
-            }
-        }
-        _ => return Err(refuse("partial original receipt")),
+        Some(result) => result,
     };
     check()?;
     tx.commit()?;

@@ -24,12 +24,15 @@ fn candidate(fixture: &Fixture) -> String {
     .expect("open native fixture VCS");
     let mut branches = BranchStore::open(fixture.root.join("branches.sqlite"))
         .expect("open native fixture branch store");
-    seed_candidate(&mut vcs, &mut branches)
+    let mut reviews =
+        ReviewStore::open(fixture.root.join("reviews.sqlite")).expect("owning review store");
+    seed_candidate(&mut vcs, &mut branches, &mut reviews)
 }
 
 fn seed_candidate<B, C>(
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     branches: &mut B,
+    reviews: &mut ReviewStore,
 ) -> String
 where
     B: Branches
@@ -96,7 +99,6 @@ where
     };
     vcs.bind_private_selection("unit", &selected, "t3")
         .expect("bind private selection");
-    let mut reviews = ReviewStore::open(":memory:").expect("open review store");
     reviews
         .create_native_contribution("review", "author", "change", MAINLINE_BRANCH_ID, &[])
         .expect("create reviewed contribution");
@@ -237,6 +239,36 @@ fn review_plan_cli_returns_blockers_without_creating_work_or_running_checks() {
     }
     assert_eq!(fixture.run(&["export"]), before);
     hosted_reader(&fixture, &witness, &first, &planning, &runtime_host);
+    let verified = admission::command(&fixture, Some((&planning, &runtime_host)))
+        .env(
+            "WHIPPLESCRIPT_SOURCE_REVIEW_STORE",
+            fixture.root.join("reviews.sqlite"),
+        )
+        .args(["--json", "review", "plan", &witness, "attempt"])
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let verified: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert!(verified["judgment"]["source_verification"].is_object());
+    assert!(!verified["judgment"]["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gap| gap["scope"] == "source/review-record"));
+    assert_ne!(verified["identity"], first["identity"]);
+    assert_eq!(fixture.run(&["export"]), before);
+    let missing = fixture.root.join("missing-review.sqlite");
+    let refused = admission::command(&fixture, Some((&planning, &runtime_host)))
+        .env("WHIPPLESCRIPT_SOURCE_REVIEW_STORE", &missing)
+        .args(["review", "plan", &witness, "attempt"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!missing.exists());
 }
 
 fn hosted_reader(
@@ -274,7 +306,9 @@ fn hosted_reader(
         DoBranches::new(sql.clone()).expect("open hosted VCS branches"),
         DoContentBlobs::new(sql.clone()).expect("open hosted content store"),
     );
-    let hosted_witness = seed_candidate(&mut vcs, &mut branches);
+    let mut reviews =
+        ReviewStore::open(":memory:").expect("independent hosted test review authority");
+    let hosted_witness = seed_candidate(&mut vcs, &mut branches, &mut reviews);
     assert_eq!(
         hosted_witness, witness,
         "both owning candidate builders retain the same subject"
@@ -344,6 +378,30 @@ fn hosted_reader(
         serde_json::from_str(&query(&request.to_string()).expect("derive hosted source plan"))
             .expect("parse hosted source plan");
     assert_eq!(hosted["judgment"]["subject"], native["judgment"]["subject"]);
+    let verified: Value = serde_json::from_str(
+        &whipplescript_host_do::source_planning::execute_installed_hosted_source_plan_with_capture(
+            &reads,
+            &trust,
+            &request.to_string(),
+            &deployment,
+            whipplescript_kernel::source_admission::SourceAdmissionCapture {
+                home: None,
+                review: Some(&reviews),
+            },
+        )
+        .expect("owning hosted source verification"),
+    )
+    .expect("parse verified hosted source judgment");
+    assert!(verified["judgment"]["source_verification"].is_object());
+    assert!(!verified["judgment"]["blockers"]
+        .as_array()
+        .expect("located source blockers")
+        .iter()
+        .any(|gap| gap["scope"] == "source/review-record"));
+    assert_eq!(
+        verified["judgment"]["subject"],
+        hosted["judgment"]["subject"]
+    );
     let comparison = |value: &Value| {
         let mut duties = value["judgment"]["obligations"].clone();
         for duty in duties
@@ -379,7 +437,16 @@ fn hosted_reader(
         .expect("parse repeated hosted source plan"),
         hosted
     );
-    for field in ["policy", "coverage", "checks", "frontier", "store"] {
+    for field in [
+        "policy",
+        "coverage",
+        "checks",
+        "frontier",
+        "store",
+        "review",
+        "revision",
+        "source_verification",
+    ] {
         let mut forged = request.clone();
         forged[field] = "caller supplied".into();
         assert!(query(&forged.to_string()).is_err());

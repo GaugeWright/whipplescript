@@ -412,3 +412,152 @@ fn protected_read_only_open_refuses_unknown_schema_generation() {
     drop(store);
     assert!(ContentStore::open_read_only_protected(fixture.path(), binding).is_err());
 }
+
+#[test]
+fn original_candidate_protected_observation_retains_exact_key_and_refuses_plain_reopen() {
+    use crate::{
+        branches::write_evidence::WriteEvidenceRef, branches::BranchStore, vcs::NativeWorkspaceVcs,
+    };
+    use std::collections::BTreeMap;
+    let fixture = Fixture::new();
+    let branch_path = fixture.0.join("branches.sqlite");
+    let codec = Codec::new(73);
+    let binding = protection("office-original-result", codec.clone());
+    let mut vcs = NativeWorkspaceVcs::from_parts(
+        BranchStore::open(&branch_path).unwrap(),
+        ContentStore::create_protected(fixture.path(), binding.clone()).unwrap(),
+    );
+    vcs.init("t0").unwrap();
+    vcs.write(
+        "main",
+        "shared.txt",
+        Some("original parent"),
+        "parent",
+        "t1",
+    )
+    .unwrap();
+    vcs.create_branch("source", None, "main", "t2").unwrap();
+    vcs.write(
+        "source",
+        "earlier.txt",
+        Some("original source"),
+        "base",
+        "t3",
+    )
+    .unwrap();
+    let original = vcs.get_branch("source").unwrap().unwrap();
+    let secret = b"synthetic protected original saved result";
+    let body = vcs.content_store().put(secret).unwrap();
+    let files = BTreeMap::from([("saved.txt".to_owned(), body.clone())]);
+    let evidence = WriteEvidenceRef {
+        schema_ref: "result/v1".into(),
+        label_ref: "private".into(),
+        content_hash: vcs
+            .content_store()
+            .put(&serde_json::to_vec(&files).unwrap())
+            .unwrap(),
+    };
+    vcs.set_actor(Some("staff:original".into()));
+    vcs.set_intent(Some("command:original".into()));
+    let created = vcs
+        .import_original_candidate_guarded(&original, &files, &[], &evidence, "t4", &mut || Ok(()))
+        .unwrap();
+    vcs.write(
+        "source",
+        "saved.txt",
+        Some("later unrelated source bytes"),
+        "later",
+        "t5",
+    )
+    .unwrap();
+    let reader = NativeWorkspaceVcs::from_parts(
+        BranchStore::open_read_only(&branch_path).unwrap(),
+        ContentStore::open_read_only_protected(fixture.path(), binding.clone()).unwrap(),
+    );
+    let before: Vec<_> = [&branch_path, &fixture.path()]
+        .into_iter()
+        .map(|p| {
+            (
+                std::fs::read(p).unwrap(),
+                std::fs::read(format!("{}-wal", p.display())).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reader
+            .observe_original_candidate_guarded(
+                &original,
+                &files,
+                &[],
+                &evidence,
+                "staff:original",
+                "command:original",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+        created
+    );
+    for (p, (db, wal)) in [&branch_path, &fixture.path()].into_iter().zip(before) {
+        assert_eq!(std::fs::read(p).unwrap(), db);
+        assert_eq!(std::fs::read(format!("{}-wal", p.display())).unwrap(), wal);
+        for raw in [db, wal] {
+            assert!(!raw.windows(secret.len()).any(|slice| slice == secret));
+        }
+    }
+    assert!(NativeWorkspaceVcs::open_for_recorded_review(&branch_path, fixture.path()).is_err());
+    assert!(NativeWorkspaceVcs::open_for_recorded_review_protected(
+        &branch_path,
+        fixture.path(),
+        protection("other-office", codec.clone()),
+    )
+    .is_err());
+    let held = NativeWorkspaceVcs::open_for_recorded_review_protected(
+        &branch_path,
+        fixture.path(),
+        binding,
+    )
+    .unwrap();
+    let (start, receive) = std::sync::mpsc::channel();
+    let (confirmed, confirmation) = std::sync::mpsc::channel();
+    let eraser_codec = codec.clone();
+    let eraser = std::thread::spawn(move || {
+        receive.recv().unwrap();
+        assert!(
+            eraser_codec.retention.try_write().is_err(),
+            "original release must retain key"
+        );
+        confirmed.send(()).unwrap();
+        eraser_codec.erase_key();
+    });
+    held.publish_retained_recorded_observation(std::slice::from_ref(&body), |current| {
+        start.send(()).unwrap();
+        confirmation.recv().unwrap();
+        assert_eq!(current.observe_original_candidate_guarded(
+            &original, &files, &[], &evidence, "staff:original", "command:original", &mut || Ok(()),
+        )?, created);
+        assert_eq!(current.content_store().get(&body)?.as_deref(), Some(secret.as_slice()));
+        for path in [&branch_path, &fixture.path()] {
+            let rival = rusqlite::Connection::open(path).unwrap();
+            rival.busy_timeout(std::time::Duration::ZERO).unwrap();
+            assert!(matches!(rival.execute_batch("BEGIN IMMEDIATE"),
+                Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy));
+        }
+        Ok(())
+    }).unwrap();
+    eraser.join().unwrap();
+    assert!(reader
+        .observe_original_candidate_guarded(
+            &original,
+            &files,
+            &[],
+            &evidence,
+            "staff:original",
+            "command:original",
+            &mut || Ok(()),
+        )
+        .is_err());
+    held.publish_retained_recorded_observation::<()>(std::slice::from_ref(&body), |_| {
+        panic!("erased original key released a payload")
+    })
+    .expect_err("erased key");
+}

@@ -12578,6 +12578,152 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn hosted_file_reference_history_preserves_input_and_result_handles() {
+        use std::{io, path::Path};
+        use whipplescript_store::{
+            files::{
+                FileContentReference, FileReferenceWriteAccepted, FileStore, FileWriteContext,
+                FileWriteFailure,
+            },
+            runtime_file_reference_inventory::{capture, RuntimeFileReferenceSite},
+            CapabilityBinding, CapabilitySchemaRegistration, EffectProviderRegistration, NewEffect,
+            NewInstance, RuleCommit,
+        };
+
+        struct References(FileContentReference);
+        impl FileStore for References {
+            fn write_content_reference(
+                &self,
+                _: &Path,
+                _: &FileContentReference,
+                _: FileWriteContext<'_>,
+            ) -> Result<FileReferenceWriteAccepted, FileWriteFailure> {
+                Ok(FileReferenceWriteAccepted {
+                    reference: self.0.clone(),
+                    byte_len: 4,
+                    evidence: None,
+                })
+            }
+            fn read_to_string(&self, _: &Path) -> io::Result<String> {
+                unreachable!()
+            }
+            fn exists(&self, _: &Path) -> bool {
+                true
+            }
+            fn create_dir_all(&self, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+            fn write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+                unreachable!()
+            }
+            fn append(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+                unreachable!()
+            }
+            fn remove(&self, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let mut store = test_support::store();
+        let version = whipplescript_store::host_actions::conformance::register(&mut store);
+        store
+            .register_capability_schema(CapabilitySchemaRegistration {
+                capability: "file.write",
+                description: "reference inventory fixture",
+                schema_json: "{}",
+                registered_by_package_id: None,
+            })
+            .unwrap();
+        store
+            .bind_capability(CapabilityBinding {
+                binding_id: "reference-files",
+                program_id: Some(&version.program_id),
+                capability: "file.write",
+                provider: "files",
+                config_json: "{}",
+            })
+            .unwrap();
+        store
+            .register_effect_provider(EffectProviderRegistration {
+                provider_id: "reference-files",
+                effect_kind: "file.write",
+                provider: "files",
+                capability: "file.write",
+                config_json: "{}",
+                registered_by_package_id: None,
+            })
+            .unwrap();
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let input = FileContentReference {
+            content_hash: "a".repeat(32),
+            label_ref: "input-private".into(),
+        };
+        let output = FileContentReference {
+            content_hash: "b".repeat(32),
+            label_ref: "result-private".into(),
+        };
+        let input_json =
+            serde_json::json!({"format":"reference","store":"docs","root":"/workspace",
+            "path":"note.txt","mode":"upsert","allow":["**"],"body_ref":input})
+            .to_string();
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "fixture",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    effect_id: "file",
+                    kind: "file.write",
+                    target: None,
+                    input_json: &input_json,
+                    status: "queued",
+                    idempotency_key: "file-command",
+                    required_capabilities_json: "[]",
+                    profile: None,
+                    correlation_id: None,
+                    source_span_json: None,
+                    timeout_seconds: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("fixture"),
+                marks: &[],
+                context_json: None,
+            })
+            .unwrap();
+        let mut kernel = whipplescript_kernel::RuntimeKernel::new(store);
+        let effect = kernel
+            .claimable_effects(&instance.instance_id)
+            .unwrap()
+            .remove(0);
+        whipplescript_kernel::effect_handlers::run_file_write_effect_generic(
+            &mut kernel,
+            &References(output.clone()),
+            &instance.instance_id,
+            &effect,
+        )
+        .unwrap();
+        let inventory = capture(&kernel.store().list_events(&instance.instance_id).unwrap());
+        assert!(inventory.has_no_observed_gaps(), "{:?}", inventory.gaps);
+        assert_eq!(inventory.uses.len(), 2);
+        assert_eq!(inventory.uses[0].site, RuntimeFileReferenceSite::WriteInput);
+        assert_eq!(inventory.uses[0].reference, Some(input));
+        assert_eq!(
+            inventory.uses[1].site,
+            RuntimeFileReferenceSite::WriteResult
+        );
+        assert_eq!(inventory.uses[1].reference, Some(output));
+    }
+
+    #[test]
     fn do_store_identity_is_stable_and_immutable() {
         let store = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
         let identity = store

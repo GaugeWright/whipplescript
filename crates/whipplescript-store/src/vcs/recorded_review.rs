@@ -78,6 +78,20 @@ impl NativeWorkspaceVcs {
         ))
     }
 
+    /// Reopen protected existing content with its exact host-owned domain and
+    /// codec. Retained observation keeps key custody through final publication;
+    /// this neither initializes stores nor grants embedding authorization.
+    pub fn open_for_recorded_review_protected(
+        branches_path: impl AsRef<Path>,
+        content_path: impl AsRef<Path>,
+        protection: crate::payload_protection::PayloadProtection,
+    ) -> StoreResult<Self> {
+        Ok(Self::from_parts(
+            BranchStore::open_for_fenced_observation(branches_path)?,
+            ContentStore::open_existing_protected(content_path, protection)?,
+        ))
+    }
+
     /// Review exactly `expected_head`, retaining complete compared inputs and
     /// caller-selected original evidence through one embedding publication.
     /// `check` is the original host authority; it must not reacquire either

@@ -7,7 +7,10 @@ use whipplescript_kernel::norm_execution_policy::{
     Buck2TestsPolicy, NativeEvidencePolicy, ProtectedPythonPolicy,
 };
 use whipplescript_kernel::norm_planning::PlanningConfiguration;
+use whipplescript_kernel::source_admission::SourceAdmissionCapture;
 use whipplescript_store::items::WorkItemStore;
+use whipplescript_store::source_review::ReviewStore;
+use whipplescript_store::source_review_types::NativeReviewReader;
 use whipplescript_store::vcs::NativeWorkspaceVcs;
 use whipplescript_store::SqliteStore;
 
@@ -16,7 +19,8 @@ pub(crate) const USAGE: &str =
   Reads the retained native candidate and authenticated norm ledger.\n\
   Returns obligations, selected evidence, required work and coverage blockers.\n\
   Host configuration: WHIPPLESCRIPT_NORM_TRUST, WHIPPLESCRIPT_NORM_PLANNING,\n\
-  WHIPPLESCRIPT_NATIVE_NORM_RUNTIME and the host-selected store paths.\n\
+  WHIPPLESCRIPT_NATIVE_NORM_RUNTIME, optional WHIPPLESCRIPT_SOURCE_REVIEW_STORE,\n\
+  and the host-selected store paths.\n\
   Does not run checks, create tracker work or admit a ref.";
 
 pub(crate) fn command(options: &super::CliOptions) -> ExitCode {
@@ -59,6 +63,10 @@ fn execute(
     super::install_decl_canonicalizers(&mut vcs);
     let ledger = WorkItemStore::open_read_only(super::items_store_path()).map_err(debug)?;
     let runtime = SqliteStore::open_read_only(runtime_path).map_err(debug)?;
+    let review = std::env::var_os("WHIPPLESCRIPT_SOURCE_REVIEW_STORE")
+        .map(|path| ReviewStore::open_read_only(std::path::PathBuf::from(path)))
+        .transpose()
+        .map_err(|error| format!("{error:?}"))?;
     let document = super::norm_commands::trust_document()?;
     let transport = super::norm_commands::custody_transport_for(&document)?;
     let trust = super::norm_commands::NormTrust::from_document(document, transport.as_deref())?;
@@ -82,7 +90,7 @@ fn execute(
     let verify = |selected: &whipplescript_kernel::norm_runner::PythonRuntime| {
         managed.installed.validate_for(selected).map_err(debug)
     };
-    whipplescript_kernel::source_admission::plan_native(
+    whipplescript_kernel::source_admission::plan_with_capture(
         &vcs,
         &ledger,
         AdmissionHost {
@@ -95,6 +103,12 @@ fn execute(
         },
         witness,
         attempt,
+        SourceAdmissionCapture {
+            home: None,
+            review: review
+                .as_ref()
+                .map(|reader| reader as &dyn NativeReviewReader),
+        },
     )
     .map(|plan| plan.to_json())
 }
