@@ -68,7 +68,9 @@ impl PayloadProtection {
             .open(&self.associated_data(plane, coordinate)?, ciphertext)
     }
 
-    pub(crate) fn retain<T>(&self, publish: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
+    /// Retain the supplied host content authority for exactly one operation.
+    /// This excludes key erasure; it grants no product or runtime access.
+    pub fn retain<T>(&self, publish: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
         let mut publish = Some(publish);
         let mut result = None;
         let mut calls = 0;

@@ -19,6 +19,13 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Embedding hosts can explicitly create and reopen protected governed runtime
+  stores and inspect original turns read-only with their exact payload codec
+  and policy verifier. Plain openers refuse protected stores; existing
+  plaintext stores are never silently converted.
+  Independent Stop requests and streaming cancellation probes preserve that
+  protection; unavailable protected storage releases a stream.
+
 - Embedding hosts may explicitly bind owned provider HTTP transport to approved
   socket addresses and TLS certificate identities. The selected transport
   refuses destination changes and redirects; it grants no task or reader access.

@@ -51,8 +51,8 @@ use whipplescript_kernel::{
     idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_store::{
-    EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SkillView,
-    SqliteStore, StoreError,
+    payload_protection::PayloadProtection, EffectCancellationRequest, EvidenceRecord, NewEffect,
+    NewEvent, RuleCommit, SkillView, SqliteStore, StoreError,
 };
 
 use crate::host_protocol::{
@@ -1879,11 +1879,32 @@ struct AdoptionRank {
 /// command. It opens an independent store connection, so an embedding UI can
 /// request cancellation while the runtime-owning thread is blocked in provider
 /// I/O. The owned loop observes it between model rounds.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HostCancellationHandle {
     store_path: PathBuf,
     instance_ref: String,
     command_id: String,
+    protection: Option<PayloadProtection>,
+}
+impl fmt::Debug for HostCancellationHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostCancellationHandle")
+            .field("store_path", &self.store_path)
+            .field("instance_ref", &self.instance_ref)
+            .field("command_id", &self.command_id)
+            .field("protected", &self.protection.is_some())
+            .finish()
+    }
+}
+
+fn open_cancellation_store(
+    path: &Path,
+    protection: Option<&PayloadProtection>,
+) -> Result<SqliteStore, StoreError> {
+    match protection {
+        Some(protection) => SqliteStore::open_initialized_protected(path, protection.clone()),
+        None => SqliteStore::open(path),
+    }
 }
 
 /// The mid-stream companion to [`HostCancellationHandle`]: polls the same
@@ -1896,13 +1917,14 @@ pub struct HostCancellationHandle {
 /// writes the request. Reads are throttled so a fast stream is never gated on
 /// SQLite, and the first observation latches: the transport's release decision
 /// and the machine's released-round settlement must agree about one stream.
-/// Failures read as "not cancelled", matching the kernel's between-rounds
-/// probe — a probe failure must not kill a healthy turn.
+/// Plain compatibility failures read as "not cancelled". Protected storage
+/// failures release the stream rather than conceal unavailable authority.
 struct StreamCancelProbe {
     store_path: PathBuf,
     instance_ref: String,
     command_id: String,
     clock: ProbeClock,
+    protection: Option<PayloadProtection>,
     last_read: std::cell::Cell<Option<Duration>>,
     latched: std::cell::Cell<bool>,
     store: std::cell::RefCell<Option<SqliteStore>>,
@@ -1933,12 +1955,18 @@ impl ProbeClock {
 impl StreamCancelProbe {
     const READ_INTERVAL: Duration = Duration::from_millis(250);
 
-    fn new(store_path: PathBuf, instance_ref: String, command_id: String) -> Self {
+    fn new(
+        store_path: PathBuf,
+        instance_ref: String,
+        command_id: String,
+        protection: Option<PayloadProtection>,
+    ) -> Self {
         Self::on_clock(
             store_path,
             instance_ref,
             command_id,
             ProbeClock::Machine(std::time::Instant::now()),
+            protection,
         )
     }
 
@@ -1947,12 +1975,14 @@ impl StreamCancelProbe {
         instance_ref: String,
         command_id: String,
         clock: ProbeClock,
+        protection: Option<PayloadProtection>,
     ) -> Self {
         Self {
             store_path,
             instance_ref,
             command_id,
             clock,
+            protection,
             last_read: std::cell::Cell::new(None),
             latched: std::cell::Cell::new(false),
             store: std::cell::RefCell::new(None),
@@ -1975,14 +2005,20 @@ impl StreamCancelProbe {
         self.last_read.set(Some(now));
         let mut slot = self.store.borrow_mut();
         if slot.is_none() {
-            *slot = SqliteStore::open(&self.store_path).ok();
+            *slot = open_cancellation_store(&self.store_path, self.protection.as_ref()).ok();
         }
         let Some(store) = slot.as_mut() else {
-            return false;
+            let release = self.protection.is_some();
+            self.latched.set(release);
+            return release;
         };
-        let open = store
-            .effect_has_open_cancellation_request(&self.instance_ref, &self.command_id)
-            .unwrap_or(false);
+        let check =
+            || store.effect_has_open_cancellation_request(&self.instance_ref, &self.command_id);
+        let open = match &self.protection {
+            Some(protection) => protection.retain(check),
+            None => check(),
+        }
+        .unwrap_or(self.protection.is_some());
         if open {
             self.latched.set(true);
         }
@@ -1998,7 +2034,8 @@ impl StreamCancelProbe {
 
 impl HostCancellationHandle {
     pub fn request(&self) -> Result<(), HostRuntimeError> {
-        let mut store = SqliteStore::open(&self.store_path).map_err(HostRuntimeError::Store)?;
+        let mut store = open_cancellation_store(&self.store_path, self.protection.as_ref())
+            .map_err(HostRuntimeError::Store)?;
         let idempotency = idempotency_key(&[
             &self.instance_ref,
             &self.command_id,
@@ -2025,6 +2062,7 @@ pub struct GovernedHostRuntime {
     store_path: PathBuf,
     policy: PolicyEpochRef,
     envelope: VerifiedEnvelope,
+    protection: Option<PayloadProtection>,
 }
 
 /// Read-only original-runtime observation. No execution or writable-runtime
@@ -2040,7 +2078,7 @@ impl RecordedHostRuntime {
         signed_envelope: &str,
         resources: &R,
     ) -> Result<Self, HostRuntimeError> {
-        Self::open_using(path, epoch, resources, || {
+        Self::open_using(path, epoch, resources, None, || {
             VerifiedEnvelope::verify_signed_text(signed_envelope)
         })
     }
@@ -2055,7 +2093,25 @@ impl RecordedHostRuntime {
         verifier: &V,
         resources: &R,
     ) -> Result<Self, HostRuntimeError> {
-        Self::open_using(path, epoch, resources, || {
+        Self::open_using(path, epoch, resources, None, || {
+            VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
+        })
+    }
+
+    /// Inspect an existing protected original runtime without migration or execution.
+    /// Protection custody and the governance verifier grant no resource access.
+    pub fn open_existing_protected_with_verifier<
+        V: crate::gov::GovernanceAttestationVerifier + ?Sized,
+        R: ResourceResolver + ?Sized,
+    >(
+        path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        verifier: &V,
+        resources: &R,
+        protection: PayloadProtection,
+    ) -> Result<Self, HostRuntimeError> {
+        Self::open_using(path, epoch, resources, Some(protection), || {
             VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
         })
     }
@@ -2064,6 +2120,7 @@ impl RecordedHostRuntime {
         path: impl AsRef<Path>,
         epoch: u64,
         resources: &R,
+        protection: Option<PayloadProtection>,
         verify: impl FnOnce() -> Result<VerifiedEnvelope, String>,
     ) -> Result<Self, HostRuntimeError> {
         let access = LiveTurnAccess::new(resources);
@@ -2072,7 +2129,11 @@ impl RecordedHostRuntime {
             let envelope = verify().map_err(HostRuntimeError::PolicyRejected)?;
             let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
             let path = path.as_ref().to_path_buf();
-            let store = SqliteStore::open_read_only(&path).map_err(HostRuntimeError::Store)?;
+            let store = match protection.clone() {
+                Some(protection) => SqliteStore::open_read_only_protected(&path, protection),
+                None => SqliteStore::open_read_only(&path),
+            }
+            .map_err(HostRuntimeError::Store)?;
             require_recorded_schema(&store)?;
             Ok(Self {
                 runtime: GovernedHostRuntime {
@@ -2080,6 +2141,7 @@ impl RecordedHostRuntime {
                     store_path: path,
                     policy,
                     envelope,
+                    protection,
                 },
             })
         })();
@@ -2230,14 +2292,67 @@ impl GovernedHostRuntime {
         Self::open_verified(store_path, epoch, envelope)
     }
 
+    /// Create a new protected native runtime; existing paths are never adopted.
+    /// Policy verification occurs before the native store can create any file.
+    pub fn create_protected_with_verifier<V: crate::gov::GovernanceAttestationVerifier + ?Sized>(
+        store_path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        verifier: &V,
+        protection: PayloadProtection,
+    ) -> Result<Self, HostRuntimeError> {
+        let envelope = VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
+            .map_err(HostRuntimeError::PolicyRejected)?;
+        Self::open_verified_using(
+            store_path,
+            epoch,
+            envelope,
+            Some(protection.clone()),
+            |path| SqliteStore::create_protected(path, protection),
+        )
+    }
+
+    /// Reopen exact existing protected storage without conversion or initialization.
+    pub fn open_existing_protected_with_verifier<
+        V: crate::gov::GovernanceAttestationVerifier + ?Sized,
+    >(
+        store_path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        verifier: &V,
+        protection: PayloadProtection,
+    ) -> Result<Self, HostRuntimeError> {
+        let envelope = VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
+            .map_err(HostRuntimeError::PolicyRejected)?;
+        Self::open_verified_using(
+            store_path,
+            epoch,
+            envelope,
+            Some(protection.clone()),
+            |path| SqliteStore::open_existing_protected(path, protection),
+        )
+    }
+
     fn open_verified(
         store_path: impl AsRef<Path>,
         epoch: u64,
         envelope: VerifiedEnvelope,
     ) -> Result<Self, HostRuntimeError> {
+        Self::open_verified_using(store_path, epoch, envelope, None, |path| {
+            SqliteStore::open(path)
+        })
+    }
+
+    fn open_verified_using(
+        store_path: impl AsRef<Path>,
+        epoch: u64,
+        envelope: VerifiedEnvelope,
+        protection: Option<PayloadProtection>,
+        open: impl FnOnce(&Path) -> whipplescript_store::StoreResult<SqliteStore>,
+    ) -> Result<Self, HostRuntimeError> {
         let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
         let store_path = store_path.as_ref().to_path_buf();
-        let store = SqliteStore::open(&store_path).map_err(HostRuntimeError::Store)?;
+        let store = open(&store_path).map_err(HostRuntimeError::Store)?;
         // DR-0062 §4: a delegation edge granting a model endpoint read-authority
         // for a role is admissible only if the endpoint's derived custody class
         // clears what the signed envelope demands of that role. This is the one
@@ -2250,6 +2365,7 @@ impl GovernedHostRuntime {
             store_path,
             policy,
             envelope,
+            protection,
         })
     }
 
@@ -2549,6 +2665,7 @@ impl GovernedHostRuntime {
             store_path: self.store_path.clone(),
             instance_ref: instance_ref.into(),
             command_id: command_id.into(),
+            protection: self.protection.clone(),
         }
     }
 
@@ -3694,6 +3811,7 @@ impl GovernedHostRuntime {
             self.store_path.clone(),
             command.instance_ref.clone(),
             command.command_id.clone(),
+            self.protection.clone(),
         );
         let observed = || access.check().is_err() || probe.observed();
         let released = || access.refused.get() || probe.released();
@@ -6979,6 +7097,350 @@ workflow UnsafeHostChat {
                 .unwrap(),
             Some(original)
         );
+        assert_eq!(
+            reopened.pinned_position(&instance.instance_ref).unwrap(),
+            head
+        );
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn protected_host_runtime_preserves_original_turn_and_refuses_plain_recovery() {
+        use ring::{
+            aead,
+            rand::{SecureRandom, SystemRandom},
+        };
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use whipplescript_store::payload_protection::PayloadCodec;
+        struct Codec {
+            available: AtomicBool,
+            key_byte: u8,
+        }
+        impl Codec {
+            fn key(&self) -> Result<aead::LessSafeKey, StoreError> {
+                if !self.available.load(Ordering::Acquire) {
+                    return Err(StoreError::fault("fixture codec", "key unavailable"));
+                }
+                Ok(aead::LessSafeKey::new(
+                    aead::UnboundKey::new(&aead::AES_256_GCM, &[self.key_byte; 32]).unwrap(),
+                ))
+            }
+        }
+        impl PayloadCodec for Codec {
+            fn seal(&self, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, StoreError> {
+                let key = self.key()?;
+                let mut nonce = [0; 12];
+                SystemRandom::new().fill(&mut nonce).unwrap();
+                let mut body = plain.to_vec();
+                key.seal_in_place_append_tag(
+                    aead::Nonce::assume_unique_for_key(nonce),
+                    aead::Aad::from(aad),
+                    &mut body,
+                )
+                .map_err(|_| StoreError::fault("fixture codec", "seal failed"))?;
+                Ok([nonce.to_vec(), body].concat())
+            }
+            fn open(&self, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, StoreError> {
+                let key = self.key()?;
+                let nonce: [u8; 12] = sealed
+                    .get(..12)
+                    .and_then(|v| v.try_into().ok())
+                    .ok_or_else(|| StoreError::fault("fixture codec", "short envelope"))?;
+                let mut body = sealed[12..].to_vec();
+                let plain = key
+                    .open_in_place(
+                        aead::Nonce::assume_unique_for_key(nonce),
+                        aead::Aad::from(aad),
+                        &mut body,
+                    )
+                    .map_err(|_| StoreError::fault("fixture codec", "authentication failed"))?;
+                Ok(plain.to_vec())
+            }
+            fn retain(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), StoreError>,
+            ) -> Result<(), StoreError> {
+                self.key()?;
+                publish()
+            }
+        }
+        struct Root(bool);
+        impl crate::gov::GovernanceAttestationVerifier for Root {
+            fn verify(&self, _: &[u8], _: &crate::gov::ExternalAttestation) -> Result<(), String> {
+                if self.0 {
+                    Ok(())
+                } else {
+                    Err("synthetic denied root".into())
+                }
+            }
+        }
+        let mut policy: Value = serde_json::from_str(&signed_policy()).unwrap();
+        policy.as_object_mut().unwrap().remove("attestation");
+        let signed = SignedEnvelope::from_external_signature_v2(
+            &policy.to_string(),
+            "office-root",
+            "fixture",
+            "fixture-key",
+            "fixture-proof",
+            7,
+            "office",
+        )
+        .unwrap()
+        .to_json();
+        let codec = Arc::new(Codec {
+            available: AtomicBool::new(true),
+            key_byte: 7,
+        });
+        let protection = PayloadProtection::new("synthetic-office-chat", codec.clone()).unwrap();
+        let path = temp_store();
+        assert!(GovernedHostRuntime::create_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(false),
+            protection.clone()
+        )
+        .is_err());
+        assert!(!path.exists(), "denied policy created a database");
+        assert!(GovernedHostRuntime::open_existing_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            protection.clone()
+        )
+        .is_err());
+        assert!(
+            !path.exists(),
+            "existing-store reopen initialized a database"
+        );
+        let mut runtime = GovernedHostRuntime::create_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            protection.clone(),
+        )
+        .unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "protected-original-instance".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let mut command = turn(&instance.instance_ref, &open.policy, 1);
+        command.input.text = "synthetic private clinical prompt".into();
+        let start = runtime.pinned_position(&instance.instance_ref).unwrap();
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let execution = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &ScriptedDriver::new(vec![
+                    json!({"output_text":"synthetic private clinical answer"}),
+                ]),
+            )
+            .unwrap();
+        let cancelled_command = turn(&instance.instance_ref, &open.policy, 2);
+        let cancel_driver = CancellingDriver {
+            handle: runtime.cancellation_handle(
+                &cancelled_command.instance_ref,
+                &cancelled_command.command_id,
+            ),
+            fired: Cell::new(false),
+        };
+        let cancelled = runtime
+            .run_turn_with_driver(
+                &cancelled_command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &cancel_driver,
+            )
+            .unwrap();
+        assert_eq!(cancelled.receipt.unwrap().status, TurnStatus::Cancelled);
+        assert!(cancel_driver.fired.get());
+        let probe_command = turn(&instance.instance_ref, &open.policy, 3);
+        let clock = std::rc::Rc::new(Cell::new(Duration::ZERO));
+        let probe = StreamCancelProbe::on_clock(
+            path.clone(),
+            probe_command.instance_ref.clone(),
+            probe_command.command_id.clone(),
+            ProbeClock::Held(clock.clone()),
+            runtime.protection.clone(),
+        );
+        let probe_driver = ProbeAssertingDriver {
+            handle: runtime
+                .cancellation_handle(&probe_command.instance_ref, &probe_command.command_id),
+            probe: &probe,
+            clock,
+            checked: Cell::new(false),
+        };
+        let cancelled = runtime
+            .run_turn_with_driver(
+                &probe_command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &resources,
+                &probe_driver,
+            )
+            .unwrap();
+        assert!(probe_driver.checked.get());
+        assert_eq!(cancelled.receipt.unwrap().status, TurnStatus::Cancelled);
+        let unavailable_probe = StreamCancelProbe::new(
+            path.clone(),
+            command.instance_ref.clone(),
+            command.command_id.clone(),
+            Some(protection.clone()),
+        );
+        codec.available.store(false, Ordering::Release);
+        assert!(
+            unavailable_probe.observed(),
+            "unavailable key concealed protected cancellation standing"
+        );
+        codec.available.store(true, Ordering::Release);
+        assert!(
+            unavailable_probe.observed(),
+            "restored key revived a released protected stream"
+        );
+        drop(unavailable_probe);
+        let missing_probe_path = temp_store();
+        let missing_probe = StreamCancelProbe::new(
+            missing_probe_path.clone(),
+            command.instance_ref.clone(),
+            command.command_id.clone(),
+            Some(protection.clone()),
+        );
+        assert!(missing_probe.observed());
+        assert!(
+            !missing_probe_path.exists(),
+            "protected probe initialized a missing runtime"
+        );
+        let head = runtime.pinned_position(&instance.instance_ref).unwrap();
+        drop(runtime);
+        for suffix in ["", "-wal"] {
+            if let Ok(bytes) = fs::read(format!("{}{suffix}", path.display())) {
+                for marker in [
+                    "synthetic private clinical prompt",
+                    "synthetic private clinical answer",
+                ] {
+                    assert!(
+                        !bytes
+                            .windows(marker.len())
+                            .any(|part| part == marker.as_bytes()),
+                        "native storage retained plaintext {marker}"
+                    );
+                }
+            }
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(GovernedHostRuntime::open_with_verifier(&path, 7, &signed, &Root(true)).is_err());
+        assert!(RecordedHostRuntime::open_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            &resources
+        )
+        .is_err());
+        assert!(GovernedHostRuntime::create_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            protection.clone()
+        )
+        .is_err());
+        let foreign = PayloadProtection::new("foreign-office-chat", codec.clone()).unwrap();
+        assert!(RecordedHostRuntime::open_existing_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            &resources,
+            foreign
+        )
+        .is_err());
+        let wrong_key = PayloadProtection::new(
+            "synthetic-office-chat",
+            Arc::new(Codec {
+                available: AtomicBool::new(true),
+                key_byte: 8,
+            }),
+        )
+        .unwrap();
+        let wrong_reader = RecordedHostRuntime::open_existing_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            &resources,
+            wrong_key,
+        )
+        .unwrap();
+        assert!(
+            wrong_reader
+                .recorded_turn_execution(&command, &start, &resources)
+                .is_err(),
+            "matching domain admitted unauthenticated payloads from a wrong key"
+        );
+        drop(wrong_reader);
+        let reader = RecordedHostRuntime::open_existing_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            &resources,
+            protection.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .recorded_turn_execution(&command, &start, &resources)
+                .unwrap(),
+            Some(execution)
+        );
+        codec.available.store(false, Ordering::Release);
+        assert!(reader
+            .recorded_turn_execution(&command, &start, &resources)
+            .is_err());
+        codec.available.store(true, Ordering::Release);
+        resources.allowed.set(false);
+        assert!(reader
+            .recorded_turn_execution(&command, &start, &resources)
+            .is_err());
+        resources.allowed.set(true);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "original recovery changed database bytes"
+        );
+        drop(reader);
+        let reopened = GovernedHostRuntime::open_existing_protected_with_verifier(
+            &path,
+            7,
+            &signed,
+            &Root(true),
+            protection,
+        )
+        .unwrap();
         assert_eq!(
             reopened.pinned_position(&instance.instance_ref).unwrap(),
             head
@@ -12657,6 +13119,7 @@ workflow Method {
             command.instance_ref.clone(),
             command.command_id.clone(),
             ProbeClock::Held(clock.clone()),
+            runtime.protection.clone(),
         );
         let driver = ProbeAssertingDriver {
             handle: runtime.cancellation_handle(&command.instance_ref, &command.command_id),

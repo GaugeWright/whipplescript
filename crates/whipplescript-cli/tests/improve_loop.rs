@@ -1144,6 +1144,10 @@ rule begin
             "--json",
             "improve",
             "std.tokens",
+            // This fixture proves exact context/token adoption. Whole-second
+            // wall-clock samples can cross a boundary under fleet scheduling.
+            "--sacrifice",
+            "std.latency",
             "--program",
             &program_str,
             "--context-root",
