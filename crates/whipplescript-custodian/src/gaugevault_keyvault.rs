@@ -487,6 +487,62 @@ mod tests {
         )
     }
 
+    /// Run only through scripts/gaugevault-custodian-keyvault-live.py. Its
+    /// disposable vault contains synthetic material, and the operator's
+    /// short-lived Azure token arrives on stdin without entering test output.
+    #[test]
+    #[ignore = "requires disposable Azure Key Vault and operator token on stdin"]
+    fn live_exact_version_refusal_and_read() {
+        struct LiveToken(Zeroizing<String>, AtomicUsize);
+        impl VaultToken for LiveToken {
+            fn access_token(&self) -> Result<SecretMaterial, Error> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Ok(SecretMaterial::new(self.0.as_str().to_owned()))
+            }
+        }
+
+        let vault = VaultName::parse(&std::env::var("GV_LIVE_VAULT").unwrap()).unwrap();
+        let prefix = AccountPrefix::parse(&std::env::var("GV_LIVE_PREFIX").unwrap()).unwrap();
+        let other = AccountPrefix::parse(&std::env::var("GV_LIVE_OTHER_PREFIX").unwrap()).unwrap();
+        let name = StorageName::parse(&std::env::var("GV_LIVE_NAME").unwrap()).unwrap();
+        let reference =
+            VersionReference::parse(&vault, &name, &std::env::var("GV_LIVE_REFERENCE").unwrap())
+                .unwrap();
+        let expected_case = std::env::var("GV_LIVE_CASE").unwrap();
+
+        let mut bearer = Zeroizing::new(String::new());
+        std::io::stdin().read_to_string(&mut bearer).unwrap();
+        let token_length = bearer.trim_end_matches(['\r', '\n']).len();
+        bearer.truncate(token_length);
+        assert!(!bearer.is_empty(), "Azure bearer was absent");
+        let reader = FinalUseReader::new(vault, LiveToken(bearer, AtomicUsize::new(0)));
+
+        assert!(matches!(
+            reader.read_exact(&other, &name, &reference),
+            Err(Error::WrongAccount)
+        ));
+        assert_eq!(reader.token.1.load(Ordering::SeqCst), 0);
+        match expected_case.as_str() {
+            "enabled" => {
+                let material = reader.read_exact(&prefix, &name, &reference).unwrap();
+                assert!(
+                    material.expose() == "synthetic-gaugevault-custodian-proof",
+                    "synthetic material differed"
+                );
+            }
+            "disabled" => match reader.read_exact(&prefix, &name, &reference) {
+                Err(Error::DisabledVersion) => println!("CUSTODIAN_DISABLED_METADATA_REFUSAL"),
+                Err(Error::HttpStatus(status)) if (400..500).contains(&status) && status != 401 => {
+                    println!("CUSTODIAN_DISABLED_HTTP_STATUS_{status}");
+                }
+                Err(other) => panic!("unexpected disabled read error: {other:?}"),
+                Ok(_) => panic!("disabled version returned material"),
+            },
+            _ => panic!("unknown live proof case"),
+        }
+        assert_eq!(reader.token.1.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn reads_only_the_bound_exact_enabled_version() {
         let reference = VersionReference::parse(
