@@ -1871,6 +1871,56 @@ rule finish
             .provider_bindings
             .as_ref()
             .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(witness
+            .resource_fields
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
+    }
+
+    #[test]
+    fn hosted_worker_persists_checked_resource_fields() {
+        use crate::do_store::{as_text, SqlValue};
+        use whipplescript_store::program_imports::{
+            ProgramResourceField, ProgramResourceFieldMeaning,
+        };
+
+        let sql = store().sql;
+        let instance = DurableInstance::create(
+            sql.clone(),
+            include_str!("../../../examples/file-store-demo.whip"),
+            "{}",
+            "local/FileStoreDemo",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some("d".repeat(64)),
+                ..test_ports()
+            },
+            &[],
+            &[],
+        )
+        .expect("hosted file store source admits");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let version_id = &kernel.store().list_instances().unwrap()[0].version_id;
+        let rows = sql
+            .query(
+                "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+                &[SqlValue::Text(version_id.clone())],
+            )
+            .unwrap();
+        let witness = kernel
+            .store()
+            .program_import_witness(version_id, &as_text(&rows[0][0]))
+            .unwrap()
+            .unwrap();
+        let fields = witness
+            .resource_fields
+            .expect("resource fields inventoried");
+        assert_eq!(fields.examined.len(), 3);
+        assert!(fields.examined.iter().any(|use_site| {
+            use_site.owner == "notes_store"
+                && use_site.field == ProgramResourceField::FileStoreRoot
+                && use_site.meaning == ProgramResourceFieldMeaning::LocalRootPath
+                && use_site.values == ["./.whipplescript/filestore-demo"]
+        }));
     }
 
     #[test]

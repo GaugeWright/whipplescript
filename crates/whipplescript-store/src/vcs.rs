@@ -38,7 +38,7 @@ pub use flowing_selection::{
     FlowingBranchLineage, FlowingBranchLineageOutcome, FlowingBranchPrefix,
     FlowingEffectDisposition, FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom,
     FlowingTargetEffect, FlowingTargetEffects, FlowingTargetEffectsOutcome, NativeCandidate,
-    NativeCandidateOutcome,
+    NativeCandidateOutcome, VerifiedNativeCandidate,
 };
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 

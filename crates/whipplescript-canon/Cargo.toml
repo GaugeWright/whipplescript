@@ -9,7 +9,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-store = { version = "0.8.0", path = "../whipplescript-store", default-features = false }
+whipplescript-store = { version = "0.9.0", path = "../whipplescript-store", default-features = false }
 sha2 = "0.11"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
@@ -19,4 +19,4 @@ tree-sitter-typescript = "0.23"
 workspace = true
 
 [dev-dependencies]
-whipplescript-store = { version = "0.8.0", path = "../whipplescript-store" }
+whipplescript-store = { version = "0.9.0", path = "../whipplescript-store" }

@@ -88,6 +88,7 @@ pub mod source_review;
 pub mod source_review_git;
 #[cfg(feature = "native")]
 pub mod source_review_native;
+pub mod source_review_types;
 pub mod stat_cache;
 pub mod text_merge;
 pub mod transfer;

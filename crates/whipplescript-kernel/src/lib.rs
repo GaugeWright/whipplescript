@@ -76,6 +76,7 @@ pub mod provider;
 pub mod provider_coverage;
 pub mod provider_trust;
 pub mod resolution_recording;
+pub mod resource_coverage;
 pub mod result_contract;
 pub mod rule_correspondence;
 pub mod rule_lowering;

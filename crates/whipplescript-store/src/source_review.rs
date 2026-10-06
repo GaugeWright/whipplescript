@@ -102,6 +102,16 @@ pub struct ReviewStore {
 }
 
 impl ReviewStore {
+    /// Open only an existing review authority. No directories, schema,
+    /// revisions or migrations are created; SQLite rejects every write.
+    pub fn open_read_only(path: impl AsRef<Path>) -> ReviewResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
+        Ok(Self { connection })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> ReviewResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {

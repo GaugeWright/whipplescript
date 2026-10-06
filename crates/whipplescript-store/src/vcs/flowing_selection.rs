@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::branches::flowing_admission::{
     FlowingAdmissions, FlowingSelectedUnit, RetainFlowingAttemptOutcome,
 };
-#[cfg(feature = "native")]
 use crate::branches::flowing_admission::{FlowingCandidateWitness, FlowingUnitOutcome};
 use crate::branches::flowing_sources::{
     BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
@@ -19,12 +18,13 @@ use crate::branches::flowing_sources::{
 use crate::branches::{BranchStatus, Branches, CutRecord, CutRow};
 use crate::content::ContentBlobs;
 use crate::selection::{self, SelAtom, SelExpr};
-#[cfg(feature = "native")]
-use crate::source_review_native::NativeRevision;
+use crate::source_review_types::NativeRevision;
 
-#[cfg(feature = "native")]
 mod named_branch_candidate;
+mod native_candidate_recording;
+mod native_candidate_validation;
 use crate::{StoreError, StoreResult};
+pub use native_candidate_validation::VerifiedNativeCandidate;
 
 use super::{RawManifest, WorkspaceVcs};
 
@@ -238,7 +238,7 @@ pub enum FlowingBatchSourceOrderOutcome {
     MissingContent { content_id: String },
 }
 
-/// A content-derived, complete direct-twig prefix at an unchanged trunk base.
+/// A content-derived, complete source prefix at an unchanged trunk base.
 /// The recorded cut is a GC root, but this is preparation, not a gate verdict
 /// or permission to advance the trunk ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -757,7 +757,6 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// branch point. This refuses selective skips and a moved trunk. When
     /// units write the same path, their ordered source atoms must reproduce
     /// the selected manifest before any per-unit outcome is recorded.
-    #[cfg(feature = "native")]
     pub fn prepare_native_review_candidate(
         &mut self,
         revision: &NativeRevision,
@@ -769,8 +768,32 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
     where
         B: FlowingAdmissions,
     {
+        if actor.trim().is_empty() {
+            return Ok(NativeCandidateOutcome::CandidateMismatch);
+        }
+        match self.derive_native_review_candidate(
+            revision,
+            expected_trunk_cut_id,
+            candidate_cut_id,
+        )? {
+            NativeCandidateOutcome::Prepared(candidate) => {
+                self.record_derived_native_candidate(revision, candidate, actor, recorded_at)
+            }
+            refused => Ok(refused),
+        }
+    }
+
+    fn derive_native_review_candidate(
+        &self,
+        revision: &NativeRevision,
+        expected_trunk_cut_id: Option<&str>,
+        candidate_cut_id: &str,
+    ) -> StoreResult<NativeCandidateOutcome>
+    where
+        B: FlowingAdmissions,
+    {
         use NativeCandidateOutcome as R;
-        if candidate_cut_id.trim().is_empty() || actor.trim().is_empty() {
+        if candidate_cut_id.trim().is_empty() {
             return Ok(R::CandidateMismatch);
         }
         let Some(source) = self.branches.get_branch(&revision.source_branch_id)? else {
@@ -1126,47 +1149,8 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             self.load_manifest(Some(&selected_cut.manifest_hash))?
                 .is_empty()
         };
-        if no_op {
-            if expected_trunk_cut_id != Some(candidate_cut_id) {
-                return Ok(R::CandidateMismatch);
-            }
-        } else {
-            let origin = format!("transport:{}", revision.source_branch_id);
-            let matches = |cut: &CutRow| {
-                cut.branch_id == crate::branches::MAINLINE_BRANCH_ID
-                    && cut.parent_cut_id.as_deref() == expected_trunk_cut_id
-                    && cut.manifest_hash == selected_cut.manifest_hash
-                    && cut.change_id == candidate_cut_id
-                    && cut.origin.as_deref() == Some(origin.as_str())
-                    && cut.actor.as_deref() == Some(actor)
-                    && cut.intent.as_deref() == Some(revision.contribution_id.as_str())
-                    && cut.recorded_at == recorded_at
-            };
-            if let Some(existing) = self.branches.get_cut(candidate_cut_id)? {
-                if !matches(&existing) {
-                    return Ok(R::CandidateMismatch);
-                }
-            } else {
-                self.branches.record_cut(CutRecord {
-                    cut_id: candidate_cut_id,
-                    change_id: candidate_cut_id,
-                    branch_id: crate::branches::MAINLINE_BRANCH_ID,
-                    manifest_hash: &selected_cut.manifest_hash,
-                    parent_cut_id: expected_trunk_cut_id,
-                    origin: Some(&origin),
-                    actor: Some(actor),
-                    intent: Some(&revision.contribution_id),
-                    recorded_at,
-                })?;
-            }
-            if !self
-                .branches
-                .get_cut(candidate_cut_id)?
-                .as_ref()
-                .is_some_and(matches)
-            {
-                return Ok(R::CandidateMismatch);
-            }
+        if no_op != (expected_trunk_cut_id == Some(candidate_cut_id)) {
+            return Ok(R::CandidateMismatch);
         }
         let witness = serde_json::to_vec(&(
             "native-closed-prefix-v1",
@@ -1192,8 +1176,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             source_atoms_digest: source_atoms_digest.clone(),
             units: outcomes.clone(),
         };
-        let candidate_witness_digest =
-            self.branches.record_candidate_witness(&candidate_witness)?;
+        let candidate_witness_digest = candidate_witness.digest()?;
         Ok(R::Prepared(NativeCandidate {
             contribution_id: revision.contribution_id.clone(),
             revision_sequence: revision.sequence,
@@ -2864,6 +2847,205 @@ mod tests {
             candidate_cut_id,
             actor: "coordinator",
             recorded_at,
+        }
+    }
+
+    #[test]
+    fn retained_native_candidate_verification_reuses_closure_content_and_revision() {
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let NativeCandidateOutcome::Prepared(candidate) = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .unwrap()
+        else {
+            panic!("candidate")
+        };
+        let digest = &candidate.candidate_witness_digest;
+        vcs.retain_review_attempt("verify-attempt", digest, "t8")
+            .unwrap();
+        let before = vcs.branches.test_connection().total_changes();
+        let review_before = reviews.connection.total_changes();
+        let verified = reviews
+            .verify_retained_native_candidate(&vcs, digest, "verify-attempt")
+            .unwrap();
+        assert_eq!(verified.subject().witness().digest().unwrap(), *digest);
+        assert_eq!(vcs.branches.test_connection().total_changes(), before);
+        assert_eq!(reviews.connection.total_changes(), review_before);
+        assert!(vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+
+        vcs.write("twig", "later.txt", Some("tail"), "twig-tail", "t9")
+            .unwrap();
+        assert_eq!(
+            reviews
+                .verify_retained_native_candidate(&vcs, digest, "verify-attempt")
+                .unwrap(),
+            verified
+        );
+        for (field, wrong, original) in [
+            ("source_kind", "git", "native"),
+            ("target_ref", "another-target", MAINLINE_BRANCH_ID),
+        ] {
+            reviews
+                .connection
+                .execute(
+                    &format!("UPDATE contributions SET {field}=?1 WHERE id='review-a'"),
+                    [wrong],
+                )
+                .unwrap();
+            assert!(matches!(
+                reviews.verify_retained_native_candidate(&vcs, digest, "verify-attempt"),
+                Err(crate::source_review::ReviewError::Invalid(_))
+            ));
+            reviews
+                .connection
+                .execute(
+                    &format!("UPDATE contributions SET {field}=?1 WHERE id='review-a'"),
+                    [original],
+                )
+                .unwrap();
+        }
+        reviews
+            .create_native_contribution("predecessor", "s:author", "prior", MAINLINE_BRANCH_ID, &[])
+            .unwrap();
+        reviews
+            .connection
+            .execute(
+                "INSERT INTO predecessors VALUES ('review-a', 'predecessor')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            reviews.verify_retained_native_candidate(&vcs, digest, "verify-attempt"),
+            Err(crate::source_review::ReviewError::Invalid(_))
+        ));
+        reviews
+            .connection
+            .execute(
+                "DELETE FROM predecessors WHERE contribution_id='review-a'",
+                [],
+            )
+            .unwrap();
+        let revision = reviews.native_revision("review-a", 1).unwrap();
+        let mut changed_upload = revision.clone();
+        changed_upload.upload_id = "substituted-upload".into();
+        let error = vcs
+            .verify_retained_native_candidate(&changed_upload, digest, "verify-attempt")
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("differs from current source derivation"));
+        let mut changed_actor = revision.clone();
+        changed_actor.actor = "substituted-author".into();
+        assert!(vcs
+            .verify_retained_native_candidate(&changed_actor, digest, "verify-attempt")
+            .is_err());
+        let mut omitted = revision.clone();
+        omitted.units.remove(0);
+        assert!(format!(
+            "{:?}",
+            vcs.verify_retained_native_candidate(&omitted, digest, "verify-attempt")
+                .unwrap_err()
+        )
+        .contains("IncompletePrefix"));
+
+        let mut altered = verified.subject().witness().clone();
+        altered.units[0].outcome = FlowingUnitOutcome::Neutralized;
+        let altered_digest = vcs.branches.record_candidate_witness(&altered).unwrap();
+        vcs.retain_review_attempt("altered-attempt", &altered_digest, "t10")
+            .unwrap();
+        assert!(vcs
+            .verify_retained_native_candidate(&revision, &altered_digest, "altered-attempt")
+            .is_err());
+    }
+
+    #[test]
+    fn retained_native_candidate_verification_refuses_missing_content_and_late_source_change() {
+        struct NativeCandidateReadFault {
+            inner: ContentStore,
+            absent: Option<String>,
+            change: Option<rusqlite::Connection>,
+            changed: std::cell::Cell<bool>,
+        }
+        impl ContentBlobs for NativeCandidateReadFault {
+            fn put(&self, _: &[u8]) -> StoreResult<String> {
+                panic!("verification must not write content")
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
+                if let Some(connection) = &self.change {
+                    if !self.changed.replace(true) {
+                        connection.execute("UPDATE flowing_contributions SET scope_digest = 'changed' WHERE unit_id = 'unit-a'", []).unwrap();
+                    }
+                }
+                if self.absent.as_deref() == Some(id) {
+                    Ok(None)
+                } else {
+                    self.inner.get(id)
+                }
+            }
+        }
+        for change_source in [false, true] {
+            let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+            upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+            let NativeCandidateOutcome::Prepared(candidate) = reviews
+                .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+                .unwrap()
+            else {
+                panic!("candidate")
+            };
+            vcs.retain_review_attempt("verify-attempt", &candidate.candidate_witness_digest, "t8")
+                .unwrap();
+            let missing = vcs.manifest("twig").unwrap().unwrap()["a.txt"].clone();
+            let dir = crate::scratch::path("retained-candidate-reader");
+            std::fs::create_dir_all(&dir).unwrap();
+            let branch_path = dir.join("branches.sqlite");
+            let review_path = dir.join("reviews.sqlite");
+            vcs.branches
+                .test_connection()
+                .execute("VACUUM INTO ?1", [branch_path.to_str().unwrap()])
+                .unwrap();
+            reviews
+                .connection
+                .execute("VACUUM INTO ?1", [review_path.to_str().unwrap()])
+                .unwrap();
+            let branches = BranchStore::open_read_only(&branch_path).unwrap();
+            let review_reader = ReviewStore::open_read_only(&review_path).unwrap();
+            let blobs = NativeCandidateReadFault {
+                inner: vcs.content,
+                absent: (!change_source).then_some(missing),
+                change: change_source.then(|| rusqlite::Connection::open(&branch_path).unwrap()),
+                changed: std::cell::Cell::new(false),
+            };
+            let observer = WorkspaceVcs::from_parts(branches, blobs);
+            let error = review_reader
+                .verify_retained_native_candidate(
+                    &observer,
+                    &candidate.candidate_witness_digest,
+                    "verify-attempt",
+                )
+                .unwrap_err();
+            let error = format!("{error:?}");
+            assert!(
+                error.contains(if change_source {
+                    "premises changed during source derivation"
+                } else {
+                    "MissingContent"
+                }),
+                "{error}"
+            );
+            assert!(observer
+                .branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .is_none());
+            drop(observer);
+            drop(review_reader);
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 

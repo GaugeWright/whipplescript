@@ -114,6 +114,7 @@ pub fn capture(
         declarations: None,
         package_calls: Some(crate::construct_coverage::capture_package_calls(program)?),
         provider_bindings: Some(crate::provider_coverage::capture(program)?),
+        resource_fields: Some(crate::resource_coverage::capture(program)?),
     })
 }
 
@@ -301,6 +302,10 @@ mod tests {
             .provider_bindings
             .as_ref()
             .is_some_and(|capture| capture.examined.is_empty()));
+        assert!(stored
+            .resource_fields
+            .as_ref()
+            .is_some_and(|capture| capture.examined.is_empty()));
         assert!(kernel
             .store()
             .get_program_version(&admitted.version_id)
@@ -318,6 +323,56 @@ mod tests {
             Err(whipplescript_store::StoreError::Conflict(message))
                 if message.contains("unresolved local package import")
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn checked_native_admission_persists_and_revalidates_resource_fields() {
+        use whipplescript_store::program_imports::ProgramResourceField;
+
+        let source = include_str!("../../../examples/file-store-demo.whip");
+        let ir = program(source);
+        let source_digest = sha256_hex(source.as_bytes());
+        let basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: B,
+            packages: &[],
+        };
+        let mut kernel = crate::RuntimeKernel::new(
+            whipplescript_store::SqliteStore::open_in_memory().expect("store"),
+        );
+        let admitted = kernel
+            .create_program_version_for_compiled_program_with_imports(
+                crate::CompiledProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &crate::stable_hash_hex(source),
+                    compiler_version: "test",
+                },
+                &ir,
+                None,
+                &basis,
+                None,
+            )
+            .expect("checked admission");
+        let stored = kernel
+            .store()
+            .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.resource_fields.as_ref().unwrap().examined.len(), 3);
+        assert!(stored
+            .resource_fields
+            .as_ref()
+            .unwrap()
+            .examined
+            .iter()
+            .any(|use_site| use_site.field == ProgramResourceField::FileStoreRoot));
+        assert!(current_basis(&stored, &ir, &basis));
+        let mut changed = ir;
+        changed.file_stores[0].root = "./different-root".into();
+        assert!(!current_basis(&stored, &changed, &basis));
     }
 
     #[test]

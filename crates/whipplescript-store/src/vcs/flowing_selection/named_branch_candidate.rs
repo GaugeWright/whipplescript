@@ -20,11 +20,31 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         actor: &str,
         recorded_at: &str,
     ) -> StoreResult<NativeCandidateOutcome> {
+        if actor.trim().is_empty() {
+            return Ok(NativeCandidateOutcome::CandidateMismatch);
+        }
+        match self.derive_named_branch_candidate(
+            revision,
+            expected_trunk_cut_id,
+            candidate_cut_id,
+        )? {
+            NativeCandidateOutcome::Prepared(candidate) => {
+                self.record_derived_native_candidate(revision, candidate, actor, recorded_at)
+            }
+            refused => Ok(refused),
+        }
+    }
+
+    pub(super) fn derive_named_branch_candidate(
+        &self,
+        revision: &NativeRevision,
+        expected_trunk_cut_id: Option<&str>,
+        candidate_cut_id: &str,
+    ) -> StoreResult<NativeCandidateOutcome> {
         use NativeCandidateOutcome as R;
         if revision.contribution_id.trim().is_empty()
             || revision.units.is_empty()
             || candidate_cut_id.trim().is_empty()
-            || actor.trim().is_empty()
         {
             return Ok(R::CandidateMismatch);
         }
@@ -257,47 +277,8 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         } else {
             selected_manifest.is_empty()
         };
-        if no_op {
-            if expected_trunk_cut_id != Some(candidate_cut_id) {
-                return Ok(R::CandidateMismatch);
-            }
-        } else {
-            let origin = format!("transport:{}", revision.source_branch_id);
-            let matches = |cut: &CutRow| {
-                cut.branch_id == crate::branches::MAINLINE_BRANCH_ID
-                    && cut.parent_cut_id.as_deref() == expected_trunk_cut_id
-                    && cut.manifest_hash == prefix.selected_manifest_hash()
-                    && cut.change_id == candidate_cut_id
-                    && cut.origin.as_deref() == Some(origin.as_str())
-                    && cut.actor.as_deref() == Some(actor)
-                    && cut.intent.as_deref() == Some(revision.contribution_id.as_str())
-                    && cut.recorded_at == recorded_at
-            };
-            if let Some(existing) = self.branches.get_cut(candidate_cut_id)? {
-                if !matches(&existing) {
-                    return Ok(R::CandidateMismatch);
-                }
-            } else {
-                self.branches.record_cut(CutRecord {
-                    cut_id: candidate_cut_id,
-                    change_id: candidate_cut_id,
-                    branch_id: crate::branches::MAINLINE_BRANCH_ID,
-                    manifest_hash: prefix.selected_manifest_hash(),
-                    parent_cut_id: expected_trunk_cut_id,
-                    origin: Some(&origin),
-                    actor: Some(actor),
-                    intent: Some(&revision.contribution_id),
-                    recorded_at,
-                })?;
-            }
-            if !self
-                .branches
-                .get_cut(candidate_cut_id)?
-                .as_ref()
-                .is_some_and(matches)
-            {
-                return Ok(R::CandidateMismatch);
-            }
+        if no_op != (expected_trunk_cut_id == Some(candidate_cut_id)) {
+            return Ok(R::CandidateMismatch);
         }
         let witness = serde_json::to_vec(&(
             "native-named-branch-prefix-v1",
@@ -324,8 +305,7 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
             source_atoms_digest: source_atoms_digest.clone(),
             units: outcomes.clone(),
         };
-        let candidate_witness_digest =
-            self.branches.record_candidate_witness(&candidate_witness)?;
+        let candidate_witness_digest = candidate_witness.digest()?;
         Ok(R::Prepared(NativeCandidate {
             contribution_id: revision.contribution_id.clone(),
             revision_sequence: revision.sequence,
@@ -340,6 +320,7 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
     }
 }
 
+#[cfg(feature = "native")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +711,58 @@ mod tests {
                 unit_id: "unit-b".into()
             }
         );
+    }
+
+    #[test]
+    fn retained_named_candidate_verification_keeps_handoff_and_tail_exact() {
+        let (mut vcs, revision) = handed_branch(None);
+        let NativeCandidateOutcome::Prepared(candidate) = vcs
+            .prepare_named_branch_candidate(&revision, None, "candidate-a", "mediator", "t7")
+            .unwrap()
+        else {
+            panic!("candidate")
+        };
+        assert_eq!(
+            vcs.branches
+                .release_private_cut(ReleasePrivateCut {
+                    pin_id: "pin-a",
+                    released_by: "mediator",
+                    reason: "handed",
+                    released_at: "t8",
+                })
+                .unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        vcs.retain_review_attempt("verify-attempt", &candidate.candidate_witness_digest, "t9")
+            .unwrap();
+        let before = vcs.branches.test_connection().total_changes();
+        let verified = vcs
+            .verify_retained_native_candidate(
+                &revision,
+                &candidate.candidate_witness_digest,
+                "verify-attempt",
+            )
+            .unwrap();
+        assert_eq!(vcs.branches.test_connection().total_changes(), before);
+        append_handed_tail(&mut vcs);
+        assert_eq!(
+            vcs.verify_retained_native_candidate(
+                &revision,
+                &candidate.candidate_witness_digest,
+                "verify-attempt"
+            )
+            .unwrap(),
+            verified
+        );
+        let mut changed = revision.clone();
+        changed.units[0].intent = "substituted intent".into();
+        assert!(vcs
+            .verify_retained_native_candidate(
+                &changed,
+                &candidate.candidate_witness_digest,
+                "verify-attempt"
+            )
+            .is_err());
     }
 
     #[test]

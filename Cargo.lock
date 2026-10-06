@@ -4629,7 +4629,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whipplescript"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "htmd",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-canon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sha2 0.11.0",
  "tree-sitter",
@@ -4673,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4682,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custodian"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "cryptoki",
@@ -4699,7 +4699,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-host-do"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "hex",
  "p256",
@@ -4728,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bashkit",
  "chrono",
@@ -4758,7 +4758,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4769,7 +4769,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-claude"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -4777,7 +4777,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-codex"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -4785,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-remote-execution"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4817,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -4831,7 +4831,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-test-executor"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "futures",

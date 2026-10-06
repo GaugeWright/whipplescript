@@ -1212,6 +1212,225 @@ mod tests {
     }
 
     #[test]
+    fn hosted_retained_candidate_verification_reuses_real_content_and_complete_prefix() {
+        use whipplescript_store::branches::flowing_sources::{
+            DeclareContribution, FlowingSources, PinPrivateCut, ReleasePrivateCut,
+            ReleasePrivateCutOutcome,
+        };
+        use whipplescript_store::source_review_types::{NativeRevision, NativeUnitRef};
+        use whipplescript_store::vcs::{
+            native_dependency_basis_digest, native_read_basis_digest, FlowingSelectionOutcome,
+            FlowingTargetEffectsOutcome, NativeCandidateOutcome,
+        };
+        for named in [false, true] {
+            for no_op in [false, true] {
+                let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+                let mut vcs = crate::do_branches::compose_vcs_shared(&sql).unwrap();
+                let mut refs = DoBranches::observe(sql.clone());
+                vcs.init("t0").unwrap();
+                vcs.write(MAINLINE_BRANCH_ID, "base.txt", Some("base"), "base", "t1")
+                    .unwrap();
+                let base = refs.get_cut("base").unwrap().unwrap();
+                if named {
+                    vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t2")
+                        .unwrap();
+                    refs.open_flowing_source(&OpenFlowingSource {
+                        source_branch_id: "branch".into(),
+                        incarnation_id: "branch-inc".into(),
+                        kind: FlowingSourceKind::Branch,
+                        owner: "coordinator".into(),
+                        opened_at: "t2".into(),
+                    })
+                    .unwrap();
+                }
+                vcs.create_branch(
+                    "twig",
+                    None,
+                    if named { "branch" } else { MAINLINE_BRANCH_ID },
+                    "t2",
+                )
+                .unwrap();
+                refs.open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "twig-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t2".into(),
+                })
+                .unwrap();
+                vcs.write("twig", "a.txt", Some("A"), "source-a", "t3")
+                    .unwrap();
+                if no_op {
+                    vcs.write("twig", "a.txt", None, "source-undo", "t4")
+                        .unwrap();
+                }
+                let source = refs.get_branch("twig").unwrap().unwrap();
+                let source_id = source.head_cut_id.as_deref().unwrap();
+                let source_manifest = source.head_manifest_hash.as_deref().unwrap();
+                refs.pin_private_cut(PinPrivateCut {
+                    pin_id: "pin",
+                    twig_branch_id: "twig",
+                    cut_id: source_id,
+                    manifest_hash: source_manifest,
+                    principal: "author",
+                    retained_at: "t5",
+                })
+                .unwrap();
+                refs.declare_contribution(DeclareContribution {
+                    unit_id: "unit",
+                    pin_id: "pin",
+                    principal: "author",
+                    intent: "change",
+                    read_basis_digest: &native_read_basis_digest(
+                        Some("base"),
+                        Some(&base.manifest_hash),
+                    ),
+                    dependency_basis_digest: &native_dependency_basis_digest(&[]),
+                    scope_digest: "scope",
+                    declared_at: "t5",
+                })
+                .unwrap();
+                let FlowingSelectionOutcome::Selected(selected) = vcs
+                    .select_private_changes(
+                        "pin",
+                        &whipplescript_store::selection::parse("path(a.txt)").unwrap(),
+                    )
+                    .unwrap()
+                else {
+                    panic!("source atoms")
+                };
+                vcs.bind_private_selection("unit", &selected, "t6").unwrap();
+                if named {
+                    let target_id = "target";
+                    let FlowingTargetEffectsOutcome::Verified(target) = vcs
+                        .prepare_private_handoff_target("unit", target_id, "coordinator", "t7")
+                        .unwrap()
+                    else {
+                        panic!("actual target content")
+                    };
+                    vcs.handoff_private_selection("handoff", &target, "coordinator", "t8")
+                        .unwrap();
+                    assert_eq!(
+                        refs.release_private_cut(ReleasePrivateCut {
+                            pin_id: "pin",
+                            released_by: "coordinator",
+                            reason: "handed",
+                            released_at: "t9",
+                        })
+                        .unwrap(),
+                        ReleasePrivateCutOutcome::Released
+                    );
+                }
+                let source_branch = if named { "branch" } else { "twig" };
+                let current = refs.get_branch(source_branch).unwrap().unwrap();
+                let basis = refs.contribution_basis("unit").unwrap().unwrap();
+                let revision = NativeRevision {
+                    contribution_id: "review".into(),
+                    sequence: 1,
+                    upload_id: "upload".into(),
+                    actor: "author".into(),
+                    source_branch_id: source_branch.into(),
+                    source_incarnation_id: if named { "branch-inc" } else { "twig-inc" }.into(),
+                    source_cut_id: current.head_cut_id.unwrap(),
+                    source_manifest_hash: current.head_manifest_hash.unwrap(),
+                    units: vec![NativeUnitRef {
+                        unit_id: "unit".into(),
+                        source_cut_id: source_id.into(),
+                        pin_id: "pin".into(),
+                        basis_digest: basis.basis_digest,
+                        principal: "author".into(),
+                        intent: "change".into(),
+                    }],
+                };
+                let candidate_id = if no_op { "base" } else { "candidate" };
+                let prepared = if named {
+                    vcs.prepare_named_branch_candidate(
+                        &revision,
+                        Some("base"),
+                        candidate_id,
+                        "coordinator",
+                        "t10",
+                    )
+                } else {
+                    vcs.prepare_native_review_candidate(
+                        &revision,
+                        Some("base"),
+                        candidate_id,
+                        "coordinator",
+                        "t10",
+                    )
+                }
+                .unwrap();
+                let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+                    panic!("{prepared:?}")
+                };
+                vcs.retain_review_attempt(
+                    "verify-attempt",
+                    &candidate.candidate_witness_digest,
+                    "t11",
+                )
+                .unwrap();
+                let before = sql.query("SELECT total_changes()", &[]).unwrap();
+                let observer = crate::do_branches::observe_vcs(&sql);
+                let verified = observer
+                    .verify_retained_native_candidate(
+                        &revision,
+                        &candidate.candidate_witness_digest,
+                        "verify-attempt",
+                    )
+                    .unwrap();
+                assert_eq!(
+                    verified.subject().witness().units[0].outcome,
+                    if no_op {
+                        FlowingUnitOutcome::Neutralized
+                    } else {
+                        FlowingUnitOutcome::Applied
+                    }
+                );
+                assert_eq!(sql.query("SELECT total_changes()", &[]).unwrap(), before);
+                assert_eq!(
+                    refs.get_branch(MAINLINE_BRANCH_ID)
+                        .unwrap()
+                        .unwrap()
+                        .head_cut_id
+                        .as_deref(),
+                    Some("base")
+                );
+                let mut substituted = revision.clone();
+                substituted.upload_id = "another-upload".into();
+                assert!(observer
+                    .verify_retained_native_candidate(
+                        &substituted,
+                        &candidate.candidate_witness_digest,
+                        "verify-attempt"
+                    )
+                    .is_err());
+                if !no_op {
+                    let mismatch = if named {
+                        vcs.prepare_named_branch_candidate(
+                            &revision,
+                            Some("base"),
+                            "base",
+                            "coordinator",
+                            "t10",
+                        )
+                    } else {
+                        vcs.prepare_native_review_candidate(
+                            &revision,
+                            Some("base"),
+                            "base",
+                            "coordinator",
+                            "t10",
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(mismatch, NativeCandidateOutcome::CandidateMismatch);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hosted_source_subject_reads_current_lineage_and_holder_evidence() {
         let (sql, mut store) = fixture();
         named_origin(&sql, &mut store);

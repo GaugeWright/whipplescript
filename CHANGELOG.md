@@ -19,6 +19,52 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-05
+
+A minor release, because a tracker store this version enrolls cannot be
+written by an older `whip`, and four published crates changed public types
+that a dependent can match on, construct or call:
+
+- **Stored data.** Once a tracker store publishes discovery files (below), it
+  carries triggers that refuse any writer that does not take the publication
+  lock, and `whip` 0.8.0 and earlier do not. Their reads still work, but every
+  write fails with `no such function: whip_tracker_discovery_writer_v1`.
+  Upgrade every `whip` that shares a tracker store before using this one on it.
+- `whipplescript-store`: `NormReferenceInventory`, `NormReferenceField`,
+  `NormCharter`, `RunView`, `ProgramImportAdmissionRecord` and
+  `ProgramImportWitness` gained fields; `Unready` gained `Initiative`, which
+  moves its later variants' discriminants; `FlowingTargetEffectsOutcome` gained
+  `InitialNoopNeedsGenesis`.
+- `whipplescript-parser`: `IrProgram` and `Effect` gained fields;
+  `IrEffectKind` and `BodyEffectKind` gained `TrackerMembership` and
+  `TrackerInspect`, which moves their later variants' discriminants;
+  `BodyEffectKind::TrackerFile` and `TrackerFinish` gained `initiative`;
+  `Resource` gained `Pair`.
+- `whipplescript-kernel`: `ShellOutput`, `ShellRequest`, `ResourceRef`,
+  `ReadActionResult`, `ReconcileEffectCommand`, `BrokeredTurnInput`,
+  `CheckedImportBasis`, `AssembledContext`, `ModelRequestProvenance` and
+  `Planned` gained fields; `ResolvedPackage` gained private fields and can no
+  longer be built with a literal; `InstructionAuthority` gained `AgentAuthor`,
+  which moves and renumbers its later variants; `ChatMessage` gained
+  `Developer`; `TransportError` and `HarnessModelError` gained
+  `RetryBudgetExhausted`; and
+  `RuntimeKernel::create_program_version_for_compiled_program_with_imports`
+  takes a fifth parameter.
+- `whipplescript`: `HostedRuntimeContextRequest` gained `notices`;
+  `HostRuntimeError` gained `HomeJournal`; `NativeWorkspaceResolver` is no
+  longer `UnwindSafe` or `RefUnwindSafe`; and `workspace_grep::GrepMatcher`,
+  `grep_file_into` and `cap_grep_line` are gone, replaced by the shared
+  workspace helpers.
+
+Code that matches those enums without a wildcard arm, builds those structs with
+a literal, calls that method, compares or casts those enums by position, or
+uses the removed grep items must follow the change. The command line and
+configuration stay compatible.
+
+- A tracker store can publish its current records into each enrolled
+  checkout's `tracker/` directory as searchable HJSON, with a startup
+  `context.hjson`, refreshed under one lock with every write (WS-571).
+
 - Native workspace embeddings can retain exact prepared file bytes through an
   explicit callback before write, edit and virtual bash effects. Refusal prevents
   the file changes; retained preparation still requires a successful saved owner
@@ -81,7 +127,7 @@ next free number rather than a patch — it says so.
   as a rename the embedding host admits through `with_root_rename_admission`.
   This breaks construction of `ResourceRef`, `ShellRequest` and `ShellOutput`:
   a dependent that builds one adds `presented_as: None`, `presented_roots:
-  Vec::new()` or reads `renames`. The next release is therefore 0.9.0.
+  Vec::new()` or reads `renames`.
 - The native host no longer refuses a `bash` command because an unchanged file
   it left behind is read-only; only changed, added and removed paths are
   checked for write access.

@@ -6,6 +6,8 @@
 //! re-attestation records an unwitnessed operation. Other accepting paths
 //! still need coverage before this population can describe a Home.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
@@ -52,6 +54,110 @@ pub struct ProgramImportWitness {
     /// identities or live update edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_bindings: Option<ProgramProviderBindingCapture>,
+    /// `None` leaves the compiler's resource fields unknown on older witnesses.
+    /// `Some` classifies their spellings at this exact checked admission; it
+    /// does not resolve external resource identities or establish live edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_fields: Option<ProgramResourceFieldCapture>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramResourceField {
+    ChannelWorkspace,
+    ChannelDestination,
+    FileStoreRoot,
+    FileStoreReadGlobs,
+    FileStoreWriteGlobs,
+    SourcePath,
+    SourceWatch,
+    SourceUrl,
+    SourceEndpoint,
+    SourceAuthSecret,
+    SourceVerifiedCredential,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramResourceFieldMeaning {
+    ProviderWorkspaceSelector,
+    ProviderDestinationSelector,
+    LocalRootPath,
+    PathPolicy,
+    LocalFileInput,
+    LocalFileWatchPattern,
+    HttpFetchEndpoint,
+    InboundRoute,
+    CredentialSelector,
+}
+
+impl ProgramResourceField {
+    pub fn meaning(self) -> ProgramResourceFieldMeaning {
+        match self {
+            Self::ChannelWorkspace => ProgramResourceFieldMeaning::ProviderWorkspaceSelector,
+            Self::ChannelDestination => ProgramResourceFieldMeaning::ProviderDestinationSelector,
+            Self::FileStoreRoot => ProgramResourceFieldMeaning::LocalRootPath,
+            Self::FileStoreReadGlobs | Self::FileStoreWriteGlobs => {
+                ProgramResourceFieldMeaning::PathPolicy
+            }
+            Self::SourcePath => ProgramResourceFieldMeaning::LocalFileInput,
+            Self::SourceWatch => ProgramResourceFieldMeaning::LocalFileWatchPattern,
+            Self::SourceUrl => ProgramResourceFieldMeaning::HttpFetchEndpoint,
+            Self::SourceEndpoint => ProgramResourceFieldMeaning::InboundRoute,
+            Self::SourceAuthSecret | Self::SourceVerifiedCredential => {
+                ProgramResourceFieldMeaning::CredentialSelector
+            }
+        }
+    }
+
+    fn owner_kind(self) -> &'static str {
+        match self {
+            Self::ChannelWorkspace | Self::ChannelDestination => "channel",
+            Self::FileStoreRoot | Self::FileStoreReadGlobs | Self::FileStoreWriteGlobs => {
+                "file_store"
+            }
+            Self::SourcePath
+            | Self::SourceWatch
+            | Self::SourceUrl
+            | Self::SourceEndpoint
+            | Self::SourceAuthSecret
+            | Self::SourceVerifiedCredential => "source",
+        }
+    }
+
+    fn max_values(self) -> Option<usize> {
+        match self {
+            Self::FileStoreReadGlobs | Self::FileStoreWriteGlobs => None,
+            _ => Some(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramResourceFieldScope {
+    DeclaredFieldsV1,
+}
+
+/// An empty `values` preserves an omitted optional clause or an empty glob
+/// policy; the field itself remains examined. Each field has one fixed meaning
+/// and is unresolved for dependency routing until its host binding is proved.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramResourceFieldUse {
+    pub occurrence: usize,
+    pub owner: String,
+    pub field: ProgramResourceField,
+    pub meaning: ProgramResourceFieldMeaning,
+    pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramResourceFieldCapture {
+    pub scope: ProgramResourceFieldScope,
+    pub examined: Vec<ProgramResourceFieldUse>,
+    pub digest: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -597,6 +703,60 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             ));
         }
     }
+    if let Some(resources) = &witness.resource_fields {
+        let mut by_owner: BTreeMap<(&str, &str), BTreeSet<ProgramResourceField>> = BTreeMap::new();
+        let invalid = !is_digest(&resources.digest)
+            || resources.examined.iter().enumerate().any(|(index, field)| {
+                field.occurrence != index
+                    || field.owner.is_empty()
+                    || field.meaning != field.field.meaning()
+                    || field.values.iter().any(String::is_empty)
+                    || field
+                        .field
+                        .max_values()
+                        .is_some_and(|maximum| field.values.len() > maximum)
+                    || (field.field == ProgramResourceField::FileStoreRoot
+                        && field.values.len() != 1)
+                    || !by_owner
+                        .entry((field.field.owner_kind(), &field.owner))
+                        .or_default()
+                        .insert(field.field)
+            });
+        let incomplete = by_owner.iter().any(|((kind, _), fields)| {
+            let expected: &[ProgramResourceField] = match *kind {
+                "channel" => &[
+                    ProgramResourceField::ChannelWorkspace,
+                    ProgramResourceField::ChannelDestination,
+                ],
+                "file_store" => &[
+                    ProgramResourceField::FileStoreRoot,
+                    ProgramResourceField::FileStoreReadGlobs,
+                    ProgramResourceField::FileStoreWriteGlobs,
+                ],
+                "source" => &[
+                    ProgramResourceField::SourcePath,
+                    ProgramResourceField::SourceWatch,
+                    ProgramResourceField::SourceUrl,
+                    ProgramResourceField::SourceEndpoint,
+                    ProgramResourceField::SourceAuthSecret,
+                    ProgramResourceField::SourceVerifiedCredential,
+                ],
+                _ => unreachable!(),
+            };
+            fields.len() != expected.len() || expected.iter().any(|field| !fields.contains(field))
+        });
+        if invalid || incomplete {
+            return Err(StoreError::Conflict(
+                "resource-field witness has incomplete or misclassified fields".into(),
+            ));
+        }
+        let examined_json = serde_json::to_string(&resources.examined)?;
+        if crate::items::sha256_hex(&examined_json) != resources.digest {
+            return Err(StoreError::Conflict(
+                "resource-field witness digest differs from its fields".into(),
+            ));
+        }
+    }
     let json = serde_json::to_string(witness)?;
     let digest = crate::items::sha256_hex(&json);
     Ok((digest, json))
@@ -696,6 +856,7 @@ mod tests {
             declarations: None,
             package_calls: None,
             provider_bindings: None,
+            resource_fields: None,
         }
     }
 
@@ -812,6 +973,61 @@ mod tests {
         assert!(matches!(
             encode(&checked),
             Err(StoreError::Conflict(message)) if message.contains("provider-binding witness digest differs from its uses")
+        ));
+    }
+
+    #[test]
+    fn resource_field_witness_preserves_absence_and_refuses_false_classification() {
+        let legacy = witness(LOCK);
+        assert!(!encode(&legacy).unwrap().1.contains("resource_fields"));
+        let examined = vec![
+            ProgramResourceFieldUse {
+                occurrence: 0,
+                owner: "ops".into(),
+                field: ProgramResourceField::ChannelWorkspace,
+                meaning: ProgramResourceFieldMeaning::ProviderWorkspaceSelector,
+                values: vec![],
+            },
+            ProgramResourceFieldUse {
+                occurrence: 1,
+                owner: "ops".into(),
+                field: ProgramResourceField::ChannelDestination,
+                meaning: ProgramResourceFieldMeaning::ProviderDestinationSelector,
+                values: vec!["#ops".into()],
+            },
+        ];
+        let mut checked = legacy;
+        checked.resource_fields = Some(ProgramResourceFieldCapture {
+            scope: ProgramResourceFieldScope::DeclaredFieldsV1,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+
+        let mut omitted = checked.clone();
+        let capture = omitted.resource_fields.as_mut().unwrap();
+        capture.examined.pop();
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(matches!(
+            encode(&omitted),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        let mut false_edge = checked.clone();
+        let capture = false_edge.resource_fields.as_mut().unwrap();
+        capture.examined[1].meaning = ProgramResourceFieldMeaning::HttpFetchEndpoint;
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(matches!(
+            encode(&false_edge),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        checked.resource_fields.as_mut().unwrap().examined[1].values = vec!["changed".into()];
+        assert!(matches!(
+            encode(&checked),
+            Err(StoreError::Conflict(message)) if message.contains("digest differs")
         ));
     }
 

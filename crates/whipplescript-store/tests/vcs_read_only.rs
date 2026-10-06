@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use whipplescript_store::{
     branches::{BranchStore, Branches, MAINLINE_BRANCH_ID},
     content::{ContentBlobs, ContentStore},
+    source_review::ReviewStore,
     vcs::NativeWorkspaceVcs,
 };
 
@@ -36,9 +37,12 @@ fn observers_never_create_missing_stores_or_parent_directories() {
     for root in [fixture.0.clone(), fixture.0.join("missing-parent")] {
         let branches = root.join("branches.sqlite");
         let content = root.join("content.sqlite");
+        let reviews = root.join("reviews.sqlite");
+        assert!(ReviewStore::open_read_only(&reviews).is_err());
         assert!(BranchStore::open_read_only(&branches).is_err());
         assert!(ContentStore::open_read_only(&content).is_err());
         assert!(NativeWorkspaceVcs::open_read_only(&branches, &content).is_err());
+        assert!(!reviews.exists());
         assert!(!branches.exists());
         assert!(!content.exists());
     }
@@ -156,4 +160,33 @@ fn observer_reads_committed_wal_and_exact_cuts_but_cannot_write_or_erase() {
         observer.read_at_cut("base", "note.txt").is_err(),
         "erasure cannot fall back to the newer head"
     );
+}
+
+#[test]
+fn review_observer_reads_live_revisions_without_initializing_or_writing() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("reviews.sqlite");
+    rusqlite::Connection::open(&path).unwrap();
+    let observer = ReviewStore::open_read_only(&path).unwrap();
+    assert!(observer.contribution("review").is_err());
+    let empty = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        empty
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(observer);
+    drop(empty);
+    let mut writer = ReviewStore::open(&path).unwrap();
+    let mut observer = ReviewStore::open_read_only(&path).unwrap();
+    writer
+        .create_native_contribution("review", "author", "intent", MAINLINE_BRANCH_ID, &[])
+        .unwrap();
+    assert_eq!(observer.contribution("review").unwrap().author, "author");
+    assert!(observer
+        .create_native_contribution("forbidden", "author", "intent", MAINLINE_BRANCH_ID, &[])
+        .is_err());
+    assert!(writer.contribution("forbidden").is_err());
 }

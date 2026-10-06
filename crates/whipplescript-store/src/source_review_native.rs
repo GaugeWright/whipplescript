@@ -7,38 +7,18 @@
 use std::collections::BTreeSet;
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use serde::{Deserialize, Serialize};
 
 use crate::branches::flowing_admission::FlowingAdmissions;
-use crate::branches::flowing_fence::FlowingSourceKind;
+use crate::branches::flowing_fence::{FlowingFence, FlowingSourceKind};
 use crate::branches::flowing_sources::FlowingSources;
 use crate::branches::{BranchStatus, Branches};
 use crate::content::ContentBlobs;
 use crate::source_review::{ReviewError, ReviewResult, ReviewStore, SourceKind};
-use crate::vcs::{FlowingBranchLineageOutcome, NativeCandidateOutcome, WorkspaceVcs};
+use crate::vcs::{
+    FlowingBranchLineageOutcome, NativeCandidateOutcome, VerifiedNativeCandidate, WorkspaceVcs,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeUnitRef {
-    pub unit_id: String,
-    pub source_cut_id: String,
-    pub pin_id: String,
-    pub basis_digest: String,
-    pub principal: String,
-    pub intent: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeRevision {
-    pub contribution_id: String,
-    pub sequence: i64,
-    pub upload_id: String,
-    pub actor: String,
-    pub source_branch_id: String,
-    pub source_incarnation_id: String,
-    pub source_cut_id: String,
-    pub source_manifest_hash: String,
-    pub units: Vec<NativeUnitRef>,
-}
+pub use crate::source_review_types::{NativeRevision, NativeUnitRef};
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeUpload<'a> {
@@ -131,6 +111,33 @@ impl ReviewStore {
                 request.recorded_at,
             )?
         })
+    }
+
+    /// Verify the retained candidate against this authority's original
+    /// immutable review revision. Reading creates no candidate or receipt.
+    pub fn verify_retained_native_candidate<
+        B: Branches + FlowingSources + FlowingAdmissions + FlowingFence,
+        C: ContentBlobs,
+    >(
+        &self,
+        vcs: &WorkspaceVcs<B, C>,
+        witness_digest: &str,
+        attempt_id: &str,
+    ) -> ReviewResult<VerifiedNativeCandidate> {
+        let retained = vcs.capture_gate_subject(witness_digest, attempt_id)?;
+        let witness = retained.witness();
+        let contribution = self.contribution(&witness.contribution_id)?;
+        if contribution.source_kind != SourceKind::Native
+            || contribution.target_scope != crate::branches::MAINLINE_BRANCH_ID
+            || !contribution.predecessors.is_empty()
+        {
+            return Err(ReviewError::Invalid(
+                "native candidate needs the exact trunk contribution and predecessor receipts"
+                    .into(),
+            ));
+        }
+        let revision = self.native_revision(&witness.contribution_id, witness.revision_sequence)?;
+        Ok(vcs.verify_retained_native_candidate(&revision, witness_digest, attempt_id)?)
     }
 
     /// The caller authenticates `actor`. This checks the VCS's retained unit
