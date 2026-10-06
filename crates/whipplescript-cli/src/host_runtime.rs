@@ -281,11 +281,36 @@ pub struct RecordedWorkspaceWitness {
     pub reads: Vec<String>,
 }
 
+/// Borrowed correlation for the owner's actual native send, never a permission
+/// or saved execution grant. Credential material and headers are not exposed.
+pub struct NativeProviderRequest<'a> {
+    pub command: &'a StartTurnCommand,
+    pub ordinal: u64,
+    pub url: &'a str,
+    pub body: &'a Value,
+    pub provenance: Option<&'a whipplescript_kernel::sansio::ModelRequestProvenance>,
+    pub transport_pinned: bool,
+    pub configured_timeout: Duration,
+}
+
 pub trait ResourceResolver {
     /// Additional current product access, independent of the pinned runtime
     /// policy. A refusal terminates this invocation; detail is not disclosed.
     fn check_live_access(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Hold embedding-owned current approval through the borrowed, one-use
+    /// native send. Clamp its positive duration to the remaining authority
+    /// allowance. The owner retains the response; the hook cannot fabricate it.
+    /// The send ends at response headers, before body/live-observation callbacks.
+    /// This default preserves ordinary native sends and grants no office access.
+    fn with_native_provider_request(
+        &self,
+        request: &NativeProviderRequest<'_>,
+        send: &mut dyn FnMut(Duration) -> Result<(), String>,
+    ) -> Result<(), String> {
+        send(request.configured_timeout)
     }
 
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String>;
@@ -3672,10 +3697,17 @@ impl GovernedHostRuntime {
         );
         let observed = || access.check().is_err() || probe.observed();
         let released = || access.refused.get() || probe.released();
+        let admit_request =
+            |request: &NativeProviderRequest<'_>,
+             send: &mut dyn FnMut(Duration) -> Result<(), String>| {
+                access.check().map_err(|_| LIVE_ACCESS_REFUSED.to_owned())?;
+                resources.with_native_provider_request(request, send)
+            };
         let driver = NativeHttpDriver::for_binding(&binding)?
             .with_delta_sink(&sink)
             .with_cancel_probe(&observed)
-            .with_request_observer(observe_request);
+            .with_request_observer(observe_request)
+            .with_request_admission(command, &admit_request);
         self.run_admitted_turn(
             command,
             packages,
@@ -5002,6 +5034,12 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
 type ModelRequestObserver<'a> =
     dyn Fn(&Value, Option<&whipplescript_kernel::sansio::ModelRequestProvenance>) + 'a;
 
+type NativeRequestAdmission<'a> = dyn Fn(
+        &NativeProviderRequest<'_>,
+        &mut dyn FnMut(Duration) -> Result<(), String>,
+    ) -> Result<(), String>
+    + 'a;
+
 struct TurnRunInspection<'a> {
     stream_released: Option<&'a dyn Fn() -> bool>,
     model_provenance: &'a whipplescript_kernel::sansio::InitialModelProvenance,
@@ -5022,6 +5060,10 @@ struct NativeHttpDriver<'a> {
     /// exactly as before.
     cancel_probe: Option<&'a dyn Fn() -> bool>,
     request_observer: Option<&'a ModelRequestObserver<'a>>,
+    request_admission: Option<(&'a StartTurnCommand, &'a NativeRequestAdmission<'a>)>,
+    request_ordinal: std::cell::Cell<u64>,
+    admission_ended: std::cell::Cell<bool>,
+    timeout: Duration,
 }
 
 impl<'a> NativeHttpDriver<'a> {
@@ -5040,6 +5082,10 @@ impl<'a> NativeHttpDriver<'a> {
             delta_sink: None,
             cancel_probe: None,
             request_observer: None,
+            request_admission: None,
+            request_ordinal: std::cell::Cell::new(0),
+            admission_ended: std::cell::Cell::new(false),
+            timeout,
         }
     }
 
@@ -5070,6 +5116,80 @@ impl<'a> NativeHttpDriver<'a> {
     ) -> Self {
         self.request_observer = Some(observer);
         self
+    }
+
+    fn with_request_admission(
+        mut self,
+        command: &'a StartTurnCommand,
+        admit: &'a NativeRequestAdmission<'a>,
+    ) -> Self {
+        self.request_admission = Some((command, admit));
+        self
+    }
+
+    fn send_request(
+        &self,
+        request: &whipplescript_kernel::sansio::HttpRequest,
+        timeout: Duration,
+    ) -> Result<ureq::Response, TransportError> {
+        let mut builder = self.agent.post(&request.url).timeout(timeout);
+        for (name, value) in &request.headers {
+            builder = builder.set(name, value);
+        }
+        match builder.send_json(&request.body) {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => Ok(response),
+            Err(ureq::Error::Transport(error)) => {
+                let message = error.to_string();
+                Err(if message.to_ascii_lowercase().contains("timeout") {
+                    TransportError::Timeout
+                } else {
+                    TransportError::Transport(message)
+                })
+            }
+        }
+    }
+
+    fn admitted_send(
+        &self,
+        request: &whipplescript_kernel::sansio::HttpRequest,
+    ) -> Result<ureq::Response, TransportError> {
+        const REFUSED: &str = "native provider request admission refused";
+        let Some((command, admit)) = self.request_admission else {
+            return self.send_request(request, self.timeout);
+        };
+        let Some(ordinal) = self.request_ordinal.get().checked_add(1) else {
+            self.admission_ended.set(true);
+            return Err(TransportError::Transport(REFUSED.into()));
+        };
+        self.request_ordinal.set(ordinal);
+        let metadata = NativeProviderRequest {
+            command,
+            ordinal,
+            url: &request.url,
+            body: &request.body,
+            provenance: request.model_provenance.as_ref(),
+            transport_pinned: self.admitted_request_url.is_some(),
+            configured_timeout: self.timeout,
+        };
+        let mut attempted = false;
+        let mut invalid = false;
+        let mut outcome = None;
+        let mut send = |timeout: Duration| {
+            if attempted || timeout.is_zero() || timeout > self.timeout {
+                invalid = true;
+                return Err(REFUSED.to_owned());
+            }
+            attempted = true;
+            outcome = Some(self.send_request(request, timeout));
+            // The host controls admission, never the actual transport outcome.
+            Ok(())
+        };
+        let admission = admit(&metadata, &mut send);
+        if admission.is_err() || invalid || !attempted {
+            self.admission_ended.set(true);
+            return Err(TransportError::Transport(REFUSED.into()));
+        }
+        outcome.expect("a permitted one-use send retains its actual outcome")
     }
 
     /// Read an SSE body to its end, projecting each assistant answer-text
@@ -5146,6 +5266,11 @@ fn sse_output_text_delta(line: &str) -> Option<String> {
 impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
+        if self.admission_ended.get() {
+            return IoResult::Http(Err(TransportError::Transport(
+                "native provider request admission refused".into(),
+            )));
+        }
         if self
             .admitted_request_url
             .as_ref()
@@ -5158,21 +5283,9 @@ impl HostDriver for NativeHttpDriver<'_> {
         if let Some(observer) = self.request_observer {
             observer(&request.body, request.model_provenance.as_ref());
         }
-        let mut builder = self.agent.post(&request.url);
-        for (name, value) in &request.headers {
-            builder = builder.set(name, value);
-        }
-        let response = match builder.send_json(&request.body) {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-            Err(ureq::Error::Transport(error)) => {
-                let message = error.to_string();
-                let error = if message.to_ascii_lowercase().contains("timeout") {
-                    TransportError::Timeout
-                } else {
-                    TransportError::Transport(message)
-                };
-                return IoResult::Http(Err(error));
-            }
+        let response = match self.admitted_send(request) {
+            Ok(response) => response,
+            Err(error) => return IoResult::Http(Err(error)),
         };
         let expects_sse = request.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
@@ -7296,6 +7409,523 @@ workflow UnsafeHostChat {
         assert!(driver.requests.borrow().is_empty());
         drop(runtime);
         fs::remove_file(path).unwrap();
+    }
+
+    fn read_admission_probe_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let start = loop {
+            let n = socket.read(&mut chunk).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let length: usize = String::from_utf8_lossy(&bytes[..start])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        while bytes.len() < start + length {
+            let n = socket.read(&mut chunk).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        bytes
+    }
+
+    fn accept_admission_probe(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(7);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => return socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "receiver timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("receiver: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_request_admission_holds_embedding_writer_through_actual_governed_send() {
+        use std::io::Write;
+        struct LocalSecrets(String, std::net::SocketAddr);
+        impl SecretResolver for LocalSecrets {
+            fn resolve_provider(
+                &self,
+                _: &ProviderBindingRef,
+                _: &str,
+            ) -> Result<ResolvedProviderBinding, String> {
+                Ok(ResolvedProviderBinding::new(
+                    ModelProvider::OpenAi,
+                    "synthetic-admission-key",
+                    "gpt-test",
+                    &self.0,
+                    256,
+                    Duration::from_secs(5),
+                )
+                .with_admitted_transport(
+                    NativeProviderTransport::loopback_http(&self.0, vec![self.1]).unwrap(),
+                ))
+            }
+        }
+        struct AdmittingResources {
+            writer: rusqlite::Connection,
+            expected: StartTurnCommand,
+            calls: Cell<u64>,
+        }
+        impl ResourceResolver for AdmittingResources {
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                unreachable!()
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+            fn with_native_provider_request(
+                &self,
+                request: &NativeProviderRequest<'_>,
+                send: &mut dyn FnMut(Duration) -> Result<(), String>,
+            ) -> Result<(), String> {
+                assert_eq!(request.command, &self.expected);
+                assert!(request
+                    .body
+                    .to_string()
+                    .contains("synthetic-admitted-prompt"));
+                assert!(request.url.ends_with("/v1/responses"));
+                assert!(request.transport_pinned);
+                assert!(request.provenance.is_some());
+                assert_eq!(request.ordinal, self.calls.get() + 1);
+                assert_eq!(request.configured_timeout, Duration::from_secs(5));
+                self.calls.set(request.ordinal);
+                self.writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let result = send(Duration::from_secs(2));
+                self.writer.execute_batch("COMMIT").unwrap();
+                result
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let path = temp_store();
+        let fence_path = path.with_extension("admission.sqlite");
+        let writer = rusqlite::Connection::open(&fence_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE approval (version INTEGER); INSERT INTO approval VALUES (1)",
+            )
+            .unwrap();
+        let server_fence = fence_path.clone();
+        let server = std::thread::spawn(move || {
+            let mut socket = accept_admission_probe(&listener);
+            let request = read_admission_probe_request(&mut socket);
+            let competing = rusqlite::Connection::open(server_fence).unwrap();
+            competing.busy_timeout(Duration::ZERO).unwrap();
+            let error = competing
+                .execute_batch("BEGIN IMMEDIATE; UPDATE approval SET version=2")
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            let body = r#"{"error":{"message":"synthetic provider refusal"}}"#;
+            write!(socket,"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            request
+        });
+        let endpoint = format!("http://{address}");
+        let mut runtime =
+            GovernedHostRuntime::open(&path, 7, &signed_policy_at(&endpoint)).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "admission-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let mut command = turn(&instance.instance_ref, &open.policy, 1);
+        command.input.text = "synthetic-admitted-prompt".into();
+        let resources = AdmittingResources {
+            writer,
+            expected: command.clone(),
+            calls: Cell::new(0),
+        };
+        let result = runtime.run_turn(
+            &command,
+            &Packages,
+            &LocalSecrets(endpoint, address),
+            &resources,
+        );
+        assert_eq!(result.unwrap().receipt.unwrap().status, TurnStatus::Failed);
+        assert_eq!(resources.calls.get(), 1);
+        let received = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(received.contains("synthetic-admitted-prompt"));
+        assert!(received.contains("synthetic-admission-key"));
+        resources
+            .writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE approval SET version=2; COMMIT")
+            .unwrap();
+        drop(resources);
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(fence_path).unwrap();
+    }
+
+    #[test]
+    fn native_request_admission_refuses_observer_removal_before_pinned_receiver() {
+        struct LocalSecrets(String, std::net::SocketAddr);
+        impl SecretResolver for LocalSecrets {
+            fn resolve_provider(
+                &self,
+                _: &ProviderBindingRef,
+                _: &str,
+            ) -> Result<ResolvedProviderBinding, String> {
+                Ok(ResolvedProviderBinding::new(
+                    ModelProvider::OpenAi,
+                    "synthetic",
+                    "gpt-test",
+                    &self.0,
+                    256,
+                    Duration::from_secs(1),
+                )
+                .with_admitted_transport(
+                    NativeProviderTransport::loopback_http(&self.0, vec![self.1]).unwrap(),
+                ))
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("http://{address}");
+        let path = temp_store();
+        let mut runtime =
+            GovernedHostRuntime::open(&path, 7, &signed_policy_at(&endpoint)).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "removal-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let resources = LiveResources {
+            allowed: Cell::new(true),
+            tool_calls: Cell::new(0),
+            revoke_on_tool: false,
+        };
+        let observer_calls = Cell::new(0);
+        let observer =
+            |_: &Value, _: Option<&whipplescript_kernel::sansio::ModelRequestProvenance>| {
+                observer_calls.set(observer_calls.get() + 1);
+                resources.allowed.set(false);
+            };
+        let result = runtime.run_turn_observing_model_requests(
+            &turn(&instance.instance_ref, &open.policy, 1),
+            &Packages,
+            &LocalSecrets(endpoint, address),
+            &resources,
+            &observer,
+        );
+        assert!(result.is_err());
+        assert_eq!(observer_calls.get(), 1);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_request_admission_refusal_and_invalid_send_end_driver_without_fallback() {
+        use std::io::Write;
+        for case in [
+            "deny",
+            "no-send",
+            "zero",
+            "widen",
+            "duplicate",
+            "after-send",
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let endpoint = format!("http://{address}");
+            let server = if matches!(case, "duplicate" | "after-send") {
+                let receiver = listener.try_clone().unwrap();
+                Some(std::thread::spawn(move || {
+                    let mut socket = accept_admission_probe(&receiver);
+                    let received = read_admission_probe_request(&mut socket);
+                    let body = r#"{"synthetic":"actual response"}"#;
+                    write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+                    received
+                }))
+            } else {
+                None
+            };
+            let command = turn(
+                "synthetic-instance",
+                &PolicyEpochRef {
+                    epoch: 7,
+                    envelope_hash: "synthetic".into(),
+                    signer: "synthetic".into(),
+                    key_id: None,
+                },
+                1,
+            );
+            let binding = ResolvedProviderBinding::new(
+                ModelProvider::OpenAi,
+                "synthetic",
+                "gpt-test",
+                &endpoint,
+                256,
+                Duration::from_millis(100),
+            )
+            .with_admitted_transport(
+                NativeProviderTransport::loopback_http(&endpoint, vec![address]).unwrap(),
+            );
+            let admission_calls = Cell::new(0);
+            let admit =
+                |request: &NativeProviderRequest<'_>,
+                 send: &mut dyn FnMut(Duration) -> Result<(), String>| {
+                    admission_calls.set(admission_calls.get() + 1);
+                    assert_eq!(request.ordinal, 1);
+                    match case {
+                        "deny" => Err("private approval detail".into()),
+                        "no-send" => Ok(()),
+                        "zero" => {
+                            let _ = send(Duration::ZERO);
+                            Ok(())
+                        }
+                        "widen" => {
+                            let _ = send(Duration::from_secs(1));
+                            Ok(())
+                        }
+                        "duplicate" => {
+                            send(request.configured_timeout)?;
+                            let _ = send(request.configured_timeout);
+                            Ok(())
+                        }
+                        "after-send" => {
+                            send(request.configured_timeout)?;
+                            Err("private approval detail".into())
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+            let driver = NativeHttpDriver::for_binding(&binding)
+                .unwrap()
+                .with_request_admission(&command, &admit);
+            let request = IoRequest::Http(whipplescript_kernel::sansio::HttpRequest {
+                model_provenance: None,
+                url: format!("{endpoint}/v1/responses"),
+                headers: vec![],
+                body: json!({"synthetic":"request"}),
+            });
+            for _ in 0..2 {
+                let IoResult::Http(result) = driver.fulfill(&request);
+                assert!(
+                    matches!(result, Err(TransportError::Transport(ref text)) if text == "native provider request admission refused"),
+                    "{case}: {result:?}"
+                );
+            }
+            assert_eq!(admission_calls.get(), 1, "{case}");
+            if let Some(server) = server {
+                assert!(!server.join().unwrap().is_empty());
+            }
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{case}: extra send"
+            );
+        }
+    }
+
+    #[test]
+    fn native_request_admission_correlates_each_send_and_preserves_actual_response() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for ordinal in 1..=2 {
+                let mut socket = accept_admission_probe(&listener);
+                let bytes = read_admission_probe_request(&mut socket);
+                assert!(String::from_utf8_lossy(&bytes).contains(&format!("round-{ordinal}")));
+                let body = format!("{{\"receiver_round\":{ordinal}}}");
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let endpoint = format!("http://{address}");
+        let command = turn(
+            "synthetic-instance",
+            &PolicyEpochRef {
+                epoch: 7,
+                envelope_hash: "synthetic".into(),
+                signer: "synthetic".into(),
+                key_id: None,
+            },
+            1,
+        );
+        let binding = ResolvedProviderBinding::new(
+            ModelProvider::OpenAi,
+            "synthetic",
+            "gpt-test",
+            &endpoint,
+            256,
+            Duration::from_secs(2),
+        )
+        .with_admitted_transport(
+            NativeProviderTransport::loopback_http(&endpoint, vec![address]).unwrap(),
+        );
+        let calls = Cell::new(0);
+        let admit = |request: &NativeProviderRequest<'_>,
+                     send: &mut dyn FnMut(Duration) -> Result<(), String>| {
+            assert_eq!(request.command, &command);
+            assert_eq!(request.ordinal, calls.get() + 1);
+            assert_eq!(
+                request.body["synthetic"],
+                format!("round-{}", request.ordinal)
+            );
+            calls.set(request.ordinal);
+            send(Duration::from_secs(1))
+        };
+        let driver = NativeHttpDriver::for_binding(&binding)
+            .unwrap()
+            .with_request_admission(&command, &admit);
+        for ordinal in 1..=2 {
+            let request = IoRequest::Http(whipplescript_kernel::sansio::HttpRequest {
+                model_provenance: None,
+                url: format!("{endpoint}/v1/responses"),
+                headers: vec![],
+                body: json!({"synthetic":format!("round-{ordinal}")}),
+            });
+            let IoResult::Http(result) = driver.fulfill(&request);
+            assert_eq!(result.unwrap().body["receiver_round"], ordinal);
+        }
+        assert_eq!(calls.get(), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_request_admission_refuses_ordinal_overflow_before_receiver() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("http://{address}");
+        let command = turn(
+            "synthetic-instance",
+            &PolicyEpochRef {
+                epoch: 7,
+                envelope_hash: "synthetic".into(),
+                signer: "synthetic".into(),
+                key_id: None,
+            },
+            1,
+        );
+        let binding = ResolvedProviderBinding::new(
+            ModelProvider::OpenAi,
+            "synthetic",
+            "gpt-test",
+            &endpoint,
+            256,
+            Duration::from_millis(100),
+        )
+        .with_admitted_transport(
+            NativeProviderTransport::loopback_http(&endpoint, vec![address]).unwrap(),
+        );
+        let calls = Cell::new(0);
+        let admit = |_: &NativeProviderRequest<'_>,
+                     _: &mut dyn FnMut(Duration) -> Result<(), String>| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let driver = NativeHttpDriver::for_binding(&binding)
+            .unwrap()
+            .with_request_admission(&command, &admit);
+        driver.request_ordinal.set(u64::MAX);
+        let request = IoRequest::Http(whipplescript_kernel::sansio::HttpRequest {
+            model_provenance: None,
+            url: format!("{endpoint}/v1/responses"),
+            headers: vec![],
+            body: json!({}),
+        });
+        for _ in 0..2 {
+            let IoResult::Http(result) = driver.fulfill(&request);
+            assert!(
+                matches!(result, Err(TransportError::Transport(ref text)) if text == "native provider request admission refused")
+            );
+        }
+        assert_eq!(calls.get(), 0);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn native_request_admission_narrows_actual_transport_timeout() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut socket = accept_admission_probe(&listener);
+            let received = read_admission_probe_request(&mut socket);
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+            received
+        });
+        let endpoint = format!("http://{address}");
+        let command = turn(
+            "synthetic-instance",
+            &PolicyEpochRef {
+                epoch: 7,
+                envelope_hash: "synthetic".into(),
+                signer: "synthetic".into(),
+                key_id: None,
+            },
+            1,
+        );
+        let binding = ResolvedProviderBinding::new(
+            ModelProvider::OpenAi,
+            "synthetic",
+            "gpt-test",
+            &endpoint,
+            256,
+            Duration::from_secs(5),
+        )
+        .with_admitted_transport(
+            NativeProviderTransport::loopback_http(&endpoint, vec![address]).unwrap(),
+        );
+        let admit = |_: &NativeProviderRequest<'_>,
+                     send: &mut dyn FnMut(Duration) -> Result<(), String>| {
+            send(Duration::from_millis(100))
+        };
+        let driver = NativeHttpDriver::for_binding(&binding)
+            .unwrap()
+            .with_request_admission(&command, &admit);
+        let request = IoRequest::Http(whipplescript_kernel::sansio::HttpRequest {
+            model_provenance: None,
+            url: format!("{endpoint}/v1/responses"),
+            headers: vec![],
+            body: json!({"synthetic":"request"}),
+        });
+        let IoResult::Http(result) = driver.fulfill(&request);
+        assert!(
+            matches!(
+                result,
+                Err(TransportError::Timeout | TransportError::Transport(_))
+            ),
+            "{result:?}"
+        );
+        assert!(!server.join().unwrap().is_empty());
     }
 
     #[test]

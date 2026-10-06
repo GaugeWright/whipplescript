@@ -84,8 +84,23 @@ The `host_runtime::GovernedHostRuntime` type is the native facade that persists:
 | `PackageResolver` | Resolves the immutable bytes and the IR of a WhippleScript package, and the schemas of the tools that the package declares. |
 | `SecretResolver` | Resolves the credentials of a provider ephemerally, after the admission by the policy. |
 | `ResolvedProviderBinding::new_codex(...)` | The short-life Codex material that the host resolved. WhippleScript owns the Codex request and the SSE wire. WhippleScript never acquires, refreshes, looks up, or persists a credential. |
-| `ResourceResolver` | Resolves the bytes of an image. Realizes a tool that the system already admitted. Projects a question for a person that a package declares against only the references that the system admitted for the turn. Receives, through `observe_text_delta`, each delta of the answer text of the assistant while the native turn streams — an ephemeral projection under "Live Turn Observation" of `spec/agent-harness.md`; the durable output of the settled turn replaces it, and a delta of reasoning never arrives. |
+| `ResourceResolver` | Resolves the bytes of an image. Realizes a tool that the system already admitted. Projects a question for a person that a package declares against only the references that the system admitted for the turn. Receives, through `observe_text_delta`, each delta of the answer text of the assistant while the native turn streams — an ephemeral projection under "Live Turn Observation" of `spec/agent-harness.md`; the durable output of the settled turn replaces it, and a delta of reasoning never arrives. Its `with_native_provider_request` hook can hold the embedding's current approval through the actual native send. |
 | `NativeWorkspaceResolver` / `native_workspace_tool_specs_with_capabilities` | The native surface for files and commands that WhippleScript owns: confined file operations and governed simple commands through an executor of the host. |
+
+`ResourceResolver::with_native_provider_request` receives a borrowed
+`NativeProviderRequest`: the original command, exact URL/body/provenance,
+per-invocation ordinal, whether transport is pinned and the configured timeout.
+It receives no credential headers or secret material. Hold the embedding's
+current approval fence while invoking the borrowed send exactly once with a
+positive duration within the configured timeout and remaining authority
+allowance. The native owner keeps the actual response; the hook returns only
+admission, and cannot fabricate a provider result. Missing or repeated sends,
+invalid timeout bounds and refusal end that driver's admission without revealing
+the embedding's refusal details or falling back to another transport. Sending
+ends at response headers; body consumption and live observation callbacks follow
+outside the fence. The default performs the ordinary native send. This hook
+does not mediate caller-supplied drivers, authorize office work, or turn an
+invocation ordinal into a durable replay grant.
 
 The facade fails closed unless the signed envelope governs each resource, each
 binding of a provider, and each handle of a placement. The
