@@ -10292,7 +10292,7 @@ impl RuntimeStore for SqliteStore {
 /// `TransactionBehavior::Immediate` — including the ones that only *sometimes*
 /// write, since which branch runs is not knowable at `BEGIN`.
 #[cfg(feature = "native")]
-pub(crate) const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many compiled statements a connection keeps between calls. The hot
 /// per-row reads and appends go through `prepare_cached`, so a branch walk or

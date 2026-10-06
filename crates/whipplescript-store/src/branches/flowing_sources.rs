@@ -493,7 +493,7 @@ pub struct ReleasePrivateCut<'a> {
     pub released_at: &'a str,
 }
 
-pub trait FlowingSources {
+pub trait FlowingSources: super::flowing_parking::FlowingParking {
     fn pin_private_cut(
         &mut self,
         request: PinPrivateCut<'_>,

@@ -9,7 +9,7 @@
 //! recovery are wired.
 
 #[cfg(feature = "native")]
-mod native;
+pub(crate) mod native;
 
 use serde::{Deserialize, Serialize};
 
@@ -460,6 +460,7 @@ pub enum FlowingAdmissionRefusal {
     UnitNotHeldBySource { unit_id: String },
     UnverifiedLineage { unit_id: String },
     UnitAlreadyAdmitted { unit_id: String },
+    UnitParked { unit_id: String, park_op_id: String },
     AttemptCancelled { cancel_op_id: String },
 }
 

@@ -13,6 +13,7 @@ use whipplescript_store::branches::flowing_admission::{
     FlowingUnitOutcome, ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
 };
 use whipplescript_store::branches::flowing_fence::FlowingSourceKind;
+use whipplescript_store::branches::flowing_parking::FlowingParking;
 use whipplescript_store::branches::{
     BranchStatus, Branches, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE,
 };
@@ -763,6 +764,12 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
                         unit_id: unit.unit_id.clone(),
                     }));
                 }
+                if let Some(parked) = self.parked_flowing_unit(&unit.unit_id)? {
+                    return Ok(Refused(R::UnitParked {
+                        unit_id: unit.unit_id.clone(),
+                        park_op_id: parked.request.op_id,
+                    }));
+                }
             }
 
             let Some(witness) = read_witness(&self.sql, &request.candidate_witness_digest)? else {
@@ -973,6 +980,9 @@ mod tests {
     use whipplescript_store::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
+    };
+    use whipplescript_store::branches::flowing_parking::{
+        FlowingParkOutcome, FlowingParkRefusal, ParkFlowingUnit,
     };
     use whipplescript_store::branches::{CreateBranch, CutRecord};
 
@@ -1678,6 +1688,214 @@ mod tests {
                 .unwrap(),
             RetainFlowingAttemptOutcome::Retained(_)
         ));
+    }
+
+    fn park_request(op_id: &str, unit_id: &str) -> ParkFlowingUnit {
+        ParkFlowingUnit {
+            op_id: op_id.into(),
+            unit_id: unit_id.into(),
+            source_branch_id: "twig".into(),
+            source_incarnation_id: "inc".into(),
+            source_cut_id: "source".into(),
+            source_manifest_hash: "source-manifest".into(),
+            basis_digest: format!("basis-{}", unit_id.strip_prefix("unit-").unwrap()),
+            principal: "author".into(),
+            intent: "change".into(),
+            expected_eligibility_epoch: 0,
+            expected_owner_epoch: 0,
+            parked_holder_id: "park:repair-owner".into(),
+            actor: "coordinator".into(),
+            recorded_at: "t4".into(),
+        }
+    }
+
+    #[test]
+    fn park_first_retains_exact_holder_and_fences_hosted_trunk_cas() {
+        let (sql, mut store) = fixture();
+        let attempt = request("unit-a", "admission-a");
+        pin_attempt(&mut store, &attempt);
+        let park = park_request("park-a", "unit-a");
+        let FlowingParkOutcome::Parked(receipt) = store.park_flowing_unit(&park).unwrap() else {
+            panic!("expected parked receipt");
+        };
+        assert_eq!(receipt.former_holder.holder_cut_id, "source");
+        assert_eq!(receipt.source_fence_after.eligibility_epoch, 1);
+        assert_eq!(
+            store.parked_flowing_unit("unit-a").unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            store.parked_holder_units("park:repair-owner").unwrap(),
+            vec![receipt.clone()]
+        );
+        assert!(store.parked_holder_units("park:other").unwrap().is_empty());
+        assert!(matches!(
+            store.park_flowing_unit(&park).unwrap(),
+            FlowingParkOutcome::Existing(existing) if existing == receipt
+        ));
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::StaleEligibilityEpoch {
+                current: 1
+            })
+        ));
+        let mut fresh = request("unit-a", "admission-fresh");
+        fresh.expected_eligibility_epoch = 1;
+        assert_eq!(
+            store.admit_flowing_prefix(&fresh).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::UnitParked {
+                unit_id: "unit-a".into(),
+                park_op_id: "park-a".into(),
+            })
+        );
+        assert!(whipplescript_store::branches::flowing_holders::capture(
+            &store,
+            &witness_for(&attempt)
+        )
+        .unwrap()
+        .is_none());
+        assert!(store.admitted_unit_operation("unit-a").unwrap().is_none());
+        assert_eq!(
+            store
+                .flowing_fence_receipt("park-a")
+                .unwrap()
+                .unwrap()
+                .state,
+            receipt.source_fence_after
+        );
+        assert_eq!(
+            store
+                .park_flowing_unit(&park_request("other-park", "unit-a"))
+                .unwrap(),
+            FlowingParkOutcome::AlreadyParked(receipt)
+        );
+        let reopened = DoBranches::new(sql).unwrap();
+        assert_eq!(
+            reopened
+                .parked_flowing_unit("unit-a")
+                .unwrap()
+                .unwrap()
+                .request
+                .op_id,
+            "park-a"
+        );
+        assert_eq!(
+            reopened
+                .parked_holder_units("park:repair-owner")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn trunk_cas_first_returns_exact_admission_to_hosted_parking() {
+        let (sql, mut store) = fixture();
+        let attempt = request("unit-a", "admission-a");
+        pin_attempt(&mut store, &attempt);
+        record_gate_certificate(&sql, &attempt);
+        let FlowingAdmissionOutcome::Admitted(admitted) =
+            store.admit_flowing_prefix(&attempt).unwrap()
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(
+            store
+                .park_flowing_unit(&park_request("park-a", "unit-a"))
+                .unwrap(),
+            FlowingParkOutcome::AlreadyAdmitted(admitted)
+        );
+        assert!(store.parked_flowing_unit("unit-a").unwrap().is_none());
+        assert!(store.flowing_fence_receipt("park-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn hosted_parking_rejects_corrupt_ref_receipts_and_missing_retained_cut() {
+        for statement in [
+            "UPDATE flowing_parked_units SET holder_id = 'wrong' WHERE unit_id = 'unit-a'",
+            "DELETE FROM cuts WHERE cut_id = 'source'",
+        ] {
+            let (sql, mut store) = fixture();
+            assert!(matches!(
+                store
+                    .park_flowing_unit(&park_request("park-a", "unit-a"))
+                    .unwrap(),
+                FlowingParkOutcome::Parked(_)
+            ));
+            sql.execute(statement, &[]).unwrap();
+            let error = store.parked_flowing_unit("unit-a").unwrap_err();
+            let expected = if statement.starts_with("UPDATE") {
+                "flowing park receipt differs from its ref keys"
+            } else {
+                "flowing parked holder lost its retained cut"
+            };
+            assert!(format!("{error:?}").contains(expected));
+        }
+    }
+
+    #[test]
+    fn hosted_parking_refuses_dangling_admission_index() {
+        let (sql, mut store) = fixture();
+        sql.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        sql.execute(
+            "INSERT INTO flowing_admitted_units (unit_id, op_id) VALUES ('unit-a', 'missing')",
+            &[],
+        )
+        .unwrap();
+        sql.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        let error = store
+            .park_flowing_unit(&park_request("park-a", "unit-a"))
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("admitted flowing unit lost its receipt"));
+        assert!(store.parked_flowing_unit("unit-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn hosted_parking_refuses_changed_owner_epoch_and_bad_basis() {
+        let (_sql, mut store) = fixture();
+        let mut bad_basis = park_request("park-a", "unit-a");
+        bad_basis.basis_digest = "wrong".into();
+        assert_eq!(
+            store.park_flowing_unit(&bad_basis).unwrap(),
+            FlowingParkOutcome::Refused(FlowingParkRefusal::UnitHolderUnavailable)
+        );
+        let mut stale = park_request("park-b", "unit-a");
+        stale.expected_owner_epoch = 1;
+        assert_eq!(
+            store.park_flowing_unit(&stale).unwrap(),
+            FlowingParkOutcome::Refused(FlowingParkRefusal::StaleOwnerEpoch { current: 0 })
+        );
+        let mut wrong_owner = park_request("park-c", "unit-a");
+        wrong_owner.actor = "other".into();
+        assert_eq!(
+            store.park_flowing_unit(&wrong_owner).unwrap(),
+            FlowingParkOutcome::Refused(FlowingParkRefusal::WrongOwner)
+        );
+        assert!(store.parked_flowing_unit("unit-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn hosted_park_receipt_and_fence_roll_back_together() {
+        let (sql, mut store) = fixture();
+        sql.execute(
+            "CREATE TRIGGER fail_park_fence BEFORE INSERT ON flowing_source_fence_ops \
+             WHEN NEW.op_id = 'park-a' BEGIN SELECT RAISE(ABORT, 'fence write failed'); END",
+            &[],
+        )
+        .unwrap();
+        assert!(store
+            .park_flowing_unit(&park_request("park-a", "unit-a"))
+            .is_err());
+        assert!(store.parked_flowing_unit("unit-a").unwrap().is_none());
+        assert!(store.flowing_fence_receipt("park-a").unwrap().is_none());
+        assert_eq!(
+            store
+                .flowing_source("twig")
+                .unwrap()
+                .unwrap()
+                .eligibility_epoch,
+            0
+        );
     }
 
     fn terminal_request(

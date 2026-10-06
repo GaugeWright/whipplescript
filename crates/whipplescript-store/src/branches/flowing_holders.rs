@@ -1,7 +1,10 @@
 //! Current unit-holder evidence, read from the ref store. This does not
 //! establish dependency closure or the content derivation of a candidate.
 
-use super::flowing_admission::{FlowingCandidateWitness, FlowingGateCertificate};
+use super::flowing_admission::{
+    FlowingCandidateWitness, FlowingGateCertificate, FlowingSelectedUnit, FlowingUnitOutcome,
+};
+use super::flowing_parking::ParkFlowingUnit;
 use super::flowing_read::{Reader, StoreReader};
 use super::flowing_sources::FlowingSources;
 use super::{BranchStatus, Branches, MAINLINE_BRANCH_ID};
@@ -44,38 +47,52 @@ pub fn capture<B: Branches + FlowingSources>(
     branches: &B,
     witness: &FlowingCandidateWitness,
 ) -> StoreResult<Option<Vec<FlowingUnitHolder>>> {
-    capture_from(&StoreReader(branches), witness)
+    for selected in &witness.units {
+        if branches.parked_flowing_unit(&selected.unit_id)?.is_some() {
+            return Ok(None);
+        }
+    }
+    capture_from(
+        &StoreReader(branches),
+        &witness.source_branch_id,
+        &witness.source_cut_id,
+        &witness.source_manifest_hash,
+        &witness.units,
+    )
 }
 
 fn capture_from(
     reader: &impl Reader,
-    witness: &FlowingCandidateWitness,
+    source_branch_id: &str,
+    source_cut_id: &str,
+    source_manifest_hash: &str,
+    units: &[FlowingSelectedUnit],
 ) -> StoreResult<Option<Vec<FlowingUnitHolder>>> {
-    let Some(holder) = reader.branch(&witness.source_branch_id)? else {
+    let Some(holder) = reader.branch(source_branch_id)? else {
         return Ok(None);
     };
-    let Some(selected_cut) = reader.cut(&witness.source_cut_id)? else {
+    let Some(selected_cut) = reader.cut(source_cut_id)? else {
         return Ok(None);
     };
-    if selected_cut.branch_id != witness.source_branch_id
-        || selected_cut.manifest_hash != witness.source_manifest_hash
+    if selected_cut.branch_id != source_branch_id
+        || selected_cut.manifest_hash != source_manifest_hash
     {
         return Ok(None);
     }
     let Some(head) = holder.head_cut_id.as_deref() else {
         return Ok(None);
     };
-    if holder.branch_id != witness.source_branch_id
+    if holder.branch_id != source_branch_id
         || holder.status != BranchStatus::Active
         || holder.parent_branch_id.as_deref() != Some(MAINLINE_BRANCH_ID)
-        || !ancestor(reader, &witness.source_cut_id, head, &holder.branch_id)?
-        || witness.units.is_empty()
+        || !ancestor(reader, source_cut_id, head, &holder.branch_id)?
+        || units.is_empty()
     {
         return Ok(None);
     }
     let mut seen = BTreeSet::new();
-    let mut result = Vec::with_capacity(witness.units.len());
-    for selected in &witness.units {
+    let mut result = Vec::with_capacity(units.len());
+    for selected in units {
         if !seen.insert(&selected.unit_id) {
             return Ok(None);
         }
@@ -118,7 +135,7 @@ fn capture_from(
                     || !ancestor(
                         reader,
                         &receipt.target_after_cut_id,
-                        &witness.source_cut_id,
+                        source_cut_id,
                         &holder.branch_id,
                     )?
                 {
@@ -146,7 +163,7 @@ fn capture_from(
                     || !ancestor(
                         reader,
                         &declaration.source_cut_id,
-                        &witness.source_cut_id,
+                        source_cut_id,
                         &holder.branch_id,
                     )?
                 {
@@ -211,6 +228,36 @@ fn capture_from(
     Ok(Some(result))
 }
 
+/// Current source holder of one unit before its parking transfer. The caller
+/// serializes this read with admission and persists the returned retained cut.
+fn capture_one_from(
+    reader: &impl Reader,
+    request: &ParkFlowingUnit,
+) -> StoreResult<Option<FlowingUnitHolder>> {
+    let selected = FlowingSelectedUnit {
+        unit_id: request.unit_id.clone(),
+        basis_digest: request.basis_digest.clone(),
+        principal: request.principal.clone(),
+        intent: request.intent.clone(),
+        outcome: FlowingUnitOutcome::Applied,
+    };
+    Ok(capture_from(
+        reader,
+        &request.source_branch_id,
+        &request.source_cut_id,
+        &request.source_manifest_hash,
+        &[selected],
+    )?
+    .and_then(|holders| holders.into_iter().next()))
+}
+
+pub fn capture_one<B: Branches + FlowingSources>(
+    branches: &B,
+    request: &ParkFlowingUnit,
+) -> StoreResult<Option<FlowingUnitHolder>> {
+    capture_one_from(&StoreReader(branches), request)
+}
+
 pub fn matches_certificate(
     current: &[FlowingUnitHolder],
     certificate: &FlowingGateCertificate,
@@ -227,5 +274,24 @@ pub(crate) fn native_capture(
     connection: &rusqlite::Connection,
     witness: &FlowingCandidateWitness,
 ) -> StoreResult<Option<Vec<FlowingUnitHolder>>> {
-    capture_from(&super::flowing_read::NativeReader(connection), witness)
+    for selected in &witness.units {
+        if super::flowing_parking::native::read_by_unit(connection, &selected.unit_id)?.is_some() {
+            return Ok(None);
+        }
+    }
+    capture_from(
+        &super::flowing_read::NativeReader(connection),
+        &witness.source_branch_id,
+        &witness.source_cut_id,
+        &witness.source_manifest_hash,
+        &witness.units,
+    )
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn native_capture_one(
+    connection: &rusqlite::Connection,
+    request: &ParkFlowingUnit,
+) -> StoreResult<Option<FlowingUnitHolder>> {
+    capture_one_from(&super::flowing_read::NativeReader(connection), request)
 }

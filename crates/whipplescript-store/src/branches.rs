@@ -22,6 +22,7 @@ pub mod flowing_fence_host;
 pub mod flowing_holders;
 pub mod flowing_host;
 pub mod flowing_lineage;
+pub mod flowing_parking;
 mod flowing_read;
 pub mod flowing_rewrite;
 pub mod flowing_sources;
@@ -1172,6 +1173,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute(statement, [])?;
     }
     for statement in flowing_admission::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_parking::SCHEMA {
         connection.execute(statement, [])?;
     }
     connection.execute_batch(

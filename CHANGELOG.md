@@ -19,6 +19,27 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-06
+
+A minor release, because three published crates changed public types that a
+dependent can match on, construct or rely on being unwind-safe:
+
+- `whipplescript-store`: `FlowingAdmissionRefusal` gained `UnitParked`, which
+  moves its later variants' discriminants.
+- `whipplescript-kernel`: `SourceAdmissionJudgment` gained
+  `source_verification`.
+- `whipplescript`: `HostCancellationHandle` and `ResolvedProviderBinding` are
+  no longer `UnwindSafe` or `RefUnwindSafe`.
+
+Code that matches `FlowingAdmissionRefusal` without a wildcard arm or casts it
+by position, builds `SourceAdmissionJudgment` with a literal, or moves those
+two types across `catch_unwind` must follow the change. The tracker's
+discovery files move to schema `whipplescript.tracker.discovery/v2`: record
+files no longer carry `event_set` and `event_count`, which `context.hjson`
+does. The command line, configuration and the tracker store stay compatible;
+a store 0.9.0 enrolled is written by this release, and existing views are
+regenerated on first use.
+
 - Embedding hosts can explicitly create and reopen protected governed runtime
   stores and inspect original turns read-only with their exact payload codec
   and policy verifier. Plain openers refuse protected stores; existing
@@ -35,6 +56,23 @@ next free number rather than a patch — it says so.
   every read keeps working (DR-0186). Enrolling for discovery sets protocol 1.
   A write a store refuses for a missing `whip_` function is reported the same
   way, no longer as "this is a whip bug".
+
+- A store another `whip` held locked past this one's wait is reported as
+  busy, with advice to run the command again, no longer as "internal store
+  error (database is locked); this is a whip bug" (WS-771).
+  `whipplescript_store::STORE_BUSY_TIMEOUT` is public.
+
+- Tracker writes no longer hold the store for seconds (DR-0187). A write
+  replaces only the discovery files its change reaches, in every enrolled
+  checkout, rather than every file in every checkout: on a store with 86
+  checkouts and 773 records a write fell from about 7 s to about 1.4 s. During
+  a write a search can briefly see one record updated and a related one not
+  yet, never a stale version of a changed record. Record files no longer
+  carry the store-wide `event_set` and `event_count`, which only
+  `context.hjson` does, and the schema is
+  `whipplescript.tracker.discovery/v2`; existing views are regenerated on
+  first use. A tracker command now waits up to a minute for another's write
+  (`TRACKER_BUSY_TIMEOUT`) instead of 5 s.
 
 ## [0.9.0] — 2026-10-05
 

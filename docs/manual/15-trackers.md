@@ -84,8 +84,14 @@ old for a store's protocol still reads it, and every `whip issue` listing and
 that raised the protocol: upgrade `whip` to write. Nothing is changed by the
 refused write.
 
-A completed write publishes a complete generation. An interrupted publication
-leaves the view unavailable until a writable reopen repairs it. The tracker
+A write replaces only the files whose records changed, each atomically, so its
+cost does not grow with the number of checkouts times records. While a write
+is landing, a search can briefly find one record updated and a related one not
+yet, but never an old version of a record that write changed: those files are
+removed before the change commits and replaced after. An interrupted
+publication leaves the affected records unavailable until a writable reopen
+regenerates the view. A `whip` waits up to a minute for another one's write
+before reporting the store busy. The tracker
 store remains authoritative; generated files are neither editable work lists
 nor instructions to an agent.
 

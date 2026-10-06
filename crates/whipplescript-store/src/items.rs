@@ -256,6 +256,13 @@ const SATELLITE_SCHEMA_VERSION: i64 = 5;
 #[cfg(feature = "native")]
 const PROTECTION_SCHEMA_VERSION: i64 = 4;
 
+/// How long a tracker store connection waits for the write lock (DR-0187).
+/// Longer than `STORE_BUSY_TIMEOUT` because the tracker is one store many
+/// sessions share, and a write publishes discovery views while it holds the
+/// lock: a command should queue behind another's write, not fail.
+#[cfg(feature = "native")]
+pub const TRACKER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl IssueConflicts {
     #[must_use]
     pub fn conflicted(&self) -> bool {
@@ -358,6 +365,7 @@ impl WorkItemStore {
         }
         let connection = Connection::open(path)?;
         crate::establish_wal(&connection)?;
+        connection.busy_timeout(TRACKER_BUSY_TIMEOUT)?;
         let store = Self::from_connection(connection)?;
         store.repair_discovery()?;
         Ok(store)

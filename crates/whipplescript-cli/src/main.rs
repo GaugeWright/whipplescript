@@ -45510,6 +45510,21 @@ fn store_error(error: StoreError) -> String {
                  was changed, and reading the store still works; upgrade whip to write to it"
             )
         }
+        // Contention, not a defect (WS-771): another process held the store's
+        // write lock for longer than this one waits.
+        StoreError::Sqlite(
+            error @ rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                    ..
+                },
+                _,
+            ),
+        ) => format!(
+            "the store is busy: another whip held its write lock for longer than this whip \
+             waits for it (a minute for the tracker store), so this whip gave up ({error}). Run \
+             the command again"
+        ),
         StoreError::Sqlite(error) => {
             format!("internal store error ({error}); this is a whip bug, please report it")
         }
@@ -47104,6 +47119,10 @@ mod sibling_workflow_refusal_tests;
 #[cfg(test)]
 #[path = "main_tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "main_tests/store_error_messages.rs"]
+mod store_error_messages_tests;
 
 /// `verify_under_custodian`'s three refusals (DR-0053 §6 Amendment
 /// 2026-09-03). All three mean "whip could not ASK", which the listener turns
