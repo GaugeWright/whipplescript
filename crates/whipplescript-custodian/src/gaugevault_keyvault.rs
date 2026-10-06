@@ -16,6 +16,9 @@ use zeroize::Zeroizing;
 const API_VERSION: &str = "2025-07-01";
 const MAX_VAULT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IDENTITY_RESPONSE_BYTES: usize = 64 * 1024;
+// The backing adapter's conservative UTF-8 byte ceiling matches the hosted
+// intake adapter. It is not yet a customer-facing GaugeVault value contract.
+const MAX_SECRET_VALUE_BYTES: usize = 25 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -31,6 +34,7 @@ pub(crate) enum Error {
     MalformedResponse,
     MismatchedReference,
     DisabledVersion,
+    SecretTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -53,6 +57,13 @@ impl SecretMaterial {
 
     pub(crate) fn expose(&self) -> &str {
         &self.0
+    }
+
+    fn validate_for_use(&self) -> Result<(), Error> {
+        if self.0.len() > MAX_SECRET_VALUE_BYTES {
+            return Err(Error::SecretTooLarge);
+        }
+        Ok(())
     }
 }
 
@@ -411,7 +422,9 @@ impl<T: VaultToken, H: VaultHttp> FinalUseReader<T, H> {
         if parsed.attributes.enabled != Some(true) {
             return Err(Error::DisabledVersion);
         }
-        parsed.value.ok_or(Error::MalformedResponse)
+        let material = parsed.value.ok_or(Error::MalformedResponse)?;
+        material.validate_for_use()?;
+        Ok(material)
     }
 }
 
@@ -544,6 +557,42 @@ mod tests {
             disabled.read_exact(&prefix, &name, &reference),
             Err(Error::DisabledVersion)
         ));
+    }
+
+    #[test]
+    fn exact_version_read_enforces_the_backing_byte_ceiling() {
+        let vault = VaultName::parse("gv-test").unwrap();
+        let name = name(PREFIX);
+        let reference = VersionReference::parse(&vault, &name, &id(PREFIX)).unwrap();
+        let prefix = AccountPrefix::parse(PREFIX).unwrap();
+        let at_limit = "é".repeat(MAX_SECRET_VALUE_BYTES / 2);
+        assert_eq!(at_limit.len(), MAX_SECRET_VALUE_BYTES);
+        let admitted = reader(
+            200,
+            serde_json::json!({"id": id(PREFIX), "value": at_limit.clone(),
+                "attributes": {"enabled": true}})
+            .to_string(),
+        );
+        assert_eq!(
+            admitted
+                .read_exact(&prefix, &name, &reference)
+                .unwrap()
+                .expose()
+                .len(),
+            MAX_SECRET_VALUE_BYTES
+        );
+        let over_limit = reader(
+            200,
+            serde_json::json!({"id": id(PREFIX), "value": format!("{at_limit}é"),
+                "attributes": {"enabled": true}})
+            .to_string(),
+        );
+        assert_eq!(
+            over_limit
+                .read_exact(&prefix, &name, &reference)
+                .unwrap_err(),
+            Error::SecretTooLarge
+        );
     }
 
     #[test]
