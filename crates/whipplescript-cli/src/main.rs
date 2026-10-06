@@ -45502,6 +45502,14 @@ fn report_store_error(context: &str, error: StoreError) -> ExitCode {
 fn store_error(error: StoreError) -> String {
     match error {
         StoreError::Io(error) => format!("store I/O error: {error}"),
+        // DR-0186 backstop: a write rule a newer whip installed without raising
+        // the store's write protocol. The statement is refused before it runs.
+        StoreError::Sqlite(error) if error.to_string().contains("no such function: whip_") => {
+            format!(
+                "this store has write rules that this whip does not provide ({error}). Nothing \
+                 was changed, and reading the store still works; upgrade whip to write to it"
+            )
+        }
         StoreError::Sqlite(error) => {
             format!("internal store error ({error}); this is a whip bug, please report it")
         }
@@ -45557,6 +45565,20 @@ fn store_error(error: StoreError) -> String {
              instance would neither complete nor fail, so the edge was refused instead. \
              Retrying makes the same request; the ordering is the program's to fix"
         ),
+        // DR-0186: only writing is refused under a newer write protocol.
+        StoreError::UnsupportedVersion {
+            subject,
+            found,
+            supported,
+        } if subject.starts_with(
+            whipplescript_store::items::discovery::TRACKER_WRITE_PROTOCOL_SUBJECT,
+        ) =>
+        {
+            format!(
+                "{subject} is {found}, but this whip writes only up to {supported}. Nothing was \
+                 changed, and reading the store still works; upgrade whip to write to it"
+            )
+        }
         // DR-0054 Phase B: a store written by a newer whip fails closed with
         // both versions named. The store is intact; deleting it is never the
         // remediation.

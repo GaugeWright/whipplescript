@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{files::FileContentReference, EventView};
 
@@ -360,6 +360,17 @@ fn capture_terminal(
         return;
     };
     let accepted_value = if status == "completed" && run_status == "completed" {
+        if payload
+            .get("metadata")
+            .and_then(Value::as_object)
+            .is_none_or(|metadata| metadata.len() != 1 || !metadata.contains_key("value"))
+        {
+            gap(
+                inventory,
+                event,
+                RuntimeFileReferenceGapKind::MalformedFileTerminal,
+            );
+        }
         let Some(value) = payload
             .get("metadata")
             .and_then(|metadata| metadata.get("value"))
@@ -373,8 +384,25 @@ fn capture_terminal(
             );
             return;
         };
+        if !known_file_value(&value) {
+            gap(
+                inventory,
+                event,
+                RuntimeFileReferenceGapKind::MalformedFileTerminal,
+            );
+        }
         Some(value)
     } else {
+        if payload
+            .get("metadata")
+            .is_some_and(|metadata| !known_file_failure_metadata(metadata))
+        {
+            gap(
+                inventory,
+                event,
+                RuntimeFileReferenceGapKind::MalformedFileTerminal,
+            );
+        }
         None
     };
     if terminals
@@ -432,6 +460,14 @@ fn capture_requests(
         if kind != "file.read" && kind != "file.write" {
             continue;
         }
+        if !known_file_effect(effect) {
+            gap(
+                inventory,
+                event,
+                RuntimeFileReferenceGapKind::MalformedFileRequest,
+            );
+            continue;
+        }
         let Some(effect_id) = effect
             .get("effect_id")
             .and_then(Value::as_str)
@@ -474,6 +510,14 @@ fn capture_requests(
             None => "text",
         };
         if !matches!(format, "text" | "reference") {
+            gap(
+                inventory,
+                event,
+                RuntimeFileReferenceGapKind::MalformedFileRequest,
+            );
+            continue;
+        }
+        if !known_file_input(input, kind, format) {
             gap(
                 inventory,
                 event,
@@ -566,6 +610,22 @@ fn capture_results(
     let site = match payload.get("name").and_then(Value::as_str) {
         Some("file.read.completed") => RuntimeFileReferenceSite::ReadResult,
         Some("file.write.completed") => RuntimeFileReferenceSite::WriteResult,
+        Some("file.read.failed" | "file.write.failed") => {
+            if event.source != "kernel" {
+                gap(
+                    inventory,
+                    event,
+                    RuntimeFileReferenceGapKind::UnexpectedEventSource,
+                );
+            } else if !payload.get("value").is_some_and(known_file_failure_fact) {
+                gap(
+                    inventory,
+                    event,
+                    RuntimeFileReferenceGapKind::MalformedFileResult,
+                );
+            }
+            return;
+        }
         _ => return,
     };
     if event.source != "kernel" {
@@ -576,11 +636,26 @@ fn capture_results(
         );
         return;
     }
-    let Some(value) = payload
-        .get("value")
-        .and_then(|fact| fact.get("value"))
-        .and_then(Value::as_object)
-    else {
+    let Some(fact) = payload.get("value").and_then(Value::as_object) else {
+        gap(
+            inventory,
+            event,
+            RuntimeFileReferenceGapKind::MalformedFileResult,
+        );
+        return;
+    };
+    if !fact
+        .keys()
+        .all(|key| matches!(key.as_str(), "effect_id" | "run_id" | "status" | "value"))
+    {
+        gap(
+            inventory,
+            event,
+            RuntimeFileReferenceGapKind::MalformedFileResult,
+        );
+        return;
+    }
+    let Some(value) = fact.get("value").and_then(Value::as_object) else {
         gap(
             inventory,
             event,
@@ -598,6 +673,14 @@ fn capture_results(
         return;
     };
     if !matches!(format, "text" | "reference") {
+        gap(
+            inventory,
+            event,
+            RuntimeFileReferenceGapKind::MalformedFileResult,
+        );
+        return;
+    }
+    if !known_file_value(&Value::Object(value.clone())) {
         gap(
             inventory,
             event,
@@ -686,6 +769,108 @@ fn capture_results(
             RuntimeFileReferenceGapKind::MalformedFileResult,
         ),
     }
+}
+
+// The current codec's field vocabulary is closed for this projection. A new
+// field might carry an external reference even when `format` remains `text`;
+// its meaning must be classified before this inventory can report no gaps.
+fn known_file_effect(effect: &Value) -> bool {
+    effect.as_object().is_some_and(|fields| {
+        fields.keys().all(|field| {
+            matches!(
+                field.as_str(),
+                "effect_id"
+                    | "kind"
+                    | "target"
+                    | "input"
+                    | "status"
+                    | "program_version_id"
+                    | "revision_epoch"
+                    | "idempotency_key"
+                    | "required_capabilities"
+                    | "profile"
+                    | "correlation_id"
+                    | "timeout_seconds"
+                    | "source_span"
+            )
+        })
+    })
+}
+
+fn known_file_input(input: &Map<String, Value>, kind: &str, format: &str) -> bool {
+    input.keys().all(|field| {
+        matches!(
+            field.as_str(),
+            "format" | "store" | "path" | "root" | "allow" | "rule" | "mode"
+        ) || (kind == "file.write"
+            && ((format == "text" && matches!(field.as_str(), "body" | "body_expr"))
+                || (format == "reference" && field == "body_ref")))
+    })
+}
+
+fn known_file_value(value: &Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    let Some(format) = fields.get("format").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(format, "text" | "reference") {
+        return false;
+    }
+    fields.keys().all(|field| {
+        matches!(
+            field.as_str(),
+            "store" | "path" | "format" | "content_hash" | "bytes"
+        ) || (format == "text" && matches!(field.as_str(), "content" | "full_path" | "mode"))
+            || (format == "reference"
+                && matches!(field.as_str(), "content_reference" | "full_path" | "mode"))
+    })
+}
+
+fn known_file_failure_metadata(metadata: &Value) -> bool {
+    let Some(fields) = metadata.as_object() else {
+        return false;
+    };
+    if fields.len() != 1 {
+        return false;
+    }
+    fields.get("failure").is_some_and(|failure| {
+        failure.as_object().is_some_and(|failure| {
+            failure
+                .keys()
+                .all(|field| matches!(field.as_str(), "error_kind" | "message"))
+        })
+    })
+}
+
+fn known_file_failure_fact(fact: &Value) -> bool {
+    let Some(fields) = fact.as_object() else {
+        return false;
+    };
+    if !fields.keys().all(|field| {
+        matches!(
+            field.as_str(),
+            "effect_id" | "run_id" | "status" | "value" | "error"
+        )
+    }) {
+        return false;
+    }
+    fields
+        .get("value")
+        .and_then(Value::as_object)
+        .is_some_and(|value| {
+            value.keys().all(|field| {
+                matches!(
+                    field.as_str(),
+                    "reason" | "summary" | "effect_id" | "run_id" | "kind"
+                )
+            })
+        })
+        && fields
+            .get("error")
+            .and_then(Value::as_object)
+            .is_some_and(|error| error.keys().all(|field| field == "message"))
 }
 
 fn valid_reference(value: &Value) -> Option<FileContentReference> {
@@ -889,6 +1074,154 @@ mod tests {
     }
 
     #[test]
+    fn new_fields_cannot_hide_references_in_text_file_evidence() {
+        let hash = "a".repeat(32);
+        let value = json!({"store":"docs","path":"note.txt","format":"text",
+            "full_path":"/workspace/note.txt","mode":"upsert","bytes":4,"content_hash":hash});
+        let events = vec![
+            event(1, "instance.created", json!({})),
+            event(
+                2,
+                "rule.committed",
+                json!({"effects":[
+                    {"effect_id":"write","kind":"file.write","input":{
+                        "format":"text","store":"docs","path":"note.txt","root":"/workspace",
+                        "allow":["**"],"rule":"r","mode":"upsert","body":"note","body_expr":"note"}}
+                ]}),
+            ),
+            event(
+                3,
+                "effect.run_started",
+                json!({"effect_id":"write","run_id":"run","provider":"files"}),
+            ),
+            event(
+                4,
+                "effect.terminal",
+                json!({"effect_id":"write","run_id":"run","provider":"files",
+                    "status":"completed","run_status":"completed","metadata":{"value":value}}),
+            ),
+            event(
+                5,
+                "fact.derived",
+                json!({"name":"file.write.completed","value":{
+                    "effect_id":"write","run_id":"run","status":"completed","value":value}}),
+            ),
+        ];
+        assert!(capture(&events).has_no_observed_gaps());
+
+        let mut changed = events.clone();
+        let mut request: Value = serde_json::from_str(&changed[1].payload_json).unwrap();
+        request["effects"][0]["input"]["future_blob_ref"] = json!("opaque");
+        changed[1].payload_json = request.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileRequest
+        );
+
+        let mut changed = events.clone();
+        let mut request: Value = serde_json::from_str(&changed[1].payload_json).unwrap();
+        request["effects"][0]["future_blob_ref"] = json!("opaque");
+        changed[1].payload_json = request.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileRequest
+        );
+
+        let mut changed = events.clone();
+        let mut terminal: Value = serde_json::from_str(&changed[3].payload_json).unwrap();
+        terminal["metadata"]["value"]["body_ref"] = reference(&hash, "unexpected-private");
+        changed[3].payload_json = terminal.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileTerminal
+        );
+
+        for field in ["body_ref", "future_blob_ref", "receipt"] {
+            let mut changed = events.clone();
+            let mut fact: Value = serde_json::from_str(&changed[4].payload_json).unwrap();
+            fact["value"]["value"][field] = reference(&hash, "unexpected-private");
+            changed[4].payload_json = fact.to_string();
+            assert_eq!(
+                capture(&changed).gaps[0].kind,
+                RuntimeFileReferenceGapKind::MalformedFileResult
+            );
+        }
+    }
+
+    #[test]
+    fn failed_file_evidence_cannot_hide_a_host_receipt() {
+        let events = vec![
+            event(1, "instance.created", json!({})),
+            event(
+                2,
+                "rule.committed",
+                json!({"effects":[
+                    {"effect_id":"write","kind":"file.write","input":{
+                        "format":"text","body":"draft"}}
+                ]}),
+            ),
+            event(
+                3,
+                "effect.run_started",
+                json!({"effect_id":"write","run_id":"run","provider":"files"}),
+            ),
+            event(
+                4,
+                "effect.terminal",
+                json!({
+                    "effect_id":"write","run_id":"run","provider":"files",
+                    "status":"failed","run_status":"failed",
+                    "metadata":{"failure":{"error_kind":"file_effect_failed","message":"conflict"}}
+                }),
+            ),
+            event(
+                5,
+                "fact.derived",
+                json!({
+                    "name":"file.write.failed","value":{
+                        "effect_id":"write","run_id":"run","status":"failed",
+                        "value":{"reason":"conflict","summary":"conflict",
+                            "effect_id":"write","run_id":"run","kind":"file.write"},
+                        "error":{"message":"conflict"}
+                    }
+                }),
+            ),
+        ];
+        assert!(capture(&events).has_no_observed_gaps());
+
+        let mut changed = events.clone();
+        let mut terminal: Value = serde_json::from_str(&changed[3].payload_json).unwrap();
+        terminal["metadata"]["failure"]["receipt"] = json!({
+            "schema_ref":"host.receipt.v1","label_ref":"private"
+        });
+        changed[3].payload_json = terminal.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileTerminal
+        );
+
+        let mut changed = events.clone();
+        let mut fact: Value = serde_json::from_str(&changed[4].payload_json).unwrap();
+        fact["value"]["value"]["receipt"] = json!({
+            "schema_ref":"host.receipt.v1","label_ref":"private"
+        });
+        changed[4].payload_json = fact.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileResult
+        );
+
+        let mut changed = events;
+        let mut fact: Value = serde_json::from_str(&changed[4].payload_json).unwrap();
+        fact["value"]["future_ref"] = json!("opaque");
+        changed[4].payload_json = fact.to_string();
+        assert_eq!(
+            capture(&changed).gaps[0].kind,
+            RuntimeFileReferenceGapKind::MalformedFileResult
+        );
+    }
+
+    #[test]
     fn reference_result_without_earlier_request_is_unknown() {
         let hash = "c".repeat(32);
         let events = vec![
@@ -1003,18 +1336,21 @@ mod tests {
             RuntimeFileReferenceGapKind::MissingFileResult
         );
 
-        for value in [
-            json!({"format":"text","content_hash":hash}),
-            json!({"content_hash":hash}),
+        for (value, expected) in [
+            (
+                json!({"format":"text","content_hash":hash}),
+                RuntimeFileReferenceGapKind::TerminalRequestMismatch,
+            ),
+            (
+                json!({"content_hash":hash}),
+                RuntimeFileReferenceGapKind::MalformedFileTerminal,
+            ),
         ] {
             let mut changed = events[..4].to_vec();
             let mut accepted: Value = serde_json::from_str(&changed[3].payload_json).unwrap();
             accepted["metadata"]["value"] = value;
             changed[3].payload_json = accepted.to_string();
-            assert_eq!(
-                capture(&changed).gaps[0].kind,
-                RuntimeFileReferenceGapKind::TerminalRequestMismatch
-            );
+            assert_eq!(capture(&changed).gaps[0].kind, expected);
         }
 
         let mut changed_value = events.clone();

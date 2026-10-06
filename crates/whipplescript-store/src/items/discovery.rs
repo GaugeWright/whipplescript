@@ -2,7 +2,7 @@
 //! files contain durable facts, never a cached temporal readiness decision.
 use super::{row_to_item, WorkItemStore, ISSUE_COLS};
 use crate::{StoreError, StoreResult};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -63,7 +63,69 @@ fn require_writer(conn: &Connection) -> StoreResult<()> {
             conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS tracker_discovery_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT whip_tracker_discovery_writer_v1(); END;"))?;
         }
     }
+    // These triggers are protocol 1: a build without the writer function
+    // cannot write past them.
+    raise_write_protocol(conn, 1)
+}
+
+/// The highest tracker write protocol this build speaks (DR-0186). A store
+/// records the protocol its installed write rules require; a write through a
+/// build that speaks less is refused before it changes anything, and reads are
+/// never refused for it. Raise this, and the store's protocol where the rule is
+/// installed, when a change to the write rules would let an older writer
+/// fail or write incorrectly.
+pub const TRACKER_WRITE_PROTOCOL: i64 = 1;
+
+/// The `UnsupportedVersion` subject of a write refused under a newer protocol.
+/// The subject goes on to name the `whip` that raised the protocol.
+pub const TRACKER_WRITE_PROTOCOL_SUBJECT: &str = "tracker store write protocol";
+
+const WRITE_PROTOCOL_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS tracker_write_protocol (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL,
+    raised_by TEXT NOT NULL
+);";
+
+/// Only code that installs a write rule raises the protocol. A newer build
+/// writing an older store leaves it where it is, so older builds keep writing
+/// every store whose rules they understand.
+fn raise_write_protocol(conn: &Connection, to: i64) -> StoreResult<()> {
+    conn.execute_batch(WRITE_PROTOCOL_SCHEMA)?;
+    conn.execute(
+        "INSERT INTO tracker_write_protocol (singleton, version, raised_by) VALUES (1, ?1, ?2)
+         ON CONFLICT (singleton) DO UPDATE
+         SET version = excluded.version, raised_by = excluded.raised_by
+         WHERE excluded.version > tracker_write_protocol.version",
+        params![to, crate::WRITER_VERSION],
+    )?;
     Ok(())
+}
+
+/// The refusal a write through this build meets, when the store requires a
+/// protocol it does not speak. A store without the table is at protocol 0.
+pub(super) fn write_refusal(conn: &Connection) -> StoreResult<Option<StoreError>> {
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'tracker_write_protocol')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !recorded {
+        return Ok(None);
+    }
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT version, raised_by FROM tracker_write_protocol WHERE singleton = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .filter(|(found, _)| *found > TRACKER_WRITE_PROTOCOL)
+        .map(|(found, raised_by)| StoreError::UnsupportedVersion {
+            subject: format!("{TRACKER_WRITE_PROTOCOL_SUBJECT} (raised by whip {raised_by})"),
+            found,
+            supported: TRACKER_WRITE_PROTOCOL,
+        }))
 }
 struct WriterPermit(Arc<AtomicBool>);
 impl Drop for WriterPermit {
@@ -299,6 +361,11 @@ impl WorkItemStore {
         let permit = WriterPermit(self.discovery_writer.clone());
         permit.0.store(true, Ordering::Release);
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        // Read under the writer lock, so no newer build can raise the
+        // protocol between this check and the write.
+        if let Some(refusal) = write_refusal(&tx)? {
+            return Err(refusal);
+        }
         Ok(DiscoveryTransaction {
             tx,
             owner,
@@ -307,6 +374,11 @@ impl WorkItemStore {
         })
     }
     pub(super) fn repair_discovery(&self) -> StoreResult<()> {
+        // Repair is a write. Under a protocol this build cannot write, the
+        // views are left to a build that can, and opening still succeeds.
+        if write_refusal(&self.connection)?.is_some() {
+            return Ok(());
+        }
         if !roots(&self.connection)?.is_empty() {
             let tx = self.discovery_transaction()?;
             require_writer(&tx)?;
@@ -397,6 +469,13 @@ fn enroll_checkout_with_git(
         return Ok(false);
     }
     let root = PathBuf::from(git_path(&git.stdout)?);
+    // Enrolling is a write. Under a protocol this build cannot write, report
+    // what a newer build already enrolled and change nothing, so a reading
+    // command still works.
+    if write_refusal(&store.connection)?.is_some() {
+        let root = fs::canonicalize(&root)?;
+        return Ok(roots(&store.connection)?.contains(&root));
+    }
     let owner = identity(&store.connection)?
         .ok_or_else(|| StoreError::Conflict("discovery requires a file-backed tracker".into()))?;
     if store.protection.is_some() {
@@ -1156,5 +1235,160 @@ mod tests {
         )
         .contains("symlinked ignore configuration"));
         assert_eq!(fs::read_to_string(config).expect("preserved"), "preserve");
+    }
+    fn git_init(root: &Path) {
+        let out = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git");
+        assert!(out.status.success());
+    }
+    fn write_protocol(store: &WorkItemStore) -> Option<(i64, String)> {
+        let recorded: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'tracker_write_protocol')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("schema");
+        recorded.then(|| {
+            store
+                .connection
+                .query_row(
+                    "SELECT version, raised_by FROM tracker_write_protocol",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("protocol row")
+        })
+    }
+    #[test]
+    fn write_protocol_is_raised_only_where_its_rules_are_installed() {
+        let root = Fixture::new();
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        file(&mut store, "before enrollment", "task");
+        assert_eq!(write_protocol(&store), None, "writing alone raises nothing");
+        store.enroll_discovery(&root.0).expect("enroll");
+        assert_eq!(
+            write_protocol(&store),
+            Some((1, crate::WRITER_VERSION.to_owned()))
+        );
+        file(&mut store, "after enrollment", "task");
+        assert_eq!(write_protocol(&store).map(|(v, _)| v), Some(1));
+    }
+    #[test]
+    fn a_newer_write_protocol_refuses_writes_and_keeps_reads() {
+        let root = Fixture::new();
+        git_init(&root.0);
+        let unenrolled = Fixture::new();
+        git_init(&unenrolled.0);
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        assert!(enroll_checkout(&store, &root.0).expect("enroll"));
+        let task = file(&mut store, "written before", "task");
+        drop(store);
+        Connection::open(root.db())
+            .expect("raw")
+            .execute(
+                "UPDATE tracker_write_protocol SET version = 7, raised_by = '9.9.9'",
+                [],
+            )
+            .expect("a newer whip raised the protocol");
+        let view = read(&root.0, "tasks", &task);
+
+        // Opening, which repairs views when it may write, and reading work.
+        let mut store = WorkItemStore::open(root.db()).expect("open under newer protocol");
+        WorkItemStore::open_existing(root.db()).expect("open existing under newer protocol");
+        let before = store.export_events().expect("events");
+        assert_eq!(
+            store.get_item(&task).expect("read").expect("found").title,
+            "written before"
+        );
+        store.discovery_summary(10).expect("startup snapshot");
+        assert!(enroll_checkout(&store, &root.0).expect("already enrolled reads as enrolled"));
+        assert!(
+            !enroll_checkout(&store, &unenrolled.0).expect("not enrolled, and not enrolled now")
+        );
+        assert!(!unenrolled.0.join(".rgignore").exists());
+
+        // Every kind of write is refused before it changes anything.
+        let refusals = [
+            store
+                .file_item("q", "written after", "", &[], &json!({}), None, None)
+                .map(|_| ())
+                .expect_err("file"),
+            store
+                .set_field(&task, "title", "changed")
+                .map(|_| ())
+                .expect_err("set"),
+            store
+                .add_comment(&task, None, "comment")
+                .map(|_| ())
+                .expect_err("comment"),
+            store.enroll_discovery(&unenrolled.0).expect_err("enroll"),
+        ];
+        for refusal in refusals {
+            match refusal {
+                StoreError::UnsupportedVersion {
+                    subject,
+                    found,
+                    supported,
+                } => {
+                    assert_eq!(
+                        subject,
+                        format!("{TRACKER_WRITE_PROTOCOL_SUBJECT} (raised by whip 9.9.9)")
+                    );
+                    assert_eq!((found, supported), (7, TRACKER_WRITE_PROTOCOL));
+                }
+                other => panic!("expected the write protocol refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(store.export_events().expect("events"), before);
+        assert_eq!(read(&root.0, "tasks", &task), view);
+        assert_eq!(write_protocol(&store), Some((7, "9.9.9".to_owned())));
+    }
+    /// A change to the installed write rules must decide whether an older
+    /// writer can still write correctly (DR-0186). If it cannot, raise
+    /// TRACKER_WRITE_PROTOCOL and the protocol where the rule is installed.
+    /// Either way, record the new digest here.
+    const WRITE_RULES: (i64, &str) = (
+        1,
+        "c660c4cc9b6fccb03fb4e7d1d73c132fbdaa43ebb44a73eb499866fed64fdd15",
+    );
+    #[test]
+    fn write_rules_are_pinned_to_their_protocol() {
+        let root = Fixture::new();
+        let store = WorkItemStore::open(root.db()).expect("store");
+        store.enroll_discovery(&root.0).expect("enroll");
+        let mut rules = store
+            .connection
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+            .expect("triggers")
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}\n{}\n",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rules");
+        rules.sort();
+        let digest: String = Sha256::digest(rules.concat().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            (TRACKER_WRITE_PROTOCOL, digest.as_str()),
+            WRITE_RULES,
+            "the tracker store's write rules changed. Decide whether a build that speaks \
+             protocol {} can still write correctly under them; if not, raise \
+             TRACKER_WRITE_PROTOCOL and the protocol where the rule is installed. Then pin \
+             the new digest in WRITE_RULES (DR-0186)",
+            WRITE_RULES.0
+        );
     }
 }

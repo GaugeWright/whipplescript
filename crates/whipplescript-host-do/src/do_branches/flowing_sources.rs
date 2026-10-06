@@ -2955,6 +2955,17 @@ mod tests {
             store.declare_contribution(declaration()).unwrap(),
             DeclareContributionOutcome::Declared
         );
+        let host_evidence =
+            whipplescript_store::branches::flowing_declaration_host::read_declaration_evidence(
+                &store, "unit-1",
+            )
+            .unwrap()
+            .expect("hosted declaration has host evidence");
+        assert_eq!(host_evidence.source_cut_id, "cut-1");
+        assert_eq!(host_evidence.pin_id, "pin-1");
+        assert!(!serde_json::to_string(&host_evidence)
+            .unwrap()
+            .contains("repair customer rule"));
         assert_eq!(
             store
                 .declare_contribution(DeclareContribution {

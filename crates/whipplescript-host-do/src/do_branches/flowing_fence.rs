@@ -292,6 +292,16 @@ mod tests {
             };
             let applied = store.transition_flowing_source(&request).unwrap();
             assert!(matches!(applied, FlowingFenceOutcome::Applied(_)));
+            let host = whipplescript_store::branches::flowing_fence_host::read_fence_evidence(
+                &store, op_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(host.operation_id, op_id);
+            assert_eq!(
+                host.resulting_held,
+                store.flowing_source("branch").unwrap().unwrap().held
+            );
             assert!(matches!(
                 store.transition_flowing_source(&request).unwrap(),
                 FlowingFenceOutcome::Existing(_)

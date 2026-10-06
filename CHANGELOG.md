@@ -30,6 +30,12 @@ next free number rather than a patch — it says so.
   socket addresses and TLS certificate identities. The selected transport
   refuses destination changes and redirects; it grants no task or reader access.
 
+- A tracker store records the write protocol its write rules need, and a
+  `whip` too old for it is refused on write with advice to upgrade, while
+  every read keeps working (DR-0186). Enrolling for discovery sets protocol 1.
+  A write a store refuses for a missing `whip_` function is reported the same
+  way, no longer as "this is a whip bug".
+
 ## [0.9.0] — 2026-10-05
 
 A minor release, because a tracker store this version enrolls cannot be

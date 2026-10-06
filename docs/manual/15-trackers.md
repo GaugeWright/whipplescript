@@ -78,6 +78,12 @@ publication protocol; older connections opened before enrollment also refuse
 mutations, so they cannot silently make the files stale. Read-only export
 continues to observe the ledger.
 
+The store also records which write protocol those rules need. A `whip` too
+old for a store's protocol still reads it, and every `whip issue` listing and
+`show` works, but a write is refused up front with a message naming the `whip`
+that raised the protocol: upgrade `whip` to write. Nothing is changed by the
+refused write.
+
 A completed write publishes a complete generation. An interrupted publication
 leaves the view unavailable until a writable reopen repairs it. The tracker
 store remains authoritative; generated files are neither editable work lists

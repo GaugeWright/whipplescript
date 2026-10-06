@@ -1473,6 +1473,15 @@ mod tests {
         let recorded = store.contribution_declaration("unit-1").unwrap().unwrap();
         assert_eq!(recorded.source_cut_id, "cut-1");
         assert_eq!(recorded.source_manifest_hash, "manifest-1");
+        let host_evidence =
+            crate::branches::flowing_declaration_host::read_declaration_evidence(&store, "unit-1")
+                .unwrap()
+                .expect("native declaration has host evidence");
+        assert_eq!(host_evidence.source_cut_id, "cut-1");
+        assert_eq!(host_evidence.pin_id, "pin-1");
+        assert!(!serde_json::to_string(&host_evidence)
+            .unwrap()
+            .contains("repair customer rule"));
         assert_eq!(recorded.principal, "s:session-1");
         assert_eq!(
             store.release_private_cut(release()).unwrap(),

@@ -16,7 +16,9 @@
 //! no-destructive-verbs surface).
 
 pub mod flowing_admission;
+pub mod flowing_declaration_host;
 pub mod flowing_fence;
+pub mod flowing_fence_host;
 pub mod flowing_holders;
 pub mod flowing_host;
 pub mod flowing_lineage;

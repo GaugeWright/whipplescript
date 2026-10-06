@@ -402,6 +402,11 @@ mod tests {
         };
         assert!(held.state.held);
         assert_eq!(held.state.eligibility_epoch, 1);
+        let host = crate::branches::flowing_fence_host::read_fence_evidence(&store, "hold-1")
+            .unwrap()
+            .unwrap();
+        assert!(host.resulting_held);
+        assert_eq!(host.resulting_eligibility_epoch, 1);
         assert_eq!(
             store.transition_flowing_source(&hold).unwrap(),
             FlowingFenceOutcome::Existing(held.clone())
@@ -566,6 +571,28 @@ mod tests {
         );
         assert_eq!(store.flowing_fence_receipt("hold-1").unwrap(), Some(held));
         assert!(store.flowing_fence_receipt("stale").unwrap().is_none());
+        for op_id in [
+            "hold-1",
+            "release-1",
+            "begin-1",
+            "finish-1",
+            "revoke-1",
+            "begin-aborted",
+            "abort-1",
+            "takeover-1",
+            "close-1",
+        ] {
+            let evidence = crate::branches::flowing_fence_host::read_fence_evidence(&store, op_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.operation_id, op_id);
+            let bytes = serde_json::to_vec(&evidence).unwrap();
+            assert_eq!(
+                crate::branches::flowing_fence_host::FlowingHostFenceEvidenceV1::decode(&bytes)
+                    .unwrap(),
+                evidence
+            );
+        }
     }
 
     #[test]
