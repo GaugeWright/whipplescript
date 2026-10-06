@@ -207,7 +207,11 @@ pub(crate) struct ContainerAppIdentityToken {
 impl ContainerAppIdentityToken {
     pub(crate) fn from_env(client_id: Option<String>) -> Result<Self, Error> {
         let endpoint = std::env::var("IDENTITY_ENDPOINT").map_err(|_| Error::Authentication)?;
-        std::env::var("IDENTITY_HEADER").map_err(|_| Error::Authentication)?;
+        // The platform's rotating header is secret even during construction.
+        // Check its presence without leaving a plaintext temporary behind.
+        let _header = SecretMaterial::new(
+            std::env::var("IDENTITY_HEADER").map_err(|_| Error::Authentication)?,
+        );
         Self::with_endpoint(&endpoint, client_id)
     }
 
