@@ -251,11 +251,7 @@ impl ModelWire {
     /// an unrecognized surface has no honest fallback, so callers that cannot
     /// name a wire should refuse rather than guess.
     pub fn of_provider(provider: CoerceProvider) -> Self {
-        match provider {
-            CoerceProvider::Anthropic => ModelWire::AnthropicMessages,
-            CoerceProvider::OpenAi => ModelWire::OpenAiResponses,
-            CoerceProvider::OpenAiCompat | CoerceProvider::Xai => ModelWire::OpenAiChatCompat,
-        }
+        crate::provider_contract::coerce_provider(provider).default_wire()
     }
 
     /// Parse a declared wire name. Returns `None` for an unknown name so the
@@ -297,13 +293,13 @@ impl ModelWire {
         ModelWire::CoercedTools,
     ];
 
-    /// The request surface this dialect speaks.
+    /// The request surface this dialect speaks: the credential header shape the
+    /// provider contract declares for it, which is what makes a crossed pairing
+    /// unsendable.
     fn surface(self) -> ModelSurface {
-        match self {
-            ModelWire::AnthropicMessages => ModelSurface::Anthropic,
-            ModelWire::OpenAiResponses | ModelWire::OpenAiChatCompat | ModelWire::CoercedTools => {
-                ModelSurface::OpenAi
-            }
+        match crate::provider_contract::wire(self).auth_header {
+            crate::provider_contract::AuthHeader::XApiKey => ModelSurface::Anthropic,
+            crate::provider_contract::AuthHeader::AuthorizationBearer => ModelSurface::OpenAi,
         }
     }
 
@@ -316,7 +312,7 @@ impl ModelWire {
     /// shape. `anthropic-messages` posts to `/v1/messages` with `x-api-key`;
     /// every OpenAI dialect posts under a `Bearer` token.
     pub fn admits_provider(self, provider: CoerceProvider) -> bool {
-        self.surface() == ModelSurface::of_provider(provider)
+        crate::provider_contract::coerce_provider(provider).admits(self)
     }
 
     /// The wire for a binding that names a provider identity: what the binding
@@ -423,12 +419,7 @@ enum ModelSurface {
 
 impl ModelSurface {
     fn of_provider(provider: CoerceProvider) -> Self {
-        match provider {
-            CoerceProvider::Anthropic => ModelSurface::Anthropic,
-            CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
-                ModelSurface::OpenAi
-            }
-        }
+        ModelWire::of_provider(provider).surface()
     }
 
     fn name(self) -> &'static str {
@@ -824,10 +815,9 @@ impl HttpModelClient for MessagesApiClient {
         request
             .headers
             .push(("accept".to_owned(), "text/event-stream".to_owned()));
-        if matches!(
-            self.wire,
-            ModelWire::OpenAiChatCompat | ModelWire::CoercedTools
-        ) {
+        if let Some((field, flag)) =
+            crate::provider_contract::wire(self.wire).streamed_usage_request()
+        {
             // A Chat Completions stream reports no usage at all unless the
             // request asks for it — the ordinary non-streamed response carries
             // `usage` unconditionally, so turning streaming on for this provider
@@ -836,7 +826,7 @@ impl HttpModelClient for MessagesApiClient {
             // must discard an answer the provider already gave. The Responses
             // and Messages streams always terminate with usage, so this is the
             // one wire that has to be asked.
-            request.body["stream_options"] = json!({ "include_usage": true });
+            request.body[field] = json!({ flag: true });
         }
         request
     }
@@ -869,25 +859,29 @@ impl HttpModelClient for MessagesApiClient {
 }
 
 fn apply_xai_api_cache_header(request: &mut HttpRequest) {
+    let Some(header) =
+        crate::provider_contract::coerce_provider(CoerceProvider::Xai).cache_key_header()
+    else {
+        return;
+    };
     if let Some(key) = request
         .body
         .as_object_mut()
         .and_then(|body| body.remove("prompt_cache_key"))
         .and_then(|value| value.as_str().map(str::to_owned))
     {
-        request.headers.push(("x-grok-conv-id".to_owned(), key));
+        request.headers.push((header.to_owned(), key));
     }
 }
 
 fn apply_xai_subscription_headers(request: &mut HttpRequest, model: &str) {
-    request.headers.extend([
-        ("X-XAI-Token-Auth".to_owned(), "xai-grok-cli".to_owned()),
-        ("x-grok-model-override".to_owned(), model.to_owned()),
-        (
-            "user-agent".to_owned(),
-            format!("whipplescript/{}", env!("CARGO_PKG_VERSION")),
-        ),
-    ]);
+    let identity = crate::provider_contract::provider("xai-grok")
+        .expect("provider_contract.json declares the xai-grok identity");
+    request.headers.extend(identity.headers(model, ""));
+    request.headers.push((
+        "user-agent".to_owned(),
+        format!("whipplescript/{}", env!("CARGO_PKG_VERSION")),
+    ));
 }
 
 fn round_idempotency_key(
@@ -936,15 +930,18 @@ fn build_codex_request(
 ) -> HttpRequest {
     let mut request =
         build_openai_request(base_url, access_token, model, cache_key, messages, tools);
+    let codex = crate::provider_contract::provider("openai-codex")
+        .expect("provider_contract.json declares the openai-codex identity");
     request.url = format!(
-        "{}/backend-api/codex/responses",
-        base_url.trim_end_matches('/')
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        codex.path_on(ModelWire::OpenAiResponses)
     );
     request.body["stream"] = json!(true);
     request.body["store"] = json!(false);
     request.body["parallel_tool_calls"] = json!(false);
+    request.headers.extend(codex.headers(model, account_id));
     request.headers.extend([
-        ("chatgpt-account-id".to_owned(), account_id.to_owned()),
         ("accept".to_owned(), "text/event-stream".to_owned()),
         (
             "openai-beta".to_owned(),
@@ -1047,8 +1044,9 @@ fn build_openai_compat_request(
     // Guessing was the defect: an over-large value is refused outright rather
     // than clamped, and omitting lets the provider apply its own true ceiling —
     // which is exactly the capability we were trying to name.
+    let wire = crate::provider_contract::wire(ModelWire::OpenAiChatCompat);
     if let Some(limit) = max_tokens {
-        body["max_tokens"] = json!(limit);
+        body[wire.output_limit.field.as_str()] = json!(limit);
     }
     if !tool_defs.is_empty() {
         body["tools"] = json!(tool_defs);
@@ -1057,19 +1055,17 @@ fn build_openai_compat_request(
         // Honored by OpenAI and ignored by endpoints that don't cache — harmless.
         body["prompt_cache_key"] = json!(key);
     }
-    let mut headers = vec![
-        ("authorization".into(), format!("Bearer {api_key}")),
-        ("content-type".into(), "application/json".into()),
-    ];
+    let mut headers = wire.auth_headers(api_key);
+    headers.push(("content-type".into(), "application/json".into()));
     if let Some(key) = request_key.as_deref() {
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
         model_provenance: None,
         // The configured endpoint is the OpenAI-compatible base URL as provider docs
-        // give it (it already includes `/v1`), so append only `/chat/completions` —
-        // the OpenAI SDK `base_url` convention every compat endpoint follows.
-        url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+        // give it (it already includes `/v1`); the contract's path for this wire
+        // carries no version segment, the OpenAI SDK `base_url` convention.
+        url: wire.url(base_url),
         headers,
         body,
     }
@@ -1256,22 +1252,21 @@ fn build_coerced_tools_request(
             },
         },
     });
+    let wire = crate::provider_contract::wire(ModelWire::CoercedTools);
     if let Some(limit) = max_tokens {
-        body["max_tokens"] = json!(limit);
+        body[wire.output_limit.field.as_str()] = json!(limit);
     }
     if let Some(key) = request_key.as_deref() {
         body["prompt_cache_key"] = json!(key);
     }
-    let mut headers = vec![
-        ("authorization".into(), format!("Bearer {api_key}")),
-        ("content-type".into(), "application/json".into()),
-    ];
+    let mut headers = wire.auth_headers(api_key);
+    headers.push(("content-type".into(), "application/json".into()));
     if let Some(key) = request_key.as_deref() {
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
         model_provenance: None,
-        url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+        url: wire.url(base_url),
         headers,
         body,
     }
@@ -1438,8 +1433,9 @@ fn build_anthropic_request(
     // the model's own capability rather than omitted. Claude output ceilings are
     // known and few, which is why this wire can answer the question and the
     // OpenAI ones below cannot.
+    let wire = crate::provider_contract::wire(ModelWire::AnthropicMessages);
     body.insert(
-        "max_tokens".into(),
+        wire.output_limit.field.clone(),
         json!(max_tokens.unwrap_or_else(|| anthropic_output_limit(model))),
     );
     if let Some(system) = system {
@@ -1459,11 +1455,8 @@ fn build_anthropic_request(
     }
     body.insert("messages".into(), json!(mark_conversation_cache(msgs)));
     body.insert("tools".into(), json!(tool_defs));
-    let mut headers = vec![
-        ("x-api-key".into(), api_key.to_owned()),
-        ("anthropic-version".into(), "2023-06-01".into()),
-        ("content-type".into(), "application/json".into()),
-    ];
+    let mut headers = wire.auth_headers(api_key);
+    headers.push(("content-type".into(), "application/json".into()));
     if let Some(key) = cache_key {
         // The resume-stable per-effect run id as an `Idempotency-Key` header
         // (DR-0033): Anthropic ignores it today, but sending it costs nothing and
@@ -1472,7 +1465,7 @@ fn build_anthropic_request(
     }
     HttpRequest {
         model_provenance: None,
-        url: format!("{base_url}/v1/messages"),
+        url: wire.url(base_url),
         headers,
         body: Value::Object(body),
     }
@@ -1626,10 +1619,9 @@ fn build_openai_request(
         // request prefix from cache instead of re-reading it each round.
         body["prompt_cache_key"] = json!(key);
     }
-    let mut headers = vec![
-        ("authorization".into(), format!("Bearer {api_key}")),
-        ("content-type".into(), "application/json".into()),
-    ];
+    let wire = crate::provider_contract::wire(ModelWire::OpenAiResponses);
+    let mut headers = wire.auth_headers(api_key);
+    headers.push(("content-type".into(), "application/json".into()));
     if let Some(key) = request_key.as_deref() {
         // Same run/effect id as an `Idempotency-Key` header (DR-0033): OpenAI
         // dedupes a resumed duplicate against it. This is idempotency, distinct
@@ -1638,7 +1630,7 @@ fn build_openai_request(
     }
     HttpRequest {
         model_provenance: None,
-        url: format!("{base_url}/v1/responses"),
+        url: wire.url(base_url),
         headers,
         body,
     }

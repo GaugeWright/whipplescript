@@ -373,8 +373,13 @@ these traits:
 | `DoStorage` | The flat storage of the file plane that supports `DoFileStore`. |
 | `FetchClient` / `FetchHost` | The one async primitive that is available to an effect that uses HTTP. The primitive is `fetch`. |
 | `Alarms` | The schedule of the alarms of the DO, for a timer and for a deadline. |
-| `Secrets` | The resolution of a credential of a provider from the secrets of the DO. |
 | `ObjectStore` | The optional tier of objects that supports `TieredFileStore`. |
+
+The seam has no trait for secrets. On the admitted-session path the core
+holds only the reference of a credential, and the shell of the Worker resolves
+the reference before the egress (DR-0047, DR-0042). The legacy `POST /start`
+bootstrap still forwards the Worker's provider keys into the configuration of
+the WASM instance; WS-838 removes that.
 
 This is the surface of the runtime and the store:
 

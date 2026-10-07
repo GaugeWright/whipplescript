@@ -5085,7 +5085,7 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
         })?;
     let base_url = explicit_base_url.unwrap_or_else(|| {
         if codex_account_id.is_some() {
-            "https://chatgpt.com".to_owned()
+            crate::coerce_runtime::codex_base_url().to_owned()
         } else {
             provider.default_base_url().to_string()
         }

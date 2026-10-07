@@ -117,6 +117,12 @@ case "${1:-}" in
   do-schema)
     node scripts/check-do-schema-consistency.mjs --selftest
     node scripts/check-do-schema-consistency.mjs ;;
+  provider-contract)
+    # One owning source for what a backend is on the wire (DR-0205): the
+    # kernel and the worker read provider_contract.json, and no consumer
+    # spells a fact it holds.
+    node scripts/check-provider-contract.mjs --selftest
+    node scripts/check-provider-contract.mjs ;;
   workstream-host-contract) python3 scripts/check-workstream-host-contract.py ;;
   refusal-scanner)      python3 scripts/test-mutation-sweep.py ;;
   vendored-std)         scripts/check-vendored-std.sh ;;

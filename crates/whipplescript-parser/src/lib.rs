@@ -17709,6 +17709,22 @@ fn validate_availability_when(
     }
 }
 
+// Presence proofs never escape one validation walk. Query rows are identified
+// by their AST child path within that expression, independently of source spans.
+// Another top-level expression starts with an empty proof set, so its paths may
+// repeat without making a proof available across expression boundaries.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum PresenceRoot {
+    Binding(String),
+    Query(Vec<usize>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PresenceKey {
+    root: PresenceRoot,
+    path: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExprScope {
     // Immediate operands already checked by managed inference. The legacy
@@ -17720,6 +17736,7 @@ struct ExprScope {
     value_path_types: BTreeMap<Vec<String>, IrType>,
     binding_types: BTreeMap<String, String>,
     implicit_schema: Option<String>,
+    implicit_query_root: Option<Vec<usize>>,
 }
 
 impl ExprScope {
@@ -17730,6 +17747,7 @@ impl ExprScope {
             value_types: BTreeMap::new(),
             value_path_types: BTreeMap::new(),
             implicit_schema: None,
+            implicit_query_root: None,
         }
     }
 
@@ -17971,6 +17989,7 @@ fn validate_parsed_expression(
     validate_expr_node(
         expr,
         spans,
+        &[],
         semantic,
         scope,
         context,
@@ -17996,15 +18015,22 @@ fn validate_parsed_expression(
 /// `spans` mirrors `expr`: `spans.child(n)` is the `n`th entry of
 /// [`Expr::children`], so the two walk in lockstep and a finding about one node
 /// can name that node instead of the clause the expression sits in (D10).
+#[allow(clippy::too_many_arguments)]
 fn validate_expr_node(
     expr: &Expr,
     spans: &ExprSpans,
+    node_path: &[usize],
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
-    presence_proofs: &BTreeSet<String>,
+    presence_proofs: &BTreeSet<PresenceKey>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let child_path = |index| {
+        let mut path = node_path.to_vec();
+        path.push(index);
+        path
+    };
     match expr {
         Expr::Path(path) => {
             if path.len() < 2 {
@@ -18015,9 +18041,13 @@ fn validate_expr_node(
             let root = &path[0];
             let Some(schema) = scope.binding_types.get(root) else {
                 if let Some(schema) = &scope.implicit_schema {
-                    if let Err(fault) =
-                        validate_optional_path_access(schema, path, semantic, presence_proofs)
-                    {
+                    if let Err(fault) = validate_optional_path_access(
+                        schema,
+                        path,
+                        scope.implicit_query_root.clone().map(PresenceRoot::Query),
+                        semantic,
+                        presence_proofs,
+                    ) {
                         // The implicit-schema arm passes the author's WHOLE
                         // path, so the unproven prefix is its first `consumed`
                         // segments.
@@ -18080,9 +18110,13 @@ fn validate_expr_node(
                 });
                 return;
             };
-            if let Err(fault) =
-                validate_optional_path_access(schema, &path[1..], semantic, presence_proofs)
-            {
+            if let Err(fault) = validate_optional_path_access(
+                schema,
+                &path[1..],
+                Some(PresenceRoot::Binding(root.clone())),
+                semantic,
+                presence_proofs,
+            ) {
                 // This arm hands the checker the path WITHOUT its binding root,
                 // so the prefix it reports is one segment short of what the
                 // author would have to write in `exists(...)`. Put the root back.
@@ -18130,6 +18164,7 @@ fn validate_expr_node(
             validate_expr_node(
                 target,
                 spans.child(0),
+                &child_path(0),
                 semantic,
                 scope,
                 context,
@@ -18139,34 +18174,20 @@ fn validate_expr_node(
             validate_expr_node(
                 key,
                 spans.child(1),
+                &child_path(1),
                 semantic,
                 scope,
                 context,
                 presence_proofs,
                 diagnostics,
             );
-            let key_ty =
-                infer_expr_type(key, spans.child(1), semantic, scope, context, diagnostics);
-            if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("expr.non_string_map_key"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    // The key is the operand the message is about.
-                    span: context.node(spans.child(1)),
-                    message: format!("{} indexes a map with a non-string key", context.subject),
-                    suggestion: suggest(
-                        "use a string literal or string expression as the map key".to_owned(),
-                    ),
-                });
-            }
         }
         Expr::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 validate_expr_node(
                     item,
                     spans.child(index),
+                    &child_path(index),
                     semantic,
                     scope,
                     context,
@@ -18197,6 +18218,7 @@ fn validate_expr_node(
                 validate_expr_node(
                     &field.value,
                     spans.child(index),
+                    &child_path(index),
                     semantic,
                     scope,
                     context,
@@ -18208,6 +18230,7 @@ fn validate_expr_node(
         Expr::Unary { expr, .. } => validate_expr_node(
             expr,
             spans.child(0),
+            &child_path(0),
             semantic,
             scope,
             context,
@@ -18222,6 +18245,7 @@ fn validate_expr_node(
             validate_expr_node(
                 left,
                 spans.child(0),
+                &child_path(0),
                 semantic,
                 scope,
                 context,
@@ -18229,10 +18253,11 @@ fn validate_expr_node(
                 diagnostics,
             );
             let mut right_proofs = presence_proofs.clone();
-            collect_presence_proofs(left, &mut right_proofs);
+            collect_presence_proofs(left, scope, &mut right_proofs);
             validate_expr_node(
                 right,
                 spans.child(1),
+                &child_path(1),
                 semantic,
                 scope,
                 context,
@@ -18244,6 +18269,7 @@ fn validate_expr_node(
             validate_expr_node(
                 left,
                 spans.child(0),
+                &child_path(0),
                 semantic,
                 scope,
                 context,
@@ -18253,6 +18279,7 @@ fn validate_expr_node(
             validate_expr_node(
                 right,
                 spans.child(1),
+                &child_path(1),
                 semantic,
                 scope,
                 context,
@@ -18287,6 +18314,7 @@ fn validate_expr_node(
                 validate_expr_node(
                     arg,
                     spans.child(index),
+                    &child_path(index),
                     semantic,
                     scope,
                     context,
@@ -18298,10 +18326,12 @@ fn validate_expr_node(
         Expr::Query { guard, .. } => {
             validate_query_expr(expr, spans, semantic, scope, context, diagnostics);
             if let Some(guard) = guard {
-                let guard_scope = query_guard_scope(expr, semantic, scope);
+                let mut guard_scope = query_guard_scope(expr, semantic, scope);
+                guard_scope.implicit_query_root = Some(node_path.to_vec());
                 validate_expr_node(
                     guard,
                     spans.child(0),
+                    &child_path(0),
                     semantic,
                     &guard_scope,
                     context,
@@ -18700,8 +18730,9 @@ fn optional_presence_repair(path: &str) -> String {
 fn validate_optional_path_access(
     root_schema: &str,
     path: &[String],
+    proof_root: Option<PresenceRoot>,
     semantic: &SemanticContext,
-    presence_proofs: &BTreeSet<String>,
+    presence_proofs: &BTreeSet<PresenceKey>,
 ) -> Result<(), OptionalAccessFault> {
     let mut schema = root_schema.to_owned();
     let mut prefix = Vec::new();
@@ -18714,7 +18745,14 @@ fn validate_optional_path_access(
         };
         prefix.push(field.clone());
         if let TypeSyntax::Optional { inner, .. } = field_ty {
-            if index + 1 < path.len() && !presence_proofs.contains(&prefix.join(".")) {
+            if index + 1 < path.len()
+                && !proof_root.as_ref().is_some_and(|root| {
+                    presence_proofs.contains(&PresenceKey {
+                        root: root.clone(),
+                        path: prefix.join("."),
+                    })
+                })
+            {
                 return Err(OptionalAccessFault {
                     message: format!(
                         "`{}` must be proven present before accessing `{}`",
@@ -18736,7 +18774,7 @@ fn validate_optional_path_access(
     Ok(())
 }
 
-fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
+fn collect_presence_proofs(expr: &Expr, scope: &ExprScope, proofs: &mut BTreeSet<PresenceKey>) {
     match expr {
         Expr::Binary {
             op: BinaryOp::Ne,
@@ -18744,12 +18782,12 @@ fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
             right,
         } => {
             if matches!(**right, Expr::Literal(ExprLiteral::Null)) {
-                if let Some(path) = expr_path_key(left) {
+                if let Some(path) = expr_path_key(left, scope) {
                     proofs.insert(path);
                 }
             }
             if matches!(**left, Expr::Literal(ExprLiteral::Null)) {
-                if let Some(path) = expr_path_key(right) {
+                if let Some(path) = expr_path_key(right, scope) {
                     proofs.insert(path);
                 }
             }
@@ -18765,19 +18803,19 @@ fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
             } = expr.as_ref()
             {
                 if matches!(**right, Expr::Literal(ExprLiteral::Null)) {
-                    if let Some(path) = expr_path_key(left) {
+                    if let Some(path) = expr_path_key(left, scope) {
                         proofs.insert(path);
                     }
                 }
                 if matches!(**left, Expr::Literal(ExprLiteral::Null)) {
-                    if let Some(path) = expr_path_key(right) {
+                    if let Some(path) = expr_path_key(right, scope) {
                         proofs.insert(path);
                     }
                 }
             }
         }
         Expr::Call { name, args } if name == "exists" && args.len() == 1 => {
-            if let Some(path) = expr_path_key(&args[0]) {
+            if let Some(path) = expr_path_key(&args[0], scope) {
                 proofs.insert(path);
             }
         }
@@ -18786,26 +18824,41 @@ fn collect_presence_proofs(expr: &Expr, proofs: &mut BTreeSet<String>) {
             left,
             right,
         } => {
-            collect_presence_proofs(left, proofs);
-            collect_presence_proofs(right, proofs);
+            collect_presence_proofs(left, scope, proofs);
+            collect_presence_proofs(right, scope, proofs);
         }
         _ => {}
     }
 }
 
-fn expr_path_key(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Literal(ExprLiteral::Ident(name)) => Some(name.clone()),
-        Expr::Path(path) if path.len() >= 2 => Some(path[1..].join(".")),
+fn expr_path_key(expr: &Expr, scope: &ExprScope) -> Option<PresenceKey> {
+    let path = match expr {
+        Expr::Literal(ExprLiteral::Ident(name)) => vec![name.clone()],
+        Expr::Path(path) if !path.is_empty() => path.clone(),
         Expr::Index { target, key } => {
-            let target = expr_path_key(target)?;
+            let mut target = expr_path_key(target, scope)?;
             let key = match key.as_ref() {
                 Expr::Literal(ExprLiteral::String(value) | ExprLiteral::Ident(value)) => value,
                 _ => return None,
             };
-            Some(format!("{target}[{key:?}]"))
+            target.path.push_str(&format!("[{key:?}]"));
+            return Some(target);
         }
-        _ => None,
+        _ => return None,
+    };
+    let root = &path[0];
+    // Match the path reader's precedence: a named binding wins over an
+    // implicit query field with the same spelling.
+    if scope.binding_types.contains_key(root) || scope.value_types.contains_key(root) {
+        Some(PresenceKey {
+            root: PresenceRoot::Binding(root.clone()),
+            path: path[1..].join("."),
+        })
+    } else {
+        Some(PresenceKey {
+            root: PresenceRoot::Query(scope.implicit_query_root.clone()?),
+            path: path.join("."),
+        })
     }
 }
 
@@ -18883,7 +18936,7 @@ fn infer_expr_type(
             );
             let key_ty =
                 infer_expr_type(key, spans.child(1), semantic, scope, context, diagnostics);
-            if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
+            if !is_map_index_key_type(&key_ty) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.non_string_map_key"),
                     severity: Severity::Error,
@@ -19395,6 +19448,14 @@ fn types_comparable(left: &ExprType, right: &ExprType) -> bool {
 
 fn is_numeric_type(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Int | ExprType::Float)
+}
+
+// Literal-string fields keep their finite domain during expression inference.
+// They are still string keys; optional values and other finite domains retain
+// their existing index refusal rather than acquiring a string coercion.
+fn is_map_index_key_type(ty: &ExprType) -> bool {
+    matches!(ty, ExprType::String | ExprType::Unknown)
+        || matches!(ty, ExprType::Finite { label, .. } if label == "literal" || label == "literal union")
 }
 
 fn is_string_like_key_type(ty: &ExprType) -> bool {

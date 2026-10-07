@@ -8517,12 +8517,11 @@ test "a run" {
 /// the `Ident` arm of `parse_primary`). Every other name fails to tokenize
 /// first, so no source program reaches that arm.
 ///
-/// One finding is not covered here because it is a defect rather than a
-/// gap: `indexes a map with a non-string key` is emitted from TWO sites,
-/// one validating and one inferring, and both fire on the same expression —
-/// the author is told twice. The case below asserts the message appears; it
-/// deliberately does not assert how many times, because pinning 2 would
-/// enshrine the duplication. Neither site can be bite-tested alone while
+/// Map-key compatibility is checked by expression inference. The recursive
+/// validation walk no longer repeats that same diagnostic; the compiler matrix
+/// in `map_indexes_accept_literal_string_key_types` pins one author-facing
+/// refusal for each invalid key across the callers that infer the index.
+///
 /// The record-construction type checks: what may be assigned to a field of
 /// a map, class, enum, literal-union, or AgentRef type. A mutation sweep
 /// found these unexercised, confirmed workspace-wide.
@@ -27385,6 +27384,166 @@ coerce review(requested_at string, diff string) -> Verdict {{
         "{}",
         warning.message
     );
+}
+
+#[test]
+fn map_indexes_accept_literal_string_key_types() {
+    let bodies = [
+        "rule route\n when Task as t where t.labels[t.key] == \"high\"\n=> { }",
+        "rule route\n when Task as t where exists t.labels[t.key]\n=> { }",
+        "rule route\n when Task as t where empty(t.labels[t.key])\n=> { }",
+        "rule route\n when Task as t where count([t.labels[t.key]]) == 1\n=> { }",
+        "assert count(Task where exists labels[key]) == 0",
+        "assert exists(Task where exists labels[key])",
+        "assert empty(Task where exists labels[key])",
+        "rule route\n when Task as t\n=> {\n record Seen { value t.labels[t.key] }\n }",
+    ];
+    for (key_type, valid) in [
+        ("string", true),
+        ("\"priority\"", true),
+        ("\"priority\" | \"owner\"", true),
+        ("int", false),
+        ("bool", false),
+        ("string?", false),
+        ("AgentRef<codex>", false),
+        ("Key", false),
+    ] {
+        for body in bodies {
+            let source = format!("workflow MapKeys\nagent codex {{ provider codex\n profile \"repo-writer\"\n capacity 1 }}\nenum Key {{\n Priority\n Owner\n }}\nclass Seen {{ value string }}\nclass Task {{ labels map<string>\n key {key_type} }}\n{body}\n");
+            let compiled = compile_program(&source);
+            assert_eq!(
+                compiled.ir.is_some(),
+                valid,
+                "wrong admission for {key_type} in {body}: {:?}",
+                compiled.diagnostics
+            );
+            if valid {
+                assert!(compiled.diagnostics.is_empty());
+            } else {
+                assert_eq!(
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.code.as_str() == "expr.non_string_map_key")
+                        .count(),
+                    1,
+                    "key refusal must report one author mistake in {body} for {key_type}: {:?}",
+                    compiled.diagnostics
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn optional_presence_proofs_keep_binding_and_query_row_identity() {
+    let classes = "workflow Presence\nclass Leaf { title string }\nclass Child { maybe Leaf? }\nclass Task { maybe Leaf?\n child Child }\n";
+    let forms = ["exists {p}", "{p} != null", "null != {p}", "!({p} == null)"];
+    for form in forms {
+        for (proof_path, read_path, valid) in [
+            ("a.maybe", "a.maybe.title", true),
+            ("b.maybe", "b.maybe.title", true),
+            ("a.maybe", "b.maybe.title", false),
+            ("b.maybe", "a.maybe.title", false),
+            ("a.child.maybe", "a.child.maybe.title", true),
+            ("a.child.maybe", "b.child.maybe.title", false),
+        ] {
+            let proof = form.replace("{p}", proof_path);
+            let source = format!("{classes}rule route\n when Task as a\n when Task as b where {proof} && {read_path} == \"x\"\n=> {{ }}\n");
+            let c = compile_program(&source);
+            assert_eq!(
+                c.ir.is_some(),
+                valid,
+                "{proof} -> {read_path}: {:?}",
+                c.diagnostics
+            );
+            if !valid {
+                assert!(c
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_str() == "expr.optional_without_presence"));
+            }
+        }
+        for path in ["maybe", "child.maybe"] {
+            let proof = form.replace("{p}", path);
+            let source =
+                format!("{classes}assert exists(Task where {proof} && {path}.title == \"x\")\n");
+            let c = compile_program(&source);
+            assert!(
+                c.ir.is_some(),
+                "same implicit row {proof}: {:?}",
+                c.diagnostics
+            );
+            let source = format!("{classes}assert exists(Task where {proof} && exists(Task where {path}.title == \"x\"))\n");
+            let c = compile_program(&source);
+            assert!(c.ir.is_none(), "leaked across query rows {proof}");
+            assert!(c
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "expr.optional_without_presence"));
+        }
+    }
+    // Action query validation deliberately has ExprSpans::unknown(). Row
+    // identity must distinguish these same-schema nodes without positions.
+    for (expr, valid) in [
+        (
+            "exists(Task where maybe != null && maybe.title == \"x\")",
+            true,
+        ),
+        (
+            "exists(Task where exists maybe && maybe.title == \"x\")",
+            true,
+        ),
+        (
+            "exists(Task where maybe != null && exists(Task where maybe.title == \"x\"))",
+            false,
+        ),
+    ] {
+        let c = compile_program(&format!(
+            "{classes}action inspect() -> bool {{ return {expr} }}\n"
+        ));
+        assert_eq!(
+            c.ir.is_some(),
+            valid,
+            "action query {expr}: {:?}",
+            c.diagnostics
+        );
+        if !valid {
+            assert!(c
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "expr.optional_without_presence"));
+        }
+    }
+    for guard in [
+        "exists a.maybe || a.maybe.title == \"x\"",
+        "!exists a.maybe && a.maybe.title == \"x\"",
+        "!(a.maybe != null) && a.maybe.title == \"x\"",
+        "a.maybe.title == \"x\" && exists a.maybe",
+        "(exists a.maybe || true) && a.maybe.title == \"x\"",
+    ] {
+        let c = compile_program(&format!(
+            "{classes}rule route\n when Task as a where {guard}\n=> {{ }}\n"
+        ));
+        assert!(c.ir.is_none(), "invalid proof accepted: {guard}");
+        assert!(c
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "expr.optional_without_presence"));
+    }
+    for guard in [
+        "exists a.maybe && exists(Task where a.maybe.title == \"x\")",
+        "exists a.maybe && (true && a.maybe.title == \"x\")",
+    ] {
+        let c = compile_program(&format!(
+            "{classes}rule route\n when Task as a where {guard}\n=> {{ }}\n"
+        ));
+        assert!(
+            c.ir.is_some(),
+            "valid scoped proof rejected: {guard}: {:?}",
+            c.diagnostics
+        );
+    }
 }
 
 #[test]

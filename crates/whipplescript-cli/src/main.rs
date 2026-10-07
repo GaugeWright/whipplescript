@@ -730,7 +730,10 @@ fn turn_credential_proxy(
 /// influence would hand that choice back.
 fn proxy_upstream_for(family: &str) -> Result<&'static str, String> {
     match family {
-        "anthropic" => Ok("https://api.anthropic.com"),
+        "anthropic" => Ok(whipplescript_kernel::provider_contract::coerce_provider(
+            whipplescript_kernel::coerce_native::CoerceProvider::Anthropic,
+        )
+        .base_url()),
         other => Err(format!(
             "no credential proxy upstream is known for `{other}`"
         )),

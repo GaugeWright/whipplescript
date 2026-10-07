@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use ureq::rustls;
 use url::{Host, Url};
+use whipplescript_kernel::provider_contract;
 
 use super::{HostRuntimeError, ModelProvider};
 
@@ -145,12 +146,10 @@ impl NativeProviderTransport {
         if endpoint != self.endpoint {
             return Err(refused());
         }
-        let suffix = match provider {
-            ModelProvider::OpenAiCompat | ModelProvider::Xai => "/chat/completions",
-            ModelProvider::Anthropic => "/v1/messages",
-            ModelProvider::Codex => "/backend-api/codex/responses",
-            ModelProvider::OpenAi | ModelProvider::XaiSubscription => "/v1/responses",
-        };
+        // The identity's default wire's path, or the identity's own where it
+        // replaces the wire's (the Codex backend), from the provider contract.
+        let identity = provider_contract::provider(provider.as_str()).ok_or_else(refused)?;
+        let suffix = identity.path_on(identity.default_wire());
         let request_url = format!("{}{suffix}", endpoint.trim_end_matches('/'));
         let authority = self.authority.clone();
         let addresses = self.addresses.clone();

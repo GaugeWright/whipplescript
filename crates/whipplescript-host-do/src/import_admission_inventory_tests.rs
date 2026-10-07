@@ -85,8 +85,7 @@ fn basis(program: &Program, compiler: &str, paint_source: &str) -> CurrentImport
         } else {
             packages(paint_source)
         },
-        constructs: None,
-        declarations: None,
+        construct_basis: None,
     }
 }
 
@@ -406,6 +405,43 @@ fn current_basis_revalidation<S: RuntimeStore>(mut fresh: impl FnMut() -> S) {
     let uncaptured = store
         .create_program_version(version(&sketch, COMPILER))
         .unwrap();
+    let after_second = store.program_import_operation_roster().unwrap();
+    let selected = import_coverage::revalidate_selected(
+        &store,
+        std::slice::from_ref(&first.operation_id),
+        current(PAINT_SOURCE, COMPILER),
+    )
+    .unwrap();
+    assert_eq!(selected.frontier, after_second.frontier);
+    assert_eq!(selected.selected, after_second.operations[..1]);
+    assert_eq!(selected.outside, after_second.operations[1..]);
+    assert!(selected.gaps.is_empty());
+    assert_eq!(
+        import_coverage::revalidate_selected(
+            &store,
+            std::slice::from_ref(&first.operation_id),
+            current(CHANGED_PAINT_SOURCE, COMPILER),
+        )
+        .unwrap()
+        .gaps,
+        same_lock
+    );
+    assert_eq!(
+        import_coverage::revalidate_selected(&store, &["missing-from-target".into()], |_| panic!(
+            "an absent selected operation has no version to recapture"
+        ),)
+        .unwrap()
+        .gaps,
+        vec![ImportCoverageGap::MissingOperation {
+            operation_id: "missing-from-target".into(),
+        }]
+    );
+    assert!(import_coverage::revalidate_selected(
+        &store,
+        &[first.operation_id.clone(), first.operation_id.clone()],
+        current(PAINT_SOURCE, COMPILER),
+    )
+    .is_err());
     assert_eq!(
         gaps(import_coverage::revalidate(&store, current(PAINT_SOURCE, COMPILER)).unwrap()),
         vec![ImportCoverageGap::Unwitnessed {
@@ -434,6 +470,16 @@ fn current_basis_revalidation<S: RuntimeStore>(mut fresh: impl FnMut() -> S) {
         .create_program_version(version(&paint, COMPILER))
         .unwrap();
     assert_eq!(again.version_id, witnessed.version_id);
+    let reused_roster = reused.program_import_operation_roster().unwrap();
+    let reused_selected = import_coverage::revalidate_selected(
+        &reused,
+        std::slice::from_ref(&witnessed.operation_id),
+        current(PAINT_SOURCE, COMPILER),
+    )
+    .unwrap();
+    assert!(reused_selected.gaps.is_empty());
+    assert_eq!(reused_selected.selected, reused_roster.operations[..1]);
+    assert_eq!(reused_selected.outside, reused_roster.operations[1..]);
     assert!(matches!(
         gaps(import_coverage::revalidate(&reused, current(PAINT_SOURCE, COMPILER)).unwrap())
             .as_slice(),

@@ -119,6 +119,14 @@ struct OperatorEnv {
 /// `image.generate` instead (DR-0120), and the whole ladder below follows that
 /// difference: which environment names it reads, which registry row it takes as
 /// its default, and which provider kind it commits to the admission key.
+/// The Codex backend's origin, from the provider contract (DR-0205): where a
+/// ChatGPT-plan OAuth credential is spent instead of the OpenAI public API.
+pub(crate) fn codex_base_url() -> &'static str {
+    whipplescript_kernel::provider_contract::provider("openai-codex")
+        .expect("provider_contract.json declares the openai-codex identity")
+        .base_url()
+}
+
 pub const COERCE_CAPABILITY: &str = "schema.coerce";
 
 /// The provider kind a capability's backend must be registered under.
@@ -517,7 +525,7 @@ fn native_selection(
         .flatten();
     let base_url = explicit_base_url.unwrap_or_else(|| {
         if codex_account_id.is_some() {
-            "https://chatgpt.com".to_owned()
+            codex_base_url().to_owned()
         } else {
             backend.default_base_url().to_owned()
         }

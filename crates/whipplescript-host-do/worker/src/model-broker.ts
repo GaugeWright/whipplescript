@@ -1,13 +1,23 @@
+import {
+  CREDENTIAL_HEADERS,
+  OUTPUT_LIMIT_FIELDS,
+  credentialHeader,
+  outputLimitField,
+  requestPath,
+  resolveWire,
+  wireContract,
+  type ProviderName,
+  type WireName,
+} from "./provider-contract.ts";
+
 export const MODEL_EGRESS_PROTOCOL = "whipplescript.model-egress.v1";
 export const MODEL_EGRESS_STREAM_PROTOCOL = "whipplescript.model-egress.stream.v1";
 export const MODEL_AUTH_SENTINEL = "whipplescript-model-broker";
 
 const MAX_BROKER_RESPONSE_BYTES = 16 * 1024 * 1024;
-const STRIPPED_AUTH_HEADERS = new Set([
-  "authorization",
-  "chatgpt-account-id",
-  "x-api-key",
-]);
+// Every credential-bearing header the provider contract names, on any wire or
+// identity: the sentinel is stripped from whichever one the kernel wrote.
+const STRIPPED_AUTH_HEADERS = CREDENTIAL_HEADERS;
 const FORBIDDEN_AMBIENT_AUTH_HEADERS = new Set([
   "cookie",
   "proxy-authorization",
@@ -16,15 +26,13 @@ const FORBIDDEN_AMBIENT_AUTH_HEADERS = new Set([
 export interface ModelBrokerBinding {
   credential_id: string;
   credential_class?: string;
-  provider:
-    | "openai"
-    | "openai-generic"
-    | "anthropic"
-    | "openai-codex"
-    | "xai"
-    | "cloudflare-ai-gateway";
+  /** An identity the provider contract declares; this door admits those whose
+   *  `doors` name the Durable Object (provider-realization.ts). */
+  provider: Exclude<ProviderName, "xai-grok">;
   model: string;
   base_url: string;
+  /** The request dialect the signed policy declared, when it declared one. */
+  wire?: string;
 }
 
 export interface ModelBrokerConfig {
@@ -70,11 +78,7 @@ export type ManagedProviderTokenAdmission = (
 
 const MANAGED_PROVIDER_INPUT_FRAMING_TOKENS = 256;
 const MANAGED_PROVIDER_MAX_OUTPUT_TOKENS_PER_ROUND = 4_096;
-const MANAGED_OUTPUT_LIMIT_FIELDS = [
-  "max_tokens",
-  "max_output_tokens",
-  "max_completion_tokens",
-] as const;
+const MANAGED_OUTPUT_LIMIT_FIELDS = OUTPUT_LIMIT_FIELDS;
 
 export interface ManagedProviderBound {
   body: unknown;
@@ -347,35 +351,25 @@ function validatedBrokerResponse(value: unknown): BrokerResponse {
 function directProviderBody(
   body: unknown,
   provider: ModelBrokerBinding["provider"],
-  /** True when this round speaks Anthropic's Messages API, whatever the
-   *  provider id. The metered gateway is one id over three surfaces; the
-   *  Anthropic surface alone keeps the Anthropic spelling. */
-  anthropicWire = false,
-  /** True when a gateway binding speaks the provider-native Responses API. */
-  openAiResponsesWire = false,
+  wire: WireName,
 ): unknown {
-  const providerLimit =
-    provider === "openai" || provider === "openai-codex" || openAiResponsesWire
-      ? "max_output_tokens"
-      : provider === "cloudflare-ai-gateway"
-        ? "max_completion_tokens"
-        : null;
-  if (!providerLimit) return body;
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const fields = body as Record<string, unknown>;
-  if (!("max_tokens" in fields)) return body;
-  // Two spellings of one limit is contradictory on every surface this id
-  // reaches, so the refusal is keyed off the provider and never off the
-  // rename decision below.
-  if (providerLimit in fields) {
+  // The kernel writes the Chat Completions spelling. Two spellings of one limit
+  // is contradictory on every surface, so the refusal comes before, and never
+  // depends on, the rename below.
+  const kernelLimit = wireContract("openai-chat-compat").output_limit.field;
+  if (!(kernelLimit in fields)) return body;
+  if (OUTPUT_LIMIT_FIELDS.some((field) => field !== kernelLimit && field in fields)) {
     throw new Error("provider request has conflicting output token limits");
   }
-  // Anthropic requires `max_tokens` and rejects the Chat Completions spelling
-  // outright ("max_tokens: Field required"), so the rename that is correct for
-  // the shim is fatal here. Leave the field alone.
-  if (anthropicWire) return body;
-  const { max_tokens, ...rest } = fields;
-  return { ...rest, [providerLimit]: max_tokens };
+  // An identity or wire that spells the limit otherwise has it renamed, from
+  // the contract: Anthropic requires `max_tokens` and rejects the gateway
+  // shim's `max_completion_tokens` outright, so the rename is per wire.
+  const providerLimit = outputLimitField(provider, wire);
+  if (providerLimit === kernelLimit) return body;
+  const { [kernelLimit]: limit, ...rest } = fields;
+  return { ...rest, [providerLimit]: limit };
 }
 
 export async function performModelBrokerFetch(
@@ -618,7 +612,7 @@ export async function performManagedGatewayFetch(
   };
   const fallbackRequest: SuspendedModelRequest = {
     ...request,
-    url: `${target.unifiedBillingBaseUrl}/chat/completions`,
+    url: `${target.unifiedBillingBaseUrl}${requestPath(binding.provider, "openai-chat-compat")}`,
   };
   return performDirectProviderFetch(
     fallbackRequest,
@@ -660,35 +654,18 @@ export async function performDirectProviderFetch(
   const requested = new URL(request.url);
   const admitted = new URL(binding.base_url);
   const admittedPath = admitted.pathname.replace(/\/$/, "");
-  // The metered gateway fronts three surfaces, and which one a turn is admitted
-  // against changes the path, the auth header, and the SSE grammar. `/compat`
-  // is the OpenAI-compatible shim; `/anthropic` and `/openai` are the
-  // provider-native Messages and Responses APIs. Reading the surface off the
-  // admitted path keeps all three consistent with the URL actually being called.
-  const anthropicWire = binding.provider === "anthropic"
-    || (binding.provider === "cloudflare-ai-gateway"
-      && admittedPath.endsWith("/anthropic"));
-  const openAiResponsesWire = binding.provider === "openai"
-    || binding.provider === "openai-codex"
-    || (binding.provider === "cloudflare-ai-gateway"
-      && admittedPath.endsWith("/openai"));
-  const wireProvider = anthropicWire
+  // The wire picks the path, the credential header, the output-limit spelling
+  // and the SSE grammar. It is the declared one when the admission declared
+  // one the identity admits; the metered gateway fronts three surfaces read off
+  // the admitted path's suffix; any other identity speaks its default. All of
+  // it comes from the provider contract the kernel reads too.
+  const wire = resolveWire(binding.provider, admittedPath, binding.wire);
+  const wireProvider = wire === "anthropic-messages"
     ? "anthropic"
-    : openAiResponsesWire
+    : wire === "openai-responses"
       ? "openai"
       : binding.provider;
-  const expectedPath = anthropicWire
-    ? `${admittedPath}/v1/messages`
-    : openAiResponsesWire
-      ? `${admittedPath}/v1/responses`
-    : binding.provider === "openai-generic"
-        || binding.provider === "xai"
-        || binding.provider === "cloudflare-ai-gateway"
-      // The gateway's `/compat` surface is OpenAI-compatible, so the admitted
-      // base URL already ends at `/compat` and the request appends
-      // `/chat/completions` — the same shape as a generic endpoint.
-      ? `${admittedPath}/chat/completions`
-      : `${admittedPath}/v1/responses`;
+  const expectedPath = `${admittedPath}${requestPath(binding.provider, wire)}`;
   if (
     requested.origin !== admitted.origin ||
     requested.pathname !== expectedPath ||
@@ -700,17 +677,8 @@ export async function performDirectProviderFetch(
   }
   const headers = new Headers(stripSentinelAuthentication(request.headers));
   const credential = await directProviderCredential(binding, secrets);
-  if (anthropicWire) {
-    headers.set("x-api-key", credential);
-  } else {
-    headers.set("authorization", `Bearer ${credential}`);
-  }
-  let providerBody = directProviderBody(
-    request.body,
-    binding.provider,
-    anthropicWire,
-    openAiResponsesWire,
-  );
+  headers.set(...credentialHeader(wire, credential));
+  let providerBody = directProviderBody(request.body, binding.provider, wire);
   if (tokenAdmission) {
     if (
       providerBody
@@ -720,11 +688,7 @@ export async function performDirectProviderFetch(
         field in (providerBody as Record<string, unknown>)
       )
     ) {
-      const limitField = anthropicWire
-        ? "max_tokens"
-        : openAiResponsesWire
-          ? "max_output_tokens"
-          : "max_completion_tokens";
+      const limitField = outputLimitField(binding.provider, wire);
       providerBody = {
         ...(providerBody as Record<string, unknown>),
         [limitField]: MANAGED_PROVIDER_MAX_OUTPUT_TOKENS_PER_ROUND,

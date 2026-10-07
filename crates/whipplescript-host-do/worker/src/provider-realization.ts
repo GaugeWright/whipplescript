@@ -1,23 +1,18 @@
-import { MODEL_AUTH_SENTINEL } from "./model-broker.ts";
+import { MODEL_AUTH_SENTINEL, type ModelBrokerBinding } from "./model-broker.ts";
 import { canonicalCredentialClassRef } from "./credential-class-ref.ts";
+import { DURABLE_OBJECT_PROVIDERS } from "./provider-contract.ts";
 
-export type HostedProvider =
-  | "openai"
-  | "openai-generic"
-  | "anthropic"
-  | "openai-codex"
-  /** xAI's Grok API: the Chat Completions wire, same surface as
-   *  `openai-generic`, but a first-class id because the credential is an xAI
-   *  key and never an OpenAI one. */
-  | "xai"
-  /** Metered upstream egress through a Cloudflare AI Gateway on unified
-   *  billing. Distinct from `openai-generic` even though both speak the
-   *  OpenAI-compatible surface, because *who pays* differs: a generic endpoint
-   *  is the customer's own BYOK credential, while this is a service-held
-   *  gateway token whose cost is billed onward to the deployment owner
-   *  (ADR 0085 §1 "managed plan", §6). Conflating them would make funding a
-   *  property of the URL. */
-  | "cloudflare-ai-gateway";
+/** An identity the provider contract (provider_contract.json, DR-0205) lets
+ *  this door host: every declared identity but the host-held Grok
+ *  subscription. `xai` is distinct from `openai-generic` though both speak the
+ *  Chat Completions wire, because the credential is an xAI key and never an
+ *  OpenAI one. `cloudflare-ai-gateway` is metered upstream egress on unified
+ *  billing: distinct from `openai-generic` because *who pays* differs — a
+ *  service-held gateway token billed onward to the deployment owner (DR-0085
+ *  §1 "managed plan", §6) rather than the customer's own credential.
+ *  Conflating them would make funding a property of the URL. The tests hold
+ *  this type to the contract's `doors`. */
+export type HostedProvider = ModelBrokerBinding["provider"];
 
 export interface HostTurnAdmission {
   provider_binding_id: string;
@@ -56,14 +51,10 @@ export interface ProviderRealizationEnv {
   WHIP_GATEWAY_TOKEN?: string;
 }
 
-const supportedProviders = new Set<HostedProvider>([
-  "openai",
-  "openai-generic",
-  "anthropic",
-  "openai-codex",
-  "xai",
-  "cloudflare-ai-gateway",
-]);
+// The identities whose `doors` in the provider contract name the Durable
+// Object; `HostedProvider` is the same set as a type, and the tests hold the two
+// equal.
+const supportedProviders: ReadonlySet<string> = DURABLE_OBJECT_PROVIDERS;
 
 function validateAdmission(admission: HostTurnAdmission): void {
   if (

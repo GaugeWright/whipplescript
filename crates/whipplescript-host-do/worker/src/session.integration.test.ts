@@ -23,7 +23,7 @@ import {
 } from "./integration-helpers";
 import { canonicalJson, sha256Hex } from "./private-home-protocol";
 import { canonicalCredentialClassRef } from "./credential-class-ref";
-import { SETTLES_WITHIN_MS } from "./test-bounds";
+import { SETTLES_WITHIN_MS, WORKERD_TEST_TIMEOUT_MS } from "./test-bounds";
 
 function createTestInstance(...args: Parameters<typeof WasmDurableInstance.create>): WasmDurableInstance {
   // The appended compiler digest is positional argument 14 of the WASM ABI.
@@ -3333,4 +3333,78 @@ it.each(["deadline", "cancellation", "projection-retry"] as const)("closes a tra
   await late.arrayBuffer();
   expect(late.status).toBe(202);
   expect(await starts()).toBe(beforeStarts);
+});
+
+// WS381 local qualification: observe native workerd alarm delivery only.
+// Never invoke alarm(), runDurableObjectAlarm(), or advance time. SQL/getAlarm
+// inspection callbacks never drive the object or send another application
+// start/step/poke; workerd delivers the scheduled alarm itself. Each case
+// waits its program's schedule in real time before the usual settle bound
+// applies, so the pair adds about 32 s (2 s timer, 30 s clock) to the bar.
+describe("WS381 autonomous workflow alarms", () => {
+  const programs = [
+    ["timer", 2_000, `workflow AutonomousTimer
+class Done { ok bool }
+output result Done
+rule start when started => {
+  timer 2s as waiting
+  after waiting succeeds { complete result { ok true } }
+}
+`],
+    ["clock", 30_000, `use std.time
+workflow AutonomousClock
+class Done { ok bool }
+output result Done
+signal wake.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}
+source clock as wake {
+  every 30s
+  missed coalesce
+  observe as tick
+  emit wake.tick {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }
+}
+rule finish when wake.tick as tick => { complete result { ok true } }
+`],
+  ] as const;
+  const LONGEST_SCHEDULE_MS = Math.max(...programs.map(([, scheduledMs]) => scheduledMs));
+  it.each(programs)("parks and completes through an untouched real %s alarm", async (kind, scheduledMs, program) => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(`ws381-autonomous-${kind}`));
+    const response = await stub.fetch("https://runtime.test/start", {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({ program, input: "{}", principal: `local/Autonomous${kind}` }),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(await response.json()).toMatchObject({ outcome: "parked" });
+    const before = await runInDurableObject(stub, async (_object, state) => ({
+      rows: state.storage.sql.exec("SELECT instance_id, status FROM instances").toArray(),
+      alarm: await state.storage.getAlarm(),
+      terminal: state.storage.sql.exec("SELECT event_id FROM events WHERE event_type='workflow.completed'").toArray(),
+    }));
+    expect(before.rows).toHaveLength(1);
+    expect(before.rows[0].status).not.toBe("completed");
+    expect(before.terminal).toHaveLength(0);
+    expect(before.alarm).not.toBeNull();
+    await expect.poll(async () => await runInDurableObject(stub, async (_object, state) =>
+      state.storage.sql.exec("SELECT status FROM instances").toArray()[0]?.status,
+    ), { timeout: scheduledMs + SETTLES_WITHIN_MS, intervals: [250] }).toBe("completed");
+    const after = await runInDurableObject(stub, async (_object, state) => ({
+      rows: state.storage.sql.exec("SELECT instance_id, status FROM instances").toArray(),
+      terminal: state.storage.sql.exec("SELECT event_id FROM events WHERE event_type='workflow.completed'").toArray(),
+      facts: state.storage.sql.exec("SELECT name FROM facts").toArray(),
+    }));
+    expect(after.rows).toEqual([{ ...before.rows[0], status: "completed" }]);
+    expect(after.terminal).toHaveLength(1);
+    if (kind === "clock") expect(after.facts.some((row) => row.name === "wake.tick")).toBe(true);
+  }, LONGEST_SCHEDULE_MS + WORKERD_TEST_TIMEOUT_MS);
 });

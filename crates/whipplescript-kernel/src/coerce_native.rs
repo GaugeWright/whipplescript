@@ -17,6 +17,8 @@
 //! transport. The live network call is credential-gated (see `whip auth`).
 
 use crate::coerce::{CoerceClient, CoerceRequest, CoerceResult, CoerceStatus};
+use crate::harness_model::ModelWire;
+use crate::provider_contract;
 use serde_json::{json, Map, Value};
 use whipplescript_parser::{IrClassField, IrPrimitiveType, IrProgram, IrSchema, IrType};
 
@@ -51,22 +53,13 @@ impl CoerceProvider {
         }
     }
 
-    /// Default API base URL (overridable for the Codex backend or a mock).
+    /// Default API base URL (overridable for the Codex backend or a mock), read
+    /// from the provider contract (DR-0205). Whether it carries the `/v1`
+    /// version segment follows the identity's default wire there: the Responses
+    /// and Messages paths carry it, the Chat Completions path does not, so a
+    /// Chat Completions identity's base must.
     pub fn default_base_url(self) -> &'static str {
-        match self {
-            // The OpenAi (Responses) and Anthropic builders append the full
-            // `/v1/...` path themselves, so their default base is the bare host.
-            CoerceProvider::OpenAi => "https://api.openai.com",
-            CoerceProvider::Anthropic => "https://api.anthropic.com",
-            // The OpenAiCompat builder appends only `/chat/completions` (the
-            // OpenAI-SDK `base_url` convention: the `/v1` version segment lives
-            // in base_url), so the default MUST carry `/v1` — otherwise the
-            // request 404s at `.../chat/completions`. Live-confirmed 2026-07-19.
-            CoerceProvider::OpenAiCompat => "https://api.openai.com/v1",
-            // Same `/v1`-in-base convention as OpenAiCompat: the builder
-            // appends only `/chat/completions`.
-            CoerceProvider::Xai => "https://api.x.ai/v1",
-        }
+        crate::provider_contract::coerce_provider(self).base_url()
     }
 }
 
@@ -516,6 +509,7 @@ pub fn build_request(call: &CoerceCall<'_>) -> HttpRequest {
 /// implemented equivalent of the Responses API's `text.format`). The base URL is
 /// always the caller's configured endpoint.
 fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let wire = provider_contract::wire(ModelWire::OpenAiChatCompat);
     let normalized = normalized_coerce_input(call);
     let content = openai_compat_content(&normalized.text, &normalized.images);
     let body = json!({
@@ -533,19 +527,10 @@ fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
     HttpRequest {
         model_provenance: None,
         // The configured endpoint is the OpenAI-compatible base URL as provider docs
-        // give it (it already includes `/v1`), so append only `/chat/completions` —
-        // matching the OpenAI SDK `base_url` convention every compat endpoint follows.
-        url: format!("{}/chat/completions", call.base_url.trim_end_matches('/')),
-        headers: with_idempotency_key(
-            call,
-            vec![
-                (
-                    "authorization".to_owned(),
-                    format!("Bearer {}", call.api_key),
-                ),
-                ("content-type".to_owned(), "application/json".to_owned()),
-            ],
-        ),
+        // give it (it already includes `/v1`); the contract's path for the wire
+        // carries no version segment, the OpenAI SDK `base_url` convention.
+        url: wire.url(call.base_url),
+        headers: with_idempotency_key(call, with_content_type(wire.auth_headers(call.api_key))),
         body,
     }
 }
@@ -554,6 +539,8 @@ fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
 /// `text.format` structured-output constraint. Always streams (the endpoint is
 /// SSE); the transport assembles the `response.completed` payload.
 fn build_codex_request(call: &CoerceCall<'_>, codex: CodexAuth<'_>) -> HttpRequest {
+    let codex_identity = provider_contract::provider("openai-codex")
+        .expect("provider_contract.json declares the openai-codex identity");
     let normalized = normalized_coerce_input(call);
     let content = openai_responses_content(&normalized.text, &normalized.images);
     let body = json!({
@@ -581,29 +568,36 @@ fn build_codex_request(call: &CoerceCall<'_>, codex: CodexAuth<'_>) -> HttpReque
     HttpRequest {
         model_provenance: None,
         url: format!(
-            "{}/backend-api/codex/responses",
-            call.base_url.trim_end_matches('/')
+            "{}{}",
+            call.base_url.trim_end_matches('/'),
+            codex_identity.path_on(ModelWire::OpenAiResponses)
         ),
         headers: with_idempotency_key(
             call,
-            vec![
-                (
-                    "authorization".to_owned(),
-                    format!("Bearer {}", call.api_key),
-                ),
-                ("chatgpt-account-id".to_owned(), codex.account_id.to_owned()),
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("accept".to_owned(), "text/event-stream".to_owned()),
-                (
-                    "openai-beta".to_owned(),
-                    "responses=experimental".to_owned(),
-                ),
-                ("originator".to_owned(), "codex_cli_rs".to_owned()),
-                ("session_id".to_owned(), codex.session_id.to_owned()),
-            ],
+            [
+                provider_contract::wire(ModelWire::OpenAiResponses).auth_headers(call.api_key),
+                codex_identity.headers(call.model, codex.account_id),
+                vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("accept".to_owned(), "text/event-stream".to_owned()),
+                    (
+                        "openai-beta".to_owned(),
+                        "responses=experimental".to_owned(),
+                    ),
+                    ("originator".to_owned(), "codex_cli_rs".to_owned()),
+                    ("session_id".to_owned(), codex.session_id.to_owned()),
+                ],
+            ]
+            .concat(),
         ),
         body,
     }
+}
+
+/// The wire's authentication and fixed headers, then the JSON content type.
+fn with_content_type(mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers.push(("content-type".to_owned(), "application/json".to_owned()));
+    headers
 }
 
 /// Append the `Idempotency-Key` header when the call carries a non-empty key,
@@ -624,6 +618,7 @@ fn with_idempotency_key(
 }
 
 fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let wire = provider_contract::wire(ModelWire::OpenAiResponses);
     let normalized = normalized_coerce_input(call);
     let content = openai_responses_content(&normalized.text, &normalized.images);
     let body = json!({
@@ -644,28 +639,20 @@ fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
     });
     HttpRequest {
         model_provenance: None,
-        url: format!("{}/v1/responses", call.base_url.trim_end_matches('/')),
-        headers: with_idempotency_key(
-            call,
-            vec![
-                (
-                    "authorization".to_owned(),
-                    format!("Bearer {}", call.api_key),
-                ),
-                ("content-type".to_owned(), "application/json".to_owned()),
-            ],
-        ),
+        url: wire.url(call.base_url),
+        headers: with_idempotency_key(call, with_content_type(wire.auth_headers(call.api_key))),
         body,
     }
 }
 
 fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let wire = provider_contract::wire(ModelWire::AnthropicMessages);
     let normalized = normalized_coerce_input(call);
     let content = anthropic_content(&normalized.text, &normalized.images);
     let tool_name = format!("emit_{}", sanitize_name(call.schema_name));
     let body = json!({
         "model": call.model,
-        "max_tokens": call.max_tokens,
+        wire.output_limit.field.as_str(): call.max_tokens,
         "tools": [{
             "name": tool_name,
             "description": "Return the coerced value as structured arguments.",
@@ -680,15 +667,8 @@ fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
     // we get here — this path always carries a real key.
     HttpRequest {
         model_provenance: None,
-        url: format!("{}/v1/messages", call.base_url.trim_end_matches('/')),
-        headers: with_idempotency_key(
-            call,
-            vec![
-                ("x-api-key".to_owned(), call.api_key.to_owned()),
-                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-                ("content-type".to_owned(), "application/json".to_owned()),
-            ],
-        ),
+        url: wire.url(call.base_url),
+        headers: with_idempotency_key(call, with_content_type(wire.auth_headers(call.api_key))),
         body,
     }
 }

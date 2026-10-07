@@ -1,0 +1,214 @@
+{
+  "schema": "whipplescript.provider-contract",
+  "version": 1,
+  "about": [
+    "What a model backend is on the wire, declared once (WhippleScript DR-0205, extending DR-0064).",
+    "The kernel embeds this file (provider_contract.rs) and the Durable Object worker imports it",
+    "(worker/src/provider-contract.ts); neither keeps a second copy, and",
+    "scripts/check-provider-contract.mjs fails a consumer that spells one of these facts itself.",
+    "",
+    "`wires` has one entry per ModelWire: a fact every identity speaking that dialect shares.",
+    "`providers` has one entry per payer identity, keyed by its canonical config name: a fact that",
+    "differs between identities on one dialect. `version` rises only for a change an existing",
+    "reader could not accept. spec/std-coercion.md \"The provider contract\" says what each field",
+    "means; the kernel's tests parse this file strictly and hold it to ModelWire and CoerceProvider."
+  ],
+  "wires": {
+    "anthropic-messages": {
+      "path": "/v1/messages",
+      "base_url_version": "appended",
+      "auth_header": "x-api-key",
+      "fixed_headers": { "anthropic-version": "2023-06-01" },
+      "usage_shape": "anthropic",
+      "usage_fields": {
+        "input": ["input_tokens"],
+        "output": ["output_tokens"],
+        "cache_read": ["cache_read_input_tokens"],
+        "cache_write": ["cache_creation_input_tokens"]
+      },
+      "streamed_usage": "always",
+      "output_limit": { "field": "max_tokens", "required": true },
+      "structured_output": "forced-tool",
+      "tool_vocabulary": "native"
+    },
+    "openai-responses": {
+      "path": "/v1/responses",
+      "base_url_version": "appended",
+      "auth_header": "authorization-bearer",
+      "fixed_headers": {},
+      "usage_shape": "openai",
+      "usage_fields": {
+        "input": ["input_tokens"],
+        "output": ["output_tokens"],
+        "cache_read": ["input_tokens_details.cached_tokens"],
+        "cache_write": []
+      },
+      "streamed_usage": "always",
+      "output_limit": { "field": "max_output_tokens", "required": false },
+      "structured_output": "text-format-json-schema",
+      "tool_vocabulary": "native"
+    },
+    "openai-chat-compat": {
+      "path": "/chat/completions",
+      "base_url_version": "in-base",
+      "auth_header": "authorization-bearer",
+      "fixed_headers": {},
+      "usage_shape": "openai",
+      "usage_fields": {
+        "input": ["prompt_tokens"],
+        "output": ["completion_tokens"],
+        "cache_read": ["cached_input_tokens", "prompt_tokens_details.cached_tokens"],
+        "cache_write": []
+      },
+      "streamed_usage": "stream_options.include_usage",
+      "output_limit": { "field": "max_tokens", "required": false },
+      "structured_output": "response-format-json-schema",
+      "tool_vocabulary": "native"
+    },
+    "coerced-tools": {
+      "path": "/chat/completions",
+      "base_url_version": "in-base",
+      "auth_header": "authorization-bearer",
+      "fixed_headers": {},
+      "usage_shape": "openai",
+      "usage_fields": {
+        "input": ["prompt_tokens"],
+        "output": ["completion_tokens"],
+        "cache_read": ["cached_input_tokens", "prompt_tokens_details.cached_tokens"],
+        "cache_write": []
+      },
+      "streamed_usage": "stream_options.include_usage",
+      "output_limit": { "field": "max_tokens", "required": false },
+      "structured_output": "response-format-json-schema",
+      "tool_vocabulary": "coerced"
+    }
+  },
+  "providers": {
+    "openai": {
+      "wires": ["openai-responses", "openai-chat-compat", "coerced-tools"],
+      "surface": "fixed",
+      "default_base_url": "https://api.openai.com",
+      "path": null,
+      "credential": {
+        "kind": "api-key",
+        "env": ["OPENAI_API_KEY"],
+        "stored": "openai",
+        "rungs": ["openai-codex"]
+      },
+      "extra_headers": {},
+      "output_limit": {},
+      "cache_key_carrier": "body:prompt_cache_key",
+      "doors": ["cli-coerce", "cli-harness", "embedding", "durable-object"],
+      "pricing": { "basis": "prices", "key": "openai" }
+    },
+    "openai-generic": {
+      "wires": ["openai-chat-compat", "openai-responses", "coerced-tools"],
+      "surface": "fixed",
+      "default_base_url": "https://api.openai.com/v1",
+      "path": null,
+      "credential": {
+        "kind": "api-key",
+        "env": ["OPENAI_API_KEY"],
+        "stored": "openai",
+        "rungs": ["openai-codex"]
+      },
+      "extra_headers": {},
+      "output_limit": {},
+      "cache_key_carrier": "body:prompt_cache_key",
+      "doors": ["cli-coerce", "cli-harness", "embedding", "durable-object"],
+      "pricing": { "basis": "prices", "key": "openai-generic" }
+    },
+    "anthropic": {
+      "wires": ["anthropic-messages"],
+      "surface": "fixed",
+      "default_base_url": "https://api.anthropic.com",
+      "path": null,
+      "credential": {
+        "kind": "api-key",
+        "env": ["ANTHROPIC_API_KEY"],
+        "stored": "anthropic",
+        "rungs": []
+      },
+      "extra_headers": {},
+      "output_limit": {},
+      "cache_key_carrier": "cache_control",
+      "doors": ["cli-coerce", "cli-harness", "embedding", "durable-object"],
+      "pricing": { "basis": "prices", "key": "anthropic" }
+    },
+    "xai": {
+      "wires": ["openai-chat-compat", "openai-responses", "coerced-tools"],
+      "surface": "fixed",
+      "default_base_url": "https://api.x.ai/v1",
+      "path": null,
+      "credential": {
+        "kind": "api-key",
+        "env": ["XAI_API_KEY"],
+        "stored": "xai",
+        "rungs": []
+      },
+      "extra_headers": {},
+      "output_limit": {},
+      "cache_key_carrier": "header:x-grok-conv-id",
+      "doors": ["cli-coerce", "cli-harness", "embedding", "durable-object"],
+      "pricing": { "basis": "prices", "key": "xai" }
+    },
+    "xai-grok": {
+      "wires": ["openai-responses"],
+      "surface": "fixed",
+      "default_base_url": "https://cli-chat-proxy.grok.com",
+      "path": null,
+      "credential": {
+        "kind": "oauth-subscription",
+        "env": [],
+        "stored": null,
+        "rungs": []
+      },
+      "extra_headers": {
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-model-override": "<model>"
+      },
+      "output_limit": {},
+      "cache_key_carrier": "body:prompt_cache_key",
+      "doors": ["embedding"],
+      "pricing": { "basis": "subscription", "key": null }
+    },
+    "openai-codex": {
+      "wires": ["openai-responses"],
+      "surface": "fixed",
+      "default_base_url": "https://chatgpt.com",
+      "path": "/backend-api/codex/responses",
+      "credential": {
+        "kind": "oauth-subscription",
+        "env": [],
+        "stored": null,
+        "rungs": []
+      },
+      "extra_headers": { "chatgpt-account-id": "<account>" },
+      "output_limit": {},
+      "cache_key_carrier": "body:prompt_cache_key",
+      "doors": ["cli-coerce", "cli-harness", "embedding", "durable-object"],
+      "pricing": { "basis": "prices", "key": "openai" }
+    },
+    "cloudflare-ai-gateway": {
+      "wires": ["openai-chat-compat", "anthropic-messages", "openai-responses"],
+      "surface": {
+        "/compat": "openai-chat-compat",
+        "/anthropic": "anthropic-messages",
+        "/openai": "openai-responses"
+      },
+      "default_base_url": null,
+      "path": null,
+      "credential": {
+        "kind": "gateway-token",
+        "env": ["WHIP_GATEWAY_TOKEN"],
+        "stored": null,
+        "rungs": []
+      },
+      "extra_headers": {},
+      "output_limit": { "openai-chat-compat": "max_completion_tokens" },
+      "cache_key_carrier": "surface",
+      "doors": ["durable-object"],
+      "pricing": { "basis": "gateway-measured", "key": null }
+    }
+  }
+}

@@ -279,6 +279,13 @@ section sansio-purity
 echo "== durable object schema =="
 section do-schema
 
+# The kernel and the Durable Object worker read one provider contract
+# (DR-0205), crates/whipplescript-kernel/src/provider_contract.json. Each side's
+# tests hold its reader to the artifact; this holds the consumers to the
+# reader, failing a base URL, path or header spelled at a call site. Node-only.
+echo "== provider contract =="
+section provider-contract
+
 echo "== workstream host contract =="
 section workstream-host-contract
 

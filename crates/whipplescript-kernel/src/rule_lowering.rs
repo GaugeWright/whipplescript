@@ -2742,6 +2742,12 @@ pub fn split_case_head(line: &str) -> Option<(String, Option<String>, String)> {
 
 pub fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> CaseSelection {
     let value = parse_field_value(&case.scrutinee, context);
+    // Match optional absence before JSON rendering turns Missing into a report
+    // sentinel. Keep that sentinel in reports, never bind it as a Some value.
+    let empty_ir = empty_ir_program();
+    let absent = whipplescript_parser::parse_expression(&case.scrutinee)
+        .map(|expr| eval_expr_value(&expr, &EvalScope::rule(context, &[], &[], &empty_ir)))
+        .is_ok_and(|value| value.is_missing_or_null());
     let mut fallback = None;
     for branch in &case.branches {
         if matches!(branch.pattern.as_str(), "_" | "default") {
@@ -2749,7 +2755,13 @@ pub fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> CaseSe
             continue;
         }
         let mut candidate_context = context.clone();
-        if !case_pattern_matches(&branch.pattern, &value, &mut candidate_context) {
+        let optional_pattern = branch.pattern == "None" || branch.pattern.starts_with("Some ");
+        let pattern_value = if optional_pattern && absent {
+            &Value::Null
+        } else {
+            &value
+        };
+        if !case_pattern_matches(&branch.pattern, pattern_value, &mut candidate_context) {
             continue;
         }
         if let Some(guard) = branch.guard.as_deref() {

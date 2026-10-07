@@ -9,13 +9,16 @@
 //! `revalidate` reads one store's accepting-operation roster and recaptures
 //! each checked witness from the caller's current basis. Any unwitnessed,
 //! legacy, unreadable, unrecapturable or stale operation keeps that store's
-//! coverage unknown (WS-159).
+//! coverage unknown (WS-159). `revalidate_selected` checks the exact operation
+//! IDs in a sealed Home cut and returns every operation outside it for the
+//! Home to account for separately.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use whipplescript_parser::IrProgram;
 pub use whipplescript_store::program_imports::{ProgramImportEdge, ProgramImportWitness};
-use whipplescript_store::{ProgramVersionView, RuntimeStore, StoreResult};
+use whipplescript_store::program_imports::{ProgramImportOperation, ProgramImportOperationKind};
+use whipplescript_store::{ProgramVersionView, RuntimeStore, StoreError, StoreResult};
 
 /// Explicit no-lock basis for hosts that admit only std imports.
 pub const NO_LOCK_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -189,6 +192,24 @@ pub struct CurrentLocalPackage {
     pub source_digest: String,
 }
 
+/// One currently resolved provider for a checked construct. The caller must
+/// read this mapping from the same current package snapshot as `packages`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentConstructSource {
+    pub library_id: String,
+    pub package_name: String,
+    pub source_digest: String,
+}
+
+/// Current registry and provider sources, rather than captures copied from an
+/// admitted witness. Revalidation derives both construct classes from these
+/// inputs and the current IR.
+#[derive(Clone, Debug)]
+pub struct CurrentConstructBasis {
+    pub registry: whipplescript_core::ContractRegistry,
+    pub sources: Vec<CurrentConstructSource>,
+}
+
 /// A program version's current inputs, recaptured at revalidation time from
 /// one immutable snapshot: the checked IR, the source bytes it was checked
 /// from, the lock in force, the running compiler artifact and every resolved
@@ -202,11 +223,9 @@ pub struct CurrentImportBasis {
     pub lock_digest: String,
     pub compiler_artifact_digest: String,
     pub packages: Vec<CurrentLocalPackage>,
-    /// Recaptured rule-effect construct edges, when the admission captured
-    /// them. `None` matches only a witness that never captured that class.
-    pub constructs: Option<whipplescript_store::program_imports::ProgramConstructCapture>,
-    /// Recaptured declaration edges, with the same rule as `constructs`.
-    pub declarations: Option<whipplescript_store::program_imports::ProgramDeclarationCapture>,
+    /// Current registry and provider mapping when the admission captured
+    /// construct/declaration edges. Absence cannot revalidate either class.
+    pub construct_basis: Option<CurrentConstructBasis>,
 }
 
 impl CurrentImportBasis {
@@ -231,8 +250,30 @@ impl CurrentImportBasis {
                 packages: &packages,
             },
         )?;
-        witness.constructs = self.constructs.clone();
-        witness.declarations = self.declarations.clone();
+        if let Some(construct_basis) = &self.construct_basis {
+            let sources = construct_basis
+                .sources
+                .iter()
+                .map(
+                    |source| crate::construct_coverage::ResolvedConstructSource {
+                        library_id: &source.library_id,
+                        package_name: &source.package_name,
+                        source_digest: &source.source_digest,
+                    },
+                )
+                .collect::<Vec<_>>();
+            witness.constructs = Some(crate::construct_coverage::capture(
+                &self.program,
+                &construct_basis.registry,
+                &witness,
+                &sources,
+            )?);
+            witness.declarations = Some(crate::construct_coverage::capture_declarations(
+                &self.program,
+                &construct_basis.registry,
+                &witness,
+            )?);
+        }
         Ok(witness)
     }
 }
@@ -240,6 +281,8 @@ impl CurrentImportBasis {
 /// Why one accepting operation keeps a store's import coverage unknown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportCoverageGap {
+    /// The sealed Home cut named an operation absent from this target store.
+    MissingOperation { operation_id: String },
     /// The operation admitted a version and recorded that it has no witness.
     Unwitnessed {
         operation_id: String,
@@ -288,6 +331,70 @@ pub enum ImportCoverage {
     },
 }
 
+/// Evidence for one exact selection of a store's accepting operations.
+///
+/// This deliberately has no `Complete` case. The Home must bind `selected` to
+/// its sealed journal cut, account for `outside` as later admissions or gaps,
+/// and retain the Home use door through its final ref comparison. An empty
+/// `gaps` alone cannot establish any of those Home-wide obligations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedImportCoverage {
+    pub frontier: i64,
+    pub selected: Vec<ProgramImportOperation>,
+    pub outside: Vec<ProgramImportOperation>,
+    pub gaps: Vec<ImportCoverageGap>,
+}
+
+/// Revalidate exactly the operation identities named by a sealed Home cut.
+/// The roster read also exposes later target-store operations, so a caller
+/// cannot silently treat a checked subset as the whole target population.
+/// Missing selected identities are gaps; repeated identities in the request
+/// are refused because a seal is a set of operations.
+pub fn revalidate_selected<S, F>(
+    store: &S,
+    selected_ids: &[String],
+    mut current: F,
+) -> StoreResult<SelectedImportCoverage>
+where
+    S: RuntimeStore + ?Sized,
+    F: FnMut(&ProgramVersionView) -> Option<CurrentImportBasis>,
+{
+    let requested = selected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.len() != selected_ids.len() {
+        return Err(StoreError::Conflict(
+            "sealed import operation selection contains duplicate identities".into(),
+        ));
+    }
+    let roster = store.program_import_operation_roster()?;
+    let mut selected = Vec::new();
+    let mut outside = Vec::new();
+    for operation in roster.operations {
+        if requested.contains(&operation.operation_id) {
+            selected.push(operation);
+        } else {
+            outside.push(operation);
+        }
+    }
+    let observed = selected
+        .iter()
+        .map(|operation| operation.operation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut gaps = requested
+        .iter()
+        .filter(|id| !observed.contains(id.as_str()))
+        .map(|id| ImportCoverageGap::MissingOperation {
+            operation_id: id.clone(),
+        })
+        .collect::<Vec<_>>();
+    gaps.extend(revalidate_rows(store, &selected, &mut current)?);
+    Ok(SelectedImportCoverage {
+        frontier: roster.frontier,
+        selected,
+        outside,
+        gaps,
+    })
+}
+
 /// Revalidate every recorded accepting operation in one store against the
 /// current basis. `current` is asked once per program version and must
 /// recapture that version's inputs now; returning `None` leaves every
@@ -299,12 +406,33 @@ where
     S: RuntimeStore + ?Sized,
     F: FnMut(&ProgramVersionView) -> Option<CurrentImportBasis>,
 {
-    use whipplescript_store::program_imports::ProgramImportOperationKind;
-
     let roster = store.program_import_operation_roster()?;
+    let gaps = revalidate_rows(store, &roster.operations, &mut current)?;
+    Ok(if gaps.is_empty() {
+        ImportCoverage::Complete {
+            frontier: roster.frontier,
+            operations: roster.operations.len(),
+        }
+    } else {
+        ImportCoverage::Unknown {
+            frontier: roster.frontier,
+            gaps,
+        }
+    })
+}
+
+fn revalidate_rows<S, F>(
+    store: &S,
+    operations: &[ProgramImportOperation],
+    current: &mut F,
+) -> StoreResult<Vec<ImportCoverageGap>>
+where
+    S: RuntimeStore + ?Sized,
+    F: FnMut(&ProgramVersionView) -> Option<CurrentImportBasis>,
+{
     let mut recaptured: BTreeMap<String, Option<ProgramImportWitness>> = BTreeMap::new();
     let mut gaps = Vec::new();
-    for operation in &roster.operations {
+    for operation in operations {
         let operation_id = operation.operation_id.clone();
         let version_id = operation.version_id.clone();
         let witness_digest = match (&operation.kind, &operation.witness_digest) {
@@ -357,22 +485,15 @@ where
             }),
         }
     }
-    Ok(if gaps.is_empty() {
-        ImportCoverage::Complete {
-            frontier: roster.frontier,
-            operations: roster.operations.len(),
-        }
-    } else {
-        ImportCoverage::Unknown {
-            frontier: roster.frontier,
-            gaps,
-        }
-    })
+    Ok(gaps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whipplescript_core::{
+        std_messaging_send_construct, std_messaging_send_effect_contract, ContractRegistry,
+    };
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -383,6 +504,138 @@ mod tests {
         whipplescript_parser::compile_program(source)
             .ir
             .expect("checked program")
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn sealed_selection_refuses_a_duplicate_operation_identity() {
+        let store = whipplescript_store::SqliteStore::open_in_memory().expect("store");
+        assert!(matches!(
+            revalidate_selected(&store, &["same".into(), "same".into()], |_| None),
+            Err(StoreError::Conflict(message)) if message.contains("duplicate identities")
+        ));
+    }
+
+    #[test]
+    fn current_construct_edges_are_derived_from_the_current_registry() {
+        let source = r##"use std.messaging
+workflow Notify
+class Trigger { id string }
+channel alerts { provider fixture destination "#ops" }
+rule notify
+  when Trigger as t
+=> {
+  send via alerts { text "hello" } as sent
+}
+"##;
+        let basis = CurrentImportBasis {
+            program: program(source),
+            program_source_digest: sha256_hex(source.as_bytes()),
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST.into(),
+            compiler_artifact_digest: C.into(),
+            packages: vec![],
+            construct_basis: Some(CurrentConstructBasis {
+                registry: ContractRegistry {
+                    constructs: vec![std_messaging_send_construct()],
+                    effect_contracts: vec![std_messaging_send_effect_contract()],
+                    ..ContractRegistry::default()
+                },
+                sources: vec![],
+            }),
+        };
+        let admitted = basis.recapture().expect("current construct basis");
+        assert_eq!(admitted.constructs.as_ref().unwrap().edges.len(), 1);
+        assert!(admitted.declarations.is_some());
+
+        let mut changed = basis.clone();
+        changed
+            .construct_basis
+            .as_mut()
+            .unwrap()
+            .registry
+            .constructs[0]
+            .version = "0.2.0".into();
+        assert_ne!(
+            changed.recapture().expect("changed registry is resolvable"),
+            admitted
+        );
+
+        changed
+            .construct_basis
+            .as_mut()
+            .unwrap()
+            .registry
+            .constructs
+            .clear();
+        assert!(changed.recapture().is_err());
+
+        changed.construct_basis = None;
+        let unproven = changed.recapture().expect("import-only basis");
+        assert!(unproven.constructs.is_none());
+        assert!(unproven.declarations.is_none());
+        assert_ne!(unproven, admitted);
+    }
+
+    #[test]
+    fn current_construct_edges_are_derived_from_the_current_registry() {
+        let source = r##"use std.messaging
+workflow Notify
+class Trigger { id string }
+channel alerts { provider fixture destination "#ops" }
+rule notify
+  when Trigger as t
+=> {
+  send via alerts { text "hello" } as sent
+}
+"##;
+        let basis = CurrentImportBasis {
+            program: program(source),
+            program_source_digest: sha256_hex(source.as_bytes()),
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST.into(),
+            compiler_artifact_digest: C.into(),
+            packages: vec![],
+            construct_basis: Some(CurrentConstructBasis {
+                registry: ContractRegistry {
+                    constructs: vec![std_messaging_send_construct()],
+                    effect_contracts: vec![std_messaging_send_effect_contract()],
+                    ..ContractRegistry::default()
+                },
+                sources: vec![],
+            }),
+        };
+        let admitted = basis.recapture().expect("current construct basis");
+        assert_eq!(admitted.constructs.as_ref().unwrap().edges.len(), 1);
+        assert!(admitted.declarations.is_some());
+
+        let mut changed = basis.clone();
+        changed
+            .construct_basis
+            .as_mut()
+            .unwrap()
+            .registry
+            .constructs[0]
+            .version = "0.2.0".into();
+        assert_ne!(
+            changed.recapture().expect("changed registry is resolvable"),
+            admitted
+        );
+
+        changed
+            .construct_basis
+            .as_mut()
+            .unwrap()
+            .registry
+            .constructs
+            .clear();
+        assert!(changed.recapture().is_err());
+
+        changed.construct_basis = None;
+        let unproven = changed.recapture().expect("import-only basis");
+        assert!(unproven.constructs.is_none());
+        assert!(unproven.declarations.is_none());
+        assert_ne!(unproven, admitted);
     }
 
     #[test]

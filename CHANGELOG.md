@@ -19,6 +19,9 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Rule-body optional cases route an omitted field to `None`, just like an
+  explicit `null`, instead of binding the internal missing-value marker to `Some`.
+
 - Interrupted mutation sweeps restore their original source bytes on catchable
   signals, preserving another edit or an existing recovery backup.
 - Rule guards now recognize dotted effect-query kinds as query metadata while continuing to check binding reads in filters and surrounding expressions.
@@ -31,6 +34,13 @@ next free number rather than a patch — it says so.
   whose open settled in another process, or before a restart, refuses to lower
   with a diagnostic instead of reading null fields. Opening needs a custodian,
   so the hosted runtime still refuses it.
+
+- Typed coerce calls now validate their declared argument types and paths, reject
+  unknown functions and wrong arity, and point type errors to the coerce parameter.
+
+- Optional-field presence proofs retain their binding or query-row identity. A proof for one row no longer authorizes another, and implicit query fields accept the same presence forms as qualified fields.
+
+- Map indexes accept fields with literal-string and literal-string-union key types, alongside ordinary strings. Invalid keys now produce one compatibility diagnostic.
 
 - Tracker discovery retires obsolete views and staging directories by rename,
   then deletes them after releasing the database writer and publication locks.

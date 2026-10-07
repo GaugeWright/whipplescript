@@ -20565,6 +20565,201 @@ rule route
 }
 
 #[test]
+fn dev_case_enum_guards_and_optional_absence_select_exact_routes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("enum-optional-cases");
+    fs::write(
+        &source_path,
+        r#"
+workflow CaseProof
+
+class Sentinel { internal string }
+class Box { value Sentinel? }
+class Marker { route string }
+table boxes as Box [
+  { value { internal "Missing" } }
+]
+rule marker
+  when Box as box
+=> {
+  case box.value {
+    Some marker => {
+      record Marker { route "present" }
+    }
+    None => {
+      record Marker { route "wrong" }
+    }
+  }
+}
+assert count(Marker where route == "present") == 1
+assert count(Marker where route == "wrong") == 0
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class Task {
+  id string
+  status ReviewStatus
+  assignee string?
+}
+
+class Routed {
+  id string
+  route string
+  owner string
+}
+
+table tasks as Task [
+  {
+    id "some"
+    status Accept
+    assignee "Ada"
+  }
+  {
+    id "null"
+    status Revise
+    assignee null
+  }
+  {
+    id "missing"
+    status Revise
+  }
+  {
+    id "fallback"
+    status Blocked
+    assignee null
+  }
+]
+
+rule route
+  when Task as task
+=> {
+  case task.status {
+    Accept where false => {
+      record Routed {
+        id task.id
+        route "wrong"
+        owner "wrong"
+      }
+    }
+    Accept where task.assignee == "Ada" => {
+      case task.assignee {
+        Some owner => {
+          record Routed {
+            id task.id
+            route "accepted"
+            owner owner
+          }
+        }
+        None => {
+          record Routed {
+        id task.id
+        route "wrong"
+        owner "wrong"
+      }
+        }
+      }
+    }
+    Revise => {
+      case task.assignee {
+        Some owner => {
+          record Routed {
+            id task.id
+            route "wrong"
+            owner owner
+          }
+        }
+        None where false => {
+          record Routed {
+        id task.id
+        route "wrong"
+        owner "wrong"
+      }
+        }
+        None => {
+          record Routed {
+            id task.id
+            route "unassigned"
+            owner "none"
+          }
+        }
+      }
+    }
+    Blocked where false => {
+      record Routed {
+        id task.id
+        route "wrong"
+        owner "wrong"
+      }
+    }
+    _ => {
+      record Routed {
+        id task.id
+        route "fallback"
+        owner "none"
+      }
+    }
+  }
+}
+
+assert count(Routed) == 4
+assert count(Routed where route == "accepted" && owner == "Ada") == 1
+assert count(Routed where route == "unassigned" && owner == "none") == 2
+assert count(Routed where route == "fallback") == 1
+assert count(Routed where route == "wrong") == 0
+"#,
+    )
+    .expect("write source");
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 7);
+    assert!(
+        assertions
+            .iter()
+            .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)),
+        "{dev}"
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json_isolated(bin, &store_path, &["--json", "facts", instance]);
+    let mut routes = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Routed"))
+        .map(|fact| {
+            let value = fact.get("value").expect("value");
+            (
+                value["id"].as_str().unwrap().to_owned(),
+                value["route"].as_str().unwrap().to_owned(),
+                value["owner"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    routes.sort();
+    assert_eq!(
+        routes,
+        vec![
+            ("fallback".into(), "fallback".into(), "none".into()),
+            ("missing".into(), "unassigned".into(), "none".into()),
+            ("null".into(), "unassigned".into(), "none".into()),
+            ("some".into(), "accepted".into(), "Ada".into()),
+        ]
+    );
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
 fn dev_does_not_leak_failed_case_branch_bindings() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();

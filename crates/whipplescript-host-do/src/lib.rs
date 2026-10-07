@@ -19,7 +19,7 @@
 //! What is intentionally NOT here yet (the Cloudflare-runtime greenfield): the
 //! full [`RuntimeStore`](whipplescript_store::RuntimeStore) implementation over
 //! `DoStorage` (the DO runs the same SQL the native `SqliteStore` does, through
-//! the DO SQL API), the alarms/secrets wiring (Phase 6), and the object-store
+//! the DO SQL API), the alarms wiring (Phase 6), and the object-store
 //! tier (Phase 7). Those need a live DO to build and test against; the seams they
 //! plug into are the ones proven here.
 
@@ -785,7 +785,7 @@ impl<S: DoStorage> FileStore for DoFileStore<S> {
     }
 }
 
-// -- Scheduling + config: alarms and secrets (Phase 6) --------------------
+// -- Scheduling: alarms (Phase 6) ------------------------------------------
 
 /// The DO's single-wake-up alarm scheduler. The clock-source / timer effects set
 /// the next due time here instead of an external poller; the Worker's `alarm()`
@@ -800,11 +800,16 @@ pub trait Alarms {
     fn clear_alarm(&self);
 }
 
-/// Worker secrets — the DO's config/credentials plane (no dotfiles). Provider API
-/// keys and endpoint config are read from here.
-pub trait Secrets {
-    fn get(&self, name: &str) -> Option<String>;
-}
+// There is deliberately no secrets seam here. On the admitted-session path
+// (DR-0047, DR-0042) the Rust core carries only an admitted provider binding's
+// opaque credential reference and `MODEL_AUTH_SENTINEL`, and the Worker shell
+// realizes the credential after admission — a named Worker secret
+// (`worker-secret`) or the authenticated egress broker (`model-broker`) —
+// immediately before egress (`worker/src/model-broker.ts`). A kernel-side read
+// of a secret value would put that value inside the isolate's WASM state, which
+// that path is built to avoid. The legacy `POST /start` bootstrap
+// (`makeInstance` in `worker/src/index.ts`) still forwards the Worker's provider
+// keys into the WASM config; WS-838 removes that (WS-381).
 
 // -- Large-object tier (Phase 7) ------------------------------------------
 
@@ -901,7 +906,7 @@ impl<S: DoStorage, O: ObjectStore> FileStore for TieredFileStore<S, O> {
         if !inlines {
             // Object tier: exact bytes, and drop any inline copy.
             if self.storage.file_exists(&key) {
-                self.storage.write_file(&key, "")?;
+                self.storage.delete_file(&key)?;
             }
             self.objects.put(&key, bytes)
         } else {
@@ -1091,6 +1096,12 @@ mod tests {
         assert!(!store.objects.exists("s.txt"));
         assert_eq!(store.read_to_string(small).expect("read small"), "hi");
 
+        // Growing an inline file to the exact boundary removes its inline row.
+        store.write(small, b"01234567").expect("grow to threshold");
+        assert!(!store.storage.file_exists("s.txt"));
+        assert!(store.objects.exists("s.txt"));
+        assert_eq!(store.read_to_string(small).expect("read grown"), "01234567");
+
         // Large file spills to the object store; not inline.
         store.write(big, b"0123456789").expect("big write");
         assert!(store.objects.exists("b.bin"));
@@ -1127,6 +1138,10 @@ mod tests {
             0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x0d,
         ];
 
+        store
+            .write(shot, b"old text")
+            .expect("inline before binary");
+        assert!(store.storage.file_exists("shot.png"));
         store.write(shot, &picture).expect("a picture is writable");
         assert!(
             store.objects.exists("shot.png"),
@@ -1167,7 +1182,7 @@ mod tests {
         assert!(!store.objects.exists("cfg.json"));
     }
 
-    // -- alarms + secrets --------------------------------------------------
+    // -- alarms ------------------------------------------------------------
 
     #[derive(Default)]
     struct MemAlarms {
@@ -1186,18 +1201,8 @@ mod tests {
         }
     }
 
-    struct MemSecrets;
-    impl Secrets for MemSecrets {
-        fn get(&self, name: &str) -> Option<String> {
-            match name {
-                "ANTHROPIC_API_KEY" => Some("sk-ant-test".to_string()),
-                _ => None,
-            }
-        }
-    }
-
     #[test]
-    fn alarms_hold_one_wakeup_and_secrets_resolve_config() {
+    fn alarms_hold_one_wakeup() {
         let alarms = MemAlarms::default();
         assert_eq!(alarms.current_alarm(), None);
         alarms.set_alarm(1_000);
@@ -1205,13 +1210,6 @@ mod tests {
         assert_eq!(alarms.current_alarm(), Some(2_000));
         alarms.clear_alarm();
         assert_eq!(alarms.current_alarm(), None);
-
-        let secrets = MemSecrets;
-        assert_eq!(
-            secrets.get("ANTHROPIC_API_KEY").as_deref(),
-            Some("sk-ant-test")
-        );
-        assert_eq!(secrets.get("MISSING"), None);
     }
 }
 

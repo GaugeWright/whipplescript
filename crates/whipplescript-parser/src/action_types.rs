@@ -972,9 +972,19 @@ impl Checker<'_> {
         );
     }
     fn error(&mut self, span: SourceSpan, message: String, contract: SourceSpan) {
+        self.error_with_note(span, message, contract, "action contract declared here");
+    }
+
+    fn error_with_note(
+        &mut self,
+        span: SourceSpan,
+        message: String,
+        contract: SourceSpan,
+        note: &str,
+    ) {
         self.diagnostics.push(
             Diagnostic::error(diagnostic_code!("type.mismatch"), span, message)
-                .with_related(contract, "action contract declared here"),
+                .with_related(contract, note),
         );
     }
 
@@ -1326,6 +1336,7 @@ impl Checker<'_> {
                     validate_expr_node(
                         expr,
                         &ExprSpans::unknown(),
+                        &[],
                         self.semantic,
                         &scope,
                         &context,
@@ -1363,33 +1374,54 @@ impl Checker<'_> {
         environment: &Environment,
         subject: &str,
     ) {
+        self.check_value_with_note(
+            value,
+            expected,
+            environment,
+            subject,
+            "action contract declared here",
+        );
+    }
+
+    fn check_value_with_note(
+        &mut self,
+        value: &CompositionExpr,
+        expected: &TypeSyntax,
+        environment: &Environment,
+        subject: &str,
+        contract_note: &str,
+    ) {
         let expected_ir = lower_type(expected.clone());
         if !object_contexts(&value.expr, Some(&expected_ir), self.semantic) {
-            self.error(
+            self.error_with_note(
                 value.span,
                 format!("{subject} constructs an object without an expected class or map type"),
                 expected.span(),
+                contract_note,
             );
             return;
         }
         let before = self.diagnostics.len();
         match self.infer(value, environment) {
-            Some(actual) if !assignable(&actual, &expected_ir, self.semantic) => self.error(
-                value.span,
-                format!(
-                    "{subject} expects {}, got {}",
-                    type_label(&expected_ir),
-                    type_label(&actual)
+            Some(actual) if !assignable(&actual, &expected_ir, self.semantic) => self
+                .error_with_note(
+                    value.span,
+                    format!(
+                        "{subject} expects {}, got {}",
+                        type_label(&expected_ir),
+                        type_label(&actual)
+                    ),
+                    expected.span(),
+                    contract_note,
                 ),
-                expected.span(),
-            ),
-            None if before == self.diagnostics.len() => self.error(
+            None if before == self.diagnostics.len() => self.error_with_note(
                 value.span,
                 format!(
                     "cannot determine the type of `{}` for {subject}",
                     value.source
                 ),
                 expected.span(),
+                contract_note,
             ),
             _ => {}
         }
@@ -2018,6 +2050,45 @@ impl Checker<'_> {
                 }
             }
             BodyStmt::Effect(effect) if !self.authority => match &effect.kind {
+                BodyEffectKind::Coerce { name, args, .. } => {
+                    let Some(params) = self.semantic.coerce_params.get(name) else {
+                        self.diagnostics.push(Diagnostic::error(
+                            diagnostic_code!("type.unknown_coerce"),
+                            effect.span,
+                            format!("{} calls unknown coerce function `{name}`", owner.label()),
+                        ));
+                        return;
+                    };
+                    if args.len() != params.len() {
+                        self.diagnostics.push(Diagnostic::error(
+                            diagnostic_code!("expr.arity_mismatch"),
+                            effect.span,
+                            format!(
+                                "{} calls coerce `{name}` with {} argument(s), expected {}",
+                                owner.label(),
+                                args.len(),
+                                params.len()
+                            ),
+                        ));
+                        return;
+                    }
+                    for (source, param) in args.iter().zip(params) {
+                        match parse_expression(source) {
+                            Ok(expr) => self.check_value_with_note(
+                                &CompositionExpr {
+                                    source: source.clone(),
+                                    expr,
+                                    span: effect.span,
+                                },
+                                &param.ty,
+                                environment,
+                                &format!("parameter `{}` of coerce `{name}`", param.name.name),
+                                "coerce parameter declared here",
+                            ),
+                            Err(issue) => self.scope_error(effect.span, issue, owner),
+                        }
+                    }
+                }
                 BodyEffectKind::Exec {
                     target: body::ExecTarget::Capability { stdin_binding, .. },
                     parse_target: Some(parse),
@@ -2580,3 +2651,6 @@ mod records_tests;
 
 #[cfg(test)]
 mod null_tests;
+
+#[cfg(test)]
+mod coerce_tests;
