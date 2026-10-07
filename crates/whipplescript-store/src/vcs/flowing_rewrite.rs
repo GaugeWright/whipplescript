@@ -611,6 +611,91 @@ mod tests {
         vcs
     }
 
+    #[test]
+    fn whole_twig_abandonment_prepares_every_bound_unit_without_moving_a_ref() {
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as A;
+
+        let vcs = two_units();
+        let before = vcs.branches.get_branch("twig").unwrap().unwrap();
+        let A::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("complete direct twig should prepare");
+        };
+        assert_eq!(plan.before_cut_id(), "cut-b");
+        assert_eq!(plan.branch_point_cut_id(), Some("base"));
+        assert_eq!(plan.units().len(), 2);
+        assert_eq!(plan.units()[0].unit_id(), "unit-a");
+        assert_eq!(plan.units()[1].unit_id(), "unit-b");
+        assert_eq!(plan.units()[0].atoms()[0].cut_id, "cut-a");
+        assert_eq!(plan.units()[1].atoms()[0].cut_id, "cut-b");
+        assert_eq!(vcs.branches.get_branch("twig").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn whole_twig_abandonment_refuses_an_undeclared_tail_or_changed_basis() {
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as A;
+
+        let mut vcs = two_units();
+        vcs.write("twig", "tail.txt", Some("tail"), "tail", "t4")
+            .unwrap();
+        assert_eq!(
+            vcs.prepare_whole_twig_abandonment("twig").unwrap(),
+            A::IncompleteUnits
+        );
+
+        let vcs = two_units();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_contribution_basis SET atoms_json = '[]' WHERE unit_id = 'unit-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.prepare_whole_twig_abandonment("twig").unwrap(),
+            A::UnitBasisMismatch {
+                unit_id: "unit-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn whole_twig_abandonment_keeps_overlapping_unit_atoms_distinct() {
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as A;
+
+        let mut vcs = two_units();
+        bound_write(&mut vcs, "a.txt", "A2", "cut-a2", "unit-a2");
+        let A::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("ordered overlapping writes should prepare together");
+        };
+        assert_eq!(plan.units().len(), 3);
+        let first = plan
+            .units()
+            .iter()
+            .find(|u| u.unit_id() == "unit-a")
+            .unwrap();
+        let last = plan
+            .units()
+            .iter()
+            .find(|u| u.unit_id() == "unit-a2")
+            .unwrap();
+        assert_eq!(first.atoms()[0].after, last.atoms()[0].before);
+        assert_eq!(last.atoms()[0].cut_id, "cut-a2");
+    }
+
+    #[test]
+    fn whole_twig_abandonment_refuses_rewritten_lineage_until_it_can_prove_it() {
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as A;
+
+        let (mut vcs, _) = committed_two_unit_rewrite();
+        finish_rewrite(&mut vcs);
+        assert_eq!(
+            vcs.prepare_whole_twig_abandonment("twig").unwrap(),
+            A::UnsupportedLineage {
+                cut_id: "rebased".into()
+            }
+        );
+    }
+
     fn begin_rewrite(
         vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
         plan: &FlowingDisjointRebase,

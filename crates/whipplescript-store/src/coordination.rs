@@ -776,12 +776,16 @@ impl CoordinationStore {
 /// [`DEFAULT_COORDINATION_OWNER`]. `CoordinationStore` implements this by
 /// forwarding to its inherent methods, so existing callers are unaffected.
 ///
-/// Snapshot/manifest note (experimentation-subsystem downstream requirement —
-/// tracker § Downstream-customer note): the owner-scoped `list_*_for_owner`
-/// reads here are the half a checkpoint manifest is built from. A future
-/// `snapshot`/`restore` pair that pins coordination state in a consistent cut is
-/// deferred until the checkpoint mechanism lands, so it is designed against a
-/// real consumer rather than speculatively.
+/// Snapshot/manifest capability (experimentation-subsystem downstream
+/// requirement, WS-378): coordination joins a consistent cut by POSITION, not
+/// by copy (vw note §9.3). [`Coordination::ledger_positions`] is the
+/// capability — the monotone ledgers' high-water marks, beside
+/// `WorkItems::event_position` for the tracker — and its consumers are the
+/// two checkpoint captures, `whip checkpoint` and the DO operator checkpoint,
+/// which record both in one `plane.positions` event in the same pass as the
+/// substance manifest. Leases and counters are current-state and have no
+/// position. A capture that cannot read a position refuses the cut; only a
+/// store that does not exist yet is the empty domain.
 pub trait Coordination {
     fn try_acquire_for_owner(
         &mut self,

@@ -2035,6 +2035,173 @@ rule pick
     let _ = fs::remove_dir_all(root);
 }
 
+/// The workspace plane's half of a checkpoint (vw note §9.3, WS-378)
+/// distinguishes a legitimately empty domain from an unavailable one. A
+/// coordination or tracker store that does not exist yet is an empty
+/// high-water mark, and capturing it does not create the store. A store that
+/// exists but cannot be read refuses the cut, rather than recording empty
+/// positions nobody observed, and records no `plane.positions` event.
+#[test]
+fn checkpoint_plane_positions_refuse_unavailable_stores() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let root = unique_temp_dir("plane-positions-root");
+    let side = unique_temp_dir("plane-positions-side");
+    fs::create_dir_all(&side).expect("side dir");
+    let src = temp_workflow_path("plane-positions");
+    fs::write(
+        &src,
+        format!(
+            r#"
+use std.files
+workflow PlanePositions
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+  allow write ["**"]
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "V1"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+    let dev = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store,
+            "--json",
+            "run",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Absent stores: an empty domain, captured without creating either store.
+    let absent_coordination = side.join("absent-coordination.sqlite");
+    let absent_items = side.join("absent-items.sqlite");
+    let checkpoint = run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store,
+            "--json",
+            "checkpoint",
+            &instance_id,
+            "--cut-id",
+            "empty-domains",
+        ],
+        &[
+            (
+                "WHIPPLESCRIPT_COORDINATION_STORE",
+                absent_coordination.to_str().expect("utf-8"),
+            ),
+            (
+                "WHIPPLESCRIPT_ITEMS_STORE",
+                absent_items.to_str().expect("utf-8"),
+            ),
+        ],
+    );
+    assert_eq!(
+        checkpoint.pointer("/plane_positions/coordination_ledgers"),
+        Some(&serde_json::json!([])),
+        "an absent coordination store is an empty domain: {checkpoint}"
+    );
+    assert_eq!(
+        checkpoint
+            .pointer("/plane_positions/tracker_event_seq")
+            .and_then(Value::as_i64),
+        Some(0),
+        "an absent tracker store is an empty domain: {checkpoint}"
+    );
+    assert!(
+        !absent_coordination.exists() && !absent_items.exists(),
+        "capturing positions must not create a store"
+    );
+
+    // Unreadable stores: refused, and no position pair is recorded for them.
+    let unreadable = side.join("unreadable.sqlite");
+    fs::write(&unreadable, b"not a sqlite database").expect("write unreadable store");
+    for (variable, cut_id) in [
+        (
+            "WHIPPLESCRIPT_COORDINATION_STORE",
+            "unreadable-coordination",
+        ),
+        ("WHIPPLESCRIPT_ITEMS_STORE", "unreadable-items"),
+    ] {
+        let output = whip(bin, &store_path)
+            .args([
+                "--store",
+                store,
+                "--json",
+                "checkpoint",
+                &instance_id,
+                "--cut-id",
+                cut_id,
+            ])
+            .env(variable, &unreadable)
+            .output()
+            .expect("checkpoint runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "an unreadable store refuses the cut ({variable})"
+        );
+        assert!(
+            stderr.contains("could not capture plane positions"),
+            "the refusal names the plane positions ({variable}): {stderr}"
+        );
+        let handles = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "handles", &instance_id],
+        );
+        assert_eq!(
+            handles
+                .pointer("/position_pair/cut_id")
+                .and_then(Value::as_str),
+            Some("empty-domains"),
+            "a refused cut records no position pair ({variable}): {handles}"
+        );
+    }
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(side);
+}
+
 /// A `file store`'s `allow read [...]` policy narrows which paths a `read` may
 /// touch (beyond root containment): a path matching a glob reads, a path inside
 /// the root but outside the policy fails. An empty policy means any path in the

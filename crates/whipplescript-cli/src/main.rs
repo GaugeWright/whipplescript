@@ -38413,6 +38413,59 @@ fn cancel(options: &CliOptions) -> ExitCode {
     )
 }
 
+/// The workspace plane's half of the two-plane consistent cut (vw note
+/// §9.3): one high-water position per monotone store — the coordination
+/// ledgers (`Coordination::ledger_positions`) and the tracker event log
+/// (`WorkItems::event_position`). Leases and counters are current-state and
+/// have no position.
+///
+/// Two answers that used to be one are kept apart here. A store that does
+/// not exist yet is a legitimately empty domain: nothing was ever appended,
+/// so its high-water mark is the empty one, and the capture does not create
+/// it. A store that exists but cannot be opened or read is UNAVAILABLE, and
+/// recording it as empty would claim a coherent cut at positions nobody
+/// observed, so the capture refuses ("exact, or declared-and-tagged, or
+/// refused").
+fn capture_plane_positions(coordination: &Path, items: &Path) -> Result<Value, String> {
+    use whipplescript_store::coordination::{Coordination, CoordinationStore};
+    use whipplescript_store::items::{WorkItemStore, WorkItems};
+    let ledgers = if coordination.exists() {
+        CoordinationStore::open_existing(coordination)
+            .and_then(|store| store.ledger_positions())
+            .map_err(|error| {
+                format!(
+                    "coordination store `{}` is unavailable: {}",
+                    coordination.display(),
+                    store_error(error)
+                )
+            })?
+    } else {
+        Vec::new()
+    };
+    let tracker_seq = if items.exists() {
+        WorkItemStore::open_read_snapshot(items)
+            .and_then(|store| store.event_position())
+            .map_err(|error| {
+                format!(
+                    "work-item store `{}` is unavailable: {}",
+                    items.display(),
+                    store_error(error)
+                )
+            })?
+    } else {
+        0
+    };
+    Ok(json!({
+        "coordination_ledgers": ledgers
+            .iter()
+            .map(|(owner, ledger, seq)| json!({
+                "owner": owner, "ledger": ledger, "seq": seq,
+            }))
+            .collect::<Vec<_>>(),
+        "tracker_event_seq": tracker_seq,
+    }))
+}
+
 /// `whip checkpoint <instance> [--cut-id <id>]` — capture a restorable
 /// consistent-cut checkpoint (RC-5). Binds the transcript, instance event-log,
 /// and file-manifest planes at one quiescent point; refuses if an effect is
@@ -38483,31 +38536,16 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
     let key = idempotency_key(&[instance_id, &cut_id, "checkpoint"]);
     // Two-plane consistent cut (vw note §9.3): the workspace plane's
     // monotone stores snapshot by HIGH-WATER POSITION, recorded in the
-    // same quiescent pass as the substance cut. The plane enumeration
-    // (coordination ledgers, tracker event log) is the pump audit's twin
-    // walk; leases/counters are current-state and have no position.
-    let plane_positions = {
-        use whipplescript_store::coordination::Coordination;
-        use whipplescript_store::items::WorkItems;
-        let ledgers =
-            whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
-                .ok()
-                .and_then(|coordination| coordination.ledger_positions().ok())
-                .unwrap_or_default();
-        let tracker_seq = whipplescript_store::items::WorkItemStore::open(items_store_path())
-            .ok()
-            .and_then(|items| items.event_position().ok())
-            .unwrap_or(0);
-        json!({
-            "coordination_ledgers": ledgers
-                .iter()
-                .map(|(owner, ledger, seq)| json!({
-                    "owner": owner, "ledger": ledger, "seq": seq,
-                }))
-                .collect::<Vec<_>>(),
-            "tracker_event_seq": tracker_seq,
-        })
-    };
+    // same quiescent pass as the substance cut. A store that cannot be read
+    // refuses the cut rather than being recorded as empty (WS-378).
+    let plane_positions =
+        match capture_plane_positions(&coordination_store_path(), &items_store_path()) {
+            Ok(positions) => positions,
+            Err(reason) => {
+                eprintln!("could not capture plane positions: {reason}");
+                return ExitCode::FAILURE;
+            }
+        };
     let positions_payload = json!({
         "cut_id": cut_id,
         "positions": plane_positions,
