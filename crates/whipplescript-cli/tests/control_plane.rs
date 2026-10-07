@@ -10835,6 +10835,7 @@ rule seed
   }
 }
 
+@external
 rule recall_before_work
   when WorkItem as item
   when worker is available
@@ -11349,6 +11350,7 @@ agent worker {
   capacity 1
 }
 
+@external
 rule recall_before_work
   when WorkItem as item
   when worker is available
@@ -17364,6 +17366,7 @@ rule seed
   }
 }
 
+@external
 rule recall_before_work
   when WorkItem as item
   when worker is available
@@ -17466,6 +17469,7 @@ agent worker {
   capacity 1
 }
 
+@external
 rule recall_before_work
   when WorkItem as item
   when worker is available

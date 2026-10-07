@@ -173,6 +173,7 @@ security.confidentiality_leak PROVISIONAL
 security.confinement_crossing PROVISIONAL
 security.declassify_projection_mismatch PROVISIONAL
 security.egress_scope_exceeded PROVISIONAL
+security.endorse_over_verified_source PROVISIONAL
 security.endorsed_prose_field PROVISIONAL
 security.envelope_rejected PROVISIONAL
 security.integrity_injection PROVISIONAL
@@ -191,6 +192,7 @@ security.sealed_value_crossing PROVISIONAL
 security.unauthenticated_request PROVISIONAL
 security.ungoverned_tool_surface PROVISIONAL
 security.untrusted_selector PROVISIONAL
+security.unverified_source PROVISIONAL
 security.unvouched_endorsement PROVISIONAL
 security.unwrap_not_granted PROVISIONAL
 type.duplicate_field COVERED

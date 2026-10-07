@@ -442,6 +442,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
             fingerprint: admission.fingerprint().into(),
             instance_ref: admitted.instance_id.clone(),
             admitted_at: pin,
+            anchor: command.anchor.clone(),
         };
         receipt.validate_for(command)?;
         Ok(receipt)
@@ -469,6 +470,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
             fingerprint: admission.fingerprint().into(),
             instance_ref: admission.instance_ref().into(),
             admitted_at: admission_pin(admission.instance_ref(), &stored, &prefix)?,
+            anchor: admission.command().anchor.clone(),
         };
         let command = admission.command();
         // This validates the recorded command against the authenticated

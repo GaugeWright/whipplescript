@@ -29,6 +29,7 @@ use serde_json::Value;
 
 #[cfg(feature = "native")]
 use crate::StoreError;
+#[cfg(feature = "native")]
 use crate::StoreResult;
 
 /// Execution-mode provenance column (research note §8/§9.6): `live` = an

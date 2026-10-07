@@ -4,7 +4,7 @@
   "activation": {
     "orchestratorRepository": "whipplescript-src",
     "fleetJob": "production-wiring-canary",
-    "infisicalPath": "/synthetics/wiring",
+    "infisicalPath": "/synthetics/wiring/whipplescript-src",
     "namespace": "whipplescript-production-wiring-canary",
     "runner": "scripts/production-wiring-canary-job.sh"
   },

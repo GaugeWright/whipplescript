@@ -111,6 +111,7 @@ rule echo
     let mut outcomes = Vec::new();
     for (actor, origin) in [("person:1", "editor.save"), ("agent:1", "tool.call")] {
         let command = HostActionCommand {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             issuer: "product".into(),
             scope: "workspace:1".into(),

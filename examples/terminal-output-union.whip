@@ -23,6 +23,9 @@ coerce classify(title string, body string) -> Classification {
   prompt "Classify the work item"
 }
 
+# Work items arrive from outside this workflow (an operator or another
+# system records them), so the rule says so; nothing here produces one.
+@external
 rule classify_work
   when WorkItem as item
 =>

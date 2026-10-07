@@ -1,6 +1,11 @@
 """Cheap scanner/mutator contracts; Rust compilation plants stay in the deep sweep."""
 import contextlib
 import io
+import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -455,6 +460,115 @@ class ColdProofSelectionTests(unittest.TestCase):
         with mock.patch.dict('os.environ', {'WHIPPLESCRIPT_COLD_REFUSAL_TARGET_DIR': 'target'}):
             with self.assertRaisesRegex(ValueError, 'absolute'):
                 cold.main()
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX signals must reach the Python handler")
+class InterruptedSweepTests(unittest.TestCase):
+    ORIGINAL = b'// existing editor bytes\r\nfn refusal() -> Result<(), String> {\r\n    Err("actual refusal".into())\r\n}\r\n'
+
+    def interrupt_trial(self, signum, *, self_test=True, concurrent_edit=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.rs"
+            target.write_bytes(self.ORIGINAL)
+            unrelated = root / "unrelated.rs"
+            unrelated.write_text("before")
+            ready = root / "cargo-ready"
+            binary = root / "bin"
+            binary.mkdir()
+            cargo = binary / "cargo"
+            cargo.write_text(
+                f"#!{sys.executable}\n"
+                "import os, time\nfrom pathlib import Path\n"
+                f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+                "while True: time.sleep(1)\n"
+            )
+            cargo.chmod(0o755)
+            command = [sys.executable, str(Path(sweep.__file__).resolve()),
+                       "--target", str(target), "--filter", "named-test"]
+            if not self_test:
+                command.append("--skip-self-test")
+            env = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.environ['PATH']}"}
+            process = subprocess.Popen(command, cwd=root, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            child = None
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "actual sweep must reach its cargo subprocess")
+                child = int(ready.read_text())
+                mutated = target.read_bytes()
+                self.assertNotEqual(mutated, self.ORIGINAL)
+                self.assertEqual(b"mutation_sweep_self_test" in mutated, self_test)
+                unrelated.write_text("edited during trial")
+                changed = mutated + b"// another editor's change\n"
+                if concurrent_edit:
+                    target.write_bytes(changed)
+                process.send_signal(signum)
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertEqual(unrelated.read_text(), "edited during trial")
+                backup = Path(str(target) + ".sweepbak")
+                if concurrent_edit:
+                    self.assertEqual(target.read_bytes(), changed)
+                    self.assertEqual(backup.read_bytes(), self.ORIGINAL)
+                    self.assertIn("changed outside the sweep; preserved", stderr)
+                else:
+                    self.assertEqual(process.returncode, 128 + signum, stderr)
+                    self.assertEqual(target.read_bytes(), self.ORIGINAL)
+                    self.assertFalse(backup.exists())
+                # subprocess.run must kill AND reap cargo before source restore.
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+                if child is not None:
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_catchable_interruptions_restore_calibration_and_real_trial_bytes(self):
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            for self_test in (True, False):
+                with self.subTest(signal=signum, self_test=self_test):
+                    self.interrupt_trial(signum, self_test=self_test)
+
+    def test_interrupted_trial_preserves_a_concurrent_target_edit_and_backup(self):
+        self.interrupt_trial(signal.SIGTERM, concurrent_edit=True)
+
+    def test_signal_between_write_and_ownership_record_is_deferred_until_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            target.write_bytes(self.ORIGINAL)
+            write_bytes = Path.write_bytes
+            def interrupted_write(path, content):
+                result = write_bytes(path, content)
+                signal.raise_signal(signal.SIGTERM)
+                return result
+            with self.assertRaises(SystemExit) as stopped:
+                with sweep.MutationTarget(str(target)) as mutation:
+                    with mock.patch.object(Path, "write_bytes", interrupted_write):
+                        mutation.write_text("// owned mutation\n")
+            self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
+            self.assertEqual(target.read_bytes(), self.ORIGINAL)
+            self.assertFalse(Path(str(target) + ".sweepbak").exists())
+
+    def test_an_existing_backup_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            target.write_bytes(self.ORIGINAL)
+            backup = Path(str(target) + ".sweepbak")
+            backup.write_bytes(b"another run's recovery bytes")
+            with self.assertRaises(FileExistsError), mock.patch.object(sweep, "run_suite") as trial:
+                with sweep.MutationTarget(str(target)):
+                    self.fail("an existing backup must refuse before mutation")
+            trial.assert_not_called()
+            self.assertEqual(target.read_bytes(), self.ORIGINAL)
+            self.assertEqual(backup.read_bytes(), b"another run's recovery bytes")
 
 
 if __name__ == '__main__':

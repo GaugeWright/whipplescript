@@ -230,6 +230,20 @@ pub const PENDING_EFFECT_STATUSES: &str = "('queued', 'blocked', 'blocked_by_adm
      'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', \
      'blocked_by_profile')";
 
+/// The pending statuses the status view counts as QUEUED: an effect that is
+/// waiting for its turn, including one waiting on an upstream effect, which is
+/// the program's own ordering rather than something an operator repairs.
+pub const QUEUED_EFFECT_STATUSES: &str = "('queued', 'blocked_by_dependency')";
+
+/// The pending statuses the status view counts as BLOCKED: every other member
+/// of [`PENDING_EFFECT_STATUSES`], so the two counters partition it. A binding
+/// block (`blocked`) and an admission denial (`blocked_by_admission`) were once
+/// in neither counter, which hid exactly the two blocks an operator is meant to
+/// act on from `whip status`, the command the idle summary points at for them
+/// (WS-333). `status_counters_partition_pending_statuses` holds the partition.
+pub const BLOCKED_EFFECT_STATUSES: &str = "('blocked', 'blocked_by_admission', \
+     'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')";
+
 /// The SQL predicate that says a dependency edge (`dependency`) is satisfied by
 /// its upstream effect's row (`upstream`): each generic lifecycle predicate of
 /// spec/effects-and-capabilities.md matched to exactly the terminal tag it
@@ -6823,15 +6837,13 @@ impl SqliteStore {
             &self.connection,
             "effects",
             instance_id,
-            Some("status IN ('queued', 'blocked_by_dependency')"),
+            Some(&format!("status IN {QUEUED_EFFECT_STATUSES}")),
         )?;
         let blocked_effect_count = count_where(
             &self.connection,
             "effects",
             instance_id,
-            Some(
-                "status IN ('blocked_by_capability', 'blocked_by_profile', 'blocked_by_capacity')",
-            ),
+            Some(&format!("status IN {BLOCKED_EFFECT_STATUSES}")),
         )?;
         let active_run_count = count_where(
             &self.connection,
@@ -13580,6 +13592,7 @@ fn execution_fingerprint_on(
 pub const FINGERPRINT_MODEL_METADATA_KEY: &str = "__fingerprint_model";
 
 /// Extract the fingerprint model salt from a run's metadata JSON, if present.
+#[cfg(any(feature = "native", test))]
 fn fingerprint_salt_from_metadata(metadata_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(metadata_json)
         .ok()?
@@ -17870,6 +17883,37 @@ mod tests {
             store.pending_effect_kinds().expect("pending kinds"),
             vec!["signal.emit".to_owned()]
         );
+    }
+
+    #[test]
+    fn status_counters_partition_pending_statuses() {
+        // The status view's two effect counters must together cover every
+        // pending status exactly once: a status in neither is an effect
+        // `whip status` cannot see, which is how binding blocks and admission
+        // denials went missing from it (WS-333).
+        fn statuses(list: &str) -> Vec<&str> {
+            list.trim_matches(|c| c == '(' || c == ')')
+                .split(',')
+                .map(|item| item.trim().trim_matches('\''))
+                .collect()
+        }
+        let pending = statuses(PENDING_EFFECT_STATUSES);
+        let queued = statuses(QUEUED_EFFECT_STATUSES);
+        let blocked = statuses(BLOCKED_EFFECT_STATUSES);
+        for status in &pending {
+            let homes =
+                usize::from(queued.contains(status)) + usize::from(blocked.contains(status));
+            assert_eq!(
+                homes, 1,
+                "pending status `{status}` is counted {homes} times"
+            );
+        }
+        for status in queued.iter().chain(&blocked) {
+            assert!(
+                pending.contains(status),
+                "`{status}` is counted but not pending"
+            );
+        }
     }
 
     #[test]
@@ -23928,6 +23972,57 @@ mod tests {
             .is_some());
 
         fs::remove_file(path).expect("v1 db removes");
+    }
+
+    #[test]
+    fn status_counts_binding_blocks_and_admission_denials_as_blocked() {
+        // The two blocks an operator is meant to act on were in neither status
+        // counter, so `whip status` reported an instance stuck on them as
+        // having nothing queued and nothing blocked (WS-333).
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Ralph", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = instance.instance_id.as_str();
+        store
+            .commit_rule(RuleCommit {
+                instance_id: id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[
+                    test_effect("bind", "agent.tell", "rule=start;effect=bind"),
+                    test_effect("admit", "agent.tell", "rule=start;effect=admit"),
+                    test_effect("wait", "agent.tell", "rule=start;effect=wait"),
+                ],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        store
+            .block_effect_binding(id, "bind", "credentials", "missing credentials_ref")
+            .expect("binding block");
+        store
+            .deny_effect_admission(id, "admit", "mcp:acme", "pin drifted for `acme`")
+            .expect("admission denial");
+
+        let status = store
+            .status(id)
+            .expect("status loads")
+            .expect("instance exists");
+        assert_eq!(status.blocked_effect_count, 2);
+        assert_eq!(status.queued_effect_count, 1);
     }
 
     #[test]

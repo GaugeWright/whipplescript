@@ -70,6 +70,7 @@ pub mod norm_runner;
 pub mod norm_runtime;
 pub mod norm_runtime_image;
 pub mod norm_staging;
+pub mod opened_plaintext;
 pub mod package_registry;
 pub mod principal;
 pub mod program_artifact;

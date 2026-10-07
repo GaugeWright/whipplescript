@@ -346,3 +346,185 @@ workflow Helper {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+const BUILTIN_TRIGGER_NAMES: [&str; 6] = [
+    "AgentTurn",
+    "WorkItem",
+    "Evidence",
+    "TerminalFailed",
+    "TerminalTimedOut",
+    "TerminalCancelled",
+];
+
+fn schema_trigger_source(
+    _name: &str,
+    pattern: &str,
+    declarations: &str,
+    producer: &str,
+    external: bool,
+) -> String {
+    format!("workflow Probe\noutput result R\nclass R {{ ok bool }}\n{declarations}\n{producer}\nrule start when started => {{ complete result {{ ok true }} }}\n{}rule observe when {pattern} as item => {{ complete result {{ ok true }} }}\n", if external { "@external\n" } else { "" })
+}
+
+#[test]
+fn builtin_schema_triggers_require_the_same_producers_as_explicit_facts() {
+    for name in BUILTIN_TRIGGER_NAMES {
+        for pattern in [name.to_owned(), format!("fact {name}")] {
+            let source = schema_trigger_source(name, &pattern, "", "", false);
+            asserts(
+                &ir_of(&source),
+                &format!("can never fire: nothing produces `{name}`"),
+            );
+        }
+    }
+}
+
+#[test]
+fn builtin_schema_triggers_keep_records_tables_inputs_and_external_admission() {
+    for name in BUILTIN_TRIGGER_NAMES {
+        let class = format!("class {name} {{ id string }}");
+        let record = format!("rule seed when started => {{ record {name} {{ id \"one\" }} }}");
+        is_clean(&ir_of(&schema_trigger_source(
+            name, name, &class, &record, false,
+        )));
+        let table = format!("table seed as {name} [ {{ id \"one\" }} ]");
+        is_clean(&ir_of(&schema_trigger_source(
+            name, name, &class, &table, false,
+        )));
+        // Builtin Ref inputs do not declare a competing provider schema.
+        let input = format!("input supplied {name}");
+        for pattern in [name.to_owned(), format!("fact {name}")] {
+            is_clean(&ir_of(&schema_trigger_source(
+                name, &pattern, &input, "", false,
+            )));
+            is_clean(&ir_of(&schema_trigger_source(name, &pattern, "", "", true)));
+        }
+        // Preserve the existing reserved-name guard on the explicit spelling:
+        // it is checked before liveness and is not weakened by this repair.
+        let collision = compile_program(&schema_trigger_source(
+            name,
+            &format!("fact {name}"),
+            &class,
+            &record,
+            false,
+        ));
+        assert!(collision.ir.is_none());
+        assert!(collision
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "construct.reserved_name"));
+    }
+    // Evidence has no observer-only record restriction; its actual builtin
+    // producer remains valid without a user-declared same-name class.
+    let record = "rule seed when started => { record Evidence { title \"proof\" path \"local\" summary \"observed\" } }";
+    for pattern in ["Evidence", "fact Evidence"] {
+        is_clean(&ir_of(&schema_trigger_source(
+            "Evidence", pattern, "", record, false,
+        )));
+    }
+}
+
+#[test]
+fn observer_declarations_do_not_produce_bare_schema_facts() {
+    let tracker = schema_trigger_source("WorkItem", "WorkItem", "tracker review", "", false);
+    asserts(
+        &ir_of(&tracker),
+        "can never fire: nothing produces `WorkItem`",
+    );
+    let agent = "agent worker { provider fixture profile \"code\" capacity 1 }";
+    let tell = "rule seed when started => { tell worker as turn \"hello\" }";
+    let turn = schema_trigger_source("AgentTurn", "AgentTurn", agent, tell, false);
+    asserts(
+        &ir_of(&turn),
+        "can never fire: nothing produces `AgentTurn`",
+    );
+    is_clean(&ir_of(&schema_trigger_source(
+        "WorkItem",
+        "review has ready issue",
+        "tracker review",
+        "",
+        false,
+    )));
+    is_clean(&ir_of(&schema_trigger_source(
+        "AgentTurn",
+        "worker completed turn",
+        agent,
+        tell,
+        false,
+    )));
+}
+
+/// WS-274: each builtin name, refused as an unproduced bare (or `fact`)
+/// trigger, says what that name actually means as a trigger. The suggestion is
+/// per name because the remedies differ: two have observer sugar, one is
+/// recordable, and three are terminal case payloads.
+#[test]
+fn unproduced_builtin_schema_triggers_name_their_meaning() {
+    let cases: [(&str, &[&str]); 6] = [
+        (
+            "AgentTurn",
+            &["cannot be recorded", "completed turn as turn"],
+        ),
+        (
+            "WorkItem",
+            &["cannot be recorded", "has ready issue as issue"],
+        ),
+        ("Evidence", &["record it in another rule"]),
+        (
+            "TerminalFailed",
+            &["terminal case payload", "after <effect> fails as x"],
+        ),
+        (
+            "TerminalTimedOut",
+            &["terminal case payload", "after <effect> times out as x"],
+        ),
+        (
+            "TerminalCancelled",
+            &["terminal case payload", "after <effect> cancels as x"],
+        ),
+    ];
+    for (name, expected) in cases {
+        for pattern in [name.to_owned(), format!("fact {name}")] {
+            let ir = ir_of(&schema_trigger_source(name, &pattern, "", "", false));
+            let found = lint_workflow_liveness(&ir);
+            let refusal = found
+                .iter()
+                .find(|d| d.message.contains(&format!("nothing produces `{name}`")))
+                .unwrap_or_else(|| panic!("`{pattern}` must be refused, got {found:?}"));
+            assert_eq!(refusal.code.as_str(), "graph.rule_never_fires");
+            let suggestion = &refusal.suggestion.as_ref().expect("suggestion").message;
+            for fragment in expected {
+                assert!(
+                    suggestion.contains(fragment),
+                    "`{pattern}` suggestion must contain `{fragment}`, got `{suggestion}`"
+                );
+            }
+            assert!(
+                suggestion.contains("workflow input") && suggestion.contains("@external"),
+                "`{pattern}` suggestion must keep the input/@external remedy, got `{suggestion}`"
+            );
+        }
+    }
+    // A declared class keeps the generic remedy.
+    let ir = ir_of(&schema_trigger_source(
+        "Order",
+        "Order",
+        "class Order { id string }",
+        "",
+        false,
+    ));
+    let found = lint_workflow_liveness(&ir);
+    let suggestion = &found[0].suggestion.as_ref().expect("suggestion").message;
+    assert!(
+        suggestion.starts_with("seed `Order` from a table"),
+        "{suggestion}"
+    );
+}
+
+/// WS-274: the terminal case payloads are observed through `after … fails`,
+/// which the liveness check accepts without any recorded producer.
+#[test]
+fn terminal_payloads_are_observed_through_after_blocks() {
+    let source = "workflow Probe\noutput result R\nclass R { ok bool }\nagent worker { provider fixture profile \"code\" capacity 1 }\nrule start when started => {\n  tell worker as turn \"hello\"\n  after turn fails as failure {\n    complete result { ok false }\n  }\n}\n";
+    is_clean(&ir_of(source));
+}

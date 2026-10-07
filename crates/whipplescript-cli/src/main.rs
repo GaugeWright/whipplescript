@@ -2708,13 +2708,14 @@ fn lint_missing_coord_import(ir: &IrProgram) -> Vec<LintFinding> {
     }]
 }
 
-/// ADVISORY import lint (spec/std-files.md "Manifest": import posture is a
-/// missing-import advisory only — the M5 graduated ladder, never an error;
-/// the hard `use std.files` requirement is explicitly deferred): `file store`
-/// declarations and the read/write/import/export verbs lower to `file.*`
-/// effects owned by std.files; a program using them without `use std.files`
-/// still runs, but the import is what names the package whose embedded
-/// manifest seeds the admission rows behind the effects. Detection reads the
+/// ADVISORY import lint, now redundant: under DQ-1 (spec/std-files.md
+/// "Manifest") `use std.files` is a HARD requirement, enforced by
+/// `check_authority_imports` as `security.package_import_required` at check
+/// time and at every execution door. This lint predates that and still
+/// reports the same omission as an advisory. `file store` declarations and the
+/// read/write/import/export verbs lower to `file.*` effects owned by
+/// std.files; the import is what names the package whose embedded manifest
+/// seeds the admission rows behind the effects. Detection reads the
 /// compiled IR (declared stores + lowered effect kinds), so it cannot wrongly
 /// flag prose that merely mentions a verb.
 fn lint_missing_files_import(ir: &IrProgram) -> Vec<LintFinding> {
@@ -2796,14 +2797,15 @@ fn lint_missing_tracker_import(ir: &IrProgram) -> Vec<LintFinding> {
     }]
 }
 
-/// ADVISORY import lint (spec/std-ingress.md "Static checks" #2, the M5
-/// graduated ladder: provider-kind-known is the HARD check, the import line
-/// itself is advisory only): `signal` declarations, external `source` blocks
-/// (non-clock — the clock kind is std.time's), and `emit signal … to` lower
-/// to the admission surface owned by std.ingress; a program using them
-/// without `use std.ingress` still runs, but the import is what names the
-/// package whose embedded manifest seeds the `signal.emit` admission rows and
-/// carries the driver descriptors. Detection reads the compiled IR (declared
+/// ADVISORY import lint, now redundant: under DQ-1 (spec/std-ingress.md
+/// "Static checks" #2) the `use std.ingress` import is a HARD requirement,
+/// enforced by `check_authority_imports` as `security.package_import_required`.
+/// This lint predates that and still reports the same omission as an
+/// advisory. `signal` declarations, external `source` blocks (non-clock — the
+/// clock kind is std.time's), and `emit signal … to` lower to the admission
+/// surface owned by std.ingress; the import is what names the package whose
+/// embedded manifest seeds the `signal.emit` admission rows and carries the
+/// driver descriptors. Detection reads the compiled IR (declared
 /// signals + lowered sources/effects), so it cannot wrongly flag prose.
 fn lint_missing_ingress_import(ir: &IrProgram) -> Vec<LintFinding> {
     if ir
@@ -18022,8 +18024,8 @@ fn known_source_provider_kinds(package_lock: Option<&LoadedPackageLock>) -> BTre
 /// the M5 graduated ladder's hard rung): a `source <kind> as …` header must
 /// name a provider kind some embedded or locked manifest contributes —
 /// before embedded manifests landed, any bare ident was silently accepted
-/// and the source never resolved. The `use <package>` import itself stays an
-/// ADVISORY lint (`lint_missing_ingress_import`), never a hard error.
+/// and the source never resolved. The `use std.ingress` import is a separate
+/// HARD check under DQ-1 (`check_authority_imports`).
 fn validate_source_provider_kinds(
     ir: &IrProgram,
     package_lock: Option<&LoadedPackageLock>,
@@ -35886,6 +35888,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                             "warning: {alias} duplicates an existing issue (same queue + title)"
                         );
                     }
+                    emit_concurrent_claim_advisories(&report);
                     if report.rejected > 0 {
                         eprintln!(
                             "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
@@ -35899,6 +35902,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                             "new_issues": report.new_issues,
                             "rejected": report.rejected,
                             "duplicate_submissions": report.duplicate_submissions,
+                            "concurrent_claims": report.concurrent_claims,
                         }))
                     } else {
                         println!(
@@ -35958,6 +35962,13 @@ fn issue(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// Warn about newly established historical pairs without claiming live ownership.
+fn emit_concurrent_claim_advisories(report: &whipplescript_store::items::ImportReport) {
+    for pair in &report.concurrent_claims {
+        eprintln!("warning: {} has historical concurrent claim acquisitions by {} and {} ({}, {}); this does not assert current ownership", pair.issue_id, pair.actors[0], pair.actors[1], pair.event_ids[0], pair.event_ids[1]);
+    }
+}
+
 /// Render a tracker merge/import result: warn on every genuine duplicate
 /// submission (a distinct issue filed independently with the same queue + title;
 /// never a silent collapse), then summarize.
@@ -35968,6 +35979,7 @@ fn emit_import_report(
     for alias in &report.duplicate_submissions {
         eprintln!("warning: {alias} duplicates an existing issue (same queue + title)");
     }
+    emit_concurrent_claim_advisories(report);
     if report.rejected > 0 {
         eprintln!(
             "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
@@ -35981,6 +35993,7 @@ fn emit_import_report(
             "new_issues": report.new_issues,
             "rejected": report.rejected,
             "duplicate_submissions": report.duplicate_submissions,
+            "concurrent_claims": report.concurrent_claims,
         }))
     } else {
         println!(
@@ -36214,6 +36227,20 @@ fn signal(options: &CliOptions) -> ExitCode {
             );
             ExitCode::from(1)
         }
+        // DR-0053 §6: governance grounds this signal's label on a signature,
+        // and an operator's `whip signal` proves nothing about who sent it.
+        SignalAdmission::Refused(SignalRefusal::VerificationRequired { source }) => {
+            eprintln!(
+                "signal `{event_name}` is admitted only from a delivery the custodian verified: the \
+                 governance envelope says `require verified {source}` (DR-0053 §6), so its label \
+                 is evidence-conditioned and an asserted `whip signal` injection is refused"
+            );
+            eprintln!(
+                "deliver it to `{source}`'s endpoint signed under its credential, or remove \
+                 `require verified {source}` from the envelope"
+            );
+            ExitCode::from(1)
+        }
         SignalAdmission::Refused(SignalRefusal::PayloadInvalid { errors }) => {
             eprintln!(
                 "payload does not conform to signal `{event_name}`: {}",
@@ -36346,7 +36373,7 @@ fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
             )
         };
     let result = serve_on(listener, |delivery| {
-        decide(
+        let outcome = decide(
             &routes,
             &secret_for,
             &verify_with,
@@ -36357,7 +36384,22 @@ fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
             // in a particular state and a store failure needs a broken one, so
             // neither is reachable through a socket.
             |source, instance, observation, key| {
-                map_admission(
+                // `decide` admits only after the door the source declares has
+                // answered yes, and it asks `verified with` first. So a source
+                // that declares one reached here VERIFIED, and says so to the
+                // core — which is what lets a `require verified` signal in
+                // (DR-0053 §6) through this door and no other.
+                let admission = if source.verified_credential.is_some() {
+                    whipplescript_kernel::ingress_pass::admit_verified_observation(
+                        kernel,
+                        instance,
+                        ir,
+                        source,
+                        observation,
+                        key.to_owned(),
+                        &envelope,
+                    )
+                } else {
                     whipplescript_kernel::ingress_pass::admit_observation(
                         kernel,
                         instance,
@@ -36367,10 +36409,42 @@ fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
                         key.to_owned(),
                         &envelope,
                     )
-                    .map_err(|error| format!("{error:?}")),
-                )
+                };
+                map_admission(admission.map_err(|error| format!("{error:?}")))
             },
-        )
+        );
+        // A delivery the custodian judged and refused leaves a fact (DR-0053
+        // §6): outcome, never payload. It goes to the listener's instance,
+        // because correlation reads the body and this body was never trusted.
+        if let crate::ingress_listener::DeliveryOutcome::Refused(
+            crate::ingress_listener::DeliveryRefusal::Unverified { outcome: word, .. },
+        ) = &outcome
+        {
+            if let Some(source) = routes.get(delivery.path.as_str()) {
+                let key = crate::ingress_listener::delivery_id(&delivery.headers, &delivery.body);
+                match whipplescript_kernel::ingress_pass::record_source_rejection(
+                    kernel,
+                    &default_instance,
+                    source,
+                    word,
+                    &key,
+                ) {
+                    Ok(Some(fact)) => {
+                        eprintln!("ingress: {} recorded source.rejected {fact}", delivery.path)
+                    }
+                    Ok(None) => eprintln!(
+                        "ingress: {} rejection not recorded: instance `{default_instance}` does \
+                         not exist",
+                        delivery.path
+                    ),
+                    Err(error) => eprintln!(
+                        "ingress: {} rejection not recorded: {error:?}",
+                        delivery.path
+                    ),
+                }
+            }
+        }
+        outcome
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -37666,6 +37740,14 @@ fn trace(options: &CliOptions) -> ExitCode {
         "evidence": evidence.iter().map(evidence_to_json).collect::<Vec<_>>(),
         "evidence_links": links.iter().map(evidence_link_to_json).collect::<Vec<_>>(),
     });
+    let sealed = trace_sealed_inventory(&trace_json);
+    let sealed_count = sealed
+        .get("envelopes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if let Some(object) = trace_json.as_object_mut() {
+        object.insert("sealed".to_owned(), sealed);
+    }
     if trace_options.check {
         if let Some(object) = trace_json.as_object_mut() {
             object.insert(
@@ -37710,6 +37792,10 @@ fn trace(options: &CliOptions) -> ExitCode {
             evidence.len(),
             links.len()
         );
+        if sealed_count > 0 {
+            println!("sealed={sealed_count} showing=structure contents=withheld");
+            println!("  {TRACE_SEALED_WITHHELD_REASON}");
+        }
         match conformance {
             Some(Ok(())) => {
                 println!("conformance=ok abstract_events={}", abstract_records.len());
@@ -37725,6 +37811,91 @@ fn trace(options: &CliOptions) -> ExitCode {
             None => ExitCode::SUCCESS,
         }
     }
+}
+
+/// Why a trace shows a sealed value's structure and not its contents.
+const TRACE_SEALED_WITHHELD_REASON: &str = "whip trace holds no custody: sealed values are recorded only as envelopes, so it shows who sealed what under which credential and context, never the plaintext (DR-0074 §7)";
+
+/// What `whip trace` can say about the sealed values in its own report
+/// (DR-0074 §7): structure always, contents only with custody, and which of
+/// the two it is showing.
+///
+/// Reconstructing history needs no custody because the log holds only
+/// envelopes. Reading plaintext out of it does, and this command holds none
+/// and opens nothing, so every envelope is reported as structure with its
+/// contents withheld. That is stated in the report rather than left for a
+/// reader to infer from base64 that looks like data.
+///
+/// An envelope is recognized by [`whipplescript_custody::Envelope::recognize`],
+/// the same recognizer the worker uses to open sealed effect inputs, and is
+/// located by a JSON pointer into this report together with the record that
+/// carries it. Recognition only labels; it authorizes no opening.
+fn trace_sealed_inventory(trace: &Value) -> Value {
+    const SECTIONS: [(&str, &str); 5] = [
+        ("events", "event_id"),
+        ("facts", "fact_id"),
+        ("effects", "effect_id"),
+        ("runs", "run_id"),
+        ("evidence", "evidence_id"),
+    ];
+
+    fn escape(token: &str) -> String {
+        token.replace('~', "~0").replace('/', "~1")
+    }
+
+    fn walk(value: &Value, pointer: &str, record: &Value, out: &mut Vec<Value>) {
+        if let Some(envelope) = whipplescript_custody::Envelope::recognize(value) {
+            out.push(json!({
+                "at": pointer,
+                "record": record,
+                "credential": envelope.credential.as_str(),
+                "context": envelope.context,
+                "label": envelope.label,
+                "ciphertext_bytes": envelope.ciphertext_len(),
+                "contents": "withheld",
+            }));
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    walk(child, &format!("{pointer}/{}", escape(key)), record, out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{pointer}/{index}"), record, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut envelopes = Vec::new();
+    for (section, id_field) in SECTIONS {
+        let Some(items) = trace.get(section).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, item) in items.iter().enumerate() {
+            let record = json!({
+                "section": section,
+                "id": item.get(id_field).cloned().unwrap_or(Value::Null),
+            });
+            walk(
+                item,
+                &format!("/{section}/{index}"),
+                &record,
+                &mut envelopes,
+            );
+        }
+    }
+    json!({
+        "showing": "structure",
+        "contents": "withheld",
+        "custody": "none",
+        "reason": TRACE_SEALED_WITHHELD_REASON,
+        "envelopes": envelopes,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -43066,9 +43237,9 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                                 "rule `{}` can never fire: nothing produces `{name}`",
                                 rule.name
                             ),
-                            suggestion: whipplescript_parser::suggest(format!(
-                                "seed `{name}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
-                            )),
+                            suggestion: whipplescript_parser::suggest(
+                                unproduced_schema_trigger_suggestion(name),
+                            ),
                         });
                     }
                     continue;
@@ -43101,19 +43272,26 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 // by external systems the lint cannot see.
                 continue;
             }
-            let builtin = matches!(
-                first,
-                "AgentTurn"
-                    | "WorkItem"
-                    | "Evidence"
-                    | "TerminalFailed"
-                    | "TerminalTimedOut"
-                    | "TerminalCancelled"
-            );
-            if builtin
-                || produced.contains(&format!("schema:{first}"))
-                || input_schemas.contains(first)
-            {
+            // Bare class names read schema facts, just like `fact Class`
+            // (DR-0250). That holds for the six builtin schema names too, and
+            // each means something different as a bare trigger:
+            //
+            // - `AgentTurn` and `WorkItem` are observer-only schemas (DR-0097):
+            //   no rule may record one, so only a workflow input or an
+            //   `@external` rule can feed the bare form. Their runtime
+            //   observations are the sugar forms `<agent> completed turn` and
+            //   `<tracker> has ready issue`, which read observer facts a `tell`
+            //   or a tracker produces, not `schema:AgentTurn`/`schema:WorkItem`.
+            // - `Evidence` is user-recordable: the bare form is legal exactly
+            //   when a rule records it, a table seeds it, or an input supplies it.
+            // - `TerminalFailed`, `TerminalTimedOut` and `TerminalCancelled` are
+            //   case payload schemas the kernel projects into an
+            //   `after <effect> fails/times out/cancels as x` block. They are
+            //   observer-only too, so the bare form needs an input or `@external`.
+            //
+            // A name being builtin is therefore never itself a producer; the
+            // refusal's suggestion names the observation form where one exists.
+            if produced.contains(&format!("schema:{first}")) || input_schemas.contains(first) {
                 continue;
             }
             diagnostics.push(Diagnostic {
@@ -43126,14 +43304,42 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     "rule `{}` can never fire: nothing produces `{first}`",
                     rule.name
                 ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "seed `{first}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
+                suggestion: whipplescript_parser::suggest(unproduced_schema_trigger_suggestion(
+                    first,
                 )),
             });
         }
     }
 
     diagnostics
+}
+
+/// The remedy for a schema trigger nothing produces (DR-0250). A declared class
+/// is seeded or recorded; a builtin schema name says what it actually means as
+/// a trigger, because most of them cannot be recorded at all and the reaction
+/// the author wanted is written another way.
+fn unproduced_schema_trigger_suggestion(name: &str) -> String {
+    const ARRIVES: &str =
+        "declare it as a workflow input, or tag the rule `@external` if it arrives from an external system";
+    match name {
+        "AgentTurn" => format!(
+            "`AgentTurn` cannot be recorded by a rule; to react to an agent finishing a turn, `tell` it and write `when <agent> completed turn as turn`; otherwise {ARRIVES}"
+        ),
+        "WorkItem" => format!(
+            "`WorkItem` cannot be recorded by a rule; to react to tracker work, declare a tracker and write `when <tracker> has ready issue as issue`; otherwise {ARRIVES}"
+        ),
+        "TerminalFailed" | "TerminalTimedOut" | "TerminalCancelled" => {
+            let outcome = match name {
+                "TerminalFailed" => "fails",
+                "TerminalTimedOut" => "times out",
+                _ => "cancels",
+            };
+            format!(
+                "`{name}` is a terminal case payload the runtime projects, not a fact a rule records; handle it with `after <effect> {outcome} as x {{ ... }}`; otherwise {ARRIVES}"
+            )
+        }
+        _ => format!("seed `{name}` from a table, record it in another rule, {ARRIVES}"),
+    }
 }
 
 /// Resolve and validate an agent tool grant (DR-0025): a granted name must name a

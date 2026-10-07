@@ -81,6 +81,7 @@ rule begin
     let mut outcomes = Vec::new();
     for actor in ["person:1", "agent:1"] {
         let command = HostActionCommand {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             issuer: "product".into(),
             scope: "workspace:typed".into(),

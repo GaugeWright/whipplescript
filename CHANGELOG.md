@@ -19,6 +19,19 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Interrupted mutation sweeps restore their original source bytes on catchable
+  signals, preserving another edit or an existing recovery backup.
+- Rule guards now recognize dotted effect-query kinds as query metadata while continuing to check binding reads in filters and surrounding expressions.
+- Effect-query `where` filters now reject non-boolean results during compilation, matching fact-query filters.
+
+- `open <sealed> into <Type> with <credential> as <binding>` now runs. The
+  plaintext reaches only the `after … as <alias>` of the open, from process
+  memory; the open's recorded output is the envelope's identity, and no record
+  ever holds the plaintext. `declassify` is materialized at run time. A region
+  whose open settled in another process, or before a restart, refuses to lower
+  with a diagnostic instead of reading null fields. Opening needs a custodian,
+  so the hosted runtime still refuses it.
+
 - Tracker discovery retires obsolete views and staging directories by rename,
   then deletes them after releasing the database writer and publication locks.
   A slow cleanup no longer blocks another tracker writer; interrupted cleanup
@@ -51,6 +64,16 @@ next free number rather than a patch — it says so.
   `.with_embedded_std_manifests(whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS)`
   on its facade, or pass an explicit empty set if it ships no standard
   vocabulary. This needs a middle-number release.
+
+- Bare builtin schema triggers now require the same real schema producer or
+  workflow input as explicit fact triggers, unless the rule is `@external`.
+  Declaring a tracker or telling an agent no longer makes an otherwise inert
+  bare WorkItem or AgentTurn trigger pass `check`; use the existing observer
+  sugar for those runtime observations. Declared-class producers, Evidence
+  records and terminal payloads keep their existing behavior. The refusal's
+  suggestion now says what each builtin name means as a trigger: the
+  `completed turn` and `has ready issue` sugar for AgentTurn and WorkItem, and
+  `after <effect> fails/times out/cancels as x` for the three terminal payloads.
 
 ## [0.10.0] — 2026-10-06
 
@@ -106,6 +129,14 @@ regenerated on first use.
   `whipplescript.tracker.discovery/v2`; existing views are regenerated on
   first use. A tracker command now waits up to a minute for another's write
   (`TRACKER_BUSY_TIMEOUT`) instead of 5 s.
+
+- A host action may name the held claim it serves: `HostActionCommand.anchor`
+  is repeated on its `ActionAdmissionReceipt`, and a result read with protocol
+  `whipplescript.action-result.v4` also returns the run's act footprint and
+  its unobserved share (DR-0207). Wire bytes, fingerprints and V1/V2 reads are
+  unchanged for actions without an anchor. **Breaking for Rust dependents:**
+  the three structs gained public fields, so a struct literal must add
+  `anchor: None` or `footprint: None`.
 
 ## [0.9.0] — 2026-10-05
 
@@ -173,6 +204,8 @@ configuration stay compatible.
   exact original evidence.
 
 - Hosted lease expiry preserves the original event completion time when rebuilding run projections, including tracker result recovery.
+
+- Missing required workflow inputs now name their declaration location, including when the invoked workflow comes from an included file.
 
 - Workspace edit and grep semantics now share pure helpers across native and Durable Object hosts. The native workspace resolver rejects overlapping edits while preserving leading BOMs; hosted grep keeps the same parameter behavior and 500-character line cap.
 

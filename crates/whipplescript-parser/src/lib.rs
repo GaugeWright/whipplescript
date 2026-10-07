@@ -3199,6 +3199,7 @@ struct SemanticContext {
 #[derive(Clone, Debug, Default)]
 struct WorkflowInputSurface {
     inputs: BTreeMap<String, TypeSyntax>,
+    input_spans: BTreeMap<String, SourceSpan>,
     /// The workflow's `output` contract types by name. A parent's
     /// `after <invoke-binding> succeeds as r` binds `r` to this contract so
     /// `r.<field>` type-checks against the child's declared output (the runtime
@@ -8435,6 +8436,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             workflow.name.clone(),
             WorkflowInputSurface {
                 inputs,
+                input_spans: workflow_input_spans_for_items(&program.items),
                 outputs: workflow_outputs_for_items(&program.items),
                 failures: workflow_failures_for_items(&program.items),
                 schemas: top_level_schemas.clone(),
@@ -8450,6 +8452,7 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
             workflow.name.name.clone(),
             WorkflowInputSurface {
                 inputs: workflow_inputs_for_items(&workflow.items),
+                input_spans: workflow_input_spans_for_items(&workflow.items),
                 outputs: workflow_outputs_for_items(&workflow.items),
                 failures: workflow_failures_for_items(&workflow.items),
                 schemas,
@@ -8907,6 +8910,18 @@ fn workflow_inputs_for_items(items: &[Item]) -> BTreeMap<String, TypeSyntax> {
         .filter_map(|item| match item {
             Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Input => {
                 Some((contract.name.name.clone(), contract.ty.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn workflow_input_spans_for_items(items: &[Item]) -> BTreeMap<String, SourceSpan> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::WorkflowContract(contract) if contract.kind == WorkflowContractKind::Input => {
+                Some((contract.name.name.clone(), contract.name.span))
             }
             _ => None,
         })
@@ -17479,7 +17494,7 @@ fn validate_workflow_invocations(
             if seen.contains(input) {
                 continue;
             }
-            diagnostics.push(Diagnostic {
+            let mut diagnostic = Diagnostic {
                 code: diagnostic_code!("type.missing_required_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
@@ -17489,7 +17504,12 @@ fn validate_workflow_invocations(
                 suggestion: suggest(format!(
                     "add `{input}` to the `{target}` invocation payload"
                 )),
-            });
+            };
+            if let Some(declared_at) = surface.input_spans.get(input) {
+                diagnostic = diagnostic
+                    .with_related(*declared_at, format!("input `{input}` is declared here"));
+            }
+            diagnostics.push(diagnostic);
         }
     }
 }
@@ -18592,7 +18612,7 @@ fn validate_query_expr(
         return;
     };
     if *kind == QueryKind::Fact {
-        let Some(schema) = query_head_schema(head, semantic) else {
+        let Some(_) = query_head_schema(head, semantic) else {
             diagnostics.push(Diagnostic {
                 code: diagnostic_code!("type.unknown_schema"),
                 severity: Severity::Error,
@@ -18613,34 +18633,37 @@ fn validate_query_expr(
             });
             return;
         };
-        if let Some(guard) = guard {
-            let guard_scope = scope.with_implicit_schema(schema);
-            let ty = infer_expr_type(
-                guard,
-                spans.child(0),
-                semantic,
-                &guard_scope,
-                context,
-                diagnostics,
-            );
-            if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("expr.non_boolean_condition"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    // The `where` expression is the one that has to be a bool.
-                    span: context.node(spans.child(0)),
-                    message: format!(
-                        "{} fact query `{}` has non-boolean `where` expression",
-                        context.subject,
-                        head.trim()
-                    ),
-                    suggestion: suggest(
-                        "query `where` expressions must evaluate to bool".to_owned(),
-                    ),
-                });
-            }
+    }
+    if let Some(guard) = guard {
+        let guard_scope = query_guard_scope(expr, semantic, scope);
+        let ty = infer_expr_type(
+            guard,
+            spans.child(0),
+            semantic,
+            &guard_scope,
+            context,
+            diagnostics,
+        );
+        if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.non_boolean_condition"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                fixits: Vec::new(),
+                // The `where` expression is the one that has to be a bool.
+                span: context.node(spans.child(0)),
+                message: format!(
+                    "{} {} query `{}` has non-boolean `where` expression",
+                    context.subject,
+                    if *kind == QueryKind::Fact {
+                        "fact"
+                    } else {
+                        "effect"
+                    },
+                    head.trim()
+                ),
+                suggestion: suggest("query `where` expressions must evaluate to bool".to_owned()),
+            });
         }
     }
 }
@@ -25681,9 +25704,36 @@ fn validate_known_field_paths_in_index(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // An effect query's kind is metadata, not a binding read. Keep its
+    // operand's exact token offset so the same spelling in a `where` filter
+    // or adjacent expression is still checked. `scan` already masks prose
+    // and comments, and the expression parser remains responsible for syntax.
+    let query_kind_roots: BTreeSet<usize> = lex_expr(scan)
+        .windows(4)
+        .filter_map(|tokens| match &tokens {
+            [ExprToken {
+                kind: ExprTokenKind::Symbol('('),
+                ..
+            }, ExprToken {
+                kind: ExprTokenKind::Ident(effect),
+                ..
+            }, ExprToken {
+                kind: ExprTokenKind::Ident(kind),
+                ..
+            }, operand]
+                if effect == "effect" && kind == "kind" =>
+            {
+                Some(operand.start)
+            }
+            _ => None,
+        })
+        .collect();
     // One body naming one missing binding twice is one mistake.
     let mut reported: BTreeSet<String> = BTreeSet::new();
     for dotted in dotted_paths(scan) {
+        if query_kind_roots.contains(&dotted.root_at) {
+            continue;
+        }
         let check = check_field_path(
             rule,
             &dotted.root,

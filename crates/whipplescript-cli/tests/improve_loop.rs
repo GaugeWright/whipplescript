@@ -3761,3 +3761,30 @@ fn an_unknown_gauge_is_refused_before_a_campaign_is_minted() {
         "the first accepted campaign takes the first id: {report}"
     );
 }
+
+/// Source syntax already refuses malformed thresholds. Keep the command's
+/// refusal ahead of scenario/campaign storage; the IR collector regression
+/// separately exercises malformed threshold text at the consumer boundary.
+#[test]
+fn malformed_declared_bar_command_refuses_before_campaign_storage() {
+    let env = Env::new("malformed-declared-bar");
+    let program_path = env.dir.join("program.whip");
+    fs::write(
+        &program_path,
+        "workflow G\noutput result R\nclass R { v string }\nclass Ticket { title string }\n\
+         gauge quality {\n  judge via exec \"score\"\n  expect P(ok) at least broken\n}\n\
+         rule j\n  when Ticket as t\n=> { complete result { v t.title } }\n",
+    )
+    .unwrap();
+    let error = env.run_expect_failure(&[
+        "improve",
+        "quality",
+        "--program",
+        program_path.to_str().unwrap(),
+        "--proposer",
+        "fixture",
+    ]);
+    assert!(error.contains("does not compile"), "{error}");
+    assert!(!std::path::Path::new(&env.improve_store).exists());
+    assert!(!std::path::Path::new(&env.store).exists());
+}

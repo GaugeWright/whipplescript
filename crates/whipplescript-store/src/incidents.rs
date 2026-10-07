@@ -19,6 +19,7 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
+#[cfg(feature = "native")]
 use crate::StoreResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

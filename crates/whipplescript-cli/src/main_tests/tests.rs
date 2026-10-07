@@ -2285,3 +2285,76 @@ fn norm_legacy_mainline_dispatch_refuses_on_both_hosts() {
     );
     worlds.close();
 }
+
+/// DR-0074 §7: `whip trace` recovers structure without custody and contents
+/// only with it, and says which it is showing. The trace holds no custody, so
+/// every recorded envelope is reported as structure with its contents
+/// withheld, located by a pointer into the report and by its record.
+#[test]
+fn trace_reports_sealed_values_as_structure_with_contents_withheld() {
+    let envelope = json!({
+        "credential": "vault/patients",
+        "context": "eff_wrap",
+        "label": null,
+        "nonce_b64": "AAAAAAAAAAAAAAAA",
+        "ciphertext_b64": "aGVsbG8gd29ybGQ=",
+    });
+    let trace = json!({
+        "events": [{
+            "event_id": "evt_1",
+            "payload": {"metadata": {"value": envelope.clone()}},
+        }],
+        "facts": [{
+            "fact_id": "fact_1",
+            "value": {"id": "p1", "notes/raw": envelope.clone()},
+        }],
+        "effects": [{
+            "effect_id": "eff_2",
+            // Not an envelope: one required member is missing, so it is data.
+            "input": {"credential": "vault/patients", "context": "x", "nonce_b64": "AA=="},
+        }],
+        "runs": [],
+        "evidence": [],
+    });
+
+    let sealed = trace_sealed_inventory(&trace);
+    assert_eq!(sealed["showing"], "structure");
+    assert_eq!(sealed["contents"], "withheld");
+    assert_eq!(sealed["custody"], "none");
+    assert!(
+        sealed["reason"].as_str().unwrap().contains("DR-0074"),
+        "{sealed}"
+    );
+    let envelopes = sealed["envelopes"].as_array().expect("envelopes");
+    assert_eq!(envelopes.len(), 2, "{sealed}");
+
+    assert_eq!(envelopes[0]["at"], "/events/0/payload/metadata/value");
+    assert_eq!(
+        envelopes[0]["record"],
+        json!({"section": "events", "id": "evt_1"})
+    );
+    assert_eq!(envelopes[0]["credential"], "vault/patients");
+    assert_eq!(envelopes[0]["context"], "eff_wrap");
+    assert_eq!(envelopes[0]["ciphertext_bytes"], 11);
+    assert_eq!(envelopes[0]["contents"], "withheld");
+
+    // A JSON-pointer token escapes `/` as `~1`.
+    assert_eq!(envelopes[1]["at"], "/facts/0/value/notes~1raw");
+    assert_eq!(
+        envelopes[1]["record"],
+        json!({"section": "facts", "id": "fact_1"})
+    );
+
+    // Nothing in the report carries ciphertext presented as contents.
+    for entry in envelopes {
+        assert!(entry.get("ciphertext_b64").is_none(), "{entry}");
+        assert!(entry.get("value").is_none(), "{entry}");
+    }
+}
+
+#[test]
+fn trace_with_no_sealed_values_still_says_what_it_shows() {
+    let sealed = trace_sealed_inventory(&json!({"events": [], "facts": []}));
+    assert_eq!(sealed["showing"], "structure");
+    assert_eq!(sealed["envelopes"], json!([]));
+}

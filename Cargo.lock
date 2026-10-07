@@ -4714,6 +4714,7 @@ dependencies = [
 name = "whipplescript-host-do"
 version = "0.10.0"
 dependencies = [
+ "ed25519-dalek",
  "hex",
  "p256",
  "regex",

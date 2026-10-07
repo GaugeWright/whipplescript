@@ -8,9 +8,11 @@ use super::{
     FlowingAttemptFinishOutcome, FlowingAttemptFinishReceipt, FlowingAttemptFinishRefusal,
     FlowingAttemptPin, FlowingCancelOutcome, FlowingCancelReceipt, FlowingCancelRefusal,
     FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateEvidence,
+    FlowingGateIssuerRefusal, FlowingGateIssuerSignature, FlowingGateTrustedIssuer,
     FlowingGateVerdict, FlowingUnitOutcome, ReleaseFlowingAttemptOutcome,
     RetainFlowingAttemptOutcome,
 };
+use super::{ConfigureFlowingGateIssuerOutcome, RecordFlowingGateSignatureOutcome};
 use crate::branches::flowing_coverage::{
     FlowingCoveragePremises, RecordCoveragePremisesOutcome, HOME_COVERAGE_DOMAIN,
 };
@@ -274,6 +276,75 @@ fn read_gate_certificate(
         Ok(certificate)
     })
     .transpose()
+}
+
+fn read_trusted_issuers(connection: &Connection) -> StoreResult<Vec<FlowingGateTrustedIssuer>> {
+    let mut statement = connection.prepare(
+        "SELECT issuer_id, issuer_json FROM flowing_gate_trusted_issuers ORDER BY issuer_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut issuers = Vec::new();
+    for row in rows {
+        let (issuer_id, json) = row?;
+        let issuer: FlowingGateTrustedIssuer = serde_json::from_str(&json)?;
+        if issuer.issuer_id != issuer_id || super::validate_trusted_issuer(&issuer).is_err() {
+            return Err(StoreError::Conflict(
+                "flowing gate trusted issuer differs from its key".into(),
+            ));
+        }
+        issuers.push(issuer);
+    }
+    Ok(issuers)
+}
+
+fn read_signatures(
+    connection: &Connection,
+    handle: &str,
+) -> StoreResult<Vec<FlowingGateIssuerSignature>> {
+    let mut statement = connection.prepare(
+        "SELECT handle, issuer_id, issuer_epoch, signature_json \
+         FROM flowing_gate_certificate_signatures WHERE handle = ?1 \
+         ORDER BY issuer_id, issuer_epoch",
+    )?;
+    let rows = statement.query_map([handle], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut signatures = Vec::new();
+    for row in rows {
+        let (stored_handle, issuer_id, epoch, json) = row?;
+        let signature: FlowingGateIssuerSignature = serde_json::from_str(&json)?;
+        if signature.certificate_handle != stored_handle
+            || signature.issuer_id != issuer_id
+            || signature.issuer_epoch != epoch
+        {
+            return Err(StoreError::Conflict(
+                "flowing gate signature differs from its key".into(),
+            ));
+        }
+        signatures.push(signature);
+    }
+    Ok(signatures)
+}
+
+/// The ref CAS's issuer check: the exact handle must carry a signature from an
+/// issuer the trust root holds now, read inside the same transaction.
+fn issuer_refusal(
+    connection: &Connection,
+    handle: &str,
+) -> StoreResult<Option<FlowingGateIssuerRefusal>> {
+    Ok(super::verify_issued(
+        handle,
+        &read_trusted_issuers(connection)?,
+        &read_signatures(connection, handle)?,
+    )
+    .err())
 }
 
 impl BranchStore {
@@ -691,6 +762,10 @@ impl FlowingAdmissions for BranchStore {
         if !certificate.matches_request(request) {
             return Ok(O::Refused(R::GateCertificateMismatch));
         }
+        if let Some(refusal) = issuer_refusal(&tx, &request.certificate_handle)? {
+            // MUTATION-SUCCESS-EXPR: Ok(O::Finished(FlowingAttemptFinishReceipt { request: request.clone(), verdict: FlowingGateVerdict::Failed }))
+            return Ok(O::Refused(R::GateIssuer(refusal)));
+        }
         let verdict = match certificate.admission_refusal() {
             Some(super::FlowingAdmissionRefusal::GateFailed) => FlowingGateVerdict::Failed,
             Some(super::FlowingAdmissionRefusal::GateUnrun) => FlowingGateVerdict::Unrun,
@@ -954,6 +1029,9 @@ impl FlowingAdmissions for BranchStore {
         if !certificate.matches_request(request) {
             return Ok(Refused(R::GateCertificateMismatch));
         }
+        if let Some(refusal) = issuer_refusal(&tx, &request.certificate_handle)? {
+            return Ok(Refused(R::GateIssuer(refusal)));
+        }
         if let Some(refusal) = certificate.admission_refusal() {
             return Ok(Refused(refusal));
         }
@@ -1144,15 +1222,97 @@ impl FlowingAdmissions for BranchStore {
         Ok(outcome)
     }
 
+    fn configure_flowing_gate_issuer(
+        &mut self,
+        issuer: &FlowingGateTrustedIssuer,
+    ) -> StoreResult<ConfigureFlowingGateIssuerOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_trusted_issuers(&tx)?
+            .into_iter()
+            .find(|current| current.issuer_id == issuer.issuer_id);
+        let outcome = super::configure_issuer_outcome(current, issuer);
+        if let ConfigureFlowingGateIssuerOutcome::Configured(configured) = &outcome {
+            tx.execute(
+                "INSERT INTO flowing_gate_trusted_issuers (issuer_id, issuer_json) \
+                 VALUES (?1, ?2) ON CONFLICT(issuer_id) DO UPDATE SET issuer_json = ?2",
+                params![&configured.issuer_id, serde_json::to_string(configured)?],
+            )?;
+            tx.commit()?;
+        }
+        Ok(outcome)
+    }
+
     fn flowing_coverage_premises(&self) -> StoreResult<Option<FlowingCoveragePremises>> {
         read_coverage_premises(&self.connection)
+    }
+
+    fn flowing_gate_trusted_issuers(&self) -> StoreResult<Vec<FlowingGateTrustedIssuer>> {
+        read_trusted_issuers(&self.connection)
+    }
+
+    fn record_flowing_gate_signature(
+        &mut self,
+        signature: &FlowingGateIssuerSignature,
+    ) -> StoreResult<RecordFlowingGateSignatureOutcome> {
+        use RecordFlowingGateSignatureOutcome as O;
+        if let Err(field) = super::validate_issuer_signature(signature) {
+            return Ok(O::Invalid { field });
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_gate_certificate(&tx, &signature.certificate_handle)?.is_none() {
+            return Ok(O::CertificateMissing);
+        }
+        if let Some(existing) = read_signatures(&tx, &signature.certificate_handle)?
+            .into_iter()
+            .find(|existing| {
+                existing.issuer_id == signature.issuer_id
+                    && existing.issuer_epoch == signature.issuer_epoch
+            })
+        {
+            if existing != *signature {
+                return Err(StoreError::Conflict(
+                    "flowing gate signature differs from the one already retained".into(),
+                ));
+            }
+            return Ok(O::Existing(existing));
+        }
+        if let Err(refusal) = super::verify_issued(
+            &signature.certificate_handle,
+            &read_trusted_issuers(&tx)?,
+            std::slice::from_ref(signature),
+        ) {
+            return Ok(O::Refused(refusal));
+        }
+        tx.execute(
+            "INSERT INTO flowing_gate_certificate_signatures \
+             (handle, issuer_id, issuer_epoch, signature_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &signature.certificate_handle,
+                &signature.issuer_id,
+                signature.issuer_epoch,
+                serde_json::to_string(signature)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(O::Recorded(signature.clone()))
+    }
+
+    fn flowing_gate_signatures(
+        &self,
+        certificate_handle: &str,
+    ) -> StoreResult<Vec<FlowingGateIssuerSignature>> {
+        read_signatures(&self.connection, certificate_handle)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branches::flowing_admission::{FlowingGateCheck, FlowingGateVerdict};
+    use crate::branches::flowing_admission::{test_issuer, FlowingGateCheck, FlowingGateVerdict};
     use crate::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
@@ -1653,6 +1813,43 @@ mod tests {
                 params![
                     certificate.handle().unwrap(),
                     serde_json::to_string(certificate).unwrap()
+                ],
+            )
+            .unwrap();
+        sign_gate_certificate(store, &certificate.handle().unwrap());
+    }
+
+    /// Trust the fixture issuer at epoch 1 and retain its signature over the
+    /// handle, as a fleet issuer would after a run.
+    fn sign_gate_certificate(store: &BranchStore, handle: &str) {
+        insert_trusted_issuer(store, &test_issuer::trusted(test_issuer::ISSUER, 1, 7));
+        insert_signature(store, &test_issuer::sign(handle, test_issuer::ISSUER, 1, 7));
+    }
+
+    fn insert_trusted_issuer(store: &BranchStore, issuer: &FlowingGateTrustedIssuer) {
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO flowing_gate_trusted_issuers (issuer_id, issuer_json) \
+                 VALUES (?1, ?2)",
+                params![&issuer.issuer_id, serde_json::to_string(issuer).unwrap()],
+            )
+            .unwrap();
+    }
+
+    /// Raw row write: models a writer that bypasses the recording API, so the
+    /// ref CAS is the check under test.
+    fn insert_signature(store: &BranchStore, signature: &FlowingGateIssuerSignature) {
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO flowing_gate_certificate_signatures \
+                 (handle, issuer_id, issuer_epoch, signature_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &signature.certificate_handle,
+                    &signature.issuer_id,
+                    signature.issuer_epoch,
+                    serde_json::to_string(signature).unwrap()
                 ],
             )
             .unwrap();
@@ -2665,6 +2862,395 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+    }
+
+    fn clear_issuance(store: &BranchStore) {
+        store
+            .connection
+            .execute_batch(
+                "DELETE FROM flowing_gate_certificate_signatures; \
+                 DELETE FROM flowing_gate_trusted_issuers;",
+            )
+            .unwrap();
+    }
+
+    fn assert_trunk_unmoved(store: &BranchStore, attempt: &FlowingAdmissionRequest) {
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn native_ref_requires_a_current_trusted_issuer_signature() {
+        use FlowingGateIssuerRefusal as I;
+        let mut store = fixture();
+        let attempt = request("unit-a", "issued");
+        let handle = attempt.certificate_handle.clone();
+        pin_attempt(&mut store, &attempt);
+        let refused = |store: &mut BranchStore, issuer: I| {
+            assert_eq!(
+                store.admit_flowing_prefix(&attempt).unwrap(),
+                FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::GateIssuer(issuer))
+            );
+            assert_trunk_unmoved(store, &attempt);
+        };
+
+        clear_issuance(&store);
+        insert_signature(
+            &store,
+            &test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7),
+        );
+        refused(&mut store, I::TrustRootMissing);
+
+        clear_issuance(&store);
+        insert_trusted_issuer(&store, &test_issuer::trusted(test_issuer::ISSUER, 1, 7));
+        refused(&mut store, I::Unsigned);
+
+        // Forged issuer: the trusted name over the exact handle, wrong key.
+        insert_signature(
+            &store,
+            &test_issuer::sign(&handle, test_issuer::ISSUER, 1, 9),
+        );
+        refused(
+            &mut store,
+            I::BadSignature {
+                issuer_id: test_issuer::ISSUER.into(),
+            },
+        );
+
+        // Swapped digest: a genuine signature over another certificate,
+        // relabelled onto this handle.
+        store
+            .connection
+            .execute("DELETE FROM flowing_gate_certificate_signatures", [])
+            .unwrap();
+        let mut swapped = test_issuer::sign("sha256:other-certificate", test_issuer::ISSUER, 1, 7);
+        swapped.certificate_handle = handle.clone();
+        insert_signature(&store, &swapped);
+        refused(
+            &mut store,
+            I::BadSignature {
+                issuer_id: test_issuer::ISSUER.into(),
+            },
+        );
+
+        store
+            .connection
+            .execute("DELETE FROM flowing_gate_certificate_signatures", [])
+            .unwrap();
+        insert_signature(&store, &test_issuer::sign(&handle, "elsewhere", 1, 7));
+        refused(&mut store, I::ForeignIssuer);
+
+        // Old-epoch issuer: genuine at epoch 1, retired by a rotation.
+        insert_signature(
+            &store,
+            &test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7),
+        );
+        let rotated = test_issuer::trusted(test_issuer::ISSUER, 2, 8);
+        assert_eq!(
+            store.configure_flowing_gate_issuer(&rotated).unwrap(),
+            ConfigureFlowingGateIssuerOutcome::Configured(rotated.clone())
+        );
+        refused(
+            &mut store,
+            I::IssuerEpochMismatch {
+                issuer_id: test_issuer::ISSUER.into(),
+                signed: 1,
+                current: 2,
+            },
+        );
+
+        let current = test_issuer::sign(&handle, test_issuer::ISSUER, 2, 8);
+        assert_eq!(
+            store.record_flowing_gate_signature(&current).unwrap(),
+            RecordFlowingGateSignatureOutcome::Recorded(current)
+        );
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some(attempt.candidate_cut_id.as_str())
+        );
+    }
+
+    #[test]
+    fn native_finish_requires_an_issued_certificate() {
+        let mut store = fixture();
+        let attempt = terminal_request(&store, "unsigned-finish", FlowingGateVerdict::Failed);
+        pin_attempt(&mut store, &attempt);
+        store
+            .connection
+            .execute("DELETE FROM flowing_gate_certificate_signatures", [])
+            .unwrap();
+        assert_eq!(
+            store.finish_flowing_attempt(&attempt).unwrap(),
+            FlowingAttemptFinishOutcome::Refused(FlowingAttemptFinishRefusal::GateIssuer(
+                FlowingGateIssuerRefusal::Unsigned
+            ))
+        );
+        assert!(store
+            .flowing_finish_for_attempt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A trust-root or signature row whose JSON disagrees with its primary
+    /// key is indeterminate: the CAS and both read APIs refuse it rather than
+    /// trusting either half.
+    #[test]
+    fn native_issuance_rows_that_differ_from_their_key_are_indeterminate() {
+        let mut store = fixture();
+        let attempt = request("unit-a", "tampered-issuance");
+        let handle = attempt.certificate_handle.clone();
+        pin_attempt(&mut store, &attempt);
+        let indeterminate = |store: &mut BranchStore, what: &str| {
+            assert!(
+                matches!(
+                    store.admit_flowing_prefix(&attempt),
+                    Err(StoreError::Conflict(message)) if message.contains(what)
+                ),
+                "the CAS refuses a {what} row"
+            );
+            assert_trunk_unmoved(store, &attempt);
+        };
+        let set_issuer_json = |store: &BranchStore, issuer: &FlowingGateTrustedIssuer| {
+            store
+                .connection
+                .execute(
+                    "UPDATE flowing_gate_trusted_issuers SET issuer_json = ?1 WHERE issuer_id = ?2",
+                    params![serde_json::to_string(issuer).unwrap(), test_issuer::ISSUER],
+                )
+                .unwrap();
+        };
+        let set_signature_json = |store: &BranchStore, signature: &FlowingGateIssuerSignature| {
+            store
+                .connection
+                .execute(
+                    "UPDATE flowing_gate_certificate_signatures SET signature_json = ?1 \
+                     WHERE handle = ?2 AND issuer_id = ?3 AND issuer_epoch = 1",
+                    params![
+                        serde_json::to_string(signature).unwrap(),
+                        &handle,
+                        test_issuer::ISSUER
+                    ],
+                )
+                .unwrap();
+        };
+        let trusted = test_issuer::trusted(test_issuer::ISSUER, 1, 7);
+        let signed = test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7);
+
+        // Trust root: the row names another issuer, then carries an invalid key.
+        let issuer_differs = "trusted issuer differs from its key";
+        let mut renamed = trusted.clone();
+        renamed.issuer_id = "elsewhere".into();
+        let mut unkeyed = trusted.clone();
+        unkeyed.public_key = "zz".into();
+        for tampered in [renamed, unkeyed] {
+            set_issuer_json(&store, &tampered);
+            indeterminate(&mut store, issuer_differs);
+            assert!(matches!(
+                store.flowing_gate_trusted_issuers(),
+                Err(StoreError::Conflict(message)) if message.contains(issuer_differs)
+            ));
+        }
+        set_issuer_json(&store, &trusted);
+
+        // Signature: the row's handle, issuer or epoch disagrees with its key.
+        let signature_differs = "signature differs from its key";
+        let mut rehandled = signed.clone();
+        rehandled.certificate_handle = "sha256:other-certificate".into();
+        let mut reissued = signed.clone();
+        reissued.issuer_id = "elsewhere".into();
+        let mut reepoched = signed.clone();
+        reepoched.issuer_epoch = 2;
+        for tampered in [rehandled, reissued, reepoched] {
+            set_signature_json(&store, &tampered);
+            indeterminate(&mut store, signature_differs);
+            assert!(matches!(
+                store.flowing_gate_signatures(&handle),
+                Err(StoreError::Conflict(message)) if message.contains(signature_differs)
+            ));
+        }
+        set_signature_json(&store, &signed);
+
+        assert_eq!(store.flowing_gate_trusted_issuers().unwrap(), vec![trusted]);
+        assert_eq!(
+            store.flowing_gate_signatures(&handle).unwrap(),
+            vec![signed]
+        );
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn native_signature_recording_and_issuer_configuration_refuse_early() {
+        use RecordFlowingGateSignatureOutcome as O;
+        let mut store = fixture();
+        let handle = request("unit-a", "record").certificate_handle;
+        clear_issuance(&store);
+        let issuer = test_issuer::trusted(test_issuer::ISSUER, 1, 7);
+        assert_eq!(
+            store.configure_flowing_gate_issuer(&issuer).unwrap(),
+            ConfigureFlowingGateIssuerOutcome::Configured(issuer.clone())
+        );
+        assert_eq!(
+            store.configure_flowing_gate_issuer(&issuer).unwrap(),
+            ConfigureFlowingGateIssuerOutcome::Existing(issuer.clone())
+        );
+        assert_eq!(
+            store
+                .configure_flowing_gate_issuer(&test_issuer::trusted(test_issuer::ISSUER, 1, 8))
+                .unwrap(),
+            ConfigureFlowingGateIssuerOutcome::EpochNotAdvanced { current: 1 }
+        );
+        assert_eq!(store.flowing_gate_trusted_issuers().unwrap(), vec![issuer]);
+
+        let mut invalid = test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7);
+        invalid.signature = "00".into();
+        assert_eq!(
+            store.record_flowing_gate_signature(&invalid).unwrap(),
+            O::Invalid { field: "signature" }
+        );
+        assert_eq!(
+            store
+                .record_flowing_gate_signature(&test_issuer::sign(
+                    "sha256:no-such-certificate",
+                    test_issuer::ISSUER,
+                    1,
+                    7
+                ))
+                .unwrap(),
+            O::CertificateMissing
+        );
+        assert_eq!(
+            store
+                .record_flowing_gate_signature(&test_issuer::sign(&handle, "elsewhere", 1, 7))
+                .unwrap(),
+            O::Refused(FlowingGateIssuerRefusal::ForeignIssuer)
+        );
+        assert_eq!(
+            store
+                .record_flowing_gate_signature(&test_issuer::sign(
+                    &handle,
+                    test_issuer::ISSUER,
+                    1,
+                    9
+                ))
+                .unwrap(),
+            O::Refused(FlowingGateIssuerRefusal::BadSignature {
+                issuer_id: test_issuer::ISSUER.into()
+            })
+        );
+        assert!(store.flowing_gate_signatures(&handle).unwrap().is_empty());
+        let good = test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7);
+        assert_eq!(
+            store.record_flowing_gate_signature(&good).unwrap(),
+            O::Recorded(good.clone())
+        );
+        assert_eq!(
+            store.record_flowing_gate_signature(&good).unwrap(),
+            O::Existing(good.clone())
+        );
+        assert_eq!(store.flowing_gate_signatures(&handle).unwrap(), vec![good]);
+
+        // A different row already under the key is not silently kept or replaced.
+        store
+            .connection
+            .execute("DELETE FROM flowing_gate_certificate_signatures", [])
+            .unwrap();
+        insert_signature(
+            &store,
+            &test_issuer::sign(&handle, test_issuer::ISSUER, 1, 9),
+        );
+        let error = store
+            .record_flowing_gate_signature(&test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7))
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("differs from the one already retained"));
+    }
+
+    #[test]
+    fn native_admission_survives_a_crash_after_cas_and_a_later_rotation() {
+        let root = std::env::temp_dir().join(format!(
+            "whipplescript-issued-cas-{}-{}",
+            std::process::id(),
+            NEXT_REVIEW_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("branches.sqlite");
+        let attempt = request("unit-a", "crash-after-cas");
+        {
+            let mut store = fixture();
+            pin_attempt(&mut store, &attempt);
+            store
+                .connection
+                .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+                .unwrap();
+        }
+        let receipt = {
+            let mut store = BranchStore::open(&path).unwrap();
+            let FlowingAdmissionOutcome::Admitted(receipt) =
+                store.admit_flowing_prefix(&attempt).unwrap()
+            else {
+                panic!("an issued certificate admits");
+            };
+            receipt
+            // The coordinator dies here, after the CAS committed and before it
+            // learned the outcome.
+        };
+        let mut store = BranchStore::open(&path).unwrap();
+        // The issuer rotates before the retry. The durable receipt answers the
+        // retry; the retired signature cannot reopen or repeat the CAS.
+        let rotated = test_issuer::trusted(test_issuer::ISSUER, 2, 8);
+        assert_eq!(
+            store.configure_flowing_gate_issuer(&rotated).unwrap(),
+            ConfigureFlowingGateIssuerOutcome::Configured(rotated)
+        );
+        assert_eq!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Existing(receipt)
+        );
+        let admissions: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM flowing_admissions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(admissions, 1);
+        assert_eq!(
+            store
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some(attempt.candidate_cut_id.as_str())
+        );
+        let mut competing = request("unit-a", "competing-after-crash");
+        competing.recorded_at = "t9".into();
+        assert_eq!(
+            store.admit_flowing_prefix(&competing).unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::TrunkStale {
+                current: Some(attempt.candidate_cut_id.clone())
+            })
+        );
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

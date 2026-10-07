@@ -64,12 +64,12 @@ SKIP_SELF_TEST="${WHIPPLESCRIPT_SWEEP_SELF_TESTED:-}"
 DEADLINE="${WHIPPLESCRIPT_SWEEP_DEADLINE:-}"
 DEFERRED="${WHIPPLESCRIPT_SWEEP_DEFERRED:-}"
 
-# A sweep leaves the tree mutated if it is killed mid-run, and a stale mutation
-# reads as a broken build rather than an interrupted sweep. Refuse to start on a
-# tree that already has uncommitted changes to the target, so an interrupted run
-# is always recoverable with `git checkout -- <file>`.
+# The sweep restores its own target bytes on INT, TERM and HUP after stopping
+# and reaping its cargo subprocess. It preserves an intervening target edit and
+# the recovery backup rather than overwriting someone else's work. Refuse to
+# start on a dirty target; a hard kill (SIGKILL) cannot run cleanup.
 #
-# To stop a run, kill its `mutation_sweep.py` and the `cargo test` it spawned
+# For recovery after a hard kill, stop its `mutation_sweep.py` and `cargo test`
 # by pid, after confirming with `lsof -p <pid> | grep cwd` that they belong to
 # your worktree: other sessions run sweeps, so never kill by pattern. Then
 # restore the target, remove `<file>.sweepbak`, and check that nothing is still

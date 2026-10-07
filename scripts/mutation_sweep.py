@@ -26,12 +26,13 @@ import difflib
 import os
 import re
 import shlex
-import shutil
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Callable
 
 # A refusal is either pushed onto a diagnostic list or returned as an error.
 PUSH_PATTERNS = ("diagnostics.push(", "errors.push(")
@@ -1085,8 +1086,74 @@ def blamed_as_text(names: list[str]) -> str:
     return ", ".join(f"`{name}`" for name in names) or "a test cargo did not name"
 
 
+class MutationTarget:
+    """Restore only our last write; retain recovery bytes if someone edits it.
+
+    The exclusive backup refuses overlapping sweeps. Byte comparisons detect
+    intervening edits, not an atomic guarantee against concurrent editors.
+    Catchable signals unwind subprocess.run (which kills and waits for its
+    child on BaseException) before restoring the source. SIGKILL cannot unwind.
+    """
+
+    def __init__(self, target: str):
+        self.target = Path(target)
+        self.backup = Path(target + ".sweepbak")
+        self.original = self.target.read_bytes()
+        self.written = self.original
+        self.handlers: dict[int, object] = {}
+        self.writing = False
+        self.pending_signal: int | None = None
+
+    def __enter__(self):
+        # Never overwrite another run's recovery file, even if it looks stale.
+        with self.backup.open("xb") as handle:
+            handle.write(self.original)
+        for signum in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if signum is not None:
+                self.handlers[signum] = signal.signal(signum, self.interrupt)
+        return self
+
+    def interrupt(self, signum, _frame):
+        if self.writing:
+            self.pending_signal = signum
+            return
+        # A second signal must not interrupt unwinding or the restore itself.
+        for caught in self.handlers:
+            signal.signal(caught, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    def write_bytes(self, content: bytes):
+        if self.target.read_bytes() != self.written:
+            raise RuntimeError(f"{self.target} changed outside the sweep; preserved it and {self.backup}")
+        # Defer a signal until the successful write is recorded as ours.
+        self.writing = True
+        try:
+            self.target.write_bytes(content)
+            self.written = content
+        finally:
+            self.writing = False
+        if self.pending_signal is not None:
+            signum = self.pending_signal
+            self.pending_signal = None
+            self.interrupt(signum, None)
+
+    def write_text(self, content: str):
+        self.write_bytes(content.encode())
+
+    def __exit__(self, _kind, _exception, _traceback):
+        try:
+            for caught in self.handlers:
+                signal.signal(caught, signal.SIG_IGN)
+            self.write_bytes(self.original)
+            self.backup.unlink()
+        finally:
+            for caught, handler in self.handlers.items():
+                signal.signal(caught, handler)
+
+
 def sweep(
-    target: str, filter_expr: str, sites: list[Site], backup: str, deadline: float | None = None
+    target: str, filter_expr: str, sites: list[Site], backup: str, deadline: float | None = None,
+    write: Callable[[str], None] | None = None
 ) -> tuple[list[Site], list[Site], list[Site]]:
     """Returns (unexercised refusals, sites the sweep could not measure, sites
     it reached the deadline before starting).
@@ -1112,7 +1179,7 @@ def sweep(
             print(f"  {number:4d}/{len(sites)}  SKIP (no mutation)  {site.label}", flush=True)
             unmeasured.append(site)
             continue
-        Path(target).write_text("\n".join(mutated))
+        (write or Path(target).write_text)("\n".join(mutated))
         outcome = run_suite(filter_expr)
         if outcome == PASSED:
             survivors.append(site)
@@ -1482,7 +1549,8 @@ def batch_unreachable_mutations(lines: list[str], sites: list[Site], start: int)
     return result
 
 
-def self_test(target: str, filter_expr: str, backup: str) -> bool:
+def self_test(target: str, filter_expr: str, backup: str,
+              write: Callable[[str], None] | None = None) -> bool:
     """Compile every calibration mutation together, then run the actual suite.
 
     The plants are unreachable functions with independent edits. Running the
@@ -1512,7 +1580,7 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
     except ValueError as error:
         print(f"SELF TEST FAILED: {error}", file=sys.stderr)
         return False
-    Path(target).write_text("\n".join(mutated))
+    (write or Path(target).write_text)("\n".join(mutated))
     outcome = run_suite(filter_expr)
     if outcome != PASSED:
         if outcome == BUILD_FAILED:
@@ -1598,8 +1666,7 @@ def main() -> int:
 
     backup = target + ".sweepbak"
     missing: set[int] = set()
-    shutil.copy(target, backup)
-    try:
+    with MutationTarget(target) as mutation:
         if args.skip_self_test:
             # Said out loud, every time. A run that skipped its own bite test
             # and does not say so is exactly the silent degradation this script
@@ -1611,9 +1678,9 @@ def main() -> int:
             )
         else:
             print("== self test ==", flush=True)
-            if not self_test(target, args.filter, backup):
+            if not self_test(target, args.filter, backup, mutation.write_text):
                 return 1
-            shutil.copy(backup, target)
+            mutation.write_bytes(mutation.original)
 
         sites = find_sites(Path(backup).read_text().split("\n"))
         if args.only_lines:
@@ -1635,10 +1702,7 @@ def main() -> int:
             print(f"note: sweeping {args.limit} of {len(sites)} sites", flush=True)
             sites = sites[: args.limit]
         print(f"== sweeping {len(sites)} refusals in {target} ==", flush=True)
-        survivors, unmeasured, deferred = sweep(target, args.filter, sites, backup, args.deadline)
-    finally:
-        shutil.copy(backup, target)
-        os.remove(backup)
+        survivors, unmeasured, deferred = sweep(target, args.filter, sites, backup, args.deadline, mutation.write_text)
 
     print(f"\n{len(survivors)} of {len(sites)} refusals unexercised by `{args.filter}`")
     for site in survivors:

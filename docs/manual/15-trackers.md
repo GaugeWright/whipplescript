@@ -304,6 +304,22 @@ The full set of commands is larger than this working set. The set also has
 `import`, and `sync` to move a backlog between machines. The `whip help issue`
 command lists each command.
 
+The `WS-N` identifier is a local alias. When backlogs merge, an issue's durable
+identity is the content hash of its creation event. Event IDs hash the event
+kind, issue identity, exact serialized payload bytes, actor, sorted parent IDs,
+and UTC timestamp. The builtin records timestamps to the second and adds no
+nonce or within-second tiebreaker. Creation events have no prior issue identity
+or parents.
+
+Byte-identical independent submissions in the same second therefore share one
+ID when every hashed field agrees, including the actor. Independent clones
+with the same predecessors can also produce the same event ID. Import treats
+an identical event as already present; it cannot distinguish an independent
+submission from a retransmission. Different payload bytes, actors, parent sets,
+issue identities, or timestamps produce distinct IDs. Two distinct issue IDs
+with the same queue and title instead produce an advisory duplicate-submission
+warning for a person to reconcile with a `duplicates` relation.
+
 This surface is not a back door for an administrator. This surface is the other
 half of the design. The backlog is state of the workspace with a neutral
 surface. Thus a person at the shell and an `@service` workflow with many agents

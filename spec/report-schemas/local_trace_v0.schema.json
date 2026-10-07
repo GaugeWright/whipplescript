@@ -12,7 +12,8 @@
     "runs",
     "native_lifecycle",
     "evidence",
-    "evidence_links"
+    "evidence_links",
+    "sealed"
   ],
   "properties": {
     "schema": {"const": "whipplescript.local_trace.v0"},
@@ -45,6 +46,7 @@
       "type": "array",
       "items": {"type": "object"}
     },
+    "sealed": {"$ref": "#/$defs/sealed_inventory"},
     "abstract_trace": {
       "type": "array",
       "items": {"$ref": "#/$defs/trace_record"}
@@ -62,6 +64,41 @@
   },
   "additionalProperties": true,
   "$defs": {
+    "sealed_inventory": {
+      "type": "object",
+      "required": ["showing", "contents", "custody", "reason", "envelopes"],
+      "properties": {
+        "showing": {"const": "structure"},
+        "contents": {"const": "withheld"},
+        "custody": {"const": "none"},
+        "reason": {"type": "string"},
+        "envelopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["at", "record", "credential", "context", "label", "ciphertext_bytes", "contents"],
+            "properties": {
+              "at": {"type": "string"},
+              "record": {
+                "type": "object",
+                "required": ["section", "id"],
+                "properties": {
+                  "section": {"enum": ["events", "facts", "effects", "runs", "evidence"]},
+                  "id": {}
+                }
+              },
+              "credential": {"type": "string"},
+              "context": {"type": "string"},
+              "label": {},
+              "ciphertext_bytes": {"type": ["integer", "null"], "minimum": 0},
+              "contents": {"const": "withheld"}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
     "store_event": {
       "type": "object",
       "required": ["event_id", "sequence", "event_type", "payload", "source", "occurred_at"],

@@ -536,7 +536,7 @@ mod tests {
     fn the_snapshot_still_carries_the_spans_the_identity_drops() {
         let snapshot = snapshot_of("terminal-output-union", IDENTITY_CORPUS[0].1);
         assert!(
-            snapshot.contains(" span=575..594"),
+            snapshot.contains(" span=728..747"),
             "the snapshot lost its offsets: {snapshot}"
         );
         assert!(
@@ -544,7 +544,7 @@ mod tests {
             "the projection kept an offset"
         );
         assert!(
-            !identity_projection(&snapshot).contains("575..594"),
+            !identity_projection(&snapshot).contains("728..747"),
             "the projection kept an offset"
         );
     }

@@ -1701,6 +1701,23 @@ pub fn lower_rule(
         else {
             continue;
         };
+        // DR-0074 §3: a settled `open` binds its plaintext to the block's
+        // alias — from process memory, never from the fact, which holds only
+        // the envelope's identity.
+        let opened = match opened_alias_value(
+            facts,
+            upstream_effect_id,
+            &after.predicate,
+            after.alias.as_deref(),
+            &binding_value,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                lowering.errors.push(error);
+                continue;
+            }
+        };
+        let in_region = opened.is_some();
         let mut after_context = context.clone();
         push_effect_binding(
             &mut after_context,
@@ -1709,7 +1726,16 @@ pub fn lower_rule(
             binding_value.clone(),
         );
         if let Some(alias) = &after.alias {
-            push_effect_binding(&mut after_context, alias, upstream_effect_id, binding_value);
+            let is_opened = opened.is_some();
+            push_effect_binding(
+                &mut after_context,
+                alias,
+                upstream_effect_id,
+                opened.unwrap_or(binding_value),
+            );
+            if is_opened {
+                mark_opened(&mut after_context, alias);
+            }
         }
         for (binding, effect_id) in &binding_to_effect_id {
             if binding == &after.binding {
@@ -1719,11 +1745,19 @@ pub fn lower_rule(
                 push_effect_binding(&mut after_context, binding, effect_id, value);
             }
         }
-        let (selected_after_body, mut after_context, branch_reports) =
+        let (selected_after_body, mut after_context, mut branch_reports) =
             selected_rule_body(&after.body, &after_context);
+        if in_region {
+            withhold_opened_branch_values(&mut branch_reports);
+        }
         // Materialize `redact … as <out>` projections inside this fired `after`
         // block — its alias (the redaction's source) is now bound.
         materialize_redactions(&mut after_context, &rule.metadata.redactions);
+        materialize_declassifications(
+            &mut after_context,
+            &strip_after_blocks(&selected_after_body),
+            ir,
+        );
         lowering.branch_reports.extend(branch_reports);
         // Consumes/cancels belong to THIS scope only: a `done`/`cancel` inside a
         // deeper (not-yet-fired) nested `after` must not run when the outer
@@ -1849,6 +1883,7 @@ pub fn lower_rule(
             &selected_binding_to_effect_id,
             facts,
             &mut after_context,
+            &mut lowering.errors,
         );
         for (index, parsed) in selected_effects.iter().enumerate() {
             let effect_node = effect_node_for_parsed(rule, &selected_effects, index);
@@ -1948,6 +1983,7 @@ pub fn lower_rule(
             &binding_to_effect_id,
             &selected_after_body,
             &after_context,
+            in_region,
             &mut lowering,
         );
     }
@@ -2008,6 +2044,7 @@ fn push_settled_nested_scope_bindings(
     binding_to_effect_id: &std::collections::BTreeMap<String, String>,
     facts: &[FactView],
     context: &mut RuleContext,
+    errors: &mut Vec<String>,
 ) -> std::collections::BTreeSet<String> {
     let mut settled = std::collections::BTreeSet::new();
     for nested in after_blocks(body) {
@@ -2017,9 +2054,26 @@ fn push_settled_nested_scope_bindings(
         let Some(value) = effect_binding_value(facts, effect_id, &nested.predicate) else {
             continue;
         };
+        let opened = match opened_alias_value(
+            facts,
+            effect_id,
+            &nested.predicate,
+            nested.alias.as_deref(),
+            &value,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         push_effect_binding(context, &nested.binding, effect_id, value.clone());
         if let Some(alias) = &nested.alias {
-            push_effect_binding(context, alias, effect_id, value);
+            let is_opened = opened.is_some();
+            push_effect_binding(context, alias, effect_id, opened.unwrap_or(value));
+            if is_opened {
+                mark_opened(context, alias);
+            }
         }
         settled.insert(nested.binding.clone());
         settled.extend(push_settled_nested_scope_bindings(
@@ -2027,9 +2081,44 @@ fn push_settled_nested_scope_bindings(
             binding_to_effect_id,
             facts,
             context,
+            errors,
         ));
     }
     settled
+}
+
+/// The value the `as <alias>` of an `after` block over a settled `open` binds:
+/// its plaintext, from [`crate::opened_plaintext`]. `None` for every other
+/// block, which binds its alias to the same value as its effect binding.
+///
+/// Only the ALIAS takes the plaintext. The effect binding keeps the envelope's
+/// identity, which is what the fact holds and what the parser's confinement
+/// analysis treats as releasable: it confines the alias, so binding plaintext
+/// under the effect's own name would put it beyond the §4 check.
+fn opened_alias_value(
+    facts: &[FactView],
+    effect_id: &str,
+    predicate: &str,
+    alias: Option<&str>,
+    binding_value: &Value,
+) -> Result<Option<Value>, String> {
+    if alias.is_none() {
+        return Ok(None);
+    }
+    crate::opened_plaintext::alias_value(facts, effect_id, predicate, binding_value)
+}
+
+/// A branch report goes to the step report and on to `whip --json` and the dev
+/// stream, outside the interpreter. Inside a confinement region the scrutinee
+/// may be plaintext, so the report keeps which arm ran and drops what it saw.
+fn withhold_opened_branch_values(reports: &mut [BranchReport]) {
+    for report in reports {
+        report.actual = Value::String("<opened>".to_owned());
+        report.tag = None;
+        if report.error.is_some() {
+            report.error = Some("withheld: evaluated inside a confinement region".to_owned());
+        }
+    }
 }
 
 /// Runs the NON-effect actions of after blocks nested inside an already-fired
@@ -2049,6 +2138,7 @@ fn lower_nested_after_blocks(
     binding_to_effect_id: &std::collections::BTreeMap<String, String>,
     body: &str,
     context: &RuleContext,
+    in_region: bool,
     lowering: &mut OwnedLowering,
 ) {
     for after in after_blocks(body) {
@@ -2059,6 +2149,20 @@ fn lower_nested_after_blocks(
         else {
             continue;
         };
+        let opened = match opened_alias_value(
+            facts,
+            upstream_effect_id,
+            &after.predicate,
+            after.alias.as_deref(),
+            &binding_value,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                lowering.errors.push(error);
+                continue;
+            }
+        };
+        let in_region = in_region || opened.is_some();
         let mut after_context = context.clone();
         push_effect_binding(
             &mut after_context,
@@ -2067,7 +2171,16 @@ fn lower_nested_after_blocks(
             binding_value.clone(),
         );
         if let Some(alias) = &after.alias {
-            push_effect_binding(&mut after_context, alias, upstream_effect_id, binding_value);
+            let is_opened = opened.is_some();
+            push_effect_binding(
+                &mut after_context,
+                alias,
+                upstream_effect_id,
+                opened.unwrap_or(binding_value),
+            );
+            if is_opened {
+                mark_opened(&mut after_context, alias);
+            }
         }
         for (binding, effect_id) in binding_to_effect_id {
             if binding == &after.binding {
@@ -2077,9 +2190,17 @@ fn lower_nested_after_blocks(
                 push_effect_binding(&mut after_context, binding, effect_id, value);
             }
         }
-        let (selected_after_body, mut after_context, branch_reports) =
+        let (selected_after_body, mut after_context, mut branch_reports) =
             selected_rule_body(&after.body, &after_context);
+        if in_region {
+            withhold_opened_branch_values(&mut branch_reports);
+        }
         materialize_redactions(&mut after_context, &rule.metadata.redactions);
+        materialize_declassifications(
+            &mut after_context,
+            &strip_after_blocks(&selected_after_body),
+            ir,
+        );
         lowering.branch_reports.extend(branch_reports);
         // Same own-scope discipline as level 1: strip deeper nested blocks
         // before scanning consumes/cancels.
@@ -2146,6 +2267,7 @@ fn lower_nested_after_blocks(
             binding_to_effect_id,
             &selected_after_body,
             &after_context,
+            in_region,
             lowering,
         );
     }
@@ -2286,6 +2408,56 @@ pub fn materialize_redactions(context: &mut RuleContext, redactions: &[IrRedacti
         };
         let projected = project_record_value(&json_from_str(&source.value_json), &redaction.keep);
         push_effect_binding(context, &redaction.binding, &source.fact_id, projected);
+        // A redaction narrows a value; it does not release one (DR-0074 §6).
+        if source.provenance_class == crate::opened_plaintext::OPENED_PROVENANCE {
+            mark_opened(context, &redaction.binding);
+        }
+    }
+}
+
+/// Materialize the `declassify <source> into <Type> as <binding>` statements of
+/// a fired block (DR-0074 §5): the source's value projected onto exactly the
+/// target type's fields. The checker has already proved every one of those
+/// fields exists on the source and consulted `grant declassify`; this is the
+/// runtime half, and the result is deliberately NOT marked opened — releasing
+/// a bounded value is what the statement is for.
+pub fn materialize_declassifications(context: &mut RuleContext, body: &str, ir: &IrProgram) {
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("declassify ") else {
+            continue;
+        };
+        let Some((source, rest)) = rest.split_once(" into ") else {
+            continue;
+        };
+        let Some((target, binding)) = rest.split_once(" as ") else {
+            continue;
+        };
+        let (source, target, binding) = (source.trim(), target.trim(), binding.trim());
+        let Some(keep) = schema_field_names(ir, target) else {
+            continue;
+        };
+        let Some(root) = context
+            .bindings
+            .iter()
+            .find(|(name, _)| name == source.split('.').next().unwrap_or(source))
+            .map(|(_, fact)| fact.fact_id.clone())
+        else {
+            continue;
+        };
+        let value = parse_field_value(source, context);
+        let projected = project_record_value(&value, &keep);
+        push_effect_binding(context, binding, &root, projected);
+    }
+}
+
+/// Bind `binding` as opened plaintext, so the durable dumps leave it out.
+fn mark_opened(context: &mut RuleContext, binding: &str) {
+    if let Some((_, fact)) = context
+        .bindings
+        .iter_mut()
+        .find(|(candidate, _)| candidate == binding)
+    {
+        fact.provenance_class = crate::opened_plaintext::OPENED_PROVENANCE.to_owned();
     }
 }
 
@@ -4225,6 +4397,25 @@ pub fn parse_effect_statements(
             });
             consumed_delta = brace_delta(&statement);
             index = next_index;
+        } else if let Some((envelope, payload_type, credential)) = parse_open_statement(trimmed) {
+            // `open <sealed> into <Type> with <credential> as <binding>`
+            // (std.custody, DR-0074 §3): a `custody.unwrap` capability call
+            // whose plaintext reaches only its `after … as <alias>`, through
+            // `opened_plaintext` rather than its terminal fact.
+            let target = crate::opened_plaintext::OPEN_CAPABILITY.to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("open".to_owned()),
+                binding: binding_after_as(trimmed),
+                args: vec![envelope, payload_type, credential],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
         } else if let Some((pool, query)) = parse_recall_statement(trimmed) {
             let target = "memory.query".to_owned();
             effects.push(ParsedEffect {
@@ -5477,6 +5668,24 @@ pub fn parsed_effect_input_json(
             "bindings": context_bindings_json(context),
             "rule": rule.name,
         }),
+        // The open's input is the envelope and the narrowing, and nothing
+        // else. Deliberately no `bindings` dump: an open nested inside another
+        // region would otherwise carry that region's plaintext into this
+        // effect's durable input.
+        "capability.call" if effect.name.as_deref() == Some("open") => {
+            let envelope_expr = effect.args.first().cloned().unwrap_or_default();
+            json!({
+                "target": effect.target,
+                "source_form": "open",
+                "envelope": parse_field_value_scoped(
+                    &envelope_expr, context, live_facts, live_effects, live_ir,
+                ),
+                "envelope_expr": envelope_expr,
+                "payload_type": effect.args.get(1).cloned().unwrap_or_default(),
+                "credential": effect.args.get(2).cloned().unwrap_or_default(),
+                "rule": rule.name,
+            })
+        }
         "capability.call" if effect.name.as_deref() == Some("promote") => {
             let mut input = json!({
                 "target": effect.target,
@@ -5997,6 +6206,26 @@ pub fn prompt_provider_after_using(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `open <sealed> into <Type> with <credential> [as <binding>]` as
+/// `(sealed expression, payload type, credential)`. `None` for anything that
+/// lacks the `into` and `with` connectives, so no other statement that happens
+/// to begin with `open` is taken for one.
+pub fn parse_open_statement(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("open ")?.trim_start();
+    let (envelope, rest) = rest.split_once(" into ")?;
+    let (payload_type, rest) = rest.split_once(" with ")?;
+    let credential = rest.split_whitespace().next()?;
+    let (envelope, payload_type) = (envelope.trim(), payload_type.trim());
+    if envelope.is_empty() || payload_type.is_empty() || payload_type.contains(' ') {
+        return None;
+    }
+    Some((
+        envelope.to_owned(),
+        payload_type.to_owned(),
+        credential.to_owned(),
+    ))
 }
 
 pub fn parse_recall_statement(line: &str) -> Option<(String, String)> {
@@ -7523,6 +7752,13 @@ pub fn context_path_value(context: &RuleContext, binding: &str, path: &str) -> O
 pub fn context_bindings_json(context: &RuleContext) -> Value {
     let mut object = serde_json::Map::new();
     for (binding, fact) in &context.bindings {
+        // Every caller writes this into an effect's input, which is durable.
+        // Opened plaintext is confined to the interpreter (DR-0074 §4), and the
+        // parser refuses an effect that NAMES it, but this dump names every
+        // binding in scope, so it must leave plaintext out itself.
+        if fact.provenance_class == crate::opened_plaintext::OPENED_PROVENANCE {
+            continue;
+        }
         object.insert(binding.clone(), json_from_str(&fact.value_json));
     }
     Value::Object(object)

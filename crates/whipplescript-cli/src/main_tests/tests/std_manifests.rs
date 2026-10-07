@@ -4,6 +4,38 @@
 //! fixtures and the crate-root imports in scope.
 
 use super::*;
+
+#[test]
+fn normalized_registry_producer_materializes_manifest_defaults() {
+    let construct = whipplescript_kernel::package_registry::package_construct(
+        std::path::Path::new("widgets.json"),
+        &json!({
+            "id": "widget",
+            "construct_family": "declaration_block",
+            "keyword": "widget",
+        }),
+        "acme.widgets",
+        "0.1.0",
+    )
+    .expect("manifest may omit scope and lowering defaults");
+    let registry = contract_registry_to_json(&ContractRegistry {
+        libraries: vec![LibraryRegistration {
+            id: "acme.widgets".into(),
+            version: "0.1.0".into(),
+            standard: false,
+        }],
+        constructs: vec![construct],
+        effect_contracts: vec![],
+    });
+    assert_eq!(registry["constructs"][0]["scope"], "top_level");
+    assert_eq!(
+        registry["constructs"][0]["lowering_target"],
+        "metadata_only"
+    );
+    verify_contract_registry_platform_vocabulary(&registry, "registry", &[])
+        .expect("current producer's normalized registry must still admit");
+}
+
 #[test]
 fn typed_effect_call_is_package_authorable_and_forbids_target_capability() {
     // std.files prerequisite (DR-0019/DR-0020 chain): `typed_effect_call` is

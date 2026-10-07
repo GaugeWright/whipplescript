@@ -40,7 +40,10 @@ export function validateProductionCanaries(manifest, canaries, localJourneys = [
   // GitHub workflow gated on a repository variable, which never ran (WS-49).
   assert.equal(canaries.activation.fleetJob, "production-wiring-canary");
   assert.match(canaries.activation.runner, /^scripts\/[a-z-]+\.sh$/);
-  assert.equal(canaries.activation.infisicalPath, "/synthetics/wiring");
+  // One path per repository under GaugeWright DR-0163, which is the path
+  // scripts/production-wiring-canary-job.sh reads (DR-0230 corrected the
+  // pre-DR-0163 shared folder this named).
+  assert.equal(canaries.activation.infisicalPath, "/synthetics/wiring/whipplescript-src");
   assert.match(canaries.activation.namespace, /^[a-z0-9-]+$/);
 
   const critical = new Set(manifest.contracts

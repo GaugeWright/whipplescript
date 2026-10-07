@@ -27386,3 +27386,177 @@ coerce review(requested_at string, diff string) -> Verdict {{
         warning.message
     );
 }
+
+#[test]
+fn a_missing_workflow_input_points_at_its_declaration() {
+    let program = |payload: &str| {
+        format!("workflow Parent {{\n rule dispatch\n when started\n=> {{ invoke Child {{ {payload} }} as child }}\n}}\nworkflow Child {{\n input title string\n input count int\n}}\n")
+    };
+    for (payload, missing, wrong) in [
+        ("wrong \"x\"", vec!["count", "title"], true),
+        ("title \"x\"", vec!["count"], false),
+        ("title \"x\" count 1", vec![], false),
+    ] {
+        let source = program(payload);
+        let c = compile_program_with_root(&source, Some("Parent"));
+        assert_eq!(c.ir.is_some(), missing.is_empty(), "{:?}", c.diagnostics);
+        let faults: Vec<_> = c
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == "type.missing_required_field")
+            .collect();
+        assert_eq!(faults.len(), missing.len(), "{:?}", c.diagnostics);
+        for input in missing {
+            let d = faults
+                .iter()
+                .find(|d| {
+                    d.message == format!("workflow invocation `Child` is missing input `{input}`")
+                })
+                .expect("missing-input refusal retained");
+            assert_eq!(d.related.len(), 1);
+            assert_eq!(
+                d.related[0].message,
+                format!("input `{input}` is declared here")
+            );
+            let start = source.find(&format!("input {input}")).unwrap() + "input ".len();
+            assert_eq!(
+                d.related[0].span,
+                SourceSpan {
+                    start,
+                    end: start + input.len()
+                }
+            );
+            assert_ne!(d.related[0].span, d.span);
+            assert_eq!(
+                &source[d.related[0].span.start..d.related[0].span.end],
+                input
+            );
+        }
+        assert_eq!(
+            c.diagnostics
+                .iter()
+                .any(|d| d.message.contains("has no input `wrong`")),
+            wrong
+        );
+    }
+    let source = program("title \"x\" title \"y\" count 1");
+    let c = compile_program_with_root(&source, Some("Parent"));
+    assert!(c.ir.is_none());
+    assert!(c
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("repeats input `title`")));
+}
+
+#[test]
+fn effect_query_filters_require_boolean_results() {
+    for function in ["count", "exists", "empty"] {
+        for query in ["effect kind agent.tell", "effect kind schema.coerce"] {
+            for filter in ["1", "\"failed\"", "[true]"] {
+                let expression = if function == "count" {
+                    format!("{function}({query} where {filter}) == 0")
+                } else {
+                    format!("{function}({query} where {filter})")
+                };
+                let source = format!("workflow QueryTypes\nassert {expression}\n");
+                let compiled = compile_program(&source);
+                assert!(compiled.ir.is_none(), "accepted {expression}");
+                assert!(
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code.as_str() == "expr.non_boolean_condition"),
+                    "missing boolean refusal for {expression}: {:?}",
+                    compiled.diagnostics
+                );
+            }
+            for filter in ["true", "status == completed", "status == \"failed\""] {
+                let expression = if function == "count" {
+                    format!("{function}({query} where {filter}) == 0")
+                } else {
+                    format!("{function}({query} where {filter})")
+                };
+                let source = format!("workflow QueryTypes\nassert {expression}\n");
+                let compiled = compile_program(&source);
+                assert!(
+                    compiled.ir.is_some(),
+                    "rejected {expression}: {:?}",
+                    compiled.diagnostics
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn effect_query_kind_metadata_is_not_a_binding_read() {
+    for call in ["count", "exists", "empty"] {
+        for kind in ["agent.tell", "schema.coerce"] {
+            for filter in ["true", "status == completed"] {
+                let query = format!("{call}(effect kind {kind} where {filter})");
+                let expr = if call == "count" {
+                    format!("{query} == 0")
+                } else {
+                    query
+                };
+                for source in [
+                    format!("workflow QueryKinds\nassert {expr}\n"),
+                    format!("workflow QueryKinds\nclass Task {{ done bool }}\nrule guarded\n when Task as task where {expr}\n=> {{ }}\n"),
+                ] {
+                    let c = compile_program(&source);
+                    assert!(c.ir.is_some(), "{source}: {:?}", c.diagnostics);
+                }
+            }
+        }
+        for (filter, suffix) in [
+            ("agent.tell == \"x\"", ""),
+            ("true", " && agent.tell == \"x\""),
+            ("nosuchbinding.field == \"x\"", ""),
+        ] {
+            let query = format!("{call}(effect kind agent.tell where {filter})");
+            let expr = if call == "count" {
+                format!("{query} == 0{suffix}")
+            } else {
+                format!("{query}{suffix}")
+            };
+            let source = format!("workflow QueryKinds\nclass Task {{ done bool }}\nrule guarded\n when Task as task where {expr}\n=> {{ }}\n");
+            let c = compile_program(&source);
+            assert!(c.ir.is_none(), "unknown binding admitted: {source}");
+            assert!(c
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "type.unknown_binding"));
+        }
+        for expression in [
+            format!("{call}(effect kind agent.tell where)"),
+            format!("{call}(effect where true)"),
+        ] {
+            let c = compile_program(&format!("workflow QueryKinds\nassert {expression}\n"));
+            assert!(c.ir.is_none(), "malformed query admitted: {expression}");
+            assert!(c
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "parse.invalid_expression"));
+        }
+        let query = format!("{call}(effect kind agent.tell where agent.tell == \"x\")");
+        let expr = if call == "count" {
+            format!("{query} == 0")
+        } else {
+            query
+        };
+        let source = format!("workflow QueryKinds\nclass Task {{ done bool }}\nrule guarded\n when Task as agent where {expr}\n=> {{ }}\n");
+        let c = compile_program(&source);
+        assert!(c.ir.is_none(), "unknown field admitted: {source}");
+        assert!(c
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_field"));
+    }
+}
+
+#[test]
+fn effect_query_kind_scan_preserves_prose_and_comment_masking() {
+    let source = "workflow QueryKinds\nclass Task { done bool }\nrule guarded\n when Task as task where count(effect kind agent.tell where true) == 0 && \"effect kind missing.field\" == \"effect kind missing.field\" // count(effect kind missing.field)\n=> { }\n";
+    let c = compile_program(source);
+    assert!(c.ir.is_some(), "{:?}", c.diagnostics);
+}

@@ -48,6 +48,11 @@ interface TurnCapture {
 
 export class LiveModelContext {
   private readonly turns = new Map<string, TurnCapture>();
+  /** Set once the object's payload is gone (session tombstone or private
+   * retirement). A drive already in flight at that moment can still reach a
+   * provider before it observes the terminal phase; its body must not
+   * repopulate a capture that teardown just erased. */
+  private sealed = false;
 
   record(
     turn: string,
@@ -55,6 +60,7 @@ export class LiveModelContext {
     sourceHandles: readonly string[],
     provenance: ModelRequestProvenance | null = null,
   ): void {
+    if (this.sealed) return;
     const capture = this.turns.get(turn) ?? { calls: [], bytes: 0, incomplete: false };
     this.turns.set(turn, capture);
     if (capture.incomplete) return;
@@ -103,7 +109,10 @@ export class LiveModelContext {
     this.turns.delete(turn);
   }
 
-  clearAll(): void {
+  /** Erase every turn and refuse later captures for the rest of this isolate.
+   * Only for a terminal object teardown; a fresh isolate starts empty. */
+  seal(): void {
+    this.sealed = true;
     this.turns.clear();
   }
 }

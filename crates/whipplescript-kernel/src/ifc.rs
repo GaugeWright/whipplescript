@@ -74,9 +74,11 @@ mod selector_policy;
 mod source_flow;
 mod source_inputs;
 mod source_reads;
+mod verified_sources;
 pub use composition_bodies::{
     analyze as analyze_composition_bodies, CompositionBodies, RuleBodyAnalysis,
 };
+pub use verified_sources::{check_verified_sources, signal_requires_verification_in};
 mod managed_resources;
 pub use managed_resources::{
     resolve as resolve_managed_effect_resources, ResolvedEffect as ManagedEffectResources,
@@ -307,6 +309,19 @@ pub struct Envelope {
     /// too, whoever provisions an endpoint could lower the bar it is judged
     /// against.
     custody_demand: BTreeMap<String, crate::provider_trust::CustodyClass>,
+    /// `require verified <source>` (DR-0053 §6, amended 2026-09-03 onto the
+    /// ingress source): the inbound sources whose signal's integrity label is
+    /// EVIDENCE-CONDITIONED. The label a grant gives the signal such a source
+    /// emits attaches only to a delivery the custodian verified, so the check
+    /// refuses a program in which that source — or any other door into the same
+    /// signal — is not `verified with`, and admission refuses the signal through
+    /// every door that is not a verified delivery.
+    ///
+    /// Keyed by the source's NAME as the program declares it. In the envelope
+    /// beside `require credential` for the same reason: the program declares the
+    /// mechanism, and if the demand lived beside it, whoever edits the program
+    /// could withdraw the demand along with the verification.
+    require_verified: BTreeSet<String>,
     /// workflow-invoke resources (`invoke:<name>`) governance marks INTERNAL (E2):
     /// the target is attested as a bundle-private workflow, not a cross-boundary
     /// invocation endpoint.
@@ -626,6 +641,23 @@ impl Envelope {
             }
             Some(_) => return Err("custody_demand must be an object".to_owned()),
         }
+        // `require verified <source>` (DR-0053 §6), same discipline: a
+        // malformed entry is an error, never a dropped demand.
+        let mut require_verified: BTreeSet<String> = BTreeSet::new();
+        match value.get("require_verified") {
+            None => {}
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    let Some(source) = item.as_str() else {
+                        return Err("require_verified entries must be strings".to_owned());
+                    };
+                    reject_pattern_resource(source)
+                        .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
+                    require_verified.insert(source.to_owned());
+                }
+            }
+            Some(_) => return Err("require_verified must be an array".to_owned()),
+        }
         let capabilities = value
             .get("capabilities")
             .and_then(serde_json::Value::as_array)
@@ -911,6 +943,7 @@ impl Envelope {
             mcp_min_rung,
             credential_min_rung,
             custody_demand,
+            require_verified,
             authority,
             requires_authority,
             policy_lifetime,
@@ -953,6 +986,7 @@ impl Envelope {
         let mut credential_min_rung: Option<whipplescript_custody::Rung> = None;
         let mut custody_demand: BTreeMap<String, crate::provider_trust::CustodyClass> =
             BTreeMap::new();
+        let mut require_verified: BTreeSet<String> = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
@@ -1237,6 +1271,23 @@ impl Envelope {
                         credential_min_rung = Some(parsed);
                         continue;
                     }
+                    // `require verified <source>` (DR-0053 §6, amended
+                    // 2026-09-03): the envelope demands the upgrade from an
+                    // asserted label to an evidence-grounded one. One source
+                    // per line, like every other clause here.
+                    (Some("verified"), Some(source)) => {
+                        if tokens.len() > 3 {
+                            return Err(format!(
+                                "line {}: require verified names exactly one source: \
+                                 `require verified <source>`",
+                                index + 1
+                            ));
+                        }
+                        reject_pattern_resource(source)
+                            .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                        require_verified.insert(source.to_owned());
+                        continue;
+                    }
                     // `require custody <class> for <Role>` (DR-0062 §6): the
                     // minimum custody class an endpoint must reach before a
                     // delegation may grant it read-authority for that role.
@@ -1274,7 +1325,7 @@ impl Envelope {
                     _ => {
                         return Err(format!(
                             "line {}: require needs `require mcp <rung>`, \
-                             `require credential <rung>`, or \
+                             `require credential <rung>`, `require verified <source>`, or \
                              `require custody <class> for <Role>`",
                             index + 1
                         ))
@@ -1629,6 +1680,7 @@ impl Envelope {
             mcp_min_rung,
             credential_min_rung,
             custody_demand,
+            require_verified,
             authority,
             requires_authority,
             policy_lifetime,
@@ -1936,6 +1988,11 @@ impl Envelope {
                     .collect(),
             );
         }
+        // Evidence-conditioned sources (DR-0053 §6): same emit-when-declared
+        // rule, and inside the signed artifact for the same reason as the rungs.
+        if !self.require_verified.is_empty() {
+            canonical["require_verified"] = serde_json::json!(self.require_verified);
+        }
         // Typed host governance policy (SUB-4): same emit-when-declared rule as
         // guarantees, so envelopes carrying no policy keep their signed hashes.
         if !self.capabilities.is_empty() {
@@ -2206,6 +2263,12 @@ impl Envelope {
     /// The minimum MCP trust rung this policy requires, if any.
     pub fn mcp_min_rung(&self) -> Option<crate::mcp::McpRung> {
         self.mcp_min_rung
+    }
+
+    /// The inbound sources whose signal label this policy grounds on evidence
+    /// (`require verified <source>`, DR-0053 §6).
+    pub fn requires_verified(&self) -> &BTreeSet<String> {
+        &self.require_verified
     }
 
     /// A credential's egress allow-list, or `None` when governance never named
@@ -4939,7 +5002,10 @@ pub fn check_with_envelope_imports(
         .source_tags
         .iter()
         .any(|tag| tag.target_kind == "workflow" && tag.name == "tool");
-    let mut diagnostics = Vec::new();
+    // DR-0053 §6: the verified-source obligations are program-wide, not per
+    // rule — an endorse grant over a verified source is wrong whether or not
+    // any rule reads the signal.
+    let mut diagnostics = check_verified_sources(ir, envelope);
     for rule in &ir.rules {
         // Fact-consumption reads (Phase 0 of the cross-rule plan): a `when
         // <Schema>` trigger of a GOVERNED fact delivers that fact's content

@@ -1117,12 +1117,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn branch_store(&self) -> &B {
         &self.branches
     }
 
     /// A manifest by its content-addressed hash, for a caller that already
     /// holds an exact recorded state (a review revision) rather than a cut.
+    #[cfg(feature = "native")]
     pub(crate) fn manifest_by_hash(&self, hash: &str) -> StoreResult<BTreeMap<String, String>> {
         self.load_manifest(Some(hash))
     }

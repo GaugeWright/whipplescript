@@ -2,7 +2,7 @@
 //! projections, resolve an input, run a rule, or contact an external target.
 #[cfg(test)]
 mod tests;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use whipplescript_store::effect_recovery::fold_attempts;
@@ -12,9 +12,9 @@ use whipplescript_store::{EventView, RuntimeStore};
 
 use crate::host_facade::{positive_sequence, HostFacadeError};
 use crate::host_protocol::action_result::{
-    ActionEffectEvidence, ActionEvidenceRef, ActionInstanceStatus, ActionResultSnapshot,
-    ActionTerminalEvidence, ActionWorkflowStatus, ReadActionResult, VerifiedResultRead,
-    ACTION_RESULT_PROTOCOL,
+    act_observation, ActFootprint, ActionEffectEvidence, ActionEvidenceRef, ActionFootprint,
+    ActionInstanceStatus, ActionResultSnapshot, ActionTerminalEvidence, ActionWorkflowStatus,
+    ReadActionResult, VerifiedResultRead, ACTION_RESULT_PROTOCOL, ACTION_RESULT_PROTOCOL_V4,
 };
 use crate::host_protocol::{PinnedPosition, ProtocolError};
 use crate::RuntimeKernel;
@@ -35,7 +35,16 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
 
 #[derive(Deserialize)]
 struct RecordedRule {
-    effects: Vec<RecordedEffect>,
+    effects: Vec<RecordedRuleEffect>,
+}
+
+#[derive(Deserialize)]
+struct RecordedRuleEffect {
+    effect_id: String,
+    /// Absent from an evidence-only summary; such an effect's footprint is
+    /// unobserved rather than guessed.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +92,9 @@ fn snapshot(
         kind: admitted.event_type.clone(),
     };
     let mut effect_ids = BTreeSet::new();
+    // First-appearance order and the kind each effect was committed with.
+    let mut acts: Vec<String> = Vec::new();
+    let mut kinds: BTreeMap<String, String> = BTreeMap::new();
     let mut evidence = Vec::with_capacity(prefix.len());
     let mut events = Vec::with_capacity(prefix.len());
     for (index, event) in prefix.iter().enumerate() {
@@ -101,7 +113,14 @@ fn snapshot(
             if event.event_type == "rule.committed" {
                 let rule: RecordedRule =
                     serde_json::from_str(&event.payload_json).map_err(HostFacadeError::Json)?;
-                effect_ids.extend(rule.effects.into_iter().map(|effect| effect.effect_id));
+                for effect in rule.effects {
+                    if effect_ids.insert(effect.effect_id.clone()) {
+                        acts.push(effect.effect_id.clone());
+                    }
+                    if let Some(kind) = effect.kind {
+                        kinds.entry(effect.effect_id).or_insert(kind);
+                    }
+                }
             }
             if matches!(
                 event.event_type.as_str(),
@@ -109,7 +128,9 @@ fn snapshot(
             ) {
                 let effect: RecordedEffect =
                     serde_json::from_str(&event.payload_json).map_err(HostFacadeError::Json)?;
-                effect_ids.insert(effect.effect_id);
+                if effect_ids.insert(effect.effect_id.clone()) {
+                    acts.push(effect.effect_id);
+                }
             }
             let status = match event.event_type.as_str() {
                 "workflow.completed" => Some(ActionWorkflowStatus::Completed),
@@ -155,8 +176,27 @@ fn snapshot(
             })
         })
         .collect::<Result<Vec<_>, HostFacadeError>>()?;
+    let (protocol, footprint) = if request.reads_footprint() {
+        let acts = acts
+            .into_iter()
+            .map(|effect_id| {
+                let kind = kinds.remove(&effect_id).unwrap_or_default();
+                ActFootprint {
+                    observation: act_observation(&kind),
+                    effect_id,
+                    kind,
+                }
+            })
+            .collect();
+        (
+            ACTION_RESULT_PROTOCOL_V4,
+            Some(ActionFootprint::from_acts(acts)),
+        )
+    } else {
+        (ACTION_RESULT_PROTOCOL, None)
+    };
     Ok(ActionResultSnapshot {
-        protocol: ACTION_RESULT_PROTOCOL.into(),
+        protocol: protocol.into(),
         admission: request.admission.clone(),
         command,
         read_policy: request.policy.clone(),
@@ -168,6 +208,7 @@ fn snapshot(
         terminal,
         effects,
         evidence,
+        footprint,
     })
 }
 

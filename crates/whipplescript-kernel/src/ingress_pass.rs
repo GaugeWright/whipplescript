@@ -54,6 +54,28 @@ pub enum SignalRefusal {
     InternalChannel,
     /// The payload does not conform to the declared signal schema.
     PayloadInvalid { errors: Vec<String> },
+    /// The envelope grounds this signal's label on a signature
+    /// (`require verified <source>`, DR-0053 §6) and the delivery came through
+    /// a door that proved nothing. Well formed and not allowed, like
+    /// [`SignalRefusal::InternalChannel`].
+    VerificationRequired { source: String },
+}
+
+/// Which door a candidate came through, as far as the admission core needs to
+/// know (DR-0053 §6).
+///
+/// Only one distinction matters here: whether the custodian verified the
+/// delivery's signature before it reached the core. The listener is the only
+/// door that can say yes, and it says so by calling
+/// [`admit_verified_observation`] for a source whose `verified with` clause it
+/// has just answered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionDoor<'a> {
+    /// Every door that asserts where a delivery came from: `whip signal`, the
+    /// stdio driver, the pollers, and an `auth` endpoint.
+    Asserted,
+    /// A delivery whose signature the custodian verified under `credential`.
+    Verified { credential: &'a str },
 }
 
 /// The `whip signal` / stdio-envelope delivery key: an operator/provider
@@ -111,6 +133,30 @@ pub fn admit_external_signal_with_envelope<S: RuntimeStore>(
     delivery_key: &str,
     envelope: &ifc::EnvelopeStatus,
 ) -> StoreResult<SignalAdmission> {
+    admit_signal_at_door(
+        kernel,
+        instance_id,
+        ir,
+        signal,
+        payload,
+        delivery_key,
+        envelope,
+        AdmissionDoor::Asserted,
+    )
+}
+
+/// The admission core, told which door the candidate came through.
+#[allow(clippy::too_many_arguments)]
+fn admit_signal_at_door<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    signal: &str,
+    payload: &Value,
+    delivery_key: &str,
+    envelope: &ifc::EnvelopeStatus,
+    door: AdmissionDoor<'_>,
+) -> StoreResult<SignalAdmission> {
     // Static refusals first (declaration, governance, payload shape): they
     // hold whether or not the target instance exists, so a driver surfaces
     // the real problem before any store lookup.
@@ -123,6 +169,16 @@ pub fn admit_external_signal_with_envelope<S: RuntimeStore>(
     // injection, whatever the driver.
     if ifc::signal_is_internal_in(envelope, signal) {
         return Ok(SignalAdmission::Refused(SignalRefusal::InternalChannel));
+    }
+    // Evidence before label (DR-0053 §6): a signal whose label the envelope
+    // grounds on a signature becomes a fact only through a verified delivery,
+    // whatever the driver.
+    if let Some(source) = ifc::signal_requires_verification_in(envelope, ir, signal) {
+        if !matches!(door, AdmissionDoor::Verified { .. }) {
+            return Ok(SignalAdmission::Refused(
+                SignalRefusal::VerificationRequired { source },
+            ));
+        }
     }
     // IR-typed validation (Family B conditional presence included) — the same
     // validator the workflow-input door uses, not the weaker embedded-shape
@@ -482,11 +538,66 @@ pub fn admit_observation<S: RuntimeStore>(
     ordinal_key: String,
     envelope: &ifc::EnvelopeStatus,
 ) -> StoreResult<SignalAdmission> {
+    admit_observation_at_door(
+        kernel,
+        instance_id,
+        ir,
+        source,
+        observation,
+        ordinal_key,
+        envelope,
+        AdmissionDoor::Asserted,
+    )
+}
+
+/// [`admit_observation`] for a delivery whose signature the custodian has just
+/// verified under `source`'s `verified with` credential (DR-0053 §6).
+///
+/// The CALLER vouches for the verification; this function cannot check it, and
+/// only the inbound listener calls it, after `verify_delivery` answered yes. A
+/// source that declares no `verified with` is admitted as asserted, so a call
+/// on the wrong source fails closed rather than lending it a verified door.
+pub fn admit_verified_observation<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    source: &IrSource,
+    observation: &Value,
+    ordinal_key: String,
+    envelope: &ifc::EnvelopeStatus,
+) -> StoreResult<SignalAdmission> {
+    let door = match &source.verified_credential {
+        Some(credential) => AdmissionDoor::Verified { credential },
+        None => AdmissionDoor::Asserted,
+    };
+    admit_observation_at_door(
+        kernel,
+        instance_id,
+        ir,
+        source,
+        observation,
+        ordinal_key,
+        envelope,
+        door,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_observation_at_door<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    source: &IrSource,
+    observation: &Value,
+    ordinal_key: String,
+    envelope: &ifc::EnvelopeStatus,
+    door: AdmissionDoor<'_>,
+) -> StoreResult<SignalAdmission> {
     let empty = serde_json::Map::new();
     let observation_map = observation.as_object().unwrap_or(&empty);
     let payload = clock_emit_payload(source, observation_map);
     let delivery_key = source_delivery_key(source, observation, ordinal_key);
-    admit_external_signal_with_envelope(
+    admit_signal_at_door(
         kernel,
         instance_id,
         ir,
@@ -494,7 +605,80 @@ pub fn admit_observation<S: RuntimeStore>(
         &payload,
         &delivery_key,
         envelope,
+        door,
     )
+}
+
+/// The fact a verified source's rejected delivery leaves (DR-0053 §6).
+pub const SOURCE_REJECTED_FACT: &str = "source.rejected";
+
+/// Record that a delivery to a `verified with` source failed verification.
+///
+/// A delivery that does not verify never becomes its signal, so no rule can act
+/// on what it said — but that it ARRIVED is observable, per delivery, as a
+/// `source.rejected` fact carrying the OUTCOME and NOT the payload: the split
+/// `effect.cancelled` makes. Nothing in the value is the sender's to choose
+/// beyond which of the outcomes it earned. The body is not in it (it was never
+/// parsed and is not trusted), and neither is the sender's delivery id, which
+/// reaches only the idempotency key — so a forgery re-sent under the same id is
+/// one fact, and its text never reaches a rule.
+///
+/// `outcome` is a fixed word the listener chooses (`signature_missing`,
+/// `signature_malformed`, `signature_invalid`). A custodian that could not
+/// answer is NOT a rejection and is not recorded here: that delivery was
+/// never judged, and its sender is told to retry.
+///
+/// Returns the rejection's event id — the same one for a re-sent delivery —
+/// or `Ok(None)` when the instance does not exist: a rejection is about a
+/// door, and there is no instance to tell.
+pub fn record_source_rejection<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    source: &IrSource,
+    outcome: &str,
+    delivery_key: &str,
+) -> StoreResult<Option<String>> {
+    if kernel.store().get_instance(instance_id)?.is_none() {
+        return Ok(None);
+    }
+    let value = json!({
+        "source": source.name,
+        "signal": source.emit_signal,
+        "credential": source.verified_credential,
+        "outcome": outcome,
+    })
+    .to_string();
+    let key = idempotency_key(&[
+        instance_id,
+        SOURCE_REJECTED_FACT,
+        &source.name,
+        outcome,
+        delivery_key,
+    ]);
+    // Re-sent under the same key: the same rejection, and its fact is healed
+    // the way the admission core heals a signal's (derive_fact is replay
+    // tolerant), so a crash between the two appends loses nothing.
+    let event_id = match kernel.store().event_by_idempotency_key(instance_id, &key)? {
+        Some(existing) => existing.event_id,
+        None => {
+            kernel
+                .ingest_external_event(instance_id, SOURCE_REJECTED_FACT, &value, Some(&key))?
+                .event_id
+        }
+    };
+    kernel.derive_fact(
+        instance_id,
+        SOURCE_REJECTED_FACT,
+        &event_id,
+        &value,
+        Some(&event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            "source-rejected-fact",
+            &event_id,
+        ])),
+    )?;
+    Ok(Some(event_id))
 }
 
 /// A one-line human reason for a refusal (drivers surface it; the CLI door
@@ -520,6 +704,10 @@ pub fn refusal_reason(refusal: &SignalRefusal) -> String {
                 errors.join("; ")
             )
         }
+        SignalRefusal::VerificationRequired { source } => format!(
+            "governance requires source `{source}` to be verified (DR-0053 §6), so this signal \
+             is admitted only from a delivery the custodian verified; this door proves nothing"
+        ),
     }
 }
 
@@ -869,5 +1057,204 @@ class Seen {
             third.admitted, 1,
             "a changed line at an existing index re-admits: {third:?}"
         );
+    }
+
+    const VERIFIED_PROGRAM: &str = "@service\nworkflow Hooks\n\nuse std.ingress\nuse std.custody\n\ncredential hook_key { kind hmac-sha256 }\n\nsignal github.push { repo string }\n\noutput result R\nclass R { v string }\n\nsource http as pushes {\n  path \"/hooks/github\"\n  verified with hook_key\n  observe as observation\n  emit github.push { repo observation.path }\n}\n\nrule r\n  when github.push as p\n=> {\n  complete result { v p.repo }\n}\n";
+
+    fn verified_kernel() -> (RuntimeKernel<SqliteStore>, String, IrProgram) {
+        let compiled = compile_program(VERIFIED_PROGRAM);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("program compiles: {:#?}", compiled.diagnostics));
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let instance_id = instance_on(&mut store, "Hooks");
+        (RuntimeKernel::new(store), instance_id, ir)
+    }
+
+    fn governed(text: &str) -> ifc::EnvelopeStatus {
+        ifc::EnvelopeStatus::Verified(Box::new(
+            ifc::VerifiedEnvelope::verify_text(text).expect("envelope verifies"),
+        ))
+    }
+
+    /// DR-0053 §6: under `require verified <source>` the signal that source
+    /// emits carries a label grounded on the signature, so it becomes a fact
+    /// only through a verified delivery. Every asserted door — `whip signal`,
+    /// the stdio driver, a poller — is refused, and the verified door admits.
+    #[test]
+    fn a_required_verified_signal_admits_only_through_a_verified_delivery() {
+        let (mut kernel, instance_id, ir) = verified_kernel();
+        let envelope = governed(
+            "grant signal push -> signal:github.push from Operator\nrequire verified pushes\n",
+        );
+        let source = ir.sources[0].clone();
+        let observation = json!({"body": {}, "path": "/hooks/github", "delivery": "d-1"});
+
+        let asserted = admit_external_signal_with_envelope(
+            &mut kernel,
+            &instance_id,
+            &ir,
+            "github.push",
+            &json!({"repo": "w"}),
+            "key-1",
+            &envelope,
+        )
+        .expect("admission runs");
+        assert_eq!(
+            asserted,
+            SignalAdmission::Refused(SignalRefusal::VerificationRequired {
+                source: "pushes".to_owned()
+            })
+        );
+        assert!(refusal_reason(&SignalRefusal::VerificationRequired {
+            source: "pushes".to_owned()
+        })
+        .contains("`pushes` to be verified"),);
+        // The observation path without the verified door is still asserted.
+        let polled = admit_observation(
+            &mut kernel,
+            &instance_id,
+            &ir,
+            &source,
+            &observation,
+            "d-1".to_owned(),
+            &envelope,
+        )
+        .expect("admission runs");
+        assert!(
+            matches!(
+                polled,
+                SignalAdmission::Refused(SignalRefusal::VerificationRequired { .. })
+            ),
+            "{polled:?}"
+        );
+        // A source with no `verified with` cannot lend the verified door.
+        let mut unverified = source.clone();
+        unverified.verified_credential = None;
+        let lent = admit_verified_observation(
+            &mut kernel,
+            &instance_id,
+            &ir,
+            &unverified,
+            &observation,
+            "d-1".to_owned(),
+            &envelope,
+        )
+        .expect("admission runs");
+        assert!(
+            matches!(
+                lent,
+                SignalAdmission::Refused(SignalRefusal::VerificationRequired { .. })
+            ),
+            "{lent:?}"
+        );
+        assert!(
+            kernel
+                .store()
+                .list_facts(&instance_id)
+                .expect("facts")
+                .iter()
+                .all(|fact| fact.name != "github.push"),
+            "no asserted door produced the fact"
+        );
+
+        let verified = admit_verified_observation(
+            &mut kernel,
+            &instance_id,
+            &ir,
+            &source,
+            &observation,
+            "d-1".to_owned(),
+            &envelope,
+        )
+        .expect("admission runs");
+        assert!(
+            matches!(verified, SignalAdmission::Admitted { .. }),
+            "{verified:?}"
+        );
+    }
+
+    /// Without the demand, `verified with` changes no other door: the label is
+    /// asserted, as it is for an `auth` source, and `whip signal` still admits.
+    #[test]
+    fn without_the_demand_an_asserted_door_still_admits() {
+        let (mut kernel, instance_id, ir) = verified_kernel();
+        let envelope = governed("grant signal push -> signal:github.push from Operator\n");
+        let asserted = admit_external_signal_with_envelope(
+            &mut kernel,
+            &instance_id,
+            &ir,
+            "github.push",
+            &json!({"repo": "w"}),
+            "key-1",
+            &envelope,
+        )
+        .expect("admission runs");
+        assert!(
+            matches!(asserted, SignalAdmission::Admitted { .. }),
+            "{asserted:?}"
+        );
+    }
+
+    /// A rejected delivery leaves one `source.rejected` fact carrying the
+    /// outcome and never the payload, once per delivery key.
+    #[test]
+    fn a_rejected_delivery_leaves_an_outcome_fact_and_no_payload() {
+        let (mut kernel, instance_id, ir) = verified_kernel();
+        let source = ir.sources[0].clone();
+        let first = record_source_rejection(
+            &mut kernel,
+            &instance_id,
+            &source,
+            "signature_invalid",
+            "attacker-chosen-id",
+        )
+        .expect("records")
+        .expect("the instance exists");
+        let again = record_source_rejection(
+            &mut kernel,
+            &instance_id,
+            &source,
+            "signature_invalid",
+            "attacker-chosen-id",
+        )
+        .expect("records")
+        .expect("the instance exists");
+        assert_eq!(first, again, "a re-sent forgery is one fact");
+
+        let facts = kernel.store().list_facts(&instance_id).expect("facts");
+        let rejected: Vec<_> = facts
+            .iter()
+            .filter(|fact| fact.name == SOURCE_REJECTED_FACT)
+            .collect();
+        assert_eq!(rejected.len(), 1, "{facts:?}");
+        let value: Value = serde_json::from_str(&rejected[0].value_json).expect("json");
+        assert_eq!(
+            value,
+            json!({
+                "source": "pushes",
+                "signal": "github.push",
+                "credential": "hook_key",
+                "outcome": "signature_invalid",
+            })
+        );
+        assert!(
+            !rejected[0].value_json.contains("attacker-chosen-id"),
+            "the sender's delivery id reaches the key, never the value"
+        );
+        assert!(
+            facts.iter().all(|fact| fact.name != "github.push"),
+            "a rejection is not the signal"
+        );
+
+        let nowhere = record_source_rejection(
+            &mut kernel,
+            "no-such-instance",
+            &source,
+            "signature_missing",
+            "k",
+        )
+        .expect("records");
+        assert_eq!(nowhere, None);
     }
 }

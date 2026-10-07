@@ -200,6 +200,7 @@ fn prepare_source_with_custody<
         },
     };
     let original = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: binding.scope.clone(),

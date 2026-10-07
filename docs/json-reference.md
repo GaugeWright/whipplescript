@@ -212,10 +212,25 @@ The `whip --json trace <instance> --check` command needs these fields:
   "runs": [],
   "evidence": [],
   "evidence_links": [],
+  "sealed": {
+    "showing": "structure",
+    "contents": "withheld",
+    "custody": "none",
+    "reason": "...",
+    "envelopes": []
+  },
   "abstract_trace": [],
   "conformance": {"ok": true}
 }
 ```
+
+The `sealed` section reports each sealed value in the trace. The trace holds no
+custody. Thus the section shows the structure of each value and withholds the
+contents. Each entry in `envelopes` gives a JSON pointer into the report (`at`),
+the record that carries the value (`record`), the credential, the context, the
+label, and the length of the ciphertext in bytes. An entry never gives the
+contents. The text output prints a `sealed=` line when the trace contains a
+sealed value.
 
 ## Inspection Shapes
 

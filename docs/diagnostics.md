@@ -108,6 +108,13 @@ error[graph.rule_never_fires]: rule `escalate` can never fire: nothing produces 
    = help: seed `Escalation` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system
 ```
 
+A builtin schema name gets a different help line, because most of them cannot
+be recorded at all. `when AgentTurn as turn` with nothing producing it points at
+`when <agent> completed turn as turn`; `when WorkItem as item` at
+`when <tracker> has ready issue as issue`; and `when TerminalFailed as f` (or
+`TerminalTimedOut`, `TerminalCancelled`) at the `after <effect> fails as f`
+block the runtime fills. Only `Evidence` is recorded like a declared class.
+
 The tags in those help lines are declarations, not silencers. `@service` on a
 workflow says the workflow need not terminate — which is why an `invoke` of a
 `@service` workflow is itself refused further down this page. `@external` on a

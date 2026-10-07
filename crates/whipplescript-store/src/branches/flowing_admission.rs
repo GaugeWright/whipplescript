@@ -8,14 +8,24 @@
 //! this operation until candidate construction, gate certification and
 //! recovery are wired.
 
+mod issuer;
 #[cfg(feature = "native")]
 pub(crate) mod native;
+
+#[cfg(test)]
+pub(crate) use issuer::test_issuer;
+pub use issuer::{
+    configure_outcome as configure_issuer_outcome, signing_bytes as issuer_signing_bytes,
+    validate_issuer as validate_trusted_issuer, validate_signature as validate_issuer_signature,
+    verify_issued, ConfigureFlowingGateIssuerOutcome, FlowingGateIssuerRefusal,
+    FlowingGateIssuerSignature, FlowingGateTrustedIssuer, RecordFlowingGateSignatureOutcome,
+};
 
 use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 10] = [
+pub const SCHEMA: [&str; 12] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -59,6 +69,17 @@ pub const SCHEMA: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS flowing_coverage_premises (
         domain TEXT PRIMARY KEY,
         premises_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_gate_trusted_issuers (
+        issuer_id TEXT PRIMARY KEY,
+        issuer_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_gate_certificate_signatures (
+        handle TEXT NOT NULL,
+        issuer_id TEXT NOT NULL,
+        issuer_epoch INTEGER NOT NULL,
+        signature_json TEXT NOT NULL,
+        PRIMARY KEY (handle, issuer_id, issuer_epoch)
     )",
 ];
 
@@ -125,6 +146,7 @@ pub enum FlowingAttemptFinishRefusal {
     CandidateWitnessMismatch,
     GateCertificateMissing,
     GateCertificateMismatch,
+    GateIssuer(FlowingGateIssuerRefusal),
     GatePlanIncomplete,
     GatePassed,
 }
@@ -251,7 +273,9 @@ impl FlowingGateEvidence {
 
 /// An exact gate result envelope. No production issuer writes this table yet:
 /// the fleet must first execute a native cut and prove the required plan and
-/// current norm basis. Ref admission refuses without a retained certificate.
+/// current norm basis. Ref admission refuses without a retained certificate,
+/// and without a signature over its handle from an issuer the ref store's
+/// trust root holds at its current epoch (see `issuer`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingGateCertificate {
     pub candidate_witness_digest: String,
@@ -467,6 +491,7 @@ pub enum FlowingAdmissionRefusal {
     AttemptPinReleased,
     GateCertificateMissing,
     GateCertificateMismatch,
+    GateIssuer(FlowingGateIssuerRefusal),
     GatePlanIncomplete,
     LineageUnavailable,
     LineageChanged,
@@ -618,6 +643,25 @@ pub trait FlowingAdmissions {
         &mut self,
         request: &FlowingCancelRequest,
     ) -> crate::StoreResult<FlowingCancelOutcome>;
+    /// Operator configuration of the ref authority's trust root. An issuer's
+    /// epoch only rises; raising it retires every signature made earlier. A
+    /// host must not expose this to a gate worker or any untrusted caller.
+    fn configure_flowing_gate_issuer(
+        &mut self,
+        issuer: &FlowingGateTrustedIssuer,
+    ) -> crate::StoreResult<ConfigureFlowingGateIssuerOutcome>;
+    fn flowing_gate_trusted_issuers(&self) -> crate::StoreResult<Vec<FlowingGateTrustedIssuer>>;
+    /// Retain an issuer's signature beside an existing certificate. It is
+    /// verified against the current trust root here and again under the ref
+    /// CAS, which is the check that authorizes anything.
+    fn record_flowing_gate_signature(
+        &mut self,
+        signature: &FlowingGateIssuerSignature,
+    ) -> crate::StoreResult<RecordFlowingGateSignatureOutcome>;
+    fn flowing_gate_signatures(
+        &self,
+        certificate_handle: &str,
+    ) -> crate::StoreResult<Vec<FlowingGateIssuerSignature>>;
     fn flowing_cancellation_for_attempt(
         &self,
         admission_op_id: &str,

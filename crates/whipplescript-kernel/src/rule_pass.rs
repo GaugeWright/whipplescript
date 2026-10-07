@@ -890,7 +890,16 @@ fn step_instance_with_plans_generic<S: RuntimeStore + Coordination + WorkItems +
                                 .unwrap_or(0)
                         })
                         .unwrap_or(0);
-                    !(all_settled && last_commit > last_settlement)
+                    let closed = all_settled && last_commit > last_settlement;
+                    // DR-0074 §3: a closed firing is never lowered again, so
+                    // nothing can bind the plaintext of an `open` it owns. This
+                    // is the end of that plaintext's life.
+                    if closed {
+                        if let Some(ids) = owned {
+                            crate::opened_plaintext::release(ids);
+                        }
+                    }
+                    !closed
                 });
             }
             groups.push(LoweringGroup {

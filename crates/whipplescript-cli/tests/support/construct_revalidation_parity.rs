@@ -64,6 +64,7 @@ rule echo
         .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
         .with_compiler_artifact_digest(COMPILER);
     let command = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: "workspace:1".into(),

@@ -77,9 +77,13 @@ impl Drop for Listener {
 /// Reading the port from the process rather than picking one: binding :0 and
 /// asking is the only way two tests running at once cannot collide.
 fn start(dir: &std::path::Path) -> (Listener, String) {
+    start_program(dir, &program())
+}
+
+fn start_program(dir: &std::path::Path, program: &str) -> (Listener, String) {
     let bin = env!("CARGO_BIN_EXE_whip");
     let program_path = dir.join("webhooks.whip");
-    std::fs::write(&program_path, program()).expect("write program");
+    std::fs::write(&program_path, program).expect("write program");
     let store = dir.join("store.db");
 
     // A delivery is admitted INTO A RUNNING INSTANCE — the admission core has
@@ -285,6 +289,124 @@ fn the_listener_admits_authenticates_absorbs_and_routes() {
         malformed.body.contains("not JSON"),
         "the sender learns what to correct: {}",
         malformed.body
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `verified with` source whose credential the custodian would hold.
+fn verified_program() -> String {
+    r#"@service
+workflow Webhooks
+
+use std.ingress
+use std.custody
+
+credential hook_key { kind hmac-sha256 }
+
+signal github.push { repo string }
+
+output result R
+class R { v string }
+
+source http as pushes {
+  path "/hooks/github"
+  verified with hook_key
+  observe as observation
+  emit github.push {
+    repo observation.path
+  }
+}
+
+rule note
+  when github.push as push
+=> {
+  complete result { v push.repo }
+}
+"#
+    .to_owned()
+}
+
+fn facts(dir: &std::path::Path, instance: &str) -> Vec<serde_json::Value> {
+    let store = dir.join("store.db");
+    let output = whip_command(env!("CARGO_BIN_EXE_whip"))
+        .args([
+            "--store",
+            store.to_str().expect("store path"),
+            "--json",
+            "facts",
+            instance,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("facts runs");
+    assert!(
+        output.status.success(),
+        "facts failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .expect("facts prints json")
+        .as_array()
+        .cloned()
+        .expect("a facts array")
+}
+
+/// DR-0053 §6: a delivery to a verified source that does not verify never
+/// becomes its signal, and its arrival is observable as ONE `source.rejected`
+/// fact per delivery, carrying the outcome and not the payload.
+///
+/// An unsigned delivery is refused before the custodian is asked, so this runs
+/// without one — which is also why it is the case worth driving end to end:
+/// the fact is written by the listener's own process, not by the custodian.
+#[test]
+fn a_rejected_verified_delivery_leaves_one_outcome_fact() {
+    let dir = temp_dir();
+    let (listener, instance) = start_program(&dir, &verified_program());
+    let port = listener.port;
+
+    for _ in 0..2 {
+        let unsigned = deliver(
+            port,
+            "/hooks/github",
+            &[("x-whip-delivery", "forged-1")],
+            r#"{"repo":"payload-text-that-must-not-leak"}"#,
+        );
+        assert_eq!(unsigned.status, 401, "body: {}", unsigned.body);
+        assert!(
+            unsigned.body.contains("\"reason\":\"unauthenticated\""),
+            "the sender learns only that it failed: {}",
+            unsigned.body
+        );
+    }
+    drop(listener);
+
+    let facts = facts(&dir, &instance);
+    let rejected: Vec<&serde_json::Value> = facts
+        .iter()
+        .filter(|fact| fact.get("name").and_then(|v| v.as_str()) == Some("source.rejected"))
+        .collect();
+    assert_eq!(rejected.len(), 1, "one fact per delivery: {facts:#?}");
+    let value = rejected[0].get("value").expect("fact value");
+    assert_eq!(
+        value,
+        &serde_json::json!({
+            "source": "pushes",
+            "signal": "github.push",
+            "credential": "hook_key",
+            "outcome": "signature_missing",
+        })
+    );
+    let text = serde_json::to_string(&facts).expect("facts serialize");
+    assert!(
+        !text.contains("payload-text-that-must-not-leak") && !text.contains("forged-1"),
+        "neither the body nor the sender's delivery id reaches a fact: {text}"
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.get("name").and_then(|v| v.as_str()) != Some("github.push")),
+        "a rejected delivery is not the signal: {facts:#?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

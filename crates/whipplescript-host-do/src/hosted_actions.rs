@@ -350,6 +350,7 @@ rule echo
         let identity: serde_json::Value =
             serde_json::from_str(&action_identity("reference.echo", SOURCE).unwrap()).unwrap();
         json(&HostActionCommand {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             issuer: "product".into(),
             scope: "workspace:1".into(),

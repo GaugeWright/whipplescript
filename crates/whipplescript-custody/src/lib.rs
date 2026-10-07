@@ -927,6 +927,39 @@ pub struct Envelope {
     pub ciphertext_b64: String,
 }
 
+impl Envelope {
+    /// Recognize a recorded value as an envelope: the shape `seal` produces
+    /// (`custody.wrap`'s output), structural rather than tagged. Every one of
+    /// `credential`, `context`, `nonce_b64` and `ciphertext_b64` must be a
+    /// string and the whole object must deserialize, `label` included.
+    ///
+    /// One recognizer, shared by the worker that opens sealed effect inputs
+    /// and by `whip trace` that reports them, so the two cannot disagree on
+    /// what counts as sealed. Recognition authorizes nothing: opening still
+    /// needs a grant and the custodian.
+    #[must_use]
+    pub fn recognize(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        for field in ["credential", "context", "nonce_b64", "ciphertext_b64"] {
+            object.get(field)?.as_str()?;
+        }
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    /// The ciphertext's length in bytes, or `None` when `ciphertext_b64` is
+    /// not valid base64. Structure only: the length of the sealed bytes, not
+    /// of anything they contain.
+    #[must_use]
+    pub fn ciphertext_len(&self) -> Option<usize> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        STANDARD
+            .decode(&self.ciphertext_b64)
+            .ok()
+            .map(|bytes| bytes.len())
+    }
+}
+
 /// How the custodian extracts the minted material from an exchange response
 /// (DR-0053 *Open*, OAuth response capture): whip declares the path, the
 /// custodian applies it — a dumb instruction, not protocol semantics. Only
@@ -1525,6 +1558,43 @@ impl CustodyTransport for RungFloor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The envelope recognizer the worker and `whip trace` share: every
+    /// string member present and the whole shape deserializing, `label`
+    /// included. A near-miss is data, not a sealed value.
+    #[test]
+    fn an_envelope_is_recognized_only_by_its_whole_shape() {
+        let whole = serde_json::json!({
+            "credential": "vault/k",
+            "context": "eff_1",
+            "label": {"level": "secret"},
+            "nonce_b64": "AAAA",
+            "ciphertext_b64": "aGk=",
+        });
+        let envelope = Envelope::recognize(&whole).expect("whole envelope");
+        assert_eq!(envelope.context, "eff_1");
+        assert_eq!(envelope.ciphertext_len(), Some(2));
+
+        for missing in [
+            "credential",
+            "context",
+            "label",
+            "nonce_b64",
+            "ciphertext_b64",
+        ] {
+            let mut partial = whole.clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            assert!(Envelope::recognize(&partial).is_none(), "without {missing}");
+        }
+        let mut numeric = whole.clone();
+        numeric["context"] = serde_json::json!(7);
+        assert!(Envelope::recognize(&numeric).is_none());
+        assert!(Envelope::recognize(&serde_json::json!("vault/k")).is_none());
+
+        let mut garbled = envelope;
+        garbled.ciphertext_b64 = "not base64!".to_owned();
+        assert_eq!(garbled.ciphertext_len(), None);
+    }
 
     /// The kind vocabulary is closed on both sides too, and the round trip is
     /// over `ALL` so adding a variant without a spelling fails here rather than

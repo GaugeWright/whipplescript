@@ -41,6 +41,9 @@
     "@cloudflare/containers": "^0.3.7"
   },
   "overrides": {
-    "sharp": "0.35.4"
+    "sharp": "0.35.5",
+    "miniflare@5.20260815.0-alpha": {
+      "undici": "7.29.1"
+    }
   }
 }

@@ -4265,6 +4265,10 @@ export class WorkflowInstance implements DurableObject {
 
   private async tombstonePublicSession(): Promise<void> {
     ensureSchema(this.ctx.storage.sql);
+    // Provider-bound bodies captured for the privileged live read are payload
+    // too (LIVECTX-1). Teardown can land while a turn's provider call is still
+    // in flight, and that drive clears its capture only when it returns.
+    this.liveModelContext.seal();
     for (const table of [
       "files",
       "host_turn_images",
@@ -4686,7 +4690,7 @@ export class WorkflowInstance implements DurableObject {
       await this.ctx.storage.deleteAlarm();
       this.ctx.storage.sql.exec("UPDATE private_retirement SET kv_purged = 1 WHERE singleton = 1");
     }
-    this.liveModelContext.clearAll();
+    this.liveModelContext.seal();
     for (const controllers of this.turnStreams.values()) {
       for (const controller of controllers) {
         try { controller.close(); } catch { /* A terminal stream may already be closed. */ }

@@ -489,6 +489,7 @@ pub mod conformance {
     }
 }
 
+#[cfg(feature = "native")]
 use crate::StoreResult;
 
 /// A `body` column as bytes, whichever way it is stored.

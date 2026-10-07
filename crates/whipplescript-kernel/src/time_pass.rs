@@ -102,21 +102,16 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
         // Deadline expiry: a running effect times out at the run level;
         // a never-run effect expires directly.
         //
-        // The running work itself is NOT signalled to stop, and this pass
-        // cannot signal it. A durable cancellation request is the only stop
-        // signal the runtime has: `request_effect_cancellation` takes only a
-        // `running` effect, and `complete_effect` resolves every open request
-        // on the terminal it writes. So a request asked for after the terminal
-        // below is refused ("effect is timed_out; cancellation requests
-        // require running work") and one asked for before it is closed by that
-        // same terminal — either way no mid-run consumer of
-        // `effect_has_open_cancellation_request` ever observes one. The
-        // provider runs on at full cost and its late completion is then
-        // refused. Stopping the work means not terminalizing it here and
-        // letting the acknowledgement settle it, which changes the terminal a
-        // program observes (`times out` becomes `cancelled`) — a decision for
-        // a record, not for this pass. Open row in
-        // `spec/survey-residue-tracker.md`.
+        // The stop is requested through the executor-lifetime channel, not
+        // through a cancellation request, and the terminal stays `timed_out`
+        // (spec/execution-contract.md; DR-0234). For a tracked exec run this
+        // pass records `exec.fence.requested` below before the timeout
+        // terminal. Other providers' runs (delegated harnesses, agent turns)
+        // are not yet sent their DR-0035 stop verb from here, so they run on
+        // until they finish and their late completion is refused; extending
+        // the stop intent to them is WS-335. A cancellation request is not the
+        // route: `complete_effect` resolves every open request on the terminal
+        // it writes, so a mid-run consumer would never observe one.
         let running_run = kernel
             .store()
             .running_run_for_effect(instance_id, &effect.effect_id)?;

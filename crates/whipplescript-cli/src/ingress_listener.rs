@@ -20,6 +20,11 @@ use whipplescript_parser::IrSource;
 
 /// Header carrying an HMAC signature over the body, `sha256=<hex>`.
 pub const SIGNATURE_HEADER: &str = "x-whip-signature";
+/// The `source.rejected` outcomes (DR-0053 §6): fixed words, so the fact a
+/// forged delivery leaves carries nothing its sender wrote.
+pub const SIGNATURE_MISSING: &str = "signature_missing";
+pub const SIGNATURE_MALFORMED: &str = "signature_malformed";
+pub const SIGNATURE_INVALID: &str = "signature_invalid";
 /// Header carrying a shared secret verbatim.
 pub const SHARED_HEADER: &str = "x-whip-secret";
 /// Header carrying the sender's delivery id.
@@ -72,6 +77,16 @@ pub enum DeliveryRefusal {
     /// than the response body — a sender that is not the sender learns only
     /// that it failed.
     Unauthenticated(String),
+    /// A delivery to a `verified with` source that the custodian answered and
+    /// did not accept, or that carried no signature it could be asked about.
+    /// 401 like [`DeliveryRefusal::Unauthenticated`], and the sender learns no
+    /// more; it is a separate variant because it is the one refusal that leaves
+    /// a fact (DR-0053 §6): `outcome` is the fixed word `source.rejected`
+    /// records, and `detail` is the operator's.
+    Unverified {
+        outcome: &'static str,
+        detail: String,
+    },
     /// The body was not the JSON the signal's contract requires. 400.
     Malformed(String),
     /// The delivery authenticated and named a target that is not there: an
@@ -96,7 +111,7 @@ impl DeliveryRefusal {
     pub fn status(&self) -> u16 {
         match self {
             DeliveryRefusal::UnknownPath => 404,
-            DeliveryRefusal::Unauthenticated(_) => 401,
+            DeliveryRefusal::Unauthenticated(_) | DeliveryRefusal::Unverified { .. } => 401,
             DeliveryRefusal::Malformed(_) => 400,
             DeliveryRefusal::NoSuchTarget(_) => 404,
             DeliveryRefusal::Forbidden(_) => 403,
@@ -109,7 +124,9 @@ impl DeliveryRefusal {
     pub fn public_reason(&self) -> String {
         match self {
             DeliveryRefusal::UnknownPath => "no such endpoint".to_owned(),
-            DeliveryRefusal::Unauthenticated(_) => "unauthenticated".to_owned(),
+            DeliveryRefusal::Unauthenticated(_) | DeliveryRefusal::Unverified { .. } => {
+                "unauthenticated".to_owned()
+            }
             // Everything below happens AFTER authentication, so the detail goes
             // to the sender: they are the sender, and a generic answer here
             // only makes their integration harder to fix.
@@ -139,7 +156,9 @@ impl DeliveryRefusal {
                 DeliveryRefusal::NoSuchTarget(refusal_reason(refusal))
             }
             // Well formed and not allowed, which is not the same as malformed.
-            SignalRefusal::InternalChannel => DeliveryRefusal::Forbidden(refusal_reason(refusal)),
+            SignalRefusal::InternalChannel | SignalRefusal::VerificationRequired { .. } => {
+                DeliveryRefusal::Forbidden(refusal_reason(refusal))
+            }
             SignalRefusal::UndeclaredSignal { .. } | SignalRefusal::PayloadInvalid { .. } => {
                 DeliveryRefusal::Malformed(refusal_reason(refusal))
             }
@@ -193,19 +212,27 @@ pub fn verify_delivery(
     delivery: &RawDelivery,
     verify_with: VerifyWith<'_>,
 ) -> Result<(), DeliveryRefusal> {
-    let unauthenticated = |detail: &str| Err(DeliveryRefusal::Unauthenticated(detail.to_owned()));
+    let unverified = |outcome: &'static str, detail: &str| {
+        Err(DeliveryRefusal::Unverified {
+            outcome,
+            detail: detail.to_owned(),
+        })
+    };
     let Some(presented) = delivery.headers.get(SIGNATURE_HEADER) else {
-        return unauthenticated("no signature header");
+        return unverified(SIGNATURE_MISSING, "no signature header");
     };
     let Some(hex) = presented.strip_prefix("sha256=") else {
-        return unauthenticated("signature is not `sha256=<hex>`");
+        return unverified(SIGNATURE_MALFORMED, "signature is not `sha256=<hex>`");
     };
     let Ok(signature) = decode_hex(hex) else {
-        return unauthenticated("signature is not hex");
+        return unverified(SIGNATURE_MALFORMED, "signature is not hex");
     };
     match verify_with(credential, &delivery.body, &signature) {
         Ok(true) => Ok(()),
-        Ok(false) => unauthenticated("the custodian did not verify the signature over the body"),
+        Ok(false) => unverified(
+            SIGNATURE_INVALID,
+            "the custodian did not verify the signature over the body",
+        ),
         Err(detail) => Err(DeliveryRefusal::Unavailable(format!(
             "the custodian could not verify under `{credential}`: {detail}"
         ))),
@@ -722,6 +749,9 @@ where
                 DeliveryRefusal::Unauthenticated(detail) => {
                     eprintln!("ingress: {} refused: {detail}", delivery.path)
                 }
+                DeliveryRefusal::Unverified { outcome, detail } => {
+                    eprintln!("ingress: {} rejected ({outcome}): {detail}", delivery.path)
+                }
                 DeliveryRefusal::Malformed(detail) => {
                     eprintln!("ingress: {} rejected: {detail}", delivery.path)
                 }
@@ -1087,10 +1117,15 @@ mod tests {
         // The LITERAL, not only the status: a mutation sweep rewrites the
         // message and leaves the status alone, so a test that read the code
         // alone would pass with the refusal saying anything at all.
-        let DeliveryRefusal::Unauthenticated(detail) = &refusal else {
-            panic!("an unsigned delivery is unauthenticated: {refusal:?}");
+        // A verified source's refusal is `Unverified`, the variant that leaves
+        // a `source.rejected` fact, with the fixed outcome word that fact
+        // carries.
+        let DeliveryRefusal::Unverified { outcome, detail } = &refusal else {
+            panic!("an unsigned delivery is unverified: {refusal:?}");
         };
+        assert_eq!(*outcome, SIGNATURE_MISSING);
         assert!(detail.contains("no signature header"), "{detail}");
+        assert_eq!(refusal.public_reason(), "unauthenticated");
 
         // A signature the custodian does not accept.
         let forged = decide(
@@ -1106,6 +1141,33 @@ mod tests {
         };
         assert_eq!(refusal.status(), 401);
         assert_eq!(refusal.public_reason(), "unauthenticated");
+        assert!(
+            matches!(
+                &refusal,
+                DeliveryRefusal::Unverified { outcome, detail }
+                    if *outcome == SIGNATURE_INVALID && detail.contains("did not verify")
+            ),
+            "{refusal:?}"
+        );
+
+        // A signature header that is not `sha256=<hex>`, and one that is not
+        // hex: both malformed, both the same fixed word.
+        for header in ["v1=00ff", "sha256=zz"] {
+            let malformed = decide(
+                &routes,
+                &|_| None,
+                &|_, _, _| panic!("a malformed signature must not reach the custodian"),
+                &signed("{}", header),
+                "inst-1",
+                never_admits,
+            );
+            let DeliveryOutcome::Refused(DeliveryRefusal::Unverified { outcome, .. }) = &malformed
+            else {
+                panic!("a malformed signature is unverified: {malformed:?}");
+            };
+            assert_eq!(*outcome, SIGNATURE_MALFORMED, "{header}");
+            assert_eq!(malformed.status(), 401);
+        }
 
         // The custodian could not be ASKED. This is the distinction worth the
         // test: 503 and retry, not 401 — telling an honest sender their
@@ -1408,6 +1470,21 @@ mod tests {
             "well formed and not allowed is not the same as malformed"
         );
 
+        // DR-0053 §6: a signal whose label governance grounds on a signature,
+        // reaching the core through a door that proved nothing.
+        let unproven = map_admission(Ok(SignalAdmission::Refused(
+            SignalRefusal::VerificationRequired {
+                source: "pushes".to_owned(),
+            },
+        )))
+        .expect_err("not through an asserted door");
+        assert_eq!(unproven.status(), 403);
+        assert!(
+            unproven.public_reason().contains("`pushes`"),
+            "{}",
+            unproven.public_reason()
+        );
+
         let invalid = map_admission(Ok(SignalAdmission::Refused(
             SignalRefusal::PayloadInvalid {
                 errors: vec!["repo: expected string".to_owned()],
@@ -1514,6 +1591,12 @@ mod tests {
             "no such endpoint"
         );
         assert_eq!(DeliveryRefusal::UnknownPath.status(), 404);
+        let unverified = DeliveryRefusal::Unverified {
+            outcome: SIGNATURE_INVALID,
+            detail: "the custodian did not verify the signature over the body".to_owned(),
+        };
+        assert_eq!(unverified.public_reason(), "unauthenticated");
+        assert_eq!(unverified.status(), 401);
     }
 
     // The PRE-AUTH read is the part of a delivery an unauthenticated peer

@@ -26,20 +26,29 @@ fn fixture() -> (
     ReadActionResult,
     GovernedHostFacade<NativeStores>,
 ) {
-    let action = CompiledHostAction::compile(
-        "reference.echo",
-        r#"
+    fixture_with(ECHO, None)
+}
+
+const ECHO: &str = r#"
 workflow ResultFixture
 input content InputReference
 output result Result
 class InputReference { handle string version_ref string label_ref string }
 class Result { handle string }
 rule echo when InputReference as reference => { complete result { handle reference.handle } }
-"#,
-        None,
-    )
-    .unwrap();
+"#;
+
+fn fixture_with(
+    source: &str,
+    anchor: Option<crate::host_protocol::action::ActionAnchor>,
+) -> (
+    CompiledHostAction,
+    ReadActionResult,
+    GovernedHostFacade<NativeStores>,
+) {
+    let action = CompiledHostAction::compile("reference.echo", source, None).unwrap();
     let mut command = command();
+    command.anchor = anchor;
     command.operation = "reference.echo".into();
     command.program_version_ref = action.version_ref().into();
     command.input_schema_ref = action.input_schema_ref().into();
@@ -494,4 +503,168 @@ fn result_workflow_terminal_does_not_settle_an_external_attempt() {
     assert!(disputed.effects[0].attempts[0].disputed);
     assert_eq!(disputed.effects[0].attempts[0].evidence.len(), 2);
     assert_eq!(disputed.terminal, before.terminal);
+}
+
+fn claim() -> crate::host_protocol::action::ActionAnchor {
+    crate::host_protocol::action::ActionAnchor {
+        authority: "product".into(),
+        claim_ref: "claim:step-1".into(),
+    }
+}
+
+/// A V4 read of `request`, signed by the fixture's own policy authority.
+fn v4(request: &ReadActionResult) -> ReadActionResult {
+    ReadActionResult {
+        protocol: crate::host_protocol::action_result::ACTION_RESULT_PROTOCOL_V4.into(),
+        read_authority: Some("product".into()),
+        ..request.clone()
+    }
+}
+
+#[test]
+fn a_run_under_a_held_claim_carries_the_claim_on_its_receipt_and_record() {
+    let (action, request, mut facade) = fixture_with(ECHO, Some(claim()));
+    assert_eq!(request.admission.anchor, Some(claim()));
+    crate::rule_pass::step_instance_generic(
+        facade.kernel_mut(),
+        &request.admission.instance_ref,
+        action.program(),
+        None,
+        None,
+    )
+    .unwrap();
+    let record = read(&facade, &v4(&request)).unwrap();
+    assert_eq!(
+        record.protocol,
+        crate::host_protocol::action_result::ACTION_RESULT_PROTOCOL_V4
+    );
+    assert_eq!(record.admission.anchor, Some(claim()));
+    assert_eq!(record.command.anchor, Some(claim()));
+    let footprint = record.footprint.as_ref().unwrap();
+    assert_eq!((footprint.unobserved, footprint.total), (0, 0));
+    assert_eq!(footprint.unobserved_share(), None);
+
+    // A reader that predates the fields is never sent one it would reject.
+    assert!(matches!(
+        request.signing_bytes(),
+        Err(ProtocolError::WrongVersion(_))
+    ));
+    let mut stripped = request.clone();
+    stripped.admission.anchor = None;
+    assert!(read(&facade, &stripped).is_err());
+
+    // The receipt binds the anchor the command was admitted with.
+    let mut substituted = v4(&request);
+    substituted.admission.anchor.as_mut().unwrap().claim_ref = "claim:other".into();
+    assert!(read(&facade, &substituted).is_err());
+}
+
+#[test]
+fn an_unanchored_receipt_and_an_older_read_are_byte_identical_to_before() {
+    let (_, request, facade) = fixture();
+    assert_eq!(request.admission.anchor, None);
+    let receipt = serde_json::to_string(&request.admission).unwrap();
+    assert!(!receipt.contains("anchor"));
+    let decoded: crate::host_protocol::action::ActionAdmissionReceipt =
+        serde_json::from_str(&receipt).unwrap();
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), receipt);
+    let command = serde_json::to_value(&read(&facade, &request).unwrap().command).unwrap();
+    assert!(command.get("anchor").is_none());
+
+    let record = read(&facade, &request).unwrap();
+    assert_eq!(record.protocol, ACTION_RESULT_PROTOCOL);
+    assert_eq!(record.footprint, None);
+    let wire = serde_json::to_string(&record).unwrap();
+    assert!(!wire.contains("footprint") && !wire.contains("anchor"));
+    let decoded: ActionResultSnapshot = serde_json::from_str(&wire).unwrap();
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+
+    // The new fields arrive only to a reader that negotiated V4.
+    let negotiated = read(&facade, &v4(&request)).unwrap();
+    assert!(negotiated.footprint.is_some());
+    assert_eq!(negotiated.admission, record.admission);
+    assert_eq!(negotiated.command, record.command);
+}
+
+#[test]
+fn a_run_with_shell_acts_reports_a_nonzero_unobserved_share() {
+    use crate::host_protocol::action_result::{act_observation, FootprintObservation};
+    use serde_json::json;
+    let (_, request, facade) = fixture();
+    let mut prefix = facade
+        .kernel()
+        .store()
+        .chain_prefix(&request.admission.instance_ref)
+        .unwrap();
+    let sequence = i64::try_from(prefix.len() + 1).unwrap();
+    prefix.push(OwnedChainEntry {
+        event_id: format!("fixture:{sequence}"),
+        sequence,
+        event_type: "rule.committed".into(),
+        payload_json: json!({"effects": [
+            {"effect_id": "shell", "kind": "exec.command"},
+            {"effect_id": "save", "kind": "file.write"},
+            {"effect_id": "agent", "kind": "agent.tell"},
+            {"effect_id": "file", "kind": "tracker.file"},
+        ]})
+        .to_string(),
+        occurred_at: "2026-10-06T00:00:00Z".into(),
+        source: Some("kernel".into()),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: None,
+        format_version: Some(1),
+    });
+    let record = snapshot(&v4(&request), prefix.clone()).unwrap();
+    let footprint = record.footprint.unwrap();
+    assert_eq!(
+        footprint
+            .acts
+            .iter()
+            .map(|act| (act.effect_id.as_str(), act.observation))
+            .collect::<Vec<_>>(),
+        [
+            ("shell", FootprintObservation::Unobserved),
+            ("save", FootprintObservation::Observed),
+            ("agent", FootprintObservation::Unobserved),
+            ("file", FootprintObservation::Observed),
+        ]
+    );
+    assert_eq!((footprint.unobserved, footprint.total), (2, 4));
+    assert_eq!(footprint.unobserved_share(), Some(0.5));
+    // An older reader of the same run is sent neither field.
+    assert_eq!(snapshot(&request, prefix).unwrap().footprint, None);
+    // A kind this build does not know is never assumed mediated.
+    assert_eq!(
+        act_observation("future.kind"),
+        FootprintObservation::Unobserved
+    );
+    assert_eq!(act_observation(""), FootprintObservation::Unobserved);
+}
+
+#[test]
+fn an_anchored_run_that_commits_a_shell_act_reports_it_unobserved() {
+    let source = r#"
+workflow ResultFixture
+input content InputReference
+output result Result
+class InputReference { handle string version_ref string label_ref string }
+class Result { handle string }
+rule run when InputReference as reference => { exec "true" as attempt }
+"#;
+    let (action, request, mut facade) = fixture_with(source, Some(claim()));
+    crate::rule_pass::step_instance_generic(
+        facade.kernel_mut(),
+        &request.admission.instance_ref,
+        action.program(),
+        None,
+        None,
+    )
+    .unwrap();
+    let record = read(&facade, &v4(&request)).unwrap();
+    assert_eq!(record.admission.anchor, Some(claim()));
+    let footprint = record.footprint.unwrap();
+    assert_eq!((footprint.unobserved, footprint.total), (1, 1));
+    assert_eq!(footprint.acts[0].kind, "exec.command");
+    assert_eq!(footprint.unobserved_share(), Some(1.0));
 }

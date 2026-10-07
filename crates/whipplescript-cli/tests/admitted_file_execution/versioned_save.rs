@@ -246,6 +246,7 @@ fn run<S, B, C>(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );
     let command = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: "workspace:1".into(),

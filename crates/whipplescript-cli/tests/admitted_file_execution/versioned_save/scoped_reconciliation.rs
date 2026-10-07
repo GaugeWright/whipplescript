@@ -215,6 +215,7 @@ fn run_scoped<S, B, C>(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );
     let original = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: "workspace:1".into(),

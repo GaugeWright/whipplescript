@@ -84,6 +84,7 @@ mod tests {
             effect_id: "effect:1".into(),
             run_id: "run:1".into(),
             admission: ActionAdmissionReceipt {
+                anchor: None,
                 protocol: super::super::action::HOST_ACTION_PROTOCOL.into(),
                 fingerprint: "original-fingerprint".into(),
                 instance_ref: "instance:1".into(),

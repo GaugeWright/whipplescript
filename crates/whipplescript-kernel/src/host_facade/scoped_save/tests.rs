@@ -268,6 +268,7 @@ fn setup(
         recorded_at: "t1".into(),
     };
     let mut command = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: "workspace".into(),

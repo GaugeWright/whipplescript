@@ -527,6 +527,7 @@ where
         );
         let scope = scope();
         let command = HostActionCommand {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             issuer: "product".into(),
             scope: "workspace".into(),

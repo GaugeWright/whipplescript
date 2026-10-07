@@ -48,3 +48,15 @@ test("only a fully labeled model call can claim complete provenance", () => {
   assert.deepEqual(captures.read("one")?.calls.map((call) => call.provenance_complete),
     [true, false, false]);
 });
+
+test("a sealed capture erases every turn and refuses an in-flight late record", () => {
+  const captures = new LiveModelContext();
+  captures.record("one\0turn", { input: "one" }, []);
+  captures.record("two\0turn", { input: "two" }, []);
+  captures.seal();
+  assert.equal(captures.read("one\0turn"), null);
+  assert.equal(captures.read("two\0turn"), null);
+  // A drive that was already awaiting a provider when teardown landed.
+  captures.record("one\0turn", { input: "late" }, []);
+  assert.equal(captures.read("one\0turn"), null);
+});

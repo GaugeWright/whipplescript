@@ -49,6 +49,9 @@ mod protection;
 #[cfg(feature = "native")]
 pub use protection::TrackerEventMetadata;
 
+mod claim_advisory;
+pub use claim_advisory::{concurrent_claim_advisories, ConcurrentClaimAdvisory};
+
 pub mod readiness;
 #[cfg(feature = "native")]
 mod readiness_native;
@@ -312,6 +315,8 @@ pub struct ImportReport {
     /// Newly-seen assertions re-aliased on this clone (DR-0084 Decision 2).
     pub new_assertions: usize,
     pub duplicate_submissions: Vec<String>,
+    /// Newly established historical acquisition pairs; not current active claims.
+    pub concurrent_claims: Vec<ConcurrentClaimAdvisory>,
     /// Events refused because their `event_id` did not equal the SHA-256 of
     /// their own content (tamper / corruption), or a created event whose id did
     /// not match its issue identity. The content-addressed integrity check that
@@ -2166,6 +2171,7 @@ impl WorkItemStore {
     /// are rebuilt from the unioned log.
     pub fn import_events(&mut self, events: &[TrackerEvent]) -> StoreResult<ImportReport> {
         let mut report = ImportReport::default();
+        let mut claim_before = std::collections::BTreeMap::new();
         {
             let tx = self.discovery_transaction()?;
             for event in events {
@@ -2209,6 +2215,14 @@ impl WorkItemStore {
                     continue;
                 }
                 let parents_json = serde_json::to_string(&event.parents)?;
+                if let Some(cid) = &event.issue_id {
+                    if !claim_before.contains_key(cid) {
+                        claim_before.insert(
+                            cid.clone(),
+                            concurrent_claim_advisories(cid, &load_issue_events(&tx, cid)?),
+                        );
+                    }
+                }
                 let changes = tx.execute(
                     "INSERT OR IGNORE INTO tracker_events \
                      (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
@@ -2288,10 +2302,10 @@ impl WorkItemStore {
             }
             // Genuine duplicate submission: a newly-seen creation that describes
             // the SAME issue (same queue + title) as a DISTINCT issue already in
-            // the log. Content-addressing gives every independent submission its
-            // own id, so a real duplicate is two distinct `issue.created` events —
-            // unlike a re-transmit, which shares one id. Advisory only (resolved
-            // by a `duplicates` relation), NEVER a silent collapse.
+            // the log. Distinct creation-event content gives distinct ids;
+            // byte-identical submissions with the same actor and second share
+            // one id, just like a re-transmit. The advisory covers only distinct
+            // ids (resolved by a `duplicates` relation), not that same-id case.
             if !unaliased.is_empty() {
                 let created: Vec<(String, String)> = tx
                     .prepare(
@@ -2353,6 +2367,23 @@ impl WorkItemStore {
             // Import and materialization share a commit: no writer or crash can
             // expose a new event set with the previous derived state.
             tx_rebuild_projection(&tx)?;
+            for (cid, before) in claim_before {
+                let after = concurrent_claim_advisories(&cid, &load_issue_events(&tx, &cid)?);
+                let alias: Option<String> = tx
+                    .query_row(
+                        "SELECT alias FROM tracker_aliases WHERE content_id = ?1",
+                        [&cid],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(alias) = alias else {
+                    continue;
+                };
+                for mut pair in after.into_iter().filter(|pair| !before.contains(pair)) {
+                    pair.issue_id = alias.clone();
+                    report.concurrent_claims.push(pair);
+                }
+            }
             tx.commit()?;
         }
         Ok(report)
@@ -2732,18 +2763,6 @@ fn tx_now(tx: &Transaction<'_>) -> StoreResult<String> {
         .map_err(Into::into)
 }
 
-/// The SHA-256 content id of an event (ADR-0002 phase B1: the tracker event
-/// Merkle-DAG). The id commits to the event's whole content INCLUDING its
-/// sorted parent ids, so the log is a hash-chain: altering any past event
-/// changes its id and breaks every downstream `parents` link — a tampered
-/// issue is DETECTABLE, the adversarial-integrity property FNV content-addressing
-/// cannot give. SHA-256 (not FNV) precisely because the threat is a deliberate
-/// forger, who could otherwise compute a colliding event. Two byte-identical
-/// events (same kind/issue/payload/actor/parents/clock) share an id and dedup on
-/// merge; the distinguishing `created_at` keeps genuine re-submissions distinct.
-///
-/// Backend-agnostic (shared by the native rusqlite store and the durable-object
-/// `DoSql` store — DO parity) so both mint identical ids for identical events.
 /// The event kinds that ROOT a ledger object's history: their event id IS the
 /// object's durable identity (hashed with no issue_id and no parents), and a
 /// transported creation event must carry its own id as its object identity.
@@ -2754,6 +2773,19 @@ pub fn is_creation_kind(kind: &str) -> bool {
     matches!(kind, "issue.created" | "assertion.created")
 }
 
+/// The SHA-256 content id of an event (DR-0002 phase B1: the tracker event
+/// Merkle-DAG). The id commits to the event's whole content INCLUDING its
+/// sorted parent ids, so the log is a hash-chain: altering any past event
+/// changes its id and breaks every downstream `parents` link — a tampered
+/// issue is DETECTABLE, the adversarial-integrity property FNV content-addressing
+/// cannot give. SHA-256 (not FNV) precisely because the threat is a deliberate
+/// forger, who could otherwise compute a colliding event. Two byte-identical
+/// events (same kind/issue/payload/actor/parents/clock) share an id and dedup on
+/// merge. A different `created_at` distinguishes re-submissions; an identical
+/// full tuple within the same second shares one id, with no extra tiebreaker.
+///
+/// Backend-agnostic (shared by the native rusqlite store and the durable-object
+/// `DoSql` store — DO parity) so both mint identical ids for identical events.
 pub fn event_content_id(
     kind: &str,
     issue_id: Option<&str>,
@@ -3513,12 +3545,8 @@ fn fold_event(
             if let (Some(id), Some(field), Some(value)) =
                 (issue_id, str_of("field"), str_of("value"))
             {
-                // Only the columns v1 sets via field_set; unknown fields are ignored.
-                let column = match field.as_str() {
-                    "title" => "title",
-                    "body" => "body",
-                    "status" => "status",
-                    _ => return Ok(()),
+                let Some(column) = projection_column(&field) else {
+                    return Ok(());
                 };
                 tx.execute(
                     &format!(
@@ -5904,6 +5932,91 @@ mod tests {
         assert!(!conflicts.conflicted(), "same value → convergence");
     }
 
+    #[test]
+    fn concurrent_claim_advisory_waits_for_ancestry_and_preserves_causal_order() {
+        let mut a = WorkItemStore::open_in_memory().unwrap();
+        let mut b = WorkItemStore::open_in_memory().unwrap();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &serde_json::json!({}), None, None)
+            .unwrap();
+        let creation = a.export_events().unwrap();
+        b.import_events(&creation).unwrap();
+        a.claim_item(&issue.id, "alice", None).unwrap();
+        b.claim_item("WS-1", "bob", None).unwrap();
+        let left = a.export_events().unwrap();
+        let right = b.export_events().unwrap();
+        let claims: Vec<_> = left
+            .iter()
+            .chain(&right)
+            .filter(|e| e.kind == "claim.acquired")
+            .cloned()
+            .collect();
+        let mut unrelated = WorkItemStore::open_in_memory().unwrap();
+        unrelated
+            .file_item(
+                "q",
+                "Other permanently identified task",
+                "",
+                &[],
+                &serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+        unrelated.claim_item("WS-1", "dave", None).unwrap();
+        let other = unrelated.export_events().unwrap();
+        let mut target = WorkItemStore::open_in_memory().unwrap();
+        assert!(target
+            .import_events(&other)
+            .unwrap()
+            .concurrent_claims
+            .is_empty());
+        assert!(
+            target
+                .import_events(&claims)
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "missing ancestry cannot prove concurrency"
+        );
+        let pair = target.import_events(&creation).unwrap().concurrent_claims;
+        assert_eq!(pair.len(), 1, "ancestor arrival establishes the pair");
+        assert_eq!(pair[0].issue_id, "WS-2");
+        assert_eq!(pair[0].content_id, creation[0].issue_id.as_deref().unwrap());
+        let mut actors = pair[0].actors.to_vec();
+        actors.sort();
+        assert_eq!(actors, ["alice", "bob"]);
+        let mut all = left.clone();
+        all.extend(right.clone());
+        all.reverse();
+        assert!(
+            target
+                .import_events(&all)
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "retransmission is quiet"
+        );
+        let mut reverse = WorkItemStore::open_in_memory().unwrap();
+        reverse.import_events(&other).unwrap();
+        assert_eq!(
+            reverse.import_events(&all).unwrap().concurrent_claims,
+            pair,
+            "delivery order does not choose an actor"
+        );
+        a.release_item(&issue.id, Some("alice")).unwrap();
+        a.claim_item(&issue.id, "carol", None).unwrap();
+        let mut sequential = WorkItemStore::open_in_memory().unwrap();
+        assert!(
+            sequential
+                .import_events(&a.export_events().unwrap())
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "causally ordered reacquisition is not concurrent"
+        );
+    }
+
     /// Cross-clone concurrent claims must BOTH survive a merge. Regression:
     /// lease ids were minted from the clone-LOCAL alias (`L-WS-1-0` on both
     /// clones), so the import fold's INSERT OR IGNORE on the `lease_id`
@@ -6243,8 +6356,9 @@ mod tests {
     }
 
     /// A genuine duplicate submission — two clones independently FILE the same
-    /// issue (same queue + title) — mints two distinct content ids. Merging them
-    /// surfaces the second as a duplicate_submission warning (advisory; a human
+    /// issue (same queue + title) with different actors — mints distinct content
+    /// ids. Identical creation tuples in the same second share one id instead.
+    /// Merging distinct ids surfaces a duplicate_submission warning (a human
     /// reconciles via a `duplicates` relation), never a silent collapse.
     /// A tampered event (payload mutated but the id kept, or an id that collides
     /// with an honest event) is REJECTED on import, not folded — the content-
@@ -6299,7 +6413,7 @@ mod tests {
             .expect("files");
         let a_events = a.export_events().unwrap();
         let b_events = b.export_events().unwrap();
-        // Distinct content ids — independent submissions are not the same event.
+        // Different actors make these independent submissions distinct events.
         assert_ne!(a_events[0].event_id, b_events[0].event_id);
 
         // A pulls in B's independent submission of the same issue.
@@ -7268,6 +7382,70 @@ mod tests {
             .map(|item| item.id)
             .collect();
         assert_eq!(ready, vec![blocked.id]);
+    }
+
+    /// Display fields share one mapping; unsupported fields remain event-only
+    /// through native rebuild and cross-clone import.
+    #[test]
+    fn field_projection_mapping_survives_rebuild_and_import() {
+        let mut source = open_memory();
+        let item = source
+            .file_item(
+                "backlog",
+                "initial",
+                "initial body",
+                &[],
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("file issue");
+        for (field, value) in [
+            ("title", "renamed"),
+            ("body", "new body"),
+            ("status", "in_progress"),
+        ] {
+            assert!(source
+                .set_field(&item.id, field, value)
+                .expect("set display field"));
+        }
+        let before = source.get_item(&item.id).unwrap().unwrap();
+        let unsupported = "title, status";
+        assert!(source
+            .set_field(&item.id, unsupported, "not a column")
+            .unwrap());
+        let after = source.get_item(&item.id).unwrap().unwrap();
+        assert_eq!(after.title, "renamed");
+        assert_eq!(after.body, "new body");
+        assert_eq!(after.status, "in_progress");
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "unsupported fields touch no display column"
+        );
+        let events = source.export_events().unwrap();
+        let unknown = events
+            .iter()
+            .find(|event| {
+                event.kind == "issue.field_set"
+                    && serde_json::from_str::<Value>(&event.payload_json).unwrap()["field"]
+                        == unsupported
+            })
+            .expect("unsupported field remains a durable event");
+        let projection = source.dump_projection().unwrap();
+        source.rebuild_projection().unwrap();
+        assert_eq!(source.dump_projection().unwrap(), projection);
+        assert_eq!(source.export_events().unwrap(), events);
+
+        let mut destination = open_memory();
+        destination.import_events(&events).unwrap();
+        assert_eq!(destination.dump_projection().unwrap(), projection);
+        assert!(destination
+            .export_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.event_id == unknown.event_id));
+        destination.rebuild_projection().unwrap();
+        assert_eq!(destination.dump_projection().unwrap(), projection);
     }
 
     /// Projection determinism (`tracker-projection.maude`): a rebuild-from-events

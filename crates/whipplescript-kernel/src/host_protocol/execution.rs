@@ -231,6 +231,7 @@ pub(crate) mod tests {
             issuer: original.issuer.clone(),
             scope: original.scope.clone(),
             admission: ActionAdmissionReceipt {
+                anchor: None,
                 protocol: HOST_ACTION_PROTOCOL.into(),
                 fingerprint: original.fingerprint().expect("command fingerprint"),
                 instance_ref: instance.clone(),

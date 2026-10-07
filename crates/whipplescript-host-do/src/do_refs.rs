@@ -231,13 +231,45 @@ mod tests {
     #[test]
     fn a_synchronous_object_store_carries_the_suite_holding_bytes() {
         whipplescript_store::content::conformance::run_suite(|| {
-            crate::do_branches::DoContentBlobs::with_external_bytes(
+            let mut blobs = crate::do_branches::DoContentBlobs::with_external_bytes(
                 RusqliteDoSql::in_memory(),
                 Box::new(MemObjects::default()),
             )
-            .expect("content blobs open")
+            .expect("content blobs open");
+            // Exercise erasure through the tombstone-free object backend too,
+            // including the suite's small text payloads. The DO ledger must
+            // keep answering Erased after the backend simply deletes bytes.
+            blobs.set_threshold_bytes(0);
+            blobs
         })
         .expect("suite runs");
+    }
+
+    #[test]
+    fn erasure_survives_a_backend_that_retains_no_tombstones() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
+        let objects = std::rc::Rc::new(MemObjects::default());
+        let mut blobs = crate::do_branches::DoContentBlobs::with_external_bytes(
+            RusqliteDoSql::in_memory(),
+            Box::new(objects.clone()),
+        )
+        .expect("open");
+        blobs.set_threshold_bytes(0);
+        let id = blobs.put_text("doomed").expect("external put");
+        assert!(!objects.blobs.borrow().is_empty());
+        assert!(matches!(
+            blobs.erase(&id, "2026-10-02").unwrap(),
+            EraseOutcome::Erased { .. }
+        ));
+        assert!(
+            objects.blobs.borrow().is_empty(),
+            "backend deletes bytes without a tombstone"
+        );
+        assert!(matches!(
+            blobs.status(&id).unwrap(),
+            BlobStatus::Erased { .. }
+        ));
+        assert_eq!(blobs.get(&id).unwrap(), None);
     }
 
     /// The round trip the parity gap was about, spelled out: a picture goes in,

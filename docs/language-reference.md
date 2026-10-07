@@ -1379,6 +1379,10 @@ When an IFC governance envelope is active, that envelope must govern the
 minimum trust rung with a `require mcp <rung>` statement. A server below that
 rung exposes no tool at all.
 
+A profile does not narrow MCP tools. The capabilities that a profile names do
+not describe an external server. The grant, the coverage and the rung floor of
+the envelope, and the classification of each tool are what limit an MCP turn.
+
 A provider configuration with a `profile_ids` field is also an allow-list of
 endpoints. Such a configuration blocks an agent turn with a profile that does
 not match, before the system starts the provider. The broader policy of the
@@ -2516,6 +2520,30 @@ reason: provisioning a credential must not lower the bar that judges it. The
 resource identity of a credential is `credential:<name>` and is deliberately
 free of the backend, so a migration from one sealing backend to another does
 not invalidate the grants that name it.
+
+### Verified inbound sources
+
+An inbound `http` source can name a credential with `verified with
+<credential>` in place of `auth`. The custodian then checks the signature of
+each delivery, and the key never enters the `whip` process. A delivery that
+does not verify never becomes its signal. Its arrival is recorded as one
+`source.rejected` fact with the fields `source`, `signal`, `credential` and
+`outcome`. The fact never carries the body.
+
+The signed governance envelope can make the label of the signal depend on
+that verification:
+
+```text
+grant signal charge -> signal:charge.received from Billing
+require verified stripe_hooks
+```
+
+With `require verified`, the checker refuses the program unless the source
+`stripe_hooks` and every other source that emits `charge.received` are
+`verified with`. At run time the signal is admitted only from a verified
+delivery: `whip signal` and every other door are refused. An endorse grant over
+a verified source is a check error, because a signature proves who sent a
+delivery and not that its contents can be trusted.
 
 Send an outbound message with a `send via <channel> { ... } as <binding>`
 statement:

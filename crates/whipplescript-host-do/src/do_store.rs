@@ -8521,13 +8521,11 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let fact_count = count_where("facts", None)?;
         let queued_effect_count = count_where(
             "effects",
-            Some("status IN ('queued', 'blocked_by_dependency')"),
+            Some(&format!("status IN {QUEUED_EFFECT_STATUSES}")),
         )?;
         let blocked_effect_count = count_where(
             "effects",
-            Some(
-                "status IN ('blocked_by_capability', 'blocked_by_profile', 'blocked_by_capacity')",
-            ),
+            Some(&format!("status IN {BLOCKED_EFFECT_STATUSES}")),
         )?;
         let active_run_count = count_where("runs", Some("status = 'running'"))?;
         let failure_count = count_where("effects", Some("status IN ('failed', 'timed_out')"))?;
@@ -10554,6 +10552,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         events: &[whipplescript_store::items::TrackerEvent],
     ) -> StoreResult<whipplescript_store::items::ImportReport> {
         let mut report = whipplescript_store::items::ImportReport::default();
+        let mut claim_before = std::collections::BTreeMap::new();
         for event in events {
             if event.kind.starts_with("norm.") {
                 report.rejected += 1;
@@ -10590,6 +10589,17 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             }
             let parents_json =
                 serde_json::to_string(&event.parents).map_err(|e| sql_err(e.to_string()))?;
+            if let Some(cid) = &event.issue_id {
+                if !claim_before.contains_key(cid) {
+                    claim_before.insert(
+                        cid.clone(),
+                        whipplescript_store::items::concurrent_claim_advisories(
+                            cid,
+                            &do_load_issue_events(&self.sql, cid)?,
+                        ),
+                    );
+                }
+            }
             let changes = self
                 .sql
                 .execute(
@@ -10732,6 +10742,27 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             }
         }
         self.rebuild_tracker_projection()?;
+        for (cid, before) in claim_before {
+            let after = whipplescript_store::items::concurrent_claim_advisories(
+                &cid,
+                &do_load_issue_events(&self.sql, &cid)?,
+            );
+            let rows = self
+                .sql
+                .query(
+                    "SELECT alias FROM tracker_aliases WHERE content_id = ?1",
+                    &[text(&cid)],
+                )
+                .map_err(sql_err)?;
+            let Some(row) = rows.first() else {
+                continue;
+            };
+            let alias = as_text(&row[0]);
+            for mut pair in after.into_iter().filter(|pair| !before.contains(pair)) {
+                pair.issue_id = alias.clone();
+                report.concurrent_claims.push(pair);
+            }
+        }
         Ok(report)
     }
 
@@ -12721,6 +12752,91 @@ pub(crate) mod tests {
             RuntimeFileReferenceSite::WriteResult
         );
         assert_eq!(inventory.uses[1].reference, Some(output));
+    }
+
+    #[test]
+    fn concurrent_claim_advisory_waits_for_ancestry_and_preserves_causal_order() {
+        let mut a = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut b = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &serde_json::json!({}), None, None)
+            .unwrap();
+        let creation = a.export_events().unwrap();
+        b.import_events(&creation).unwrap();
+        a.claim_item(&issue.id, "alice", None).unwrap();
+        b.claim_item("WS-1", "bob", None).unwrap();
+        let left = a.export_events().unwrap();
+        let right = b.export_events().unwrap();
+        let claims: Vec<_> = left
+            .iter()
+            .chain(&right)
+            .filter(|e| e.kind == "claim.acquired")
+            .cloned()
+            .collect();
+        let mut unrelated = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        unrelated
+            .file_item(
+                "q",
+                "Other permanently identified task",
+                "",
+                &[],
+                &serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+        unrelated.claim_item("WS-1", "dave", None).unwrap();
+        let other = unrelated.export_events().unwrap();
+        let mut target = store();
+        assert!(target
+            .import_events(&other)
+            .unwrap()
+            .concurrent_claims
+            .is_empty());
+        assert!(
+            target
+                .import_events(&claims)
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "missing ancestry cannot prove concurrency"
+        );
+        let pair = target.import_events(&creation).unwrap().concurrent_claims;
+        assert_eq!(pair.len(), 1, "ancestor arrival establishes the pair");
+        assert_eq!(pair[0].issue_id, "WS-2");
+        assert_eq!(pair[0].content_id, creation[0].issue_id.as_deref().unwrap());
+        let mut actors = pair[0].actors.to_vec();
+        actors.sort();
+        assert_eq!(actors, ["alice", "bob"]);
+        let mut all = left.clone();
+        all.extend(right.clone());
+        all.reverse();
+        assert!(
+            target
+                .import_events(&all)
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "retransmission is quiet"
+        );
+        let mut reverse = store();
+        reverse.import_events(&other).unwrap();
+        assert_eq!(
+            reverse.import_events(&all).unwrap().concurrent_claims,
+            pair,
+            "delivery order does not choose an actor"
+        );
+        a.release_item(&issue.id, Some("alice")).unwrap();
+        a.claim_item(&issue.id, "carol", None).unwrap();
+        let mut sequential = store();
+        assert!(
+            sequential
+                .import_events(&a.export_events().unwrap())
+                .unwrap()
+                .concurrent_claims
+                .is_empty(),
+            "causally ordered reacquisition is not concurrent"
+        );
     }
 
     #[test]

@@ -49,6 +49,8 @@ whipplescript-store = { version = "0.10.0", path = "../whipplescript-store", fea
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Provides `Severity` for constructing `DiagnosticRecord` in the store tests.
 whipplescript-core = { version = "0.10.0", path = "../whipplescript-core" }
+# Signs fixture gate certificates as a trusted issuer would (SR-3, WS-232).
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

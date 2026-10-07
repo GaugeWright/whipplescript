@@ -19,6 +19,10 @@ sha2 = "0.11"
 # FNV-1a content-addressing cannot provide. NOT optional: the durable-object
 # host (no-default-features, DR-0033) shares the pure hashing + DAG-conflict
 # core, so this must compile on wasm too (sha2 is pure-Rust wasm-safe).
+# Ed25519 verification of gate-certificate issuer signatures at the ref CAS
+# (SR-3, WS-232). Shared with the durable-object host, so pure-Rust and
+# no-default-features like sha2. The UPROAR conformance test also uses it.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
 
 [features]
 # `native` pulls in the rusqlite-backed store impls (SqliteStore /
@@ -41,9 +45,6 @@ rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions", "ho
 
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 hex = "0.4"
-# The UPROAR reference vectors' Ed25519 signatures (norm_uproar's
-# conformance test against gaugenet's pinned vectors). Test-only.
-ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

@@ -2191,8 +2191,234 @@ complete result answer }
         ));
     }
 
-    // The worker-shell loop over an effect-free workflow: `create`, then `step`
-    // until a terminal — no HTTP round, one settle.
+    /// The worker-shell loop over an effect-free workflow: `create`, then `step`
+    /// until a terminal — no HTTP round, one settle.
+    #[test]
+    fn durable_instance_drives_an_effect_free_workflow_to_terminal() {
+        let source = "workflow MinimalNoop\n\noutput result StartupSeen\n\n\
+             class StartupSeen {\n  source string\n  state \"observed\"\n}\n\n\
+             rule observe_start\n  when started\n=> {\n\
+             \x20 record StartupSeen {\n    source \"external.started\"\n    state \"observed\"\n  }\n\n\
+             \x20 complete result {\n    source \"external.started\"\n    state \"observed\"\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/MinimalNoop",
+            test_ports(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        assert!(
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
+            "the worker drives the instance to its terminal in one step"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// DO package bootstrap end-to-end (spec/durable-object-runtime-tracker.md):
+    /// a COORDINATION effect (`lease.acquire`) now passes the REAL admission gate
+    /// on the DO — the `create` path seeds the embedded std.coord manifest, so
+    /// the effect's provider/capability/binding rows exist and it admits, drives
+    /// to `Held`, and completes. Before the bootstrap this kind was waved through
+    /// by a `do_policy_block_on` exemption; that exemption is gone, so this
+    /// terminal is proof the seeded rows carry the admission (not an exemption).
+    #[test]
+    fn durable_instance_admits_a_coordination_effect_through_the_real_gate() {
+        let source = "use std.coord\n\nworkflow CoordAdmit\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             lease slot {\n  key Env\n  slots 1\n  ttl 10m\n}\n\n\
+             class Env {\n  id string\n}\n\n\
+             table envs as Env [\n  { id \"prod\" }\n]\n\n\
+             rule grab\n  when Env as env\n=> {\n\
+             \x20 acquire slot for env.id as grabbed\n\n\
+             \x20 after grabbed held {\n    complete result { ok 1 }\n  }\n\
+             \x20 after grabbed contended {\n    complete result { ok 0 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/CoordAdmit",
+            test_ports(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        // Drive to quiescence: the record→acquire→complete chain settles across
+        // the machine's fixpoint (no HTTP, so no NeedsHttp suspension).
+        for _ in 0..8 {
+            match instance.step(None, TEST_NOW_MS) {
+                DurableStepOutcome::Terminal => break,
+                DurableStepOutcome::Parked { .. } => {}
+                other => panic!("coordination admit drove to an unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed"),
+            "the lease.acquire effect admitted through the seeded gate and completed"
+        );
+    }
+
+    /// DO-plane memory end-to-end (spec/std-memory.md MEM-3): a `learn` then
+    /// `recall` workflow drives to terminal on the DO, and the DO's own SQLite
+    /// memory table holds the REAL learned entry — proving the DoMemoryStore is
+    /// wired through the capability dispatch (the std.memory binding routes
+    /// `memory-provider` to it), not the fixture. Before this, DO memory
+    /// capabilities returned the fixture context.
+    #[test]
+    fn durable_instance_learns_and_recalls_real_memory_on_the_do() {
+        use crate::do_memory::DoMemoryStore;
+        use whipplescript_store::memory::MemoryStore;
+
+        let base = store().sql;
+        // A second handle onto the SAME in-memory DB (Rc<Connection>), so the
+        // test can read back what the run wrote.
+        let inspect = base.clone();
+
+        let source = "use std.memory\n\nworkflow DoMemory\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             memory pool notes {\n  context limit 8\n}\n\n\
+             class Seed {\n  topic string\n}\n\n\
+             table seeds as Seed [\n  { topic \"alpha\" }\n]\n\n\
+             rule go\n  when Seed as seed\n=> {\n\
+             \x20 learn from seed.topic into notes { note \"remember alpha detail\" } as saved\n\n\
+             \x20 after saved succeeds {\n\
+             \x20   complete result { ok 1 }\n  }\n}\n";
+        let mut instance =
+            DurableInstance::create(base, source, "{}", "local/DoMemory", test_ports(), &[], &[])
+                .expect("create");
+        for _ in 0..12 {
+            match instance.step(None, TEST_NOW_MS) {
+                DurableStepOutcome::Terminal => break,
+                DurableStepOutcome::Parked { .. } => {}
+                other => panic!("memory workflow drove to an unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed"),
+            "the learn chain settled"
+        );
+
+        // The learn effect wrote REAL data into the DO's memory table (routed
+        // through the DoMemoryStore-backed provider, not the fixture), and a
+        // recall over the same DO store reads it back matched by subject — the
+        // DoMemoryStore query path the capability's memory.query arm also uses.
+        let store = DoMemoryStore::open(inspect).expect("memory store");
+        let hits = store.query("notes", "alpha", None).expect("query");
+        assert_eq!(hits.len(), 1, "the DO learned one entry into the pool");
+        assert!(
+            hits[0].text.contains("alpha") && hits[0].text.contains("remember alpha detail"),
+            "the entry carries the learned source + note: {}",
+            hits[0].text
+        );
+    }
+
+    /// The alarm cycle (DR-0033 Phase 6): a timer workflow PARKS with the
+    /// timer's due instant surfaced as `next_due_unix_ms` (the shell sets the
+    /// DO alarm from it), and the alarm's re-entry `step` — a later injected
+    /// `now` — runs the due-time pass, fires the timer, and completes.
+    #[test]
+    fn timer_workflow_parks_with_next_due_then_alarm_reentry_completes() {
+        let source = "workflow TimerDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n\
+             \x20 timer 2s as pause\n\n\
+             \x20 after pause succeeds {\n    complete result { ok 1 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/TimerDemo",
+            test_ports(),
+            &[],
+            &[],
+        )
+        .expect("create");
+
+        // First step: the timer is pending and not yet due — the instance
+        // parks and names its wake-up (creation-anchored, so within 2s of the
+        // store's clock; assert presence and sanity, not the exact instant).
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("a pending timer names its wake-up")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("running")
+        );
+
+        // The alarm fires: re-enter with a `now` past the due instant. The
+        // due-time pass completes the timer, the rule pass sees it, and the
+        // workflow completes — no external poller involved.
+        let after_due = next_due + 1_000;
+        assert!(
+            matches!(instance.step(None, after_due), DurableStepOutcome::Terminal),
+            "the alarm re-entry fires the timer and completes the workflow"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// Clock sources on the DO (P6 tail): an interval source parks with the
+    /// NEXT occurrence as the wake-up, and the alarm re-entry admits the
+    /// signal fact through the lifted clock pass.
+    #[test]
+    fn clock_source_parks_with_next_tick_and_fires_on_alarm_reentry() {
+        let source = "workflow ClockDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             signal demo.tick {\n  scheduled_at time\n  observed_at time\n  occurrence_id string\n  missed_count int\n}\n\n\
+             source clock as ticker {\n  every 30s\n  missed coalesce\n\n\
+             \x20 observe as tick\n  emit demo.tick {\n    scheduled_at tick.scheduled_at\n    observed_at tick.observed_at\n    occurrence_id tick.occurrence_id\n    missed_count tick.missed_count\n  }\n}\n\n\
+             rule stop_on_tick\n  when demo.tick as tick\n=> {\n  complete result { ok 1 }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/ClockDemo",
+            test_ports(),
+            &[],
+            &[],
+        )
+        .expect("create");
+
+        // First step (well before any tick is due relative to the store's
+        // wall-clock created_at): parks, naming the next 30s occurrence.
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("an interval source names its next tick")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+
+        // The alarm fires: a `now` past the tick admits the signal fact and
+        // the rule finishes the workflow.
+        assert!(
+            matches!(
+                instance.step(None, next_due + 1_000),
+                DurableStepOutcome::Terminal
+            ),
+            "the alarm re-entry admits the clock tick and finishes"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
 
     /// DR-0054 Phase B: `create` registers REAL revision identity (the hash of
     /// the bootstrap source bytes and this build's crate version — never the
@@ -2785,6 +3011,328 @@ rule go
             1,
             "the container round has one terminal effect"
         );
+    }
+
+    /// Every text value in every durable table: what an isolate leaves behind.
+    fn durable_text_values<S: DoSql>(sql: &S) -> Vec<String> {
+        use crate::do_store::{as_text, SqlValue};
+        let tables = sql
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[],
+            )
+            .expect("table list");
+        let mut values = Vec::new();
+        for row in tables {
+            let name = as_text(&row[0]).replace('"', "\"\"");
+            for stored in sql
+                .query(&format!("SELECT * FROM \"{name}\""), &[])
+                .expect("table scan")
+            {
+                for cell in stored {
+                    if let SqlValue::Text(text) = cell {
+                        values.push(text);
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    fn idempotency_header(request: &HttpRequest) -> String {
+        request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+            .map(|(_, value)| value.clone())
+            .expect("provider request carries an idempotency key")
+    }
+
+    /// EDGE-8 (DR-0033 Decision 3): a coerce effect suspended at its `NeedsIo`
+    /// boundary survives the loss of the whole in-memory handle. A fresh handle
+    /// derives the same running effect from durable state, reissues the
+    /// identical provider operation under the same idempotency identity, and
+    /// settles it once. The provider credential reaches the request it signs
+    /// and nothing durable.
+    #[test]
+    fn durable_coerce_round_survives_complete_handle_loss() {
+        use whipplescript_kernel::coerce_native::{
+            DEFAULT_COERCE_MAX_TOKENS, DEFAULT_COERCE_TIMEOUT_SECS,
+        };
+
+        const CANARY: &str = "canary-coerce-secret-must-not-persist";
+        let source = "workflow CoerceRecovery\n\noutput result Decision\n\n\
+             class Decision {\n  score float\n}\n\n\
+             coerce scoreIt() -> Decision {\n  prompt \"\"\"\n  Score it.\n  {{ ctx.output_format }}\n  \"\"\"\n}\n\n\
+             rule go\n  when started\n=> {\n  coerce scoreIt() as review\n\
+             \x20 after review succeeds as decision {\n    complete result { score decision.score }\n  }\n\
+             \x20 after review fails {\n    complete result { score 0.0 }\n  }\n}\n";
+        let base = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('schema.coerce', 'Coerce.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
+        ] {
+            base.sql.execute(stmt, &[]).expect("seed coerce provider");
+        }
+        let sql = base.sql;
+        let ports = || DurableEffectPorts {
+            coerce: Some(ResolvedCoercionConfig {
+                provider_id: "anthropic".to_owned(),
+                backend: CoerceProvider::Anthropic,
+                base_url: "https://api.anthropic.com".to_owned(),
+                api_key: CANARY.to_owned(),
+                model: "claude-test".to_owned(),
+                max_tokens: DEFAULT_COERCE_MAX_TOKENS,
+                timeout_secs: DEFAULT_COERCE_TIMEOUT_SECS,
+                codex_account_id: None,
+            }),
+            ..test_ports()
+        };
+        let create = |sql| {
+            DurableInstance::create(sql, source, "{}", "local/CoerceRecovery", ports(), &[], &[])
+        };
+
+        let mut instance = create(sql.clone()).expect("create");
+        let request = match instance.step(None, TEST_NOW_MS) {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected coerce NeedsHttp, got {other:?}"),
+        };
+        assert!(request.url.contains("anthropic"), "{}", request.url);
+        let idempotency = idempotency_header(&request);
+        drop(instance);
+        assert!(
+            !durable_text_values(&sql)
+                .iter()
+                .any(|value| value.contains(CANARY)),
+            "the provider credential is absent from durable state at the boundary"
+        );
+
+        let mut instance = create(sql.clone()).expect("reattach");
+        let replay = match instance.step(None, TEST_NOW_MS) {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected reattached coerce NeedsHttp, got {other:?}"),
+        };
+        assert_eq!(replay.url, request.url);
+        assert_eq!(replay.body, request.body);
+        assert_eq!(idempotency_header(&replay), idempotency);
+
+        let response = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "content": [{ "type": "tool_use", "name": "Decision", "input": { "score": 0.9 } }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+        };
+        assert!(matches!(
+            instance.step(Some(Ok(response)), TEST_NOW_MS),
+            DurableStepOutcome::Terminal
+        ));
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let runs = kernel
+            .store()
+            .list_runs(&instance.instance_id)
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "reattachment must not mint a second run");
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(
+            kernel
+                .store()
+                .list_effects(&instance.instance_id)
+                .expect("effects")
+                .iter()
+                .filter(|effect| effect.kind == "schema.coerce" && effect.status == "completed")
+                .count(),
+            1,
+            "the coerce round settles exactly once"
+        );
+        drop(instance);
+        assert!(
+            !durable_text_values(&sql)
+                .iter()
+                .any(|value| value.contains(CANARY)),
+            "the provider credential is absent from durable state after settlement"
+        );
+    }
+
+    /// EDGE-8: a multi-round agent turn loses its whole handle at EACH model
+    /// round's `NeedsIo` boundary. Every reattachment reissues the identical
+    /// round under that round's own idempotency identity; a tool executed
+    /// between rounds is not executed again by the reattachment; the turn
+    /// settles one run and one terminal effect; and the provider credential,
+    /// which signs only the in-memory request, is absent from durable state.
+    #[test]
+    fn durable_agent_model_rounds_survive_complete_handle_loss() {
+        use std::cell::Cell;
+        use whipplescript_kernel::harness_loop::{ToolCall, ToolOutcome, ToolSpec, ToolStatus};
+        use whipplescript_kernel::harness_model::MessagesApiClient;
+
+        const CANARY: &str = "canary-agent-secret-must-not-persist";
+        struct CountingLookup(Rc<Cell<usize>>);
+        impl ToolExecutor for CountingLookup {
+            fn execute(&self, call: &ToolCall) -> ToolOutcome {
+                assert_eq!(call.name, "lookup");
+                self.0.set(self.0.get() + 1);
+                ToolOutcome {
+                    status: ToolStatus::Ok,
+                    content: "lookup result".to_owned(),
+                }
+            }
+        }
+
+        let source = "workflow AgentRecovery\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let base = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            base.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let sql = base.sql;
+        let executions = Rc::new(Cell::new(0));
+        let ports = || DurableEffectPorts {
+            agent_model: Some(Box::new(MessagesApiClient::new(
+                CoerceProvider::Anthropic,
+                CANARY,
+                "claude-test",
+                "https://api.anthropic.com",
+                1024,
+                Some("agent-command-1".to_owned()),
+            ))),
+            agent_tools: Some(Box::new(CountingLookup(Rc::clone(&executions)))),
+            agent_tool_specs: Some(vec![ToolSpec {
+                name: "lookup".to_owned(),
+                description: "Look something up.".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } },
+                    "required": ["q"],
+                    "additionalProperties": false
+                }),
+            }]),
+            ..test_ports()
+        };
+        let create = |sql| {
+            DurableInstance::create(sql, source, "{}", "local/AgentRecovery", ports(), &[], &[])
+        };
+        let assert_no_canary = |sql: &_, at: &str| {
+            let leaked: Vec<_> = durable_text_values(sql)
+                .into_iter()
+                .filter(|value| value.contains(CANARY))
+                .collect();
+            assert!(leaked.is_empty(), "credential persisted {at}: {leaked:?}");
+        };
+        let next_round = |instance: &mut DurableInstance<_>, incoming| match instance
+            .step(incoming, TEST_NOW_MS)
+        {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected a model round, got {other:?}"),
+        };
+
+        // Round 1, then a complete handle loss at its boundary.
+        let mut instance = create(sql.clone()).expect("create");
+        let first = next_round(&mut instance, None);
+        assert!(first.url.ends_with("/v1/messages"), "{}", first.url);
+        let first_key = idempotency_header(&first);
+        drop(instance);
+        assert!(
+            durable_text_values(&sql)
+                .iter()
+                .any(|value| value.contains("Do the thing.")),
+            "the scan reaches durable turn state, so an absence is evidence"
+        );
+        assert_no_canary(&sql, "at the first boundary");
+
+        let mut instance = create(sql.clone()).expect("reattach round 1");
+        let replay = next_round(&mut instance, None);
+        assert_eq!(replay.url, first.url);
+        assert_eq!(replay.body, first.body);
+        assert_eq!(idempotency_header(&replay), first_key);
+
+        // The model asks for a tool; the turn runs it and yields round 2.
+        let tool_round = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "content": [{
+                    "type": "tool_use", "id": "call-1", "name": "lookup",
+                    "input": { "q": "the thing" }
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+        };
+        let second = next_round(&mut instance, Some(Ok(tool_round)));
+        assert_eq!(executions.get(), 1, "the tool ran once between rounds");
+        let second_key = idempotency_header(&second);
+        assert_ne!(second_key, first_key, "each round has its own identity");
+        assert!(
+            second.body.to_string().contains("lookup result"),
+            "round 2 carries the tool result"
+        );
+        drop(instance);
+        assert_no_canary(&sql, "at the second boundary");
+
+        // Round 2 survives its own handle loss without re-running the tool.
+        let mut instance = create(sql.clone()).expect("reattach round 2");
+        let replay = next_round(&mut instance, None);
+        assert_eq!(replay.url, second.url);
+        assert_eq!(replay.body, second.body);
+        assert_eq!(idempotency_header(&replay), second_key);
+        assert_eq!(executions.get(), 1, "reattachment did not re-run the tool");
+
+        let final_round = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "content": [{ "type": "text", "text": "did the thing" }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+        };
+        assert!(matches!(
+            instance.step(Some(Ok(final_round)), TEST_NOW_MS),
+            DurableStepOutcome::Terminal
+        ));
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let runs = kernel
+            .store()
+            .list_runs(&instance.instance_id)
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "reattachment must not mint a second run");
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(
+            kernel
+                .store()
+                .list_effects(&instance.instance_id)
+                .expect("effects")
+                .iter()
+                .filter(|effect| effect.kind == "agent.tell" && effect.status == "completed")
+                .count(),
+            1,
+            "the multi-round turn settles exactly once"
+        );
+        drop(instance);
+        assert_no_canary(&sql, "after settlement");
+        assert_eq!(executions.get(), 1);
     }
 
     /// Script hard-off Layer 2, seeding key (a) on the DO (S6d-6,

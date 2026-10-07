@@ -276,6 +276,7 @@ fn setup(case: &str, actor: &str) -> Fixture {
         ResolutionMemoryScope::new("home".into(), "target:path".into(), "compartment".into())
             .expect("scope");
     let mut command = HostActionCommand {
+        anchor: None,
         protocol: HOST_ACTION_PROTOCOL.into(),
         issuer: "product".into(),
         scope: "workspace".into(),

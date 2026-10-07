@@ -622,9 +622,12 @@ struct GaugeSpec {
     builtin: bool,
 }
 
-fn bar_from_ir(bar: &whipplescript_parser::IrGaugeBar) -> Option<BarSpec> {
-    let threshold = bar.threshold.parse::<f64>().ok()?;
-    Some(BarSpec {
+fn bar_from_ir(bar: &whipplescript_parser::IrGaugeBar) -> Result<BarSpec, String> {
+    let threshold = bar
+        .threshold
+        .parse::<f64>()
+        .map_err(|_| format!("declared bar threshold `{}` is not a number", bar.threshold))?;
+    Ok(BarSpec {
         chance_field: (bar.form == "chance").then(|| bar.subject.clone()),
         stat: (bar.form == "stat").then(|| bar.subject.clone()),
         ge: bar.op == ">=",
@@ -632,7 +635,7 @@ fn bar_from_ir(bar: &whipplescript_parser::IrGaugeBar) -> Option<BarSpec> {
     })
 }
 
-fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
+fn collect_gauge_specs(ir: &IrProgram) -> Result<Vec<GaugeSpec>, String> {
     // Keep the instrument fixed when a candidate changes its own grading
     // coerce. Share the baseline program for prompt and schema resolution.
     let judge_ir = std::sync::Arc::new(ir.clone());
@@ -640,9 +643,14 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
         .gauges
         .iter()
         .map(|gauge: &IrGauge| {
-            let bar = gauge.expect.as_ref().and_then(bar_from_ir);
+            let bar = gauge
+                .expect
+                .as_ref()
+                .map(bar_from_ir)
+                .transpose()
+                .map_err(|error| format!("gauge `{}`: {error}", gauge.name))?;
             let direction_up = bar.as_ref().map(|b| b.ge).unwrap_or(true);
-            GaugeSpec {
+            Ok(GaugeSpec {
                 name: gauge.name.clone(),
                 judge: match gauge.judge_kind.as_str() {
                     "exec" => JudgeSpec::Exec(gauge.judge_target.clone()),
@@ -658,9 +666,9 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
                 inputs: gauge.inputs.clone(),
                 direction_up,
                 builtin: false,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     for name in BUILTIN_GAUGES {
         specs.push(GaugeSpec {
             name: (*name).to_owned(),
@@ -673,7 +681,7 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
             builtin: true,
         });
     }
-    specs
+    Ok(specs)
 }
 
 // ---------------------------------------------------------------------------
@@ -4580,6 +4588,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 compile_failure_summary(&error)
             )
         })?;
+    let specs = collect_gauge_specs(&ir)?;
     let declared = declared_campaign_specs(&ir)?;
     let args = parse_improve_args(&options.args, &declared)?;
     let program_path = probe_path;
@@ -4615,7 +4624,6 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
     } else {
         None
     };
-    let specs = collect_gauge_specs(&ir);
     if specs.iter().all(|spec| spec.builtin) && !args.spec.repair {
         return Err(
             "no gauges declared; declare `gauge <name> { judge via ... }` before improving"
@@ -6989,7 +6997,7 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
                 compile_failure_summary(&error)
             )
         })?;
-    let specs = collect_gauge_specs(&ir);
+    let specs = collect_gauge_specs(&ir)?;
     let mut improve_store = open_improve_store()?;
     let scenario = improve_store
         .get_scenario(&scenario_name)
@@ -7246,7 +7254,7 @@ fn run_settle(options: &CliOptions) -> Result<ExitCode, String> {
                 compile_failure_summary(&error)
             )
         })?;
-    let specs = collect_gauge_specs(&ir);
+    let specs = collect_gauge_specs(&ir)?;
     let spec = specs
         .iter()
         .find(|spec| spec.name == gauge_name)
@@ -7680,10 +7688,16 @@ pub(crate) fn ambient_score_after_dev(
     if ir.gauges.is_empty() {
         return;
     }
+    let specs = match collect_gauge_specs(ir) {
+        Ok(specs) => specs,
+        Err(error) => {
+            eprintln!("{error} (ambient gauge scoring skipped)");
+            return;
+        }
+    };
     let Ok(store) = SqliteStore::open(store_path) else {
         return;
     };
-    let specs = collect_gauge_specs(ir);
     // A malformed price table must not break the dev loop (ambient is
     // silent-skip by design), but it should not be silent either.
     let prices = PriceTable::load(provider_config_paths).unwrap_or_else(|error| {
@@ -8004,6 +8018,66 @@ mod tests {
             unavailable.tags,
             vec!["edit-diff-unavailable", "edit-account-unreported"]
         );
+    }
+
+    fn declared_bar_program(expect: &str) -> IrProgram {
+        let source = format!(
+            "workflow G\noutput result R\nclass R {{ v string }}\nclass Ticket {{ title string }}\n\
+             gauge quality {{\n  judge via exec \"score\"\n{expect}\n}}\n\
+             rule j\n  when Ticket as t\n=> {{ complete result {{ v t.title }} }}\n"
+        );
+        let compiled = whipplescript_parser::compile_program(&source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        compiled.ir.expect("valid declared gauge")
+    }
+
+    #[test]
+    fn declared_bar_unparseable_threshold_refuses_gauge_collection() {
+        let mut ir = declared_bar_program("  expect P(ok) at least 0.9");
+        for threshold in ["not-a-number", ""] {
+            ir.gauges[0].expect.as_mut().unwrap().threshold = threshold.to_owned();
+            let error = collect_gauge_specs(&ir).expect_err("a declared bar cannot disappear");
+            assert_eq!(
+                error,
+                format!("gauge `quality`: declared bar threshold `{threshold}` is not a number")
+            );
+        }
+    }
+
+    #[test]
+    fn declared_bar_invalid_ambient_scoring_does_not_open_the_store() {
+        let mut ir = declared_bar_program("  expect P(ok) at least 0.9");
+        ir.gauges[0].expect.as_mut().unwrap().threshold = "broken".to_owned();
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("missing.sqlite");
+        ambient_score_after_dev(&store, "instance", &ir, true, &[], "hash");
+        assert!(
+            !store.exists(),
+            "invalid gauges must not open storage or record scores"
+        );
+    }
+
+    #[test]
+    fn declared_bar_missing_and_valid_thresholds_keep_their_meaning() {
+        let absent = collect_gauge_specs(&declared_bar_program("")).unwrap();
+        assert!(absent[0].bar.is_none());
+        assert!(absent[0].direction_up);
+        for (expect, chance, stat, ge, threshold) in [
+            ("  expect P(ok) at least 0.9", Some("ok"), None, true, 0.9),
+            ("  expect mean at most 3", None, Some("mean"), false, 3.0),
+        ] {
+            let specs = collect_gauge_specs(&declared_bar_program(expect)).unwrap();
+            let bar = specs[0].bar.as_ref().expect("declared hard bar retained");
+            assert_eq!(bar.chance_field.as_deref(), chance);
+            assert_eq!(bar.stat.as_deref(), stat);
+            assert_eq!(bar.ge, ge);
+            assert_eq!(bar.threshold, threshold);
+            assert_eq!(specs[0].direction_up, ge);
+        }
     }
 
     fn spec_quality_no_bar(name: &str) -> GaugeSpec {

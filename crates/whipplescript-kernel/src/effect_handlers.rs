@@ -4105,10 +4105,10 @@ pub fn run_memory_capability(
 /// [`CustodyTransport`] — native's unix socket and the in-process transport both
 /// call this, so `seal` behaves identically on either.
 ///
-/// Only `custody.wrap` is handled. `custody.unwrap` is deliberately absent:
-/// opening is DR-0074 §3's `open` region, which is Slice 2 and is governed by a
-/// type-narrowed grant. A provider that could unwrap before the region existed
-/// would be the over-grant this whole record removes.
+/// `custody.wrap` returns the envelope. `custody.unwrap` is DR-0074 §3's `open`:
+/// it returns the envelope's identity as its output and holds the plaintext in
+/// [`crate::opened_plaintext`] for the region that consumes it, so no record
+/// ever carries it.
 ///
 /// The wrapping key never reaches whip. What comes back is the envelope, and
 /// only its identity and non-secret metadata cross into the effect's output —
@@ -4252,11 +4252,7 @@ pub fn open_sealed_effect_inputs(
     // narrowed by the credential match below: an envelope under a credential
     // this effect was not granted is left sealed rather than opened.
     fn envelope_of(value: &Value) -> Option<Envelope> {
-        let object = value.as_object()?;
-        for field in ["credential", "context", "nonce_b64", "ciphertext_b64"] {
-            object.get(field)?.as_str()?;
-        }
-        serde_json::from_value(value.clone()).ok()
+        Envelope::recognize(value)
     }
 
     let mut failure: Option<String> = None;
@@ -4413,33 +4409,88 @@ pub fn run_custody_capability(
                 },
             }
         }
-        // DR-0074 §3 says `open`'s output is TRANSIENT — "available to its
-        // `after` block, never written to the event". That cannot be built on
-        // the current execution model, and the reason is checkable rather than
-        // a matter of effort: `rule_lowering::effect_binding_value` resolves
-        // EVERY `after` binding out of `facts.value_json`, so a durable fact is
-        // the only channel an effect output has to its own `after` block.
-        //
-        // The two things this handler could return are both wrong. Producing
-        // the plaintext writes it into that fact, which is precisely the §4
-        // violation the record exists to prevent. Producing envelope identity
-        // instead satisfies §4 but LIES: the checker types the binding at the
-        // `into <Type>` class, so `patient.notes` would read null at run time
-        // with nothing reporting it.
-        //
-        // So it refuses, for the same reason the hosted path refuses in Slice 1
-        // — a security operation must not appear to have happened. The
-        // custodian's own `unwrap` is exercised by `whipplescript-custodian`'s
-        // tests; what is missing is a non-durable channel from an effect's
-        // result to its `after` block, and that is a decision DR-0074 does not
-        // contain rather than code nobody has written.
-        Some("custody.unwrap") => fail(
-            "custody unwrap: opening is compiled and checked, but not executable — an `after` \
-             binding resolves from a durable fact, so an open's plaintext has no non-durable \
-             channel to its region (DR-0074 §3's transient output). Refusing rather than \
-             recording plaintext or binding an envelope the checker types as its payload."
-                .to_owned(),
-        ),
+        // DR-0074 §3, amended 2026-08-30: `open`'s plaintext is never written
+        // to a record. The custodian's answer goes into the process-local slot
+        // keyed by this effect's id, and what the effect PRODUCES — what its
+        // terminal fact durably records — is the envelope's identity, exactly
+        // the manifest's output schema. The rule lowering binds the region's
+        // `as <alias>` from the slot (`opened_plaintext::alias_value`), and
+        // refuses to lower it if this process does not hold the entry, so the
+        // identity is never mistaken for the payload the checker typed.
+        Some(crate::opened_plaintext::OPEN_CAPABILITY) => {
+            let input = json_from_str(&effect.input_json);
+            let Some(credential) = input.get("credential").and_then(Value::as_str) else {
+                return fail("custody unwrap: no credential named".to_owned());
+            };
+            let payload_type = input
+                .get("payload_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let envelope = match input
+                .get("envelope")
+                .cloned()
+                .map(serde_json::from_value::<whipplescript_custody::Envelope>)
+            {
+                Some(Ok(envelope)) => envelope,
+                Some(Err(_)) | None => {
+                    return fail(
+                        "custody unwrap: the opened value is not a sealed envelope".to_owned(),
+                    )
+                }
+            };
+            // The grant names a credential; an envelope sealed under another
+            // one is not this open's to open, whatever the custodian would say.
+            if envelope.credential.as_str() != credential {
+                return fail(format!(
+                    "custody unwrap: the envelope was sealed under `{}`, not `{credential}`",
+                    envelope.credential.as_str()
+                ));
+            }
+            let credential = match CredentialName::new(credential) {
+                Ok(name) => name,
+                Err(error) => return fail(format!("custody unwrap: {error}")),
+            };
+            let context = envelope.context.clone();
+            let call = CustodyCall::new(
+                UseAttribution {
+                    run_id: run_id.to_owned(),
+                    actor: None,
+                    effect_key: Some(effect.effect_id.clone()),
+                },
+                CustodyOp::Unwrap {
+                    credential: credential.clone(),
+                    envelope,
+                    context: context.clone(),
+                },
+            );
+            let plaintext_b64 = match transport.call(call) {
+                Err(error) => return fail(format!("custody unwrap: transport: {error}")),
+                Ok(reply) => match reply.outcome {
+                    Err(error) => return fail(format!("custody unwrap refused: {error}")),
+                    Ok(CustodyOk::Unwrapped { plaintext_b64, .. }) => plaintext_b64,
+                    Ok(other) => {
+                        return fail(format!(
+                            "custody unwrap: custodian answered with a non-unwrap result: {other:?}"
+                        ))
+                    }
+                },
+            };
+            let Some(bytes) = crate::exec_http::base64_decode(&plaintext_b64) else {
+                return fail("custody unwrap: payload is not base64".to_owned());
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                return fail("custody unwrap: payload is not UTF-8".to_owned());
+            };
+            // `seal` wrapped the value's JSON, so the payload parses back into
+            // the value the author sealed rather than a string of it.
+            crate::opened_plaintext::hold(&effect.effect_id, json_from_str(&text));
+            CapabilityOutcome::Produced(json!({
+                "credential": credential.as_str(),
+                "context": context,
+                "payload_type": payload_type,
+            }))
+        }
         other => fail(format!(
             "custody-provider does not handle capability `{}`",
             other.unwrap_or_default()
@@ -5155,28 +5206,72 @@ mod custody_capability_tests {
         );
     }
 
-    #[test]
-    fn the_custody_provider_refuses_to_unwrap_rather_than_leak_or_lie() {
-        // The `open` region is now compiled and checked, but opening is still
-        // not EXECUTABLE, and the refusal says so instead of guessing.
-        //
-        // `rule_lowering::effect_binding_value` resolves every `after` binding
-        // out of `facts.value_json`, so a durable fact is the only channel an
-        // effect result has to its own `after` block. Producing the plaintext
-        // would write it there — the §4 violation the record exists to prevent.
-        // Producing envelope identity instead would satisfy §4 and LIE, because
-        // the checker types that binding at the `into <Type>` class, so
-        // `patient.notes` would read null with nothing reporting it.
-        let transport = custodian_with_wrapping_key();
-        let outcome = run_custody_capability(
-            &transport,
-            &effect("custody.unwrap", r#"{"credential":"phi_key"}"#),
-            "run-1",
+    fn open_effect(envelope: &Value, credential: &str) -> ClaimableEffect {
+        let mut claimable = effect(
+            "custody.unwrap",
+            &json!({
+                "credential": credential,
+                "envelope": envelope,
+                "payload_type": "PatientRecord",
+            })
+            .to_string(),
         );
-        let CapabilityOutcome::Failed { message, .. } = outcome else {
-            panic!("custody.unwrap must refuse until the transient channel exists");
+        claimable.effect_id = format!("effect-open-{credential}-{}", std::process::id());
+        claimable
+    }
+
+    #[test]
+    fn open_produces_the_envelope_identity_and_holds_the_plaintext() {
+        // DR-0074 §3, amended: what an open PRODUCES is what its terminal fact
+        // records, so it is the envelope's identity — the manifest's output
+        // schema — and the plaintext goes to the process-local slot its region
+        // reads, never into the outcome.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let open = open_effect(&envelope, "phi_key");
+        let CapabilityOutcome::Produced(value) = run_custody_capability(&transport, &open, "run-1")
+        else {
+            panic!("the open must settle");
         };
-        assert!(message.contains("no non-durable channel"), "{message}");
+        assert_eq!(
+            value,
+            json!({
+                "credential": "phi_key",
+                "context": "effect-seal-1",
+                "payload_type": "PatientRecord",
+            })
+        );
+        assert!(!value.to_string().contains("chest pain"));
+        assert!(crate::opened_plaintext::is_held(&open.effect_id));
+        crate::opened_plaintext::release([&open.effect_id]);
+    }
+
+    #[test]
+    fn open_refuses_an_envelope_sealed_under_another_credential() {
+        // The grant names a credential; an envelope under any other one is not
+        // this open's to open, whatever the custodian would answer.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let open = open_effect(&envelope, "billing_key");
+        let CapabilityOutcome::Failed { message, .. } =
+            run_custody_capability(&transport, &open, "run-1")
+        else {
+            panic!("a mismatched credential must refuse");
+        };
+        assert!(message.contains("sealed under `phi_key`"), "{message}");
+        assert!(!crate::opened_plaintext::is_held(&open.effect_id));
+    }
+
+    #[test]
+    fn open_refuses_a_value_that_is_not_an_envelope() {
+        let transport = custodian_with_wrapping_key();
+        let open = open_effect(&json!({ "notes": "plain" }), "phi_key");
+        let CapabilityOutcome::Failed { message, .. } =
+            run_custody_capability(&transport, &open, "run-1")
+        else {
+            panic!("a non-envelope must refuse");
+        };
+        assert!(message.contains("not a sealed envelope"), "{message}");
     }
 
     #[test]

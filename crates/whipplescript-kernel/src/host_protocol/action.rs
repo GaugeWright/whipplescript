@@ -57,6 +57,25 @@ pub struct ActionCause {
     pub digest: String,
 }
 
+/// The held claim an action's acts served (DR-0207). `authority` names the
+/// system that granted and holds the claim, `claim_ref` that system's immutable
+/// claim record. The runtime records it as the issuer supplied it under its
+/// signature; that the claim was live and held by the executor at admission is
+/// the admission verifier's to establish, never this structural validator's.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionAnchor {
+    pub authority: String,
+    pub claim_ref: String,
+}
+
+impl ActionAnchor {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        nonempty("anchor authority", &self.authority)?;
+        nonempty("anchor claim", &self.claim_ref)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionProvenance {
@@ -108,6 +127,12 @@ pub struct HostActionCommand {
     pub provenance: ActionProvenance,
     pub inputs: BTreeMap<String, ActionInput>,
     pub resources: BTreeMap<String, ActionResource>,
+    /// The held claim the action serves (DR-0207). Absent means no claim was
+    /// held, and stays absent: the runtime never infers one. Omitted when
+    /// absent, so an unanchored command's signing bytes and fingerprint are
+    /// exactly those of a command that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ActionAnchor>,
 }
 
 impl HostActionCommand {
@@ -130,6 +155,9 @@ impl HostActionCommand {
         }
         self.policy.validate()?;
         self.provenance.validate()?;
+        if let Some(anchor) = &self.anchor {
+            anchor.validate()?;
+        }
         for (name, input) in &self.inputs {
             nonempty("action input name", name)?;
             nonempty("action input handle", &input.handle)?;
@@ -312,11 +340,18 @@ pub struct ActionAdmissionReceipt {
     pub instance_ref: String,
     #[serde(deserialize_with = "super::action_wire::Position::deserialize")]
     pub admitted_at: PinnedPosition,
+    /// The admitted command's anchor, repeated so a reader of the receipt alone
+    /// sees the claim the run served (DR-0207). Present exactly when the
+    /// command carried one; omitted otherwise, so an unanchored receipt is
+    /// byte-identical to one that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ActionAnchor>,
 }
 
 impl ActionAdmissionReceipt {
     pub fn validate_for(&self, command: &HostActionCommand) -> Result<(), ProtocolError> {
         if self.protocol != HOST_ACTION_PROTOCOL
+            || self.anchor != command.anchor
             || self.fingerprint != command.fingerprint()?
             || self.instance_ref != command.instance_ref()?
             || self.admitted_at.instance_ref != self.instance_ref
@@ -377,6 +412,7 @@ pub(crate) mod tests {
 
     pub(crate) fn command() -> HostActionCommand {
         HostActionCommand {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             issuer: "product".into(),
             scope: "workspace:1".into(),
@@ -680,6 +716,7 @@ pub(crate) mod tests {
         let cmd = command();
         let instance_ref = cmd.instance_ref().unwrap();
         let receipt = ActionAdmissionReceipt {
+            anchor: None,
             protocol: HOST_ACTION_PROTOCOL.into(),
             fingerprint: cmd.fingerprint().unwrap(),
             instance_ref: instance_ref.clone(),

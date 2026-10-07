@@ -107,18 +107,19 @@ pub fn verify_contract_registry_platform_vocabulary(
         {
             continue;
         }
-        let Some(family) = construct.get("construct_family").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(lowering_target) = construct.get("lowering_target").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(scope) = construct.get("scope").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(keyword) = construct.get("keyword").and_then(Value::as_str) else {
-            continue;
-        };
+        // Registry rows are normalized registrations: manifest defaults have
+        // already been materialized by the producer. Missing coordinates must
+        // not bypass the vocabulary and authorability checks below.
+        let family = required_json_string(construct, "construct_family", &construct_label)?;
+        let lowering_target = required_json_string(construct, "lowering_target", &construct_label)?;
+        let scope = required_json_string(construct, "scope", &construct_label)?;
+        let keyword = required_json_string(construct, "keyword", &construct_label)?;
+        let (family, lowering_target, scope, keyword) = (
+            family.as_str(),
+            lowering_target.as_str(),
+            scope.as_str(),
+            keyword.as_str(),
+        );
         let Some(lowering) = PLATFORM_CONSTRUCT_CATALOG.lowering(lowering_target) else {
             return Err(format!(
                 "{construct_label}.lowering_target uses unsupported construct lowering `{lowering_target}`"
@@ -2883,6 +2884,31 @@ mod registry_vocabulary_refusal_tests {
     #[test]
     fn a_legitimate_package_construct_is_admitted() {
         verify(json!([package_construct()]), json!([])).expect("must admit");
+    }
+
+    #[test]
+    fn normalized_construct_coordinates_cannot_be_omitted_or_malformed() {
+        for field in ["construct_family", "lowering_target", "scope", "keyword"] {
+            let expected = format!("registry.constructs[0] must have non-empty `{field}` string");
+            let mut missing = package_construct();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_eq!(reason(json!([missing]), json!([])), expected);
+            for malformed in [
+                json!(null),
+                json!(false),
+                json!(7),
+                json!([]),
+                json!({}),
+                json!(""),
+                json!(" "),
+            ] {
+                let mut construct = package_construct();
+                construct[field] = malformed;
+                assert_eq!(reason(json!([construct]), json!([])), expected);
+            }
+        }
+        verify(json!([package_construct()]), json!([]))
+            .expect("complete registry must still admit");
     }
 
     #[test]
