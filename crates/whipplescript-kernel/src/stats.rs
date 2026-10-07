@@ -49,8 +49,9 @@ use whipplescript_parser::IrEffectKind;
 ///
 /// This is the repository's one implementation of that rule. `whip improve`'s
 /// `TurnUsage` delegates here rather than keeping a second copy — DR-0118 asks
-/// for reuse, and the hosted `project_usage` normalises to the opposite
-/// convention, which is a divergence the provider-contract tracker owns.
+/// for reuse. The hosted `project_usage` reports the inclusive convention, as a
+/// projection of these buckets rather than a second parse (DR-0205, the
+/// provider contract).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageBuckets {
     pub input_uncached: i64,
