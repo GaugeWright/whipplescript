@@ -11,9 +11,9 @@ theme:
   name: material
   logo: assets/logo.svg
   favicon: assets/favicon.svg
-  font:
-    text: IBM Plex Serif
-    code: Inconsolata
+  # Both faces are self-hosted in docs/assets/brand.css (GaugeWright Chrome for
+  # text, Commit Mono for code), so Material fetches nothing from Google Fonts.
+  font: false
   palette:
     # Navy-led by default (ecosystem-aligned); light is a toggle.
     - scheme: slate

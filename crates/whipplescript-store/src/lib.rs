@@ -313,7 +313,7 @@ pub enum StoreError {
     /// will print once to stderr and carry on past. That is right for a race
     /// and for a per-attempt refusal like "run is not running". It is wrong for
     /// a failure that is not a refusal at all, which is what
-    /// [`StoreError::Invariant`] now carries.
+    /// [`StoreError::Fault`] now carries.
     Conflict(String),
     /// Something broke. This is not a refusal, and looking again will not help.
     ///

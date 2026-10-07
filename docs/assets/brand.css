@@ -1,18 +1,20 @@
 /* WhippleScript docs — the GaugeWright colour scheme (navy ground, blue accent)
-   and its two text faces (GaugeWright DR-0072): GaugeWright Chrome for
-   headings, nav and chrome; IBM Plex Serif for body copy, because documentation
-   is read at length.
+   and its faces. GaugeWright Chrome carries every word of the documentation —
+   body copy, headings, navigation and chrome — and Commit Mono carries code.
+   IBM Plex Serif is used only for message text in a chat log (GaugeWright
+   DR-0245), and these docs render no chat log, so they do not load it.
 
-   The prose face is not imported here: `theme.font.text` in mkdocs.yml is set to
-   IBM Plex Serif, so Material emits the single Google Fonts request for it.
+   Both faces are self-hosted below and `theme.font` in mkdocs.yml is `false`,
+   so Material makes no Google Fonts request at all.
    GaugeWright Chrome is a subset of Erewhon, renamed
    because the OFL reserves the upstream name for unmodified builds; see
    fonts/OFL-GaugeWrightChrome.txt.
    The name is ecosystem-wide, not repository-local: one subset, one name, one
    owner, per the GaugeWright brand specification. It is not on Google Fonts and is
-   self-hosted below, regular and italic only — no bold ships, so every chrome
-   selector Material renders bold is reset to 400 rather than left to synthesise
-   a faux bold. */
+   self-hosted below, regular and italic only — no bold ships, so every selector
+   Material renders bold, semantic strong included, is held at 400 rather than
+   left to synthesise a faux bold. Emphasis comes from size, spacing and colour.
+   The font files are byte copies of those GaugeWright's tools/docs-theme owns. */
 
 @font-face {
   font-family: "GaugeWright Chrome";
@@ -54,18 +56,26 @@
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
+/* Commit Mono is a variable face (200-700), so code may still be bold. See
+   fonts/OFL-CommitMono.txt. */
+@font-face {
+  font-family: "CommitMono";
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url("fonts/commit-mono-v1.143.woff2") format("woff2");
+}
 
 :root {
   --ws-navy: #0e2d50;
   --ws-blue: #1f61c4;
   --ws-chrome: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-  --ws-text: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   /* --ws-serif keeps its name but points at the chrome face again. */
   --ws-serif: var(--ws-chrome);
-  /* Body copy too, not only the headings. One family carries everything a
-     person reads or operates, so the prose stops falling back to Material's
-     own sans. */
-  --md-text-font: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  /* Material's whole theme reads these two, so body copy, search, footer and
+     every other surface take the chrome face and code takes Commit Mono. */
+  --md-text-font: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --md-code-font: "CommitMono", "Commit Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
 /* Match material's own two-attribute selector (scheme + primary=black) so our
@@ -82,37 +92,11 @@ body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
   --md-typeset-a-color: #6aa3ff;
 }
 
-/* Headings and every piece of chrome a reader navigates by: the header title
-   and topic, the sidebar titles and links, and the top-level tabs. Without the
-   nav and tab links the split would only reach headings, and most navigation
-   text would stay on the prose face. */
-.md-typeset h1,
-.md-typeset h2,
-.md-typeset h3,
-.md-typeset h4,
-.md-typeset h5,
-.md-typeset h6,
-.md-header,
-.md-header__title,
-.md-header__topic,
-.md-nav,
-.md-nav__title,
-.md-nav__link,
-.md-tabs,
-.md-tabs__link,
-/* Operated or scanned, so chrome — these were reading in the prose face
-   because --md-text-font sets the whole theme and only some of the chrome had
-   been claimed back. A search field, a result label, a footer link and a
-   repository label are all glanced at, never read at length. */
-.md-search__input,
-.md-search-result__title,
-.md-search-result__meta,
-.md-footer,
-.md-source,
-.md-typeset .md-button {
-  font-family: var(--ws-serif);
-  /* Backstop for anything Material bolds through a more specific selector than
-     the reset below: a missing weight is declined, never faked. */
+/* The chrome face ships at 400 only. A missing weight is declined, never
+   faked: font-synthesis is inherited, so this reaches every element. */
+body,
+input,
+button {
   font-synthesis-weight: none;
 }
 .md-typeset h1,
@@ -121,12 +105,25 @@ body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
   font-weight: 400;
   letter-spacing: -0.01em;
 }
-/* The chrome face ships at 400 only. These are the selectors Material renders
-   bold, so each is held at 400 to keep the browser from synthesising one. */
+/* Everything Material renders bold in the chrome face, semantic strong and b
+   included, is held at 400. Code keeps its weights: Commit Mono ships them. */
+.md-typeset strong,
+.md-typeset b,
+.md-typeset th,
+.md-typeset table:not([class]) th,
+.md-typeset dt,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6,
+.md-typeset .admonition-title,
+.md-typeset summary,
+.md-typeset .md-button,
 .md-header__title,
 .md-header__topic,
 .md-nav__title,
 .md-nav__link,
-.md-tabs__link {
+.md-tabs__link,
+.md-search-result__title,
+.md-source__repository {
   font-weight: 400;
 }

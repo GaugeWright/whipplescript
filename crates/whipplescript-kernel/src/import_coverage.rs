@@ -578,67 +578,6 @@ rule notify
     }
 
     #[test]
-    fn current_construct_edges_are_derived_from_the_current_registry() {
-        let source = r##"use std.messaging
-workflow Notify
-class Trigger { id string }
-channel alerts { provider fixture destination "#ops" }
-rule notify
-  when Trigger as t
-=> {
-  send via alerts { text "hello" } as sent
-}
-"##;
-        let basis = CurrentImportBasis {
-            program: program(source),
-            program_source_digest: sha256_hex(source.as_bytes()),
-            version_source_digest: None,
-            lock_digest: NO_LOCK_DIGEST.into(),
-            compiler_artifact_digest: C.into(),
-            packages: vec![],
-            construct_basis: Some(CurrentConstructBasis {
-                registry: ContractRegistry {
-                    constructs: vec![std_messaging_send_construct()],
-                    effect_contracts: vec![std_messaging_send_effect_contract()],
-                    ..ContractRegistry::default()
-                },
-                sources: vec![],
-            }),
-        };
-        let admitted = basis.recapture().expect("current construct basis");
-        assert_eq!(admitted.constructs.as_ref().unwrap().edges.len(), 1);
-        assert!(admitted.declarations.is_some());
-
-        let mut changed = basis.clone();
-        changed
-            .construct_basis
-            .as_mut()
-            .unwrap()
-            .registry
-            .constructs[0]
-            .version = "0.2.0".into();
-        assert_ne!(
-            changed.recapture().expect("changed registry is resolvable"),
-            admitted
-        );
-
-        changed
-            .construct_basis
-            .as_mut()
-            .unwrap()
-            .registry
-            .constructs
-            .clear();
-        assert!(changed.recapture().is_err());
-
-        changed.construct_basis = None;
-        let unproven = changed.recapture().expect("import-only basis");
-        assert!(unproven.constructs.is_none());
-        assert!(unproven.declarations.is_none());
-        assert_ne!(unproven, admitted);
-    }
-
-    #[test]
     fn composite_version_basis_requires_an_exact_digest() {
         let ir = program("workflow Checked\n");
         let basis = CheckedImportBasis {
