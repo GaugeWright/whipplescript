@@ -11,6 +11,9 @@ use super::{
     FlowingGateVerdict, FlowingUnitOutcome, ReleaseFlowingAttemptOutcome,
     RetainFlowingAttemptOutcome,
 };
+use crate::branches::flowing_coverage::{
+    FlowingCoveragePremises, RecordCoveragePremisesOutcome, HOME_COVERAGE_DOMAIN,
+};
 use crate::branches::flowing_fence;
 use crate::branches::flowing_fence::FlowingSourceKind;
 use crate::branches::{BranchStatus, BranchStore, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE};
@@ -423,6 +426,28 @@ fn ancestor(connection: &Connection, older: &str, newer: &str) -> StoreResult<bo
         cursor = BranchStore::cut_by_id(connection, &id)?.and_then(|cut| cut.parent_cut_id);
     }
     Ok(false)
+}
+
+pub(crate) fn read_coverage_premises(
+    connection: &Connection,
+) -> StoreResult<Option<FlowingCoveragePremises>> {
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT premises_json FROM flowing_coverage_premises WHERE domain = ?1",
+            [HOME_COVERAGE_DOMAIN],
+            |row| row.get(0),
+        )
+        .optional()?;
+    json.map(|json| {
+        let premises: FlowingCoveragePremises = serde_json::from_str(&json)?;
+        if premises.invalid_field().is_some() {
+            return Err(StoreError::Conflict(
+                "flowing coverage premises are malformed".into(),
+            ));
+        }
+        Ok(premises)
+    })
+    .transpose()
 }
 
 impl FlowingAdmissions for BranchStore {
@@ -950,6 +975,13 @@ impl FlowingAdmissions for BranchStore {
         if !crate::branches::flowing_holders::matches_certificate(&holders, &certificate) {
             return Ok(Refused(R::HolderChanged));
         }
+        if let Err(refusal) = crate::branches::flowing_coverage::check(
+            certificate.coverage.as_ref(),
+            read_coverage_premises(&tx)?.as_ref(),
+            &request.candidate_manifest_hash,
+        )? {
+            return Ok(Refused(refusal));
+        }
         let Some(pin) = read_attempt_pin(&tx, &request.op_id)? else {
             return Ok(Refused(R::AttemptPinMissing));
         };
@@ -1090,6 +1122,31 @@ impl FlowingAdmissions for BranchStore {
     ) -> StoreResult<Option<FlowingCancelReceipt>> {
         read_cancellation(&self.connection, "admission_op_id", admission_op_id)
     }
+
+    fn record_flowing_coverage_premises(
+        &mut self,
+        premises: &FlowingCoveragePremises,
+    ) -> StoreResult<RecordCoveragePremisesOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = read_coverage_premises(&tx)?;
+        let outcome =
+            crate::branches::flowing_coverage::record_outcome(existing.as_ref(), premises);
+        if let RecordCoveragePremisesOutcome::Recorded(next) = &outcome {
+            tx.execute(
+                "INSERT INTO flowing_coverage_premises (domain, premises_json) VALUES (?1, ?2) \
+                 ON CONFLICT(domain) DO UPDATE SET premises_json = excluded.premises_json",
+                params![HOME_COVERAGE_DOMAIN, serde_json::to_string(next)?],
+            )?;
+            tx.commit()?;
+        }
+        Ok(outcome)
+    }
+
+    fn flowing_coverage_premises(&self) -> StoreResult<Option<FlowingCoveragePremises>> {
+        read_coverage_premises(&self.connection)
+    }
 }
 
 #[cfg(test)]
@@ -1102,6 +1159,9 @@ mod tests {
     };
     use crate::branches::flowing_parking::{
         FlowingParkOutcome, FlowingParkRefusal, FlowingParking, ParkFlowingUnit,
+    };
+    use crate::branches::flowing_sources::{
+        FlowingSources, ReleasePrivateCut, ReleasePrivateCutOutcome,
     };
     use crate::branches::{Branches, CreateBranch, CutRecord};
     use crate::source_review::{ReviewError, ReviewStore, SourceKind};
@@ -1222,6 +1282,14 @@ mod tests {
                     ('unit-b', 'basis-b', '[{\"cut_id\":\"source\",\"change_id\":\"change\",\"path\":\"b\",\"before\":null,\"after\":\"b\"}]', 't2');",
             )
             .unwrap();
+        assert!(matches!(
+            store
+                .record_flowing_coverage_premises(
+                    &crate::branches::flowing_coverage::tests::premises()
+                )
+                .unwrap(),
+            crate::branches::flowing_coverage::RecordCoveragePremisesOutcome::Recorded(_)
+        ));
         for unit_id in ["unit-a", "unit-b"] {
             let attempt = request(unit_id, "fixture");
             store
@@ -1246,6 +1314,10 @@ mod tests {
             policy_digest: "sha256:fixture-policy".into(),
             rules_digest: "sha256:fixture-rules".into(),
             graph_coverage_digest: "sha256:fixture-coverage".into(),
+            coverage: Some(crate::branches::flowing_coverage::tests::basis_for(
+                &crate::branches::flowing_coverage::tests::premises(),
+                &request.candidate_manifest_hash,
+            )),
             required_checks: vec!["full-workspace-bar".into()],
             checks: vec![FlowingGateCheck {
                 check_id: "full-workspace-bar".into(),
@@ -1671,6 +1743,62 @@ mod tests {
         let FlowingParkOutcome::Parked(receipt) = store.park_flowing_unit(&park).unwrap() else {
             panic!("expected parked receipt");
         };
+        let evidence =
+            crate::branches::flowing_parking_host::read_parking_evidence(&store, "park-a")
+                .unwrap()
+                .unwrap();
+        assert_eq!(evidence.unit_id, "unit-a");
+        assert_eq!(evidence.parked_holder_id, "park:repair-owner");
+        assert_eq!(evidence.resulting_eligibility_epoch, 1);
+        let wire = serde_json::to_vec(&evidence).unwrap();
+        assert!(!String::from_utf8_lossy(&wire).contains("\"intent\""));
+        assert!(!String::from_utf8_lossy(&wire).contains("\"principal\""));
+        assert_eq!(
+            crate::branches::flowing_parking_host::FlowingHostParkingEvidenceV1::decode(&wire)
+                .unwrap(),
+            evidence
+        );
+        let mut unknown: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        unknown["new_claim"] = serde_json::json!(true);
+        assert!(
+            crate::branches::flowing_parking_host::FlowingHostParkingEvidenceV1::decode(
+                &serde_json::to_vec(&unknown).unwrap()
+            )
+            .is_err()
+        );
+        let mut missing: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("former_holder_digest");
+        assert!(
+            crate::branches::flowing_parking_host::FlowingHostParkingEvidenceV1::decode(
+                &serde_json::to_vec(&missing).unwrap()
+            )
+            .is_err()
+        );
+        let mut stale: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        stale["resulting_eligibility_epoch"] = serde_json::json!(0);
+        let stale_error =
+            crate::branches::flowing_parking_host::FlowingHostParkingEvidenceV1::decode(
+                &serde_json::to_vec(&stale).unwrap(),
+            )
+            .unwrap_err();
+        assert!(format!("{stale_error:?}").contains("parking evidence shape is invalid"));
+        let mut bad_digest: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        bad_digest["request_digest"] = serde_json::json!("sha256:bad");
+        assert!(
+            crate::branches::flowing_parking_host::FlowingHostParkingEvidenceV1::decode(
+                &serde_json::to_vec(&bad_digest).unwrap()
+            )
+            .is_err()
+        );
+        assert!(crate::branches::flowing_parking_host::read_parking_evidence(&store, "").is_err());
+        assert!(
+            crate::branches::flowing_parking_host::read_parking_evidence(&store, "missing")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(receipt.former_holder.holder_cut_id, "source");
         assert_eq!(receipt.source_fence_after.eligibility_epoch, 1);
         assert_eq!(
@@ -1721,6 +1849,97 @@ mod tests {
                 .unwrap(),
             FlowingParkOutcome::AlreadyParked(receipt)
         );
+    }
+
+    #[test]
+    fn terminal_parking_keeps_the_source_cut_after_explicit_private_pin_release() {
+        let mut store = fixture();
+        assert!(matches!(
+            store
+                .park_flowing_unit(&park_request("park-a", "unit-a"))
+                .unwrap(),
+            FlowingParkOutcome::Parked(_)
+        ));
+        let release = ReleasePrivateCut {
+            pin_id: "pin",
+            released_by: "author",
+            reason: "all declared work transferred to parked holders",
+            released_at: "t5",
+        };
+        assert_eq!(
+            store.release_private_cut(release).unwrap(),
+            ReleasePrivateCutOutcome::HasDeclaredUnit
+        );
+        let mut park_b = park_request("park-b", "unit-b");
+        park_b.expected_eligibility_epoch = store
+            .flowing_source("twig")
+            .unwrap()
+            .unwrap()
+            .eligibility_epoch;
+        assert!(matches!(
+            store.park_flowing_unit(&park_b).unwrap(),
+            FlowingParkOutcome::Parked(_)
+        ));
+        assert_eq!(
+            store.release_private_cut(release).unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        assert_eq!(
+            store
+                .private_cut_pin("pin")
+                .unwrap()
+                .unwrap()
+                .released_at
+                .as_deref(),
+            Some("t5")
+        );
+        assert!(store.pinned_cuts("year-3000").unwrap().contains("source"));
+    }
+
+    #[test]
+    fn admitted_unit_keeps_its_source_cut_after_private_and_attempt_pin_release() {
+        let mut store = fixture();
+        // Isolate one unit so admission is the only durable source-cut root.
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_contribution_basis WHERE unit_id = 'unit-b'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM flowing_contributions WHERE unit_id = 'unit-b'",
+                [],
+            )
+            .unwrap();
+        let attempt = request("unit-a", "fixture");
+        pin_attempt(&mut store, &attempt);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .release_private_cut(ReleasePrivateCut {
+                    pin_id: "pin",
+                    released_by: "author",
+                    reason: "declared unit admitted",
+                    released_at: "t5",
+                })
+                .unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        // Model the later receipt reconciliation that releases the attempt pin.
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_attempt_pins SET released_at = 't6' WHERE op_id = 'fixture'",
+                [],
+            )
+            .unwrap();
+        assert!(store.pinned_cuts("year-3000").unwrap().contains("source"));
     }
 
     #[test]
@@ -2271,6 +2490,123 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+    }
+
+    #[test]
+    fn native_ref_rechecks_coverage_premises_inside_the_trunk_cas() {
+        use crate::branches::flowing_coverage::tests::{basis_for, premises};
+        use crate::branches::flowing_coverage::{
+            FlowingCoverageBasis, FlowingCoverageClaim, RecordCoveragePremisesOutcome,
+        };
+
+        let mut store = fixture();
+        let mut attempt = request("unit-a", "coverage-attempt");
+        pin_attempt(&mut store, &attempt);
+        let admit_with = |store: &mut BranchStore,
+                          attempt: &mut FlowingAdmissionRequest,
+                          coverage: Option<FlowingCoverageBasis>| {
+            let mut certificate = certificate_for(attempt);
+            certificate.coverage = coverage;
+            insert_gate_certificate(store, &certificate);
+            attempt.certificate_handle = certificate.handle().unwrap();
+            store.admit_flowing_prefix(attempt).unwrap()
+        };
+
+        // A certificate issued before coverage was bound cannot admit.
+        assert_eq!(
+            admit_with(&mut store, &mut attempt, None),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageUnavailable)
+        );
+
+        // Stale capture: the graph moved after the owner answered.
+        let answered = premises();
+        let captured = basis_for(&answered, &attempt.candidate_manifest_hash);
+        let mut moved = answered.clone();
+        moved.graph_epoch += 1;
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&moved).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        assert_eq!(
+            admit_with(&mut store, &mut attempt, Some(captured.clone())),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageStale {
+                premise: "graph"
+            })
+        );
+        assert_eq!(
+            store.record_flowing_coverage_premises(&answered).unwrap(),
+            RecordCoveragePremisesOutcome::Regressed { premise: "graph" }
+        );
+        // Recapturing the premises does not carry the earlier answer forward.
+        let mut recaptured = FlowingCoverageBasis::under(&moved).unwrap();
+        recaptured.scopes = captured.scopes.clone();
+        assert_eq!(
+            admit_with(&mut store, &mut attempt, Some(recaptured)),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageOwnerUnvalidated {
+                scope_id: "norm-relations@home".into(),
+                owner: "owner-a".into(),
+            })
+        );
+
+        // A no-edge query over an open roster with no identifiable owner.
+        let mut unowned = moved.clone();
+        unowned.roster_digest = "sha256:roster-unowned".into();
+        unowned.required_scopes[1].owners.clear();
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&unowned).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        let mut empty_query = basis_for(&unowned, &attempt.candidate_manifest_hash);
+        empty_query.scopes[1].claim = FlowingCoverageClaim::Complete {
+            examined_digest: "sha256:what-the-query-saw".into(),
+            edge_digest: "sha256:no-edges".into(),
+        };
+        assert_eq!(
+            admit_with(&mut store, &mut attempt, Some(empty_query)),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageScopeUnknown {
+                scope_id: "norm-relations@home".into()
+            })
+        );
+        assert!(store
+            .flowing_admission_receipt(&attempt.op_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+
+        // Current premises with every owner's answer at this graph admit.
+        let mut owned = unowned.clone();
+        owned.roster_digest = "sha256:roster-owned".into();
+        owned.required_scopes[1].owners = vec!["owner-a".into()];
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&owned).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        let current = basis_for(&owned, &attempt.candidate_manifest_hash);
+        assert!(matches!(
+            admit_with(&mut store, &mut attempt, Some(current)),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn native_malformed_coverage_premises_are_never_read_as_current() {
+        let store = fixture();
+        let mut malformed = crate::branches::flowing_coverage::tests::premises();
+        malformed.registry_digest = " ".into();
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_coverage_premises SET premises_json = ?1",
+                params![serde_json::to_string(&malformed).unwrap()],
+            )
+            .unwrap();
+        let error = store.flowing_coverage_premises().unwrap_err();
+        assert!(format!("{error:?}").contains("flowing coverage premises are malformed"));
     }
 
     #[test]

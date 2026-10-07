@@ -285,7 +285,19 @@ effect inputs and turn outputs never cross it.
 every retained firing. Each entry keeps its admitted program version, revision,
 firing identity and evaluated frontier. Result statuses distinguish `ready`,
 `waiting`, `failed`, `uncertain`, `not_selected` and `not_reached`; shared
-causes are normalized once and referenced by identity.
+causes are normalized once and referenced by identity. A cause the firing never
+observed is `unknown`, with no witnesses and `witnesses_complete: false`.
+
+Reasons refine a status without changing it. A waiting operation is
+`waiting_operation` unless its recorded effect row says more:
+`waiting_capacity` (held by a capacity limit), `waiting_backoff` (re-queued
+under a recorded `retry_after` gate), `missing_configuration` (no profile or
+provider binding) or `missing_authority` (an admission gate or capability grant
+refused it). `stale_support`, `inadequate_support` and `conflicted_support`
+appear only when the owning norm evaluator's assessment, taken at the same
+evaluated frontier, is joined onto the result; the result's `support` list then
+names the requirement, artifact and audience-filtered evidence. A validity
+observation count is never one of these verdicts.
 
 ### Action Result Explanation
 
@@ -296,7 +308,7 @@ instead of selecting the latest firing. The hosted equivalent is
 
 ```json
 {
-  "schema": "whipplescript.action-explanation-query.v1",
+  "schema": "whipplescript.action-explanation-query.v2",
   "instance_id": "ins_...",
   "query": {"result": "review", "firing": null},
   "outcome": {
@@ -328,7 +340,9 @@ observational and never authorizes work or retry.
 An action result can be waiting even after its return expression has a value,
 because the action must settle all work it started. When a bound direct child is
 the obstruction, `result.waiting_on` names that child's result and
-`next_action.code` is `inspect_result`. Following that result reaches the
+`next_action.code` is `inspect_result`. A capacity or backoff wait answers
+`await_operation`; missing configuration or authority answers
+`inspect_operation_block`, which names the operation and grants nothing. Following that result reaches the
 provider operation; the action boundary does not hide it behind a generic wait.
 
 

@@ -18,6 +18,7 @@ fn result(
         waiting_on: Vec::new(),
         cause_ids: Vec::new(),
         validity_observations: 0,
+        support: Vec::new(),
         source: vec![SourceReference {
             role: SourceRole::CallSite,
             action: Some("inspect".into()),

@@ -51,6 +51,7 @@ rule echo when InputReference as reference => { complete result { handle referen
         envelope(7, "product"),
     )
     .unwrap()
+    .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
     .with_compiler_artifact_digest(
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     );

@@ -480,9 +480,13 @@ pub enum HandoffContributionOutcome {
 pub enum ReleasePrivateCutOutcome {
     Released,
     AlreadyReleased,
+    /// At least one declaration on this pin has no handoff, admission, or
+    /// named parking disposition yet.
     HasDeclaredUnit,
     Missing,
-    Invalid { field: &'static str },
+    Invalid {
+        field: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

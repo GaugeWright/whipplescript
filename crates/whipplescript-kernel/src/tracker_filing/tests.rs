@@ -128,6 +128,7 @@ fn fixture_for_source(
         .expect("compile fixture workflow");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(policy(), 7))
         .expect("create governed fixture")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );

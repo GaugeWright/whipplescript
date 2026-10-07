@@ -2,6 +2,18 @@
 # Deep schema/codec correspondence, over the same vectors as the normal Rust test.
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+# Every --reports and --journey-dir check below validates with jsonschema. Run
+# by hand without it, the first one died in a Traceback only after a cargo
+# build, which reads as a broken contract rather than a missing package.
+python3 - <<'PY'
+try:
+    import jsonschema  # noqa: F401
+except Exception as exc:
+    raise SystemExit(
+        "python jsonschema package is required; run under `nix develop` or "
+        f"install `requirements-dev.txt`: {exc}"
+    )
+PY
 python3 scripts/check-host-action-contract.py
 cargo run --quiet -p whipplescript-kernel --example host_action_contract \
   | python3 scripts/check-host-action-contract.py --reports

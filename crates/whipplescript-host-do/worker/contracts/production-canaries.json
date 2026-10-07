@@ -3,10 +3,10 @@
   "owner": "whipplescript-src",
   "activation": {
     "orchestratorRepository": "whipplescript-src",
-    "enabledVariable": "GW_WHIPPLESCRIPT_PRODUCTION_WIRING_CANARIES_ENABLED",
+    "fleetJob": "production-wiring-canary",
     "infisicalPath": "/synthetics/wiring",
     "namespace": "whipplescript-production-wiring-canary",
-    "workflow": ".github/workflows/production-wiring-canary.yml"
+    "runner": "scripts/production-wiring-canary-job.sh"
   },
   "suites": [
     {
@@ -254,6 +254,24 @@
         "Synthetic line the peer holds, promoted once under a stable promotion identity, with a synthetic reservation grant"
       ],
       "cleanup": "The journey is written and tested (runNormEvidence) but not dispatched. When it runs it reuses only the dedicated synthetic ledger and stable signed invocation identities, so every run after the first is an exact retry; norm evidence is append-only, and it calls no delete, discard, restore or rollback route. A promotion moves only a line the peer holds, never a Home's trunk.",
+      "surfaces": [
+        "whip-runtime"
+      ]
+    },
+    {
+      "id": "host-actions",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-workflow-placement",
+      "contracts": [
+        "runtime.host.action.admit",
+        "runtime.host.action.execute"
+      ],
+      "requiredInfrastructure": [
+        "A deployment-owned WHIP_ACTION_TRUST binding pinning the synthetic action authority's P-256 public key; no deployed Worker sets one yet, so every action route refuses with 503",
+        "A synthetic action authority signing key held in the canary store, never in the contract, and a synthetic placement policy bootstrapped through runtime.host.policy"
+      ],
+      "cleanup": "Not yet written or dispatched. When it runs it admits one synthetic action under a stable request id on a dedicated synthetic placement, so every run after the first is an exact replay that appends nothing; action evidence is append-only and the journey calls no discard, restore or erase route.",
       "surfaces": [
         "whip-runtime"
       ]

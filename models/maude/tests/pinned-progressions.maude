@@ -69,3 +69,64 @@ search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
 --- reachable: the silent stall observed live in manual ch. 15.
 search [1] in WHIPPLESCRIPT-REACTIVE-PROGRESSION :
   init =>! region(f1, open(K:Cnt)) RESIDUAL:Cfg .
+
+--- WS-303: independent continuation queries read the present population.
+--- Coverage: removal changes exists from its true admission result to false.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(qExists, q0, false, original, N:Nat) REST:QCfg .
+--- Coverage: the SAME removal changes empty from false to true.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(qEmpty, q0, true, original, N:Nat) REST:QCfg .
+--- Coverage: addition changes count >= 2 from false to true; nonempty alone
+--- would not distinguish the admission population of one from two.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(qCountAtLeastTwo, q2, true, original, N:Nat) REST:QCfg .
+--- Coverage: trigger consumption preserves the payload and all three query
+--- observations occur after consumption and after the independent query
+--- population has become empty. Retained clocks prove both orderings.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qTrigger(false) qConsumed(D:Nat) qChanged(q1, q0, E:Nat)
+    qObserved(qExists, q0, false, original, A:Nat)
+    qObserved(qEmpty, q0, true, original, B:Nat)
+    qObserved(qCountAtLeastTwo, q0, false, original, C:Nat) REST:QCfg
+    such that D:Nat < A:Nat /\ D:Nat < B:Nat /\ D:Nat < C:Nat
+      /\ E:Nat < A:Nat /\ E:Nat < B:Nat /\ E:Nat < C:Nat .
+--- Coverage: two observations in one firing can see DIFFERENT populations.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(qExists, q1, true, original, A:Nat)
+    qChanged(q1, q0, B:Nat) qObserved(qEmpty, q0, true, original, C:Nat)
+    REST:QCfg such that A:Nat < B:Nat /\ B:Nat < C:Nat .
+--- Coverage: a population repair can restore the admission count without
+--- restoring trigger presence; this remains a current read, not re-admission.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qTrigger(false) qChanged(q1, q0, A:Nat)
+    qChanged(q0, q1, B:Nat) qObserved(qExists, q1, true, original, C:Nat)
+    REST:QCfg such that A:Nat < B:Nat /\ B:Nat < C:Nat .
+--- Coverage: unchanged population retains ordinary predicate results.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qUnchanged =>* qObserved(qExists, q1, true, original, A:Nat)
+    qObserved(qEmpty, q1, false, original, B:Nat)
+    qObserved(qCountAtLeastTwo, q1, false, original, C:Nat) REST:QCfg .
+--- Invariant: branch selection agrees with the population AT its observation,
+--- regardless of subsequent changes. It does not compare to the final world.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(K:QKind, C:QCount, R:Bool, V:QValue, N:Nat)
+    REST:QCfg such that R:Bool =/= qPredicate(K:QKind, C:QCount) .
+--- Invariant: a live query never replaces the retained trigger payload.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>* qObserved(K:QKind, C:QCount, R:Bool, later, N:Nat) REST:QCfg .
+--- Invariant: within this observation abstraction, false results do not
+--- strand a pending branch; no runtime completion claim is made here.
+search [1] in WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY :
+  qInit =>! qPending(K:QKind) REST:QCfg .
+--- Negative control: unchanged admission/current populations cannot disagree,
+--- even under the stale-read counterfactual.
+search [1] in WHIPPLESCRIPT-STALE-CONTINUATION-QUERY :
+  qUnchanged =>* qObserved(K:QKind, C:QCount, R:Bool, V:QValue, N:Nat)
+    REST:QCfg such that R:Bool =/= qPredicate(K:QKind, C:QCount) .
+--- Bite: stale admission-query evaluation produces a wrong branch result
+--- once the independent population changes. The live-read invariant above
+--- must fail when its observer is replaced by this counterfactual.
+search [1] in WHIPPLESCRIPT-STALE-CONTINUATION-QUERY :
+  qInit =>* qObserved(K:QKind, C:QCount, R:Bool, V:QValue, N:Nat)
+    REST:QCfg such that R:Bool =/= qPredicate(K:QKind, C:QCount) .

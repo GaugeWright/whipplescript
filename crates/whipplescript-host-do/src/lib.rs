@@ -61,12 +61,18 @@ mod host_discard;
 /// Placement-neutral projection of one governed hosted turn into the public
 /// host protocol's body-free pointers and terminal receipt.
 pub mod host_projection;
+/// Governed host actions over the Worker transport: pinned action authority,
+/// admission, admitted-program execution and result reads (HA-5).
+pub mod hosted_actions;
+#[cfg(test)]
+mod import_admission_inventory_tests;
 pub mod norm_commands;
 pub mod norm_runtime;
 #[cfg(test)]
 mod rule_commit_recovery_tests;
 #[cfg(test)]
 mod run_reattach_tests;
+pub mod skill_catalogue;
 pub mod source_planning;
 
 #[cfg(test)]
@@ -100,6 +106,8 @@ mod governed_host_tests {
     use crate::do_store::{test_support, DoSql, DoSqliteStore};
     use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
     use crate::governance::{GaugeDeskGovernanceRoot, GAUGEDESK_ATTESTATION_ALGORITHM};
+
+    mod skill_catalogue_tests;
 
     fn package() -> AuthoredAgentPackage {
         AuthoredAgentPackage::from_documents(

@@ -29,7 +29,9 @@ items.
 - **`openai-generic`** — each endpoint that is compatible with OpenAI. A local
   model such as Ollama or vLLM binds through this family. An aggregator such as
   OpenRouter or Groq also binds through this family. The configuration is a
-  base URL, a model name, and a reference to a key. This family is a *model
+  base URL, a model name, and a reference to a key. The key for an endpoint is
+  stored with `whip auth set openai-generic <base-url> <key>`, one per base
+  URL, and `OPENAI_API_KEY` overrides it. This family is a *model
   backend*. This family is not a family of agent. A coercion selects this
   family directly. An agent gets to this family through the **owned** harness,
   which points at the endpoint. The declaration `provider openai-generic` is

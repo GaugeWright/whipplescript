@@ -1039,7 +1039,7 @@ describe("real WorkflowInstance hibernation", () => {
     );
     expect(explanation.status, await explanation.clone().text()).toBe(200);
     expect(await explanation.json()).toEqual({
-      schema: "whipplescript.action-explanation-query.v1",
+      schema: "whipplescript.action-explanation-query.v2",
       instance_id: opened.instance_ref,
       query: { result: "not-a-result", firing: null },
       outcome: { kind: "not_found" },
@@ -1116,12 +1116,42 @@ describe("real WorkflowInstance hibernation", () => {
       },
       placement_ceiling_ref: "do",
     };
+    // WS-683: the real authenticated Worker carries a request-bound selection
+    // to Wasm. A catalogue naming another instance must never reach the broker.
+    const catalogueOpen = await placementFetch("/host/instances/open", {
+      method: "POST",
+      body: JSON.stringify({
+        command: { ...openCommand, request_id: "open-catalogue-refusal" },
+        package: packageDocs,
+      }),
+    });
+    expect(catalogueOpen.status, await catalogueOpen.clone().text()).toBe(201);
+    const catalogueInstance = await catalogueOpen.json<{ instance_ref: string }>();
+    const rejectedCatalogue = await placementFetch("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: { ...turnCommand, command_id: "wrong-catalogue-instance", instance_ref: catalogueInstance.instance_ref },
+        package: packageDocs,
+        image_bodies: [],
+        skill_catalogue: {
+          instance_id: opened.instance_ref,
+          command_id: "wrong-catalogue-instance",
+          actor_ref: turnCommand.actor_ref,
+          entries: [],
+        },
+      }),
+    });
+    expect(rejectedCatalogue.status).toBe(502);
+    expect(await rejectedCatalogue.json()).toMatchObject({ admitted: true, outcome: "failed" });
+    expect(brokerFetch).not.toHaveBeenCalled();
+
     const turn = await placementFetch("/host/turns", {
       method: "POST",
       body: JSON.stringify({
         command: turnCommand,
         package: packageDocs,
         image_bodies: [],
+        skill_catalogue: { instance_id: opened.instance_ref, command_id: commandId, actor_ref: turnCommand.actor_ref, entries: [] },
       }),
     });
     expect(turn.status, await turn.clone().text()).toBe(200);
@@ -1845,7 +1875,7 @@ async function placementFetch(
     //
     // It counts what the FILTER yields, not the declared surface: outer
     // `/v1/...` and DO-internal `/__private/...` routes are outside it.
-    expect(operations.length).toBe(40);
+    expect(operations.length).toBe(43);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {
@@ -2529,5 +2559,266 @@ describe("hosted observation enqueue", () => {
         expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM runs WHERE instance_id = ?", vector.enqueue.command.instance).toArray()[0].n).toBe(0);
       });
     }
+  });
+});
+
+// host-action-worker-transport
+describe("governed host actions through the Worker transport", () => {
+  // The native/DO parity journey (`crates/whipplescript-cli/tests/
+  // host_action_parity.rs`) drives the public kernel API over the deployed DO
+  // schema. This drives the same journey through the real Worker, placement
+  // route, Durable Object, WASM bridge and `transactionSync`, with a proof
+  // the deployment's pinned action authority signed.
+  const ACTION_SOURCE = `
+workflow ParityAction
+input content InputReference
+output result Result
+class InputReference { handle string version_ref string label_ref string }
+class Result { handle string }
+rule echo
+  when InputReference as r
+=> { complete result { handle r.handle } }
+`;
+  const actionBindings = runtimeBindings as unknown as {
+    host_action_identity: (operation: string, source: string) => string;
+    host_action_signing_bytes: (kind: string, body: string) => string;
+  };
+  const placement = "tenant:tenant-actions:placement:placement-actions";
+  const actionFetch = (path: string, body: unknown) => SELF.fetch(
+    `https://runtime.test/v1/tenants/tenant-actions/placements/placement-actions${path}`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  const prove = async (kind: "command" | "read", body: unknown, stranger = false) => {
+    const signed = await SELF.fetch("https://runtime.test/__test/action/sign", {
+      method: "POST",
+      body: JSON.stringify({
+        signing_hex: actionBindings.host_action_signing_bytes(kind, JSON.stringify(body)),
+        stranger,
+      }),
+    });
+    return (await signed.json<{ proof: string }>()).proof;
+  };
+  const stub = () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    return namespace.get(namespace.idFromName(placement));
+  };
+  const durable = (instance: string) => runInDurableObject(stub(), (_object, state) => ({
+    events: state.storage.sql.exec<{ event_type: string; sequence: number }>(
+      "SELECT event_type, sequence FROM events WHERE instance_id = ? ORDER BY sequence",
+      instance,
+    ).toArray().map(({ event_type, sequence }) => `${sequence}:${event_type}`),
+    instances: state.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM instances",
+    ).toArray()[0].n,
+  }));
+
+  it("admits, executes and reads back human and agent actions across interruption", async () => {
+    const policy = await actionFetch("/host/policy", { epoch: 1, signed_envelope: SIGNED_ENVELOPE });
+    expect(policy.status, await policy.clone().text()).toBe(201);
+    await policy.body?.cancel();
+    const identity = JSON.parse(
+      actionBindings.host_action_identity("reference.echo", ACTION_SOURCE),
+    ) as { program_version_ref: string; input_schema_ref: string };
+
+    for (const [actor, origin] of [["person:1", "editor.save"], ["agent:1", "tool.call"]]) {
+      const command = {
+        protocol: "whipplescript.host-action.v1",
+        // The placement policy's `:v2` attestation names its authority; an
+        // action's issuer must be that authority.
+        issuer: "gaugedesk",
+        scope: "workspace:1",
+        request_id: `action:${actor}`,
+        operation: "reference.echo",
+        program_version_ref: identity.program_version_ref,
+        input_schema_ref: identity.input_schema_ref,
+        policy: POLICY_REF,
+        provenance: { initiator: actor, executor: actor, delegation: [], origin, causes: [] },
+        inputs: { content: { handle: "do", version_ref: "content:version:1", label_ref: "label:private" } },
+        resources: {},
+      };
+      const proof = await prove("command", command);
+      const before = (await runInDurableObject(stub(), (_object, state) => {
+        try {
+          return state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM instances").toArray()[0].n;
+        } catch {
+          return 0;
+        }
+      }));
+
+      // A valid signature by a key no deployment pinned is not standing, and a
+      // refused command leaves nothing behind.
+      const forged = await actionFetch("/host/actions/admit", {
+        command, source: ACTION_SOURCE, proof: await prove("command", command, true),
+      });
+      expect(forged.status).toBe(403);
+      expect(await forged.text()).toContain("not signed by a key pinned for its authority");
+      expect(await runInDurableObject(stub(), (_object, state) => {
+        try {
+          return state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM instances").toArray()[0].n;
+        } catch {
+          return 0;
+        }
+      })).toBe(before);
+
+      const admitted = await actionFetch("/host/actions/admit", { command, source: ACTION_SOURCE, proof });
+      expect(admitted.status, await admitted.clone().text()).toBe(201);
+      const receipt = await admitted.json<{
+        instance_ref: string;
+        fingerprint: string;
+        admitted_at: { sequence: number; head_digest: string };
+      }>();
+      expect(receipt.instance_ref).toMatch(/^ins_action_/);
+      const admittedState = await durable(receipt.instance_ref);
+      expect(admittedState.events.some((event) => event.endsWith(":host.action.admitted"))).toBe(true);
+      expect(admittedState.events.some((event) => event.endsWith(":workflow.completed"))).toBe(false);
+
+      // Interruption after admission applied: the response is lost, the
+      // object is evicted, and the program record beside the admission never
+      // landed. Execution refuses rather than guessing a program; the same
+      // signed request then replays the original receipt and appends nothing.
+      await runInDurableObject(stub(), async (_object, state) => {
+        await state.storage.delete(`host-action:${receipt.instance_ref}`);
+      });
+      await evictDurableObject(stub());
+      const orphaned = await actionFetch("/host/actions/execute", {
+        instance_ref: receipt.instance_ref, policy: POLICY_REF,
+      });
+      expect(orphaned.status).toBe(404);
+      expect(await orphaned.text()).toContain("no admitted action");
+      const replayed = await actionFetch("/host/actions/admit", { command, source: ACTION_SOURCE, proof });
+      expect(replayed.status).toBe(201);
+      expect(await replayed.json()).toEqual(receipt);
+      expect(await durable(receipt.instance_ref)).toEqual(admittedState);
+
+      // The same request id with a changed payload collides; it never mints a
+      // second action or rewrites the first.
+      const changed = { ...command, provenance: { ...command.provenance, origin: "another-surface" } };
+      const collided = await actionFetch("/host/actions/admit", {
+        command: changed, source: ACTION_SOURCE, proof: await prove("command", changed),
+      });
+      expect(collided.status).toBe(403);
+      await collided.body?.cancel();
+      expect(await durable(receipt.instance_ref)).toEqual(admittedState);
+
+      const query = {
+        protocol: "whipplescript.action-result.v1",
+        issuer: command.issuer,
+        scope: command.scope,
+        policy: command.policy,
+        provenance: command.provenance,
+        admission: receipt,
+        evidence_handle: "do",
+        evidence_label_ref: "label:private",
+        through: null,
+      };
+      const pendingResponse = await actionFetch("/host/actions/result", {
+        query, proof: await prove("read", query),
+      });
+      expect(pendingResponse.status, await pendingResponse.clone().text()).toBe(200);
+      const pending = await pendingResponse.json<{
+        instance_status: string;
+        terminal: unknown;
+        observed_at: unknown;
+        admission: unknown;
+      }>();
+      expect(pending.instance_status).toBe("running");
+      expect(pending.terminal).toBeNull();
+      // An admission proof is not a read proof, and neither is a read signed
+      // by an unpinned key.
+      for (const wrong of [proof, await prove("read", query, true)]) {
+        const denied = await actionFetch("/host/actions/result", { query, proof: wrong });
+        expect(denied.status).toBe(403);
+        expect(await denied.text()).toContain("not signed by a key pinned");
+      }
+
+      const executed = await actionFetch("/host/actions/execute", {
+        instance_ref: receipt.instance_ref, policy: POLICY_REF,
+      });
+      expect(executed.status, await executed.clone().text()).toBe(200);
+      expect(await executed.json()).toEqual({ instance_ref: receipt.instance_ref, status: "completed" });
+      const terminalState = await durable(receipt.instance_ref);
+      expect(terminalState.events.some((event) => event.endsWith(":workflow.completed"))).toBe(true);
+
+      // Interruption after execution applied: evict, then repeat both the
+      // execute and the original admission. Neither appends anything.
+      await evictDurableObject(stub());
+      const reexecuted = await actionFetch("/host/actions/execute", {
+        instance_ref: receipt.instance_ref, policy: POLICY_REF,
+      });
+      expect(await reexecuted.json()).toEqual({ instance_ref: receipt.instance_ref, status: "completed" });
+      const reattached = await actionFetch("/host/actions/admit", { command, source: ACTION_SOURCE, proof });
+      expect(await reattached.json()).toEqual(receipt);
+      expect(await durable(receipt.instance_ref)).toEqual(terminalState);
+
+      const completedResponse = await actionFetch("/host/actions/result", {
+        query, proof: await prove("read", query),
+      });
+      const completed = await completedResponse.json<{
+        instance_status: string;
+        terminal: unknown;
+        admission: unknown;
+      }>();
+      expect(completed.instance_status).toBe("completed");
+      expect(completed.terminal).not.toBeNull();
+      expect(completed.admission).toEqual(receipt);
+
+      // A pinned read replays exactly the historical view, after completion.
+      const pinned = { ...query, through: pending.observed_at };
+      const historical = await actionFetch("/host/actions/result", {
+        query: pinned, proof: await prove("read", pinned),
+      });
+      expect(await historical.json()).toEqual(pending);
+    }
+    expect((await runInDurableObject(stub(), (_object, state) =>
+      state.storage.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM instances WHERE instance_id LIKE 'ins_action_%'",
+      ).toArray()[0].n))).toBe(2);
+  });
+
+  it("refuses every action route the deployment has not given an authority", async () => {
+    const pinned = await runInDurableObject(stub(), (object) => {
+      const instance = object as unknown as {
+        env: { WHIP_ACTION_TRUST?: string };
+        configureActionTestTrust(trust: string | undefined): void;
+      };
+      const trust = instance.env.WHIP_ACTION_TRUST;
+      instance.configureActionTestTrust(undefined);
+      return trust;
+    });
+    expect(pinned).toBeTruthy();
+    try {
+      for (const [path, body] of [
+        ["/host/actions/admit", { command: { policy: POLICY_REF }, source: ACTION_SOURCE, proof: "00" }],
+        ["/host/actions/execute", { instance_ref: "ins_action_absent", policy: POLICY_REF }],
+        ["/host/actions/result", { query: { policy: POLICY_REF }, proof: "00" }],
+      ] as const) {
+        const refused = await actionFetch(path, body);
+        expect(refused.status, path).toBe(503);
+        expect(await refused.text(), path).toContain("no pinned action authority");
+      }
+    } finally {
+      await runInDurableObject(stub(), (object) => {
+        (object as unknown as { configureActionTestTrust(t: string | undefined): void })
+          .configureActionTestTrust(pinned);
+      });
+    }
+  });
+
+  it("rejects an absent action and malformed action bodies", async () => {
+    const unknown = await actionFetch("/host/actions/execute", {
+      instance_ref: "ins_action_absent", policy: POLICY_REF,
+    });
+    expect(unknown.status).toBe(404);
+    await unknown.body?.cancel();
+    const malformed = await actionFetch("/host/actions/admit", { command: {} });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.text()).toContain("requires command, source and proof");
+    const unread = await actionFetch("/host/actions/result", { query: {} });
+    expect(unread.status).toBe(400);
+    expect(await unread.text()).toContain("requires query and proof");
   });
 });

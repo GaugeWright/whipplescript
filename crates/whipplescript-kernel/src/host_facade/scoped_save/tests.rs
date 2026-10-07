@@ -241,6 +241,7 @@ fn setup(
         .expect("verify fixture policy");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
         .expect("construct governed facade")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );

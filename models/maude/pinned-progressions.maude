@@ -53,6 +53,10 @@
 ---     [fate-at-commit); one firing never lapses twice; no final state
 ---     strands an open region; lapsed never reads as done; lapse requires
 ---     the break;
+---   independent query witness: continuation observations read current
+---     counts 0/1/2 for exists, empty, and count >= 2 while captured payloads
+---     remain pinned; the STALE-CONTINUATION-QUERY module exposes the admission-
+---     read counterfactual. This does not compose all queries with regions.
 ---   bite: the REACTIVE module models the pre-DR-0043 semantics
 ---     [continuations require the trigger to still match, no lapse rule) and
 ---     reaches a final state with the region still open -- the silent stall
@@ -187,4 +191,92 @@ mod WHIPPLESCRIPT-REACTIVE-PROGRESSION is
       => clk(s(N)) condHolds trig(F, present) region(F, done) post(F, K) postAt(F, N) .
 
   rl [finish] : region(F, done) post(F, z) => region(F, done) workflowDone(F) .
+endm
+
+--- Independent continuation-query witness (WS-303, DR-0043 Decision 1).
+--- One recorded firing retains its trigger payload while a DIFFERENT queried
+--- population changes. Counts 0/1/2 distinguish exists, empty, and count >= 2.
+--- The observation records the population and branch result at the SAME log
+--- step. A false result selects the false branch; it is not an abort/stall.
+--- This does not compose arbitrary queries with the region machine above or
+--- establish runtime/storage atomicity. It witnesses present-vs-admission reads.
+fmod CONTINUATION-QUERY-STATE is
+  protecting BOOL .
+  protecting NAT .
+  sorts QCount QKind QValue QCfg .
+  ops q0 q1 q2 : -> QCount [ctor] .
+  ops qExists qEmpty qCountAtLeastTwo : -> QKind [ctor] .
+  ops original later : -> QValue [ctor] .
+  op qNone : -> QCfg [ctor] .
+  op __ : QCfg QCfg -> QCfg [ctor assoc comm id: qNone] .
+  op qClock : Nat -> QCfg [ctor] .
+  op qFlux : Nat -> QCfg [ctor] .
+  op qWorld : QCount -> QCfg [ctor] .
+  op qAdmission : QCount -> QCfg [ctor] .
+  op qCaptured : QValue -> QCfg [ctor] .
+  op qTrigger : Bool -> QCfg [ctor] .
+  op qConsumed : Nat -> QCfg [ctor] .
+  op qPending : QKind -> QCfg [ctor] .
+  op qChanged : QCount QCount Nat -> QCfg [ctor] .
+  op qObserved : QKind QCount Bool QValue Nat -> QCfg [ctor] .
+  op qPredicate : QKind QCount -> Bool .
+  eq qPredicate(qExists, q0) = false .
+  eq qPredicate(qExists, q1) = true .
+  eq qPredicate(qExists, q2) = true .
+  eq qPredicate(qEmpty, q0) = true .
+  eq qPredicate(qEmpty, q1) = false .
+  eq qPredicate(qEmpty, q2) = false .
+  eq qPredicate(qCountAtLeastTwo, q0) = false .
+  eq qPredicate(qCountAtLeastTwo, q1) = false .
+  eq qPredicate(qCountAtLeastTwo, q2) = true .
+  op qInit : -> QCfg .
+  op qUnchanged : -> QCfg .
+  eq qInit = qClock(0) qFlux(2) qWorld(q1) qAdmission(q1)
+      qCaptured(original) qTrigger(true)
+      qPending(qExists) qPending(qEmpty) qPending(qCountAtLeastTwo) .
+  eq qUnchanged = qClock(0) qFlux(0) qWorld(q1) qAdmission(q1)
+      qCaptured(original) qTrigger(true)
+      qPending(qExists) qPending(qEmpty) qPending(qCountAtLeastTwo) .
+endfm
+
+mod CONTINUATION-QUERY-WORLD is
+  including CONTINUATION-QUERY-STATE .
+  vars N F : Nat .
+  rl [query-add-first] : qClock(N) qFlux(s(F)) qWorld(q0)
+      => qClock(s(N)) qFlux(F) qWorld(q1) qChanged(q0, q1, N) .
+  rl [query-add-second] : qClock(N) qFlux(s(F)) qWorld(q1)
+      => qClock(s(N)) qFlux(F) qWorld(q2) qChanged(q1, q2, N) .
+  rl [query-remove-second] : qClock(N) qFlux(s(F)) qWorld(q2)
+      => qClock(s(N)) qFlux(F) qWorld(q1) qChanged(q2, q1, N) .
+  rl [query-remove-first] : qClock(N) qFlux(s(F)) qWorld(q1)
+      => qClock(s(N)) qFlux(F) qWorld(q0) qChanged(q1, q0, N) .
+  --- Retraction affects admission presence, never the captured payload.
+  rl [query-consume-trigger] : qClock(N) qTrigger(true)
+      => qClock(s(N)) qTrigger(false) qConsumed(N) .
+endm
+
+mod WHIPPLESCRIPT-LIVE-CONTINUATION-QUERY is
+  including CONTINUATION-QUERY-WORLD .
+  var N : Nat .
+  var C : QCount .
+  var K : QKind .
+  var V : QValue .
+  rl [query-observe-live] : qClock(N) qWorld(C) qCaptured(V) qPending(K)
+      => qClock(s(N)) qWorld(C) qCaptured(V)
+         qObserved(K, C, qPredicate(K, C), V, N) .
+endm
+
+--- Counterfactual: a continuation incorrectly pins its query to admission.
+--- It still records the REAL population at the observation, so the incorrect
+--- branch result is exposed rather than hidden by relabelling the evidence.
+mod WHIPPLESCRIPT-STALE-CONTINUATION-QUERY is
+  including CONTINUATION-QUERY-WORLD .
+  var N : Nat .
+  vars C A : QCount .
+  var K : QKind .
+  var V : QValue .
+  rl [query-observe-stale] :
+      qClock(N) qWorld(C) qAdmission(A) qCaptured(V) qPending(K)
+      => qClock(s(N)) qWorld(C) qAdmission(A) qCaptured(V)
+         qObserved(K, C, qPredicate(K, A), V, N) .
 endm

@@ -300,6 +300,39 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.action.admit",
+      "method": "POST",
+      "path": "/host/actions/admit",
+      "samplePath": "/host/actions/admit",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.action.execute",
+      "method": "POST",
+      "path": "/host/actions/execute",
+      "samplePath": "/host/actions/execute",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.action.result",
+      "method": "POST",
+      "path": "/host/actions/result",
+      "samplePath": "/host/actions/result",
+      "transport": "http-json",
+      "sideEffect": "none",
+      "risk": "important",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.instance.discard",
       "method": "POST",
       "path": "/host/instances/:instance/discard",

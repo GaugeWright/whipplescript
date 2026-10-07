@@ -5,11 +5,17 @@
 //! supply the exact compiler artifact digest, and write the witness in the same
 //! accepting transaction as the program version. This module neither reads a
 //! lock file nor asserts that every admitted program used this path.
+//!
+//! `revalidate` reads one store's accepting-operation roster and recaptures
+//! each checked witness from the caller's current basis. Any unwitnessed,
+//! legacy, unreadable, unrecapturable or stale operation keeps that store's
+//! coverage unknown (WS-159).
 
 use std::collections::BTreeMap;
 
 use whipplescript_parser::IrProgram;
 pub use whipplescript_store::program_imports::{ProgramImportEdge, ProgramImportWitness};
+use whipplescript_store::{ProgramVersionView, RuntimeStore, StoreResult};
 
 /// Explicit no-lock basis for hosts that admit only std imports.
 pub const NO_LOCK_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -171,6 +177,197 @@ pub fn current_basis(
     basis: &CheckedImportBasis<'_>,
 ) -> bool {
     capture_basis(program, basis).is_ok_and(|fresh| fresh == *witness)
+}
+
+/// One local package as the caller resolves it now, with a freshly read
+/// source digest. Owned so a revalidation callback can return it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentLocalPackage {
+    pub name: String,
+    pub package_id: String,
+    pub version: String,
+    pub source_digest: String,
+}
+
+/// A program version's current inputs, recaptured at revalidation time from
+/// one immutable snapshot: the checked IR, the source bytes it was checked
+/// from, the lock in force, the running compiler artifact and every resolved
+/// local package. Nothing here may be copied from the stored witness; a basis
+/// read back from the evidence it is meant to test would always agree with it.
+#[derive(Clone, Debug)]
+pub struct CurrentImportBasis {
+    pub program: IrProgram,
+    pub program_source_digest: String,
+    pub version_source_digest: Option<String>,
+    pub lock_digest: String,
+    pub compiler_artifact_digest: String,
+    pub packages: Vec<CurrentLocalPackage>,
+    /// Recaptured rule-effect construct edges, when the admission captured
+    /// them. `None` matches only a witness that never captured that class.
+    pub constructs: Option<whipplescript_store::program_imports::ProgramConstructCapture>,
+    /// Recaptured declaration edges, with the same rule as `constructs`.
+    pub declarations: Option<whipplescript_store::program_imports::ProgramDeclarationCapture>,
+}
+
+impl CurrentImportBasis {
+    fn recapture(&self) -> Result<ProgramImportWitness, String> {
+        let packages = self
+            .packages
+            .iter()
+            .map(|package| ResolvedLocalPackage {
+                name: &package.name,
+                package_id: &package.package_id,
+                version: &package.version,
+                source_digest: &package.source_digest,
+            })
+            .collect::<Vec<_>>();
+        let mut witness = capture_basis(
+            &self.program,
+            &CheckedImportBasis {
+                program_source_digest: &self.program_source_digest,
+                version_source_digest: self.version_source_digest.as_deref(),
+                lock_digest: &self.lock_digest,
+                compiler_artifact_digest: &self.compiler_artifact_digest,
+                packages: &packages,
+            },
+        )?;
+        witness.constructs = self.constructs.clone();
+        witness.declarations = self.declarations.clone();
+        Ok(witness)
+    }
+}
+
+/// Why one accepting operation keeps a store's import coverage unknown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImportCoverageGap {
+    /// The operation admitted a version and recorded that it has no witness.
+    Unwitnessed {
+        operation_id: String,
+        version_id: String,
+    },
+    /// The version predates the operation ledger; its past calls are lost.
+    LegacyGap {
+        operation_id: String,
+        version_id: String,
+    },
+    /// A checked row whose witness or version can no longer be read back.
+    MissingEvidence {
+        operation_id: String,
+        version_id: String,
+    },
+    /// No current basis could be recaptured for this program version, for
+    /// example a program the caller does not know how to re-check.
+    NoCurrentBasis {
+        operation_id: String,
+        version_id: String,
+    },
+    /// The current basis recaptures a different witness: changed source,
+    /// lock, compiler, package source under an unchanged lock, or imports.
+    Stale {
+        operation_id: String,
+        version_id: String,
+        witness_digest: String,
+    },
+}
+
+/// One runtime store's import coverage at the roster frontier it read.
+///
+/// `Complete` says only that every operation this store recorded up to
+/// `frontier` is checked and that its witness equals a fresh capture from the
+/// caller's current basis. It is not a Home-wide claim: a Home has several
+/// stores, and operations after the frontier are not covered by this answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImportCoverage {
+    Complete {
+        frontier: i64,
+        operations: usize,
+    },
+    Unknown {
+        frontier: i64,
+        gaps: Vec<ImportCoverageGap>,
+    },
+}
+
+/// Revalidate every recorded accepting operation in one store against the
+/// current basis. `current` is asked once per program version and must
+/// recapture that version's inputs now; returning `None` leaves every
+/// operation on the version unknown. An unwitnessed or legacy operation is
+/// never repaired by a valid witness on the same version, because the
+/// version row alone does not say which acceptance used which basis.
+pub fn revalidate<S, F>(store: &S, mut current: F) -> StoreResult<ImportCoverage>
+where
+    S: RuntimeStore + ?Sized,
+    F: FnMut(&ProgramVersionView) -> Option<CurrentImportBasis>,
+{
+    use whipplescript_store::program_imports::ProgramImportOperationKind;
+
+    let roster = store.program_import_operation_roster()?;
+    let mut recaptured: BTreeMap<String, Option<ProgramImportWitness>> = BTreeMap::new();
+    let mut gaps = Vec::new();
+    for operation in &roster.operations {
+        let operation_id = operation.operation_id.clone();
+        let version_id = operation.version_id.clone();
+        let witness_digest = match (&operation.kind, &operation.witness_digest) {
+            (ProgramImportOperationKind::Checked, Some(digest)) => digest,
+            (ProgramImportOperationKind::LegacyGap, _) => {
+                gaps.push(ImportCoverageGap::LegacyGap {
+                    operation_id,
+                    version_id,
+                });
+                continue;
+            }
+            _ => {
+                gaps.push(ImportCoverageGap::Unwitnessed {
+                    operation_id,
+                    version_id,
+                });
+                continue;
+            }
+        };
+        let Some(stored) = store.program_import_witness(&version_id, witness_digest)? else {
+            gaps.push(ImportCoverageGap::MissingEvidence {
+                operation_id,
+                version_id,
+            });
+            continue;
+        };
+        if !recaptured.contains_key(&version_id) {
+            let fresh = match store.get_program_version(&version_id)? {
+                Some(view) => current(&view).and_then(|basis| basis.recapture().ok()),
+                None => {
+                    gaps.push(ImportCoverageGap::MissingEvidence {
+                        operation_id,
+                        version_id,
+                    });
+                    continue;
+                }
+            };
+            recaptured.insert(version_id.clone(), fresh);
+        }
+        match &recaptured[&version_id] {
+            None => gaps.push(ImportCoverageGap::NoCurrentBasis {
+                operation_id,
+                version_id,
+            }),
+            Some(fresh) if *fresh == stored => {}
+            Some(_) => gaps.push(ImportCoverageGap::Stale {
+                operation_id,
+                version_id,
+                witness_digest: witness_digest.clone(),
+            }),
+        }
+    }
+    Ok(if gaps.is_empty() {
+        ImportCoverage::Complete {
+            frontier: roster.frontier,
+            operations: roster.operations.len(),
+        }
+    } else {
+        ImportCoverage::Unknown {
+            frontier: roster.frontier,
+            gaps,
+        }
+    })
 }
 
 #[cfg(test)]

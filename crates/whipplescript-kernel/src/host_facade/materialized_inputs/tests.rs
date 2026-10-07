@@ -73,6 +73,7 @@ fn fixture(
         envelope(policy, 7),
     )
     .expect("materialized-input fixture")
+    .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
     .with_compiler_artifact_digest(COMPILER_DIGEST);
     cmd.operation = "workflow.launch".into();
     cmd.program_version_ref = action.version_ref().into();
@@ -340,6 +341,7 @@ fn home_journal_refuses_retained_admission_with_a_missing_instance() {
                 envelope(policy(), 7),
             )
             .unwrap()
+            .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
             .with_compiler_artifact_digest(COMPILER_DIGEST)
         };
         let (materialized_action, mut command, _) = fixture(policy(), SOURCE);
@@ -430,6 +432,32 @@ fn materialized_action_refuses_missing_compiler_artifact_before_custody_or_versi
 }
 
 #[test]
+fn materialized_action_refuses_unconfigured_standard_registry_before_custody_or_version_admission()
+{
+    let (action, command, facade) = fixture(policy(), SOURCE);
+    let mut facade = GovernedHostFacade::from_verified_store(
+        facade.into_kernel().into_store(),
+        7,
+        envelope(policy(), 7),
+    )
+    .expect("facade without shipped registry")
+    .with_compiler_artifact_digest(COMPILER_DIGEST);
+    let custody = Custody::new(&command);
+    assert!(admit(&mut facade, &action, &command, &custody)
+        .unwrap_err()
+        .to_string()
+        .contains("host action admission requires the host's shipped standard registry"));
+    assert_eq!(custody.reads.get(), 0);
+    assert!(facade
+        .kernel()
+        .store()
+        .program_import_operation_roster()
+        .expect("import operations")
+        .operations
+        .is_empty());
+}
+
+#[test]
 fn materialized_action_preserves_source_and_retries_after_consumption_without_reloading() {
     let root = std::env::temp_dir().join(format!(
         "whip-materialized-{}-{}",
@@ -452,6 +480,7 @@ fn materialized_action_preserves_source_and_retries_after_consumption_without_re
             envelope(policy(), 7),
         )
         .unwrap()
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest(COMPILER_DIGEST)
     };
     let (action, cmd, _) = fixture(policy(), SOURCE);

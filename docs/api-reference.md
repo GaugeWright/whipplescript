@@ -592,7 +592,7 @@ at run time. The v0 version supplies these features:
 - **Action result explanations** — `workspace/executeCommand` advertises
   `whip.explainResult`. Its single object argument contains `instance`, `result`,
   and an optional `firing`. The result is the same
-  `whipplescript.action-explanation-query.v1` value returned by
+  `whipplescript.action-explanation-query.v2` value returned by
   `whip --json explain`; it retains the admitted program version, evaluated
   frontier, caller and definition spans, causes, and read-only next action.
 
@@ -1244,6 +1244,7 @@ listener is deferred. Refer to the "Deferred with cause" section of
 ### Issue commands
 
 ```sh
+whip issue bootstrap
 whip issue new --tracker <TR> --title <T> [--kind task|initiative] [--body <B>] [--label <L>] [--actor <A>]
 whip issue list [--tracker <TR>] [--status <S>] [--kind task|initiative]
 whip issue show <id>
@@ -1256,6 +1257,11 @@ whip issue fail <id> [--actor <A>]
 whip issue dep add <blocked> depends-on <blocker>
 whip issue rebuild
 ```
+
+Query commands read one committed snapshot of the existing store without initializing,
+enrolling or repairing it. `whip issue bootstrap` explicitly initializes a plain
+native store and establishes or repairs checkout discovery; mutations retain
+synchronous publication. A missing or incompatible store refuses a query.
 
 The issue commands operate the builtin issue tracker. Refer to
 [trackers](language-reference.md#trackers). The scope of the builtin tracker is

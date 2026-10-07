@@ -27221,3 +27221,168 @@ fn only_a_media_result_makes_a_prompt_demand_generation_authority() {
         "and an unannotated prompt demands nothing new"
     );
 }
+
+/// WS-291: a prompt that interpolates a per-call value ahead of its fixed
+/// instructions warns — the provider's prompt cache keys on the fixed prefix,
+/// so everything after the volatile value is re-processed on every call. The
+/// program is accepted; it is only more expensive than it needs to be.
+fn volatile_prompt_program(prompt: &str) -> String {
+    format!(
+        r#"
+use std.agent
+
+agent worker
+
+class Job {{
+  id string
+  started_at string
+}}
+
+workflow Volatile {{
+  input task Job
+  output result Job
+  rule go
+    when Job as t
+  => {{
+    tell worker as turn "{prompt}"
+    after turn succeeds {{
+      complete result {{ id t.id started_at t.started_at }}
+    }}
+    after turn fails {{
+      complete result {{ id t.id started_at t.started_at }}
+    }}
+  }}
+}}
+"#
+    )
+}
+
+const VOLATILE_FIXED_INSTRUCTIONS: &str = "Review the change for correctness. Name each defect with the file and line it is on, say why it is wrong, and propose the smallest fix that repairs it. Do not restate the diff, and do not comment on style.";
+
+#[test]
+fn a_volatile_value_ahead_of_a_tell_prompt_warns() {
+    let source = volatile_prompt_program(&format!(
+        "Started {{{{ t.started_at }}}}. {VOLATILE_FIXED_INSTRUCTIONS}"
+    ));
+    let compiled = compile_program(&source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let warning = compiled
+        .warnings
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_str() == "effect.volatile_prompt_prefix")
+        .unwrap_or_else(|| panic!("{:?}", compiled.warnings));
+    assert_eq!(warning.severity, Severity::Warning);
+    assert!(
+        warning.message.contains("`{{ t.started_at }}`"),
+        "the warning cites the expression: {}",
+        warning.message
+    );
+    let help = warning
+        .suggestion
+        .as_ref()
+        .expect("a suggestion")
+        .message
+        .clone();
+    assert!(help.contains("to the end of the prompt"), "{help}");
+    assert!(
+        warning.fixits.is_empty(),
+        "reordering a prompt is the author's call"
+    );
+    // The caret is on the `tell`, not on a whole-rule fallback.
+    let line = source[..warning.span.start].matches('\n').count() + 1;
+    let tell_line = source
+        .lines()
+        .position(|line| line.contains("tell worker"))
+        .expect("tell line")
+        + 1;
+    assert_eq!(line, tell_line);
+}
+
+#[test]
+fn a_volatile_value_after_the_fixed_text_is_quiet() {
+    let source = volatile_prompt_program(&format!(
+        "{VOLATILE_FIXED_INSTRUCTIONS} Started {{{{ t.started_at }}}}."
+    ));
+    let compiled = compile_program(&source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert!(
+        !compiled
+            .warnings
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "effect.volatile_prompt_prefix"),
+        "{:?}",
+        compiled.warnings
+    );
+}
+
+#[test]
+fn a_volatile_coerce_parameter_ahead_of_its_instructions_warns() {
+    let source = format!(
+        r#"
+use std.coercion
+
+class Verdict {{
+  ok bool
+}}
+
+class Change {{
+  requested_at string
+  diff string
+}}
+
+workflow Review {{
+  input change Change
+  output result Verdict
+  rule go
+    when Change as c
+  => {{
+    coerce review(c.requested_at, c.diff) as verdict
+    after verdict succeeds {{
+      complete result {{ ok verdict.ok }}
+    }}
+    after verdict fails {{
+      complete result {{ ok false }}
+    }}
+  }}
+}}
+
+coerce review(requested_at string, diff string) -> Verdict {{
+  prompt """
+  Requested {{{{ requested_at }}}}.
+  {VOLATILE_FIXED_INSTRUCTIONS}
+  {{{{ diff }}}}
+  {{{{ ctx.output_format }}}}
+  """
+}}
+"#
+    );
+    let compiled = compile_program(&source);
+    let warning = compiled
+        .warnings
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_str() == "effect.volatile_prompt_prefix")
+        .unwrap_or_else(|| panic!("{:?} / {:?}", compiled.diagnostics, compiled.warnings));
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert!(
+        warning.message.starts_with("coerce `review`'s prompt"),
+        "{}",
+        warning.message
+    );
+    assert!(
+        warning.message.contains("`{{ requested_at }}`"),
+        "{}",
+        warning.message
+    );
+}

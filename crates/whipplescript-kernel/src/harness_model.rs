@@ -3864,6 +3864,295 @@ mod tests {
             .any(|(k, v)| k == "Idempotency-Key" && v == bounded_key));
     }
 
+    // -- G3: byte stability of the cached prefix (WS-289) ---------------------
+    //
+    // `spec/inference-cache-note.md` G3 says exactly what these cover: the
+    // instruction plane the context assembler produces, plus the provider tool
+    // array, on each wire's own serializer. The world projection, which carries
+    // the turn's identity as admitted body, is outside them.
+
+    /// What a host admits into the instruction plane: the bodies the model
+    /// reads. Two requests built from equal values must share a cached prefix.
+    #[derive(Clone)]
+    struct AdmittedInstructions {
+        persona: String,
+        project_guidance: String,
+        skills: Vec<crate::context_assembly::SkillCatalogueEntry>,
+    }
+
+    impl AdmittedInstructions {
+        fn fixture() -> Self {
+            Self {
+                persona: "You are the release editor.".into(),
+                project_guidance: "Keep CHANGELOG entries in the past tense.".into(),
+                skills: vec![
+                    crate::context_assembly::SkillCatalogueEntry {
+                        name: "changelog".into(),
+                        description: "Write a CHANGELOG entry for a release.".into(),
+                        location: "/skills/changelog/SKILL.md".into(),
+                    },
+                    crate::context_assembly::SkillCatalogueEntry {
+                        name: "release-notes".into(),
+                        description: "Draft public release notes.".into(),
+                        location: "/skills/release-notes/SKILL.md".into(),
+                    },
+                ],
+            }
+        }
+    }
+
+    /// Everything about one request that is not admitted body: each
+    /// contribution's provenance (source, version, scope, audience, sequence,
+    /// lifecycle — where a host puts its timestamps and instance and run ids),
+    /// the order the host happened to collect contributions in, the run's
+    /// cache key, and the conversation that follows the prefix.
+    struct RequestMetadata {
+        source_tag: &'static str,
+        version: &'static str,
+        scope: &'static str,
+        audience: &'static str,
+        sequence: u64,
+        lifecycle: crate::context_assembly::ContributionLifecycle,
+        collected_in_reverse: bool,
+        cache_key: &'static str,
+        user: &'static str,
+    }
+
+    const FIRST_RUN: RequestMetadata = RequestMetadata {
+        source_tag: "instance:inst_01J9Z3/collected:2026-10-06T09:00:00Z",
+        version: "pkg@sha256:aaaa/run:run_7f3e",
+        scope: "turn",
+        audience: "active_agent",
+        sequence: 0,
+        lifecycle: crate::context_assembly::ContributionLifecycle::Stable,
+        collected_in_reverse: false,
+        cache_key: "public:sess_first:effect-1",
+        user: "Draft the 0.4.0 entry.",
+    };
+
+    const SECOND_RUN: RequestMetadata = RequestMetadata {
+        source_tag: "instance:inst_01JA77/collected:2026-10-07T17:45:12Z",
+        version: "pkg@sha256:aaaa/run:run_c921",
+        scope: "thread",
+        audience: "resumed_agent",
+        sequence: 41,
+        lifecycle: crate::context_assembly::ContributionLifecycle::Turn,
+        collected_in_reverse: true,
+        cache_key: "public:sess_second:effect-9",
+        user: "Now the 0.4.1 entry, please.",
+    };
+
+    fn g3_request(
+        wire: ModelWire,
+        admitted: &AdmittedInstructions,
+        meta: &RequestMetadata,
+    ) -> HttpRequest {
+        use crate::context_assembly::{
+            admit_instruction, assemble, render_available_skills, render_project_context,
+            InstructionAuthority, InstructionProposal, InstructionRole, ProjectInstruction,
+        };
+        let admit = |id: &str,
+                     ordering_key: &str,
+                     authority: InstructionAuthority,
+                     role: InstructionRole,
+                     body: String| {
+            admit_instruction(
+                InstructionProposal {
+                    contribution_id: id.to_owned(),
+                    source: format!("{id}:{}", meta.source_tag),
+                    version: meta.version.to_owned(),
+                    scope: meta.scope.to_owned(),
+                    audience: meta.audience.to_owned(),
+                    ordering_key: ordering_key.to_owned(),
+                    replacement_key: None,
+                    sequence: meta.sequence,
+                    lifecycle: meta.lifecycle,
+                    body,
+                },
+                authority,
+                role,
+            )
+            .expect("fixture respects its authority bound")
+        };
+        let mut contributions = vec![
+            admit(
+                "persona",
+                "010-persona",
+                InstructionAuthority::AgentAuthor,
+                InstructionRole::System,
+                admitted.persona.clone(),
+            ),
+            admit(
+                "agent-context",
+                "040-agent-context",
+                InstructionAuthority::Project,
+                InstructionRole::Developer,
+                render_project_context(&[ProjectInstruction {
+                    path: "AGENTS.md".into(),
+                    content: admitted.project_guidance.clone(),
+                }]),
+            ),
+            admit(
+                "available-skills",
+                "050-available-skills",
+                InstructionAuthority::Runtime,
+                InstructionRole::System,
+                render_available_skills(&admitted.skills),
+            ),
+        ];
+        if meta.collected_in_reverse {
+            contributions.reverse();
+        }
+        let assembled = assemble(contributions);
+        // The leading messages exactly as `BrokeredTurnMachine` writes them.
+        let mut messages = vec![ChatMessage::System(assembled.system_role)];
+        if !assembled.developer_role.is_empty() {
+            messages.push(ChatMessage::Developer(assembled.developer_role));
+        }
+        messages.push(ChatMessage::user_text(meta.user));
+        build_request(
+            wire,
+            "https://provider.example.invalid",
+            "key",
+            "fixture-model",
+            None,
+            Some(meta.cache_key),
+            &messages,
+            &workspace_tool_specs_from_registry(true, true, true),
+        )
+    }
+
+    /// The bytes a wire's provider caches as the stable prefix of a request.
+    ///
+    /// Anthropic: `tools` then `system`, which is everything before the
+    /// `cache_control` breakpoint on the system block. OpenAI Responses and
+    /// Chat Completions cache automatically by prefix, and render tools ahead
+    /// of the input, so the prefix is `tools` then the leading run of
+    /// instruction items (`system` / `developer`) before the conversation.
+    fn g3_cached_prefix(wire: ModelWire, body: &Value) -> String {
+        let instruction_items = |items: &Value| {
+            Value::Array(
+                items
+                    .as_array()
+                    .expect("conversation array")
+                    .iter()
+                    .take_while(|item| {
+                        matches!(item["role"].as_str(), Some("system" | "developer"))
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        };
+        let instructions = match wire {
+            ModelWire::AnthropicMessages => body["system"].clone(),
+            ModelWire::OpenAiResponses => instruction_items(&body["input"]),
+            ModelWire::OpenAiChatCompat => instruction_items(&body["messages"]),
+            ModelWire::CoercedTools => unreachable!("not a G3 serializer"),
+        };
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{wire:?}: the fixture's tools ride in the provider tool array"
+        );
+        assert!(
+            !instructions.is_null() && instructions != json!([]),
+            "{wire:?}: the fixture has instructions to cache"
+        );
+        format!("{}\n{}", body["tools"], instructions)
+    }
+
+    const G3_WIRES: [ModelWire; 3] = [
+        ModelWire::AnthropicMessages,
+        ModelWire::OpenAiResponses,
+        ModelWire::OpenAiChatCompat,
+    ];
+
+    #[test]
+    fn equal_admitted_instructions_yield_a_byte_identical_cached_prefix() {
+        let admitted = AdmittedInstructions::fixture();
+        for wire in G3_WIRES {
+            let first = g3_request(wire, &admitted, &FIRST_RUN);
+            let second = g3_request(wire, &admitted, &SECOND_RUN);
+            // The two requests really do differ: the run's key and the
+            // conversation both changed. Only the prefix may not.
+            assert_ne!(first.headers, second.headers, "{wire:?}");
+            assert_ne!(first.body, second.body, "{wire:?}");
+
+            let prefix = g3_cached_prefix(wire, &first.body);
+            assert_eq!(
+                prefix,
+                g3_cached_prefix(wire, &second.body),
+                "{wire:?}: provenance metadata, collection order, the run's cache \
+                 key or the conversation leaked into the cached prefix"
+            );
+            for (what, volatile) in [
+                ("source", FIRST_RUN.source_tag),
+                ("version", FIRST_RUN.version),
+                ("cache key", FIRST_RUN.cache_key),
+                ("conversation", FIRST_RUN.user),
+                ("source", SECOND_RUN.source_tag),
+                ("version", SECOND_RUN.version),
+                ("cache key", SECOND_RUN.cache_key),
+                ("conversation", SECOND_RUN.user),
+            ] {
+                assert!(
+                    !prefix.contains(volatile),
+                    "{wire:?}: the {what} `{volatile}` is in the prefix"
+                );
+            }
+            // And the prefix is the admitted instruction plane, not an empty
+            // match: every admitted body is in it.
+            for body in [
+                admitted.persona.as_str(),
+                admitted.project_guidance.as_str(),
+                "/skills/changelog/SKILL.md",
+                "Draft public release notes.",
+            ] {
+                assert!(prefix.contains(body), "{wire:?}: {body}");
+            }
+        }
+    }
+
+    /// The other half of the guard. Byte stability must not be bought by
+    /// suppressing a change the model is meant to see: DR-0167 has a thread
+    /// that continues under the same package take an edited instruction or
+    /// skill catalogue at its next turn, which is a new prefix.
+    #[test]
+    fn a_changed_instruction_or_skill_catalogue_changes_the_cached_prefix() {
+        let baseline = AdmittedInstructions::fixture();
+        let mut persona = baseline.clone();
+        persona.persona.push_str(" Prefer short sentences.");
+        let mut guidance = baseline.clone();
+        guidance.project_guidance = "Keep CHANGELOG entries in the present tense.".into();
+        let mut described = baseline.clone();
+        described.skills[1].description = "Draft public release notes and a summary.".into();
+        let mut added = baseline.clone();
+        added
+            .skills
+            .push(crate::context_assembly::SkillCatalogueEntry {
+                name: "version-bump".into(),
+                description: "Raise the workspace version.".into(),
+                location: "/skills/version-bump/SKILL.md".into(),
+            });
+        let mut removed = baseline.clone();
+        removed.skills.pop();
+        for wire in G3_WIRES {
+            let before = g3_cached_prefix(wire, &g3_request(wire, &baseline, &FIRST_RUN).body);
+            for (change, admitted) in [
+                ("edited persona", &persona),
+                ("edited project guidance", &guidance),
+                ("edited skill description", &described),
+                ("added skill", &added),
+                ("removed skill", &removed),
+            ] {
+                // Under the SAME metadata, so the change is the only difference.
+                let after = g3_cached_prefix(wire, &g3_request(wire, admitted, &FIRST_RUN).body);
+                assert_ne!(before, after, "{wire:?}: {change} did not reach the prefix");
+            }
+        }
+    }
+
     #[test]
     fn openai_parse_extracts_function_call() {
         let body = json!({

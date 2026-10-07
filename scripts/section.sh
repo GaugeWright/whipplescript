@@ -89,8 +89,13 @@ case "${1:-}" in
   mirror-projection)    node scripts/check-mirror-projection.mjs ;;
   governed-doors)
     scripts/check-governed-doors.sh
-    python3 scripts/test-governed-doors.py ;;
+    python3 scripts/test-governed-doors.py
+    python3 scripts/check-governed-operations.py
+    python3 scripts/test-governed-operations.py ;;
   conformance-coverage) scripts/check-conformance-coverage.sh ;;
+  host-action-correspondence)
+    python3 scripts/check-host-action-correspondence.py
+    python3 scripts/test-host-action-correspondence.py ;;
   substrate-refusals)   scripts/check-substrate-refusals.sh ;;
   build-coverage)       node scripts/check-build-coverage.mjs ;;
   gate-test-filters)

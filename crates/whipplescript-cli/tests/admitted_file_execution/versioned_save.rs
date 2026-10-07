@@ -241,6 +241,7 @@ fn run<S, B, C>(
         CompiledHostAction::compile("file.save", &source, None).expect("compile ordinary workflow");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(7))
         .expect("facade")
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );

@@ -63,6 +63,31 @@ const testNormSuccessorKey = p256JwkToGovernanceHex(testNormSuccessorJwk);
 if (!testNormSuccessorKey) throw new Error("test successor key is not a P-256 point");
 
 
+// The governed-action authority (HA-5). Its private key stays in this module;
+// the object is configured with only its public key, as a deployment would be.
+const testActionKeys = await crypto.subtle.generateKey(
+  { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+) as CryptoKeyPair;
+const testActionJwk = await crypto.subtle.exportKey("jwk", testActionKeys.publicKey);
+if (testActionJwk instanceof ArrayBuffer) throw new Error("test action key is not JWK");
+const testActionKey = p256JwkToGovernanceHex(testActionJwk);
+if (!testActionKey) throw new Error("test action key is not a P-256 point");
+// A second, unpinned authority whose valid signatures must not be standing.
+const testStrangerKeys = await crypto.subtle.generateKey(
+  { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+) as CryptoKeyPair;
+
+async function testActionSign(signingHex: string, stranger: boolean): Promise<Response> {
+  const bytes = new Uint8Array(signingHex.match(/../g)!.map((pair) => parseInt(pair, 16)));
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    stranger ? testStrangerKeys.privateKey : testActionKeys.privateKey,
+    bytes,
+  );
+  return Response.json({
+    proof: [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
+  });
+}
 
 function base64(bytes: ArrayBuffer | Uint8Array): string {
   const value =
@@ -193,6 +218,9 @@ export class WorkflowInstance extends RuntimeWorkflowInstance {
       ...env,
       HOME_ADMISSION_BINDINGS: testProjectAdmissionBindings,
       HOME_ADMISSION_KEYS: JSON.stringify({ [TEST_HOME_KEY_ID]: exportedTestHomePublicKey }),
+      WHIP_ACTION_TRUST: JSON.stringify({
+        bindings: [{ authority: "gaugedesk", algorithm: "p256-sha256", key_id: testActionKey }],
+      }),
       WHIP_NORM_TRUST: JSON.stringify({
         bindings: [
           { principal: "norm-owner", algorithm: "p256-sha256", key_id: testHomeGovernanceKey },
@@ -212,6 +240,12 @@ export class WorkflowInstance extends RuntimeWorkflowInstance {
     this.normFixtureEnv.WHIP_EXECUTOR_URL = endpoint;
     this.normFixtureEnv.WHIP_COMPUTE_ENV_HASH = epoch;
     this.normFixtureEnv.WHIP_NORM_RUNTIME = runtime;
+  }
+
+  // Only the test harness calls this, to stand for a deployment that has
+  // removed (undefined) or restored its pinned action authority.
+  configureActionTestTrust(trust: string | undefined): void {
+    this.normFixtureEnv.WHIP_ACTION_TRUST = trust;
   }
 
   configureNormTestPlanning(deployment: { planning?: string; runtime?: string; image_binding?: string; deployed_image?: string }): void {
@@ -278,6 +312,10 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/__test/action/sign") {
+      const { signing_hex, stranger } = await request.json<{ signing_hex: string; stranger?: boolean }>();
+      return testActionSign(signing_hex, stranger === true);
+    }
     if (request.method === "POST" && url.pathname === "/__test/norm/cosign") {
       const { binding, statement } = await request.json<{ binding: string; statement: unknown }>();
       return Response.json({ signature: await testNormSignature(binding, statement) });

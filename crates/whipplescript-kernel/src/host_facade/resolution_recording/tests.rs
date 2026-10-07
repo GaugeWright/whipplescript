@@ -257,6 +257,7 @@ fn setup(case: &str, actor: &str) -> Fixture {
         .expect("verify fixture policy");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
         .expect("facade")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );

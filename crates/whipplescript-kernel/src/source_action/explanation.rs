@@ -23,12 +23,16 @@ use super::{Cause, CauseId, Disposition, FailureKind, ObservedCause, WorkState};
 
 pub mod query;
 
-pub const SCHEMA: &str = "whipplescript.action-explanation.v1";
+pub mod join;
+
+pub const SCHEMA: &str = "whipplescript.action-explanation.v2";
 
 /// Project every managed firing retained by an instance at its current log
 /// frontier. Each firing uses its own immutable executable version and the
-/// exact root/context journaled when it was admitted. This is a read: it does
-/// not advance the instance, publish a phase cut, or authorize any work.
+/// exact root/context journaled when it was admitted. A pending operation's
+/// recorded capacity, backoff, configuration or authority obstruction is
+/// joined from the same prefix. This is a read: it does not advance the
+/// instance, publish a phase cut, or authorize any work.
 pub fn project_instance<S: RuntimeStore>(
     store: &S,
     instance_id: &str,
@@ -88,6 +92,7 @@ pub fn project_instance<S: RuntimeStore>(
         }
     }
 
+    let obstructions = join::operation_obstructions(&prefix.effects, &prefix.events);
     let mut explanations = Vec::new();
     for frame in &frames {
         let executable = programs
@@ -123,17 +128,17 @@ pub fn project_instance<S: RuntimeStore>(
             frontier,
         )
         .map_err(|error| StoreError::Conflict(error.to_string()))?;
-        explanations.push(
-            project(
-                &typed.plan,
-                &progression,
-                instance_id,
-                frame,
-                *epoch,
-                visible_witnesses,
-            )
-            .map_err(StoreError::Conflict)?,
-        );
+        let mut explanation = project(
+            &typed.plan,
+            &progression,
+            instance_id,
+            frame,
+            *epoch,
+            visible_witnesses,
+        )
+        .map_err(StoreError::Conflict)?;
+        join::join_operations(&mut explanation, &obstructions);
+        explanations.push(explanation);
     }
     Ok(explanations)
 }
@@ -180,10 +185,26 @@ pub enum ReasonCode {
     ValueAvailable,
     WaitingInput,
     WaitingOperation,
+    /// The operation's runtime row is held behind a provider/agent capacity
+    /// limit. Recorded by the owning effect store, never inferred from time.
+    WaitingCapacity,
+    /// The operation was re-queued under a recorded `retry_after` gate.
+    WaitingBackoff,
+    /// No profile or provider binding is configured for the operation.
+    MissingConfiguration,
+    /// An admission gate or capability grant refused the operation.
+    MissingAuthority,
     CancellationAcknowledgement,
     UncertainOutcome,
     Recovery,
     ExecutionFailure,
+    /// The owning norm evaluator, at this explanation's frontier, holds only
+    /// evidence about another artifact for the result's requirement.
+    StaleSupport,
+    /// The norm evaluator found a report that cannot count as support.
+    InadequateSupport,
+    /// Current positive and negative evidence both apply.
+    ConflictedSupport,
     NotSelected,
     NotReached,
 }
@@ -225,6 +246,10 @@ pub struct ResultExplanation {
     pub waiting_on: Vec<DependencyReference>,
     pub cause_ids: Vec<String>,
     pub validity_observations: usize,
+    /// Norm-evaluator assessments joined at the same frontier. Empty unless an
+    /// owning evaluator supplied one; an observation count is not a verdict.
+    #[serde(default)]
+    pub support: Vec<join::SupportReference>,
     /// Call sites are ordered outermost first, followed by the definition and
     /// the result site. Consumers can lead with the authored call and defer
     /// internal detail without reconstructing a stack from spans.
@@ -459,6 +484,7 @@ impl Projector<'_> {
                 waiting_on,
                 cause_ids: causes.iter().map(|cause| cause.0.clone()).collect(),
                 validity_observations,
+                support: Vec::new(),
                 source: source_references(plan, binding, node),
             },
             cause_ids: causes,

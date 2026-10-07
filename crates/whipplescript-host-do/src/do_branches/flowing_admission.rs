@@ -12,6 +12,9 @@ use whipplescript_store::branches::flowing_admission::{
     FlowingCancelRequest, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateVerdict,
     FlowingUnitOutcome, ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
 };
+use whipplescript_store::branches::flowing_coverage::{
+    FlowingCoveragePremises, RecordCoveragePremisesOutcome, HOME_COVERAGE_DOMAIN,
+};
 use whipplescript_store::branches::flowing_fence::FlowingSourceKind;
 use whipplescript_store::branches::flowing_parking::FlowingParking;
 use whipplescript_store::branches::{
@@ -118,6 +121,25 @@ fn read_gate_certificate<S: DoSql>(
             ));
         }
         Ok(certificate)
+    })
+    .transpose()
+}
+
+fn read_coverage_premises<S: DoSql>(sql: &S) -> StoreResult<Option<FlowingCoveragePremises>> {
+    sql.query(
+        "SELECT premises_json FROM flowing_coverage_premises WHERE domain = ?1",
+        &[text(HOME_COVERAGE_DOMAIN)],
+    )
+    .map_err(sql_err)?
+    .first()
+    .map(|row| {
+        let premises: FlowingCoveragePremises = serde_json::from_str(&as_text(&row[0]))?;
+        if premises.invalid_field().is_some() {
+            return Err(StoreError::Conflict(
+                "flowing coverage premises are malformed".into(),
+            ));
+        }
+        Ok(premises)
     })
     .transpose()
 }
@@ -813,6 +835,13 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
             ) {
                 return Ok(Refused(R::HolderChanged));
             }
+            if let Err(refusal) = whipplescript_store::branches::flowing_coverage::check(
+                certificate.coverage.as_ref(),
+                read_coverage_premises(&self.sql)?.as_ref(),
+                &request.candidate_manifest_hash,
+            )? {
+                return Ok(Refused(refusal));
+            }
             let Some(pin) = read_attempt_pin(&self.sql, &request.op_id)? else {
                 return Ok(Refused(R::AttemptPinMissing));
             };
@@ -966,6 +995,37 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
     ) -> StoreResult<Option<FlowingCancelReceipt>> {
         read_cancellation(&self.sql, "admission_op_id", admission_op_id)
     }
+
+    fn record_flowing_coverage_premises(
+        &mut self,
+        premises: &FlowingCoveragePremises,
+    ) -> StoreResult<RecordCoveragePremisesOutcome> {
+        exact_atomic(&self.sql, "flowing coverage premises", || {
+            let existing = read_coverage_premises(&self.sql)?;
+            let outcome = whipplescript_store::branches::flowing_coverage::record_outcome(
+                existing.as_ref(),
+                premises,
+            );
+            if let RecordCoveragePremisesOutcome::Recorded(next) = &outcome {
+                self.sql
+                    .execute(
+                        "INSERT INTO flowing_coverage_premises (domain, premises_json) \
+                         VALUES (?1, ?2) ON CONFLICT(domain) DO UPDATE SET \
+                         premises_json = excluded.premises_json",
+                        &[
+                            text(HOME_COVERAGE_DOMAIN),
+                            text(&serde_json::to_string(next)?),
+                        ],
+                    )
+                    .map_err(sql_err)?;
+            }
+            Ok(outcome)
+        })
+    }
+
+    fn flowing_coverage_premises(&self) -> StoreResult<Option<FlowingCoveragePremises>> {
+        read_coverage_premises(&self.sql)
+    }
 }
 
 #[cfg(test)]
@@ -977,12 +1037,19 @@ mod tests {
     use whipplescript_store::branches::flowing_admission::{
         FlowingGateCheck, FlowingGateVerdict, FlowingSelectedUnit,
     };
+    use whipplescript_store::branches::flowing_coverage::{
+        FlowingCoverageBasis, FlowingCoverageClaim, FlowingCoverageUniverse,
+        FlowingOwnerValidation, FlowingRequiredScope, FlowingScopeCoverage,
+    };
     use whipplescript_store::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
     };
     use whipplescript_store::branches::flowing_parking::{
         FlowingParkOutcome, FlowingParkRefusal, ParkFlowingUnit,
+    };
+    use whipplescript_store::branches::flowing_sources::{
+        FlowingSources, ReleasePrivateCut, ReleasePrivateCutOutcome,
     };
     use whipplescript_store::branches::{CreateBranch, CutRecord};
 
@@ -1066,6 +1133,12 @@ mod tests {
         ] {
             sql.execute(statement, &[]).unwrap();
         }
+        assert!(matches!(
+            store
+                .record_flowing_coverage_premises(&coverage_premises())
+                .unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
         for unit_id in ["unit-a", "unit-b"] {
             let attempt = request(unit_id, "fixture");
             store
@@ -1090,6 +1163,10 @@ mod tests {
             policy_digest: "sha256:fixture-policy".into(),
             rules_digest: "sha256:fixture-rules".into(),
             graph_coverage_digest: "sha256:fixture-coverage".into(),
+            coverage: Some(coverage_for(
+                &coverage_premises(),
+                &request.candidate_manifest_hash,
+            )),
             required_checks: vec!["full-workspace-bar".into()],
             checks: vec![FlowingGateCheck {
                 check_id: "full-workspace-bar".into(),
@@ -1139,6 +1216,104 @@ mod tests {
             "UPDATE flowing_contribution_basis SET atoms_json = ?1 WHERE unit_id = 'unit-a'",
             &[text(r#"[{"cut_id":"origin-cut","change_id":"origin-change","path":"a","before":null,"after":"a"}]"#)],
         ).unwrap();
+    }
+
+    #[test]
+    fn hosted_malformed_coverage_premises_are_never_read_as_current() {
+        let (sql, store) = fixture();
+        let mut malformed = coverage_premises();
+        malformed.registry_digest = " ".into();
+        sql.execute(
+            "UPDATE flowing_coverage_premises SET premises_json = ?1",
+            &[text(&serde_json::to_string(&malformed).unwrap())],
+        )
+        .unwrap();
+        let error = store.flowing_coverage_premises().unwrap_err();
+        assert!(format!("{error:?}").contains("flowing coverage premises are malformed"));
+    }
+
+    #[test]
+    fn hosted_ref_rechecks_coverage_premises_inside_the_trunk_cas() {
+        let (sql, mut store) = fixture();
+        let mut attempt = request("unit-a", "coverage-attempt");
+        pin_attempt(&mut store, &attempt);
+        let mut admit_with = |store: &mut DoBranches<Sql>,
+                              coverage: Option<FlowingCoverageBasis>| {
+            let mut certificate = certificate_for(&attempt);
+            certificate.coverage = coverage;
+            insert_gate_certificate(&sql, &certificate);
+            attempt.certificate_handle = certificate.handle().unwrap();
+            store.admit_flowing_prefix(&attempt).unwrap()
+        };
+        assert_eq!(
+            admit_with(&mut store, None),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageUnavailable)
+        );
+
+        let answered = coverage_premises();
+        let captured = coverage_for(&answered, "candidate-manifest");
+        let mut moved = answered.clone();
+        moved.graph_epoch += 1;
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&moved).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        assert_eq!(
+            admit_with(&mut store, Some(captured.clone())),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageStale {
+                premise: "graph"
+            })
+        );
+        assert_eq!(
+            store.record_flowing_coverage_premises(&answered).unwrap(),
+            RecordCoveragePremisesOutcome::Regressed { premise: "graph" }
+        );
+        let mut recaptured = FlowingCoverageBasis::under(&moved).unwrap();
+        recaptured.scopes = captured.scopes.clone();
+        assert_eq!(
+            admit_with(&mut store, Some(recaptured)),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageOwnerUnvalidated {
+                scope_id: "norm-relations@home".into(),
+                owner: "owner-a".into(),
+            })
+        );
+
+        let mut unowned = moved.clone();
+        unowned.roster_digest = "sha256:roster-unowned".into();
+        unowned.required_scopes[1].owners.clear();
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&unowned).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        let mut empty_query = coverage_for(&unowned, "candidate-manifest");
+        empty_query.scopes[1].claim = FlowingCoverageClaim::Complete {
+            examined_digest: "sha256:what-the-query-saw".into(),
+            edge_digest: "sha256:no-edges".into(),
+        };
+        assert_eq!(
+            admit_with(&mut store, Some(empty_query)),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::CoverageScopeUnknown {
+                scope_id: "norm-relations@home".into()
+            })
+        );
+        assert!(store
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+
+        let mut owned = unowned.clone();
+        owned.roster_digest = "sha256:roster-owned".into();
+        owned.required_scopes[1].owners = vec!["owner-a".into()];
+        assert!(matches!(
+            store.record_flowing_coverage_premises(&owned).unwrap(),
+            RecordCoveragePremisesOutcome::Recorded(_)
+        ));
+        assert!(matches!(
+            admit_with(&mut store, Some(coverage_for(&owned, "candidate-manifest"))),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
     }
 
     #[test]
@@ -1619,6 +1794,55 @@ mod tests {
         }
     }
 
+    fn coverage_premises() -> FlowingCoveragePremises {
+        FlowingCoveragePremises {
+            registry_digest: "sha256:registry-1".into(),
+            roster_digest: "sha256:roster-1".into(),
+            source_epoch: 1,
+            lock_epoch: 1,
+            graph_epoch: 1,
+            required_scopes: vec![
+                FlowingRequiredScope {
+                    scope_id: "imports@home".into(),
+                    universe: FlowingCoverageUniverse::Closed {
+                        members_digest: "sha256:programs".into(),
+                    },
+                    owners: vec!["owner-a".into()],
+                },
+                FlowingRequiredScope {
+                    scope_id: "norm-relations@home".into(),
+                    universe: FlowingCoverageUniverse::Open,
+                    owners: vec!["owner-a".into()],
+                },
+            ],
+        }
+    }
+
+    fn coverage_for(premises: &FlowingCoveragePremises, candidate: &str) -> FlowingCoverageBasis {
+        let mut basis = FlowingCoverageBasis::under(premises).unwrap();
+        basis.scopes = vec![
+            FlowingScopeCoverage {
+                scope_id: "imports@home".into(),
+                claim: FlowingCoverageClaim::Complete {
+                    examined_digest: "sha256:programs".into(),
+                    edge_digest: "sha256:edges".into(),
+                },
+                owner_validations: Vec::new(),
+            },
+            FlowingScopeCoverage {
+                scope_id: "norm-relations@home".into(),
+                claim: FlowingCoverageClaim::Unknown,
+                owner_validations: vec![FlowingOwnerValidation {
+                    owner: "owner-a".into(),
+                    candidate_manifest_hash: candidate.into(),
+                    graph_epoch: premises.graph_epoch,
+                    evidence_digest: "sha256:owner-a-answer".into(),
+                }],
+            },
+        ];
+        basis
+    }
+
     fn record_gate_certificate(sql: &Sql, request: &FlowingAdmissionRequest) {
         insert_gate_certificate(sql, &certificate_for(request));
     }
@@ -1718,6 +1942,14 @@ mod tests {
         let FlowingParkOutcome::Parked(receipt) = store.park_flowing_unit(&park).unwrap() else {
             panic!("expected parked receipt");
         };
+        let evidence = whipplescript_store::branches::flowing_parking_host::read_parking_evidence(
+            &store, "park-a",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence.unit_id, "unit-a");
+        assert_eq!(evidence.parked_holder_id, "park:repair-owner");
+        assert_eq!(evidence.resulting_eligibility_epoch, 1);
         assert_eq!(receipt.former_holder.holder_cut_id, "source");
         assert_eq!(receipt.source_fence_after.eligibility_epoch, 1);
         assert_eq!(
@@ -1786,6 +2018,94 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn terminal_parking_keeps_the_hosted_source_cut_after_private_pin_release() {
+        let (sql, mut store) = fixture();
+        assert!(matches!(
+            store
+                .park_flowing_unit(&park_request("park-a", "unit-a"))
+                .unwrap(),
+            FlowingParkOutcome::Parked(_)
+        ));
+        let release = ReleasePrivateCut {
+            pin_id: "pin",
+            released_by: "author",
+            reason: "all declared work transferred to parked holders",
+            released_at: "t5",
+        };
+        assert_eq!(
+            store.release_private_cut(release).unwrap(),
+            ReleasePrivateCutOutcome::HasDeclaredUnit
+        );
+        let mut park_b = park_request("park-b", "unit-b");
+        park_b.expected_eligibility_epoch = store
+            .flowing_source("twig")
+            .unwrap()
+            .unwrap()
+            .eligibility_epoch;
+        assert!(matches!(
+            store.park_flowing_unit(&park_b).unwrap(),
+            FlowingParkOutcome::Parked(_)
+        ));
+        assert_eq!(
+            store.release_private_cut(release).unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        let reopened = DoBranches::new(sql).unwrap();
+        assert_eq!(
+            reopened
+                .private_cut_pin("pin")
+                .unwrap()
+                .unwrap()
+                .released_at
+                .as_deref(),
+            Some("t5")
+        );
+        assert!(reopened
+            .pinned_cuts("year-3000")
+            .unwrap()
+            .contains("source"));
+    }
+
+    #[test]
+    fn admitted_unit_keeps_the_hosted_source_cut_after_private_and_attempt_pin_release() {
+        let (sql, mut store) = fixture();
+        sql.execute(
+            "DELETE FROM flowing_contribution_basis WHERE unit_id = 'unit-b'",
+            &[],
+        )
+        .unwrap();
+        sql.execute(
+            "DELETE FROM flowing_contributions WHERE unit_id = 'unit-b'",
+            &[],
+        )
+        .unwrap();
+        let attempt = request("unit-a", "fixture");
+        pin_attempt(&mut store, &attempt);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .release_private_cut(ReleasePrivateCut {
+                    pin_id: "pin",
+                    released_by: "author",
+                    reason: "declared unit admitted",
+                    released_at: "t5",
+                })
+                .unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        // Model the later receipt reconciliation that releases the attempt pin.
+        sql.execute(
+            "UPDATE flowing_attempt_pins SET released_at = 't6' WHERE op_id = 'fixture'",
+            &[],
+        )
+        .unwrap();
+        assert!(store.pinned_cuts("year-3000").unwrap().contains("source"));
     }
 
     #[test]

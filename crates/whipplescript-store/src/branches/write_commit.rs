@@ -110,6 +110,7 @@ pub(super) fn native(
         WritePreparation::Ready { after, deltas } => (after, deltas),
         WritePreparation::Refused(outcome) => return Ok(outcome),
     };
+    super::BranchStore::require_open_flowing_member(&tx, cut.branch_id)?;
     check()?;
     // Strict INSERTs are deliberate: a first-wins no-op could bind the new
     // head to an earlier, different receipt under the same identity.

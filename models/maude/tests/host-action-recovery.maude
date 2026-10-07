@@ -64,4 +64,29 @@ search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
 search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-COMPENSATION :
   state(frame(k1, a1, t1, i1), applied) compensate(k1, k2, false)
   =>* authorizedCompensation(k2, k1) C:Cfg .
+--- The file adapter's ceiling: an exact committed cut settles application.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING :
+  work(k1, ready)
+  =>* work(k1, applied) written(k1) C:Cfg .
+--- A metadata claim of a stronger ceiling never licenses resubmission.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING :
+  work(k1, ready) claimed(k1, deduplicated) retry(k1) retry(k1)
+  =>* written(k1) written(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING-PROMOTED :
+  work(k1, ready) claimed(k1, deduplicated) retry(k1) retry(k1)
+  =>* written(k1) written(k1) C:Cfg .
+--- A missing cut cannot become absence, so the write is never repeated.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING :
+  work(k1, unknown) marker(k1, unverifiable) written(k1) missingCut(k1) retry(k1)
+  =>* written(k1) written(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING-MISSING :
+  work(k1, unknown) marker(k1, unverifiable) written(k1) missingCut(k1) retry(k1)
+  =>* written(k1) written(k1) C:Cfg .
+--- Authenticated absence permits a fresh write; without it a retry refuses.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING :
+  work(k1, unknown) marker(k1, unverifiable) absenceRecord(k1) retry(k1)
+  =>* written(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING :
+  work(k1, ready) retry(k1)
+  =>* work(k1, unknown) refused(k1) C:Cfg .
 quit

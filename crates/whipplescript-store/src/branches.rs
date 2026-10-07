@@ -16,13 +16,17 @@
 //! no-destructive-verbs surface).
 
 pub mod flowing_admission;
+pub mod flowing_close_roster;
+pub mod flowing_coverage;
 pub mod flowing_declaration_host;
 pub mod flowing_fence;
 pub mod flowing_fence_host;
 pub mod flowing_holders;
 pub mod flowing_host;
 pub mod flowing_lineage;
+pub mod flowing_open_host;
 pub mod flowing_parking;
+pub mod flowing_parking_host;
 mod flowing_read;
 pub mod flowing_rewrite;
 pub mod flowing_sources;
@@ -124,6 +128,12 @@ pub enum CreateBranchOutcome {
     ParentNotActive {
         status: BranchStatus,
     },
+    /// A flowing parent's closure fence forbids new members even while its
+    /// branch row remains active for reconciliation and parking.
+    ParentAdmissionDisabled,
+    /// A flowing branch accepts direct unnamed twigs, not nested or named
+    /// branches whose obligations would escape its member inventory.
+    ParentFlowingTopology,
     /// Another ACTIVE branch already holds the name; names are optional
     /// labels, unique only among live branches.
     NameTaken {
@@ -203,6 +213,8 @@ pub enum RetargetOutcome {
     ParentNotActive {
         status: BranchStatus,
     },
+    /// Legacy retarget has no flowing membership or holder-transfer receipt.
+    ParentFlowingSource,
     /// The new parent's lineage passes through the branch itself (or IS
     /// the branch): parent pointers must stay a tree.
     WouldCycle,
@@ -940,6 +952,7 @@ impl BranchStore {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        Self::require_open_flowing_member(&tx, branch_id)?;
         if let Some(state) = flowing_fence::native::read_state(&tx, branch_id)? {
             let cut = Self::cut_by_id(&tx, cut_id)?;
             flowing_fence::require_head_move(
@@ -987,6 +1000,52 @@ impl BranchStore {
     fn require_legacy_shape_move(connection: &Connection, branch_id: &str) -> StoreResult<()> {
         if flowing_fence::native::read_state(connection, branch_id)?.is_some() {
             return Err(flowing_fence::refuse_legacy_shape_move(branch_id));
+        }
+        Ok(())
+    }
+
+    /// Nearest-first flowing ancestors. Walking the whole ancestry prevents
+    /// membership through an existing child after the parent begins closing.
+    fn flowing_ancestry(
+        connection: &Connection,
+        parent_id: &str,
+    ) -> StoreResult<Vec<flowing_fence::FlowingFenceState>> {
+        let mut cursor = Some(parent_id.to_owned());
+        let mut visited = BTreeSet::new();
+        let mut states = Vec::new();
+        while let Some(id) = cursor {
+            if !visited.insert(id.clone()) {
+                // MUTATION-SUCCESS-EXPR: Ok(Vec::new())
+                return Err(StoreError::Conflict("cyclic branch ancestry".into()));
+            }
+            if let Some(state) = flowing_fence::native::read_state(connection, &id)? {
+                states.push(state);
+            }
+            let Some(row) = Self::row_by_id(connection, &id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(Vec::new())
+                return Err(StoreError::Conflict("missing branch ancestor".into()));
+            };
+            cursor = row.parent_branch_id;
+        }
+        Ok(states)
+    }
+
+    /// A child of a flowing branch may exist before its source fence is
+    /// opened, but it cannot acquire private work in that interval.
+    fn require_open_flowing_member(connection: &Connection, branch_id: &str) -> StoreResult<()> {
+        let Some(branch) = Self::row_by_id(connection, branch_id)? else {
+            return Ok(());
+        };
+        let Some(parent_id) = branch.parent_branch_id.as_deref() else {
+            return Ok(());
+        };
+        if flowing_fence::native::read_state(connection, parent_id)?.is_some()
+            && flowing_fence::native::read_state(connection, branch_id)?.is_none()
+        {
+            // MUTATION-SUCCESS-EXPR: Ok(())
+            return Err(StoreError::Conflict(
+                "flowing member has no source fence".into(),
+            ));
         }
         Ok(())
     }
@@ -1152,7 +1211,10 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// ref authority; an older writer must not reuse an admitted source unit.
 /// Version 11 adds atomic flowing rewrite receipts and their constituent root
 /// lineage; an older writer cannot interpret a rewritten source head.
-const SATELLITE_SCHEMA_VERSION: i64 = 11;
+/// Version 12 records immutable member-opening receipts, so retries cannot
+/// mistake a changed owner or head for a different creation request.
+/// Version 13 gives all newly opened flowing sources immutable retry receipts.
+const SATELLITE_SCHEMA_VERSION: i64 = 13;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1384,6 +1446,17 @@ impl Branches for BranchStore {
                 status: parent.status,
             });
         }
+        let ancestry = Self::flowing_ancestry(&tx, request.parent_branch_id)?;
+        if ancestry.iter().any(|state| !state.admission_enabled) {
+            return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+        }
+        if ancestry.first().is_some_and(|state| {
+            state.source_branch_id != request.parent_branch_id
+                || state.kind != flowing_fence::FlowingSourceKind::Branch
+                || request.name.is_some()
+        }) {
+            return Ok(CreateBranchOutcome::ParentFlowingTopology);
+        }
         if let Some(name) = request.name {
             let holder: Option<String> = tx
                 .query_row(
@@ -1521,6 +1594,9 @@ impl Branches for BranchStore {
             return Ok(RetargetOutcome::ParentNotActive {
                 status: parent.status,
             });
+        }
+        if !Self::flowing_ancestry(&tx, new_parent_branch_id)?.is_empty() {
+            return Ok(RetargetOutcome::ParentFlowingSource);
         }
         // Parent pointers must stay a tree: refuse if the new parent's
         // lineage passes through the branch itself (self-parent is the
@@ -1839,6 +1915,10 @@ impl Branches for BranchStore {
                       WHERE released_at IS NULL \
                       UNION SELECT source_cut_id FROM flowing_handoffs \
                       UNION SELECT target_after_cut_id FROM flowing_handoffs \
+                      UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
+                      JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
+                      UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
+                      JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
                       UNION SELECT source_cut_id FROM flowing_attempt_pins \
                       WHERE released_at IS NULL \
                       UNION SELECT candidate_cut_id FROM flowing_attempt_pins \

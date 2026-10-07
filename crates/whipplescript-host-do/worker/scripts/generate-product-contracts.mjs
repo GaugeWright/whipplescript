@@ -46,6 +46,12 @@ const hostOperations = [
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],
+  // Governed host actions (HA-5): admission under the deployment's pinned
+  // action authority, ordinary execution of the admitted program, and a
+  // separately authorized result read.
+  ["runtime.host.action.admit", "POST", "/host/actions/admit", "http-json", "mutation", "critical"],
+  ["runtime.host.action.execute", "POST", "/host/actions/execute", "http-json", "mutation", "critical"],
+  ["runtime.host.action.result", "POST", "/host/actions/result", "http-json", "none", "important"],
   ["runtime.host.instance.discard", "POST", "/host/instances/:instance/discard", "http-json", "mutation", "critical"],
   ["runtime.host.turn.cancel", "POST", "/host/instances/:instance/turns/:turn/cancel", "http-json", "mutation", "critical"],
   ["runtime.host.files.sync", "POST", "/host/instances/:instance/files/sync", "http-json", "mutation", "critical"],
@@ -151,6 +157,16 @@ function evidenceFor(id) {
   if (id === "runtime.host.norm.publications") {
     const publication = "src/authenticated-host.integration.test.ts#norm-observation-publication";
     return { contract: [publication], authority: [publication], journey: [publication], deployed: [], property: [publication] };
+  }
+  if (id === "runtime.host.action.admit" || id === "runtime.host.action.execute" || id === "runtime.host.action.result") {
+    const action = "src/authenticated-host.integration.test.ts#host-action-worker-transport";
+    return {
+      contract: ["src/authenticated-host.integration.test.ts#declared-route-surface"],
+      authority: [action],
+      journey: [action],
+      deployed: [],
+      property: ["src/authenticated-host.integration.test.ts#declared-route-surface", action],
+    };
   }
   const publicSession = id.startsWith("runtime.public.");
   const declaredInnerRoute = id.startsWith("runtime.host.")

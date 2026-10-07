@@ -238,11 +238,18 @@ fn action_agent_shadowing_clears_scalar_and_field_refinements() {
         ),
         ("record Input", "record.target", "record", "record.target"),
     ] {
+        // The shadowing `tell` binds a string, so a field read through it is
+        // an unknown field on that scalar rather than the outer record.
+        let expected = if shadow == "record" {
+            diagnostic_code!("type.unknown_field")
+        } else {
+            diagnostic_code!("type.mismatch")
+        };
         let body = format!("case {selector} {{ writer => {{ tell writer as {shadow} \"new value\"\n{} }} _ => {{ }} }}", tell(target, "write"));
         let text = source(params, &body, "");
         let errors = authority(&text);
         assert_eq!(errors.len(), 1, "{text}: {errors:?}");
-        assert_eq!(errors[0].code, diagnostic_code!("type.mismatch"));
+        assert_eq!(errors[0].code, expected, "{errors:?}");
     }
 }
 

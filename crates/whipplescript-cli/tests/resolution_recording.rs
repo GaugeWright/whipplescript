@@ -489,6 +489,7 @@ where
         .expect("fixture policy");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope)
         .expect("facade")
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );
@@ -508,6 +509,7 @@ where
                     .expect("original policy verified"),
             )
             .expect("original action policy")
+            .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
             .with_compiler_artifact_digest(
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             );

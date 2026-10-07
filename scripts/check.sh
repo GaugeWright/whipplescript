@@ -205,6 +205,12 @@ section carries-buckify-crates
     echo "== conformance coverage =="
     section conformance-coverage
 
+    # The host-action Maude models say the model is safe; this says which
+    # store/kernel function each rule stands for and which test fails if the
+    # implementation takes a control's forbidden transition (HA-1).
+    echo "== host-action correspondence =="
+    section host-action-correspondence
+
     # DR-0066 §8 opens "a change that weakens one of these is a defect even when
     # it makes something faster", and not one of its seven refusals had a check.
     # Two are mechanically checkable; the other five are recorded as unchecked
@@ -236,8 +242,8 @@ fi
 
 echo "== workflow action pins =="
 # Every third-party action must be SHA-pinned, not floating on a tag. The lane
-# this most protects is publish-crates.yml, whose job holds the crates.io token
-# and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
+# this most protects is docs-deploy.yml, whose job holds a Cloudflare deploy
+# token. Cheap, needs no toolchain, so it runs on every change.
 section workflow-action-pins
 
 echo "== version declarations =="

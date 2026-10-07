@@ -18,9 +18,21 @@ conformance tests must establish those implementation boundaries.
 `host-action-recovery.maude` adds exact attempt/target/input evidence binding,
 late evidence after terminal failure, preserved contradictory evidence,
 suspension of disputed recovery, and fresh authorization for compensation.
-Its 16 searches include six reachable negative controls. The model's sink is
-unverifiable; stronger adapter recovery ceilings and correspondence to the
-store/executor implementation remain separate obligations.
+It also models the file adapter's declared recovery ceiling: every file
+dispatch marker is `unverifiable` whatever ceiling run metadata claims, an
+exact committed cut proves only application, and a missing cut is never
+absence, so a write is repeated only after separately authenticated absence.
+Its 23 searches include eight reachable negative controls. Stronger ceilings
+for other adapters (transactional, deduplicated, reconcilable) need their own
+model and conformance evidence before any adapter may declare one.
+
+[`../host-action-correspondence.tsv`](../host-action-correspondence.tsv) maps
+every rule of both host-action models to the store or kernel function that
+realises it and the regression test that fails if the implementation takes a
+control's forbidden transition. `scripts/check-host-action-correspondence.py`,
+the bar's `host-action-correspondence` section, fails when a rule has no row
+or a named function or test disappears. It checks names; what each test
+asserts is the test's own business.
 
 `lexical-failure-handler.maude` models scope-wide recovery after local
 continuations have had priority and the rule's outer workflow disposition. Its

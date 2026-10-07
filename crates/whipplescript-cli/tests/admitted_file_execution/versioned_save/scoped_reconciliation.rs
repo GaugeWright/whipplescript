@@ -210,6 +210,7 @@ fn run_scoped<S, B, C>(
     let action = CompiledHostAction::compile("file.save", SOURCE, None).expect("compiled workflow");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, scoped_envelope(7))
         .expect("facade")
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );

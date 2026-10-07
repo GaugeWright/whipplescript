@@ -19,6 +19,39 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Tracker discovery retires obsolete views and staging directories by rename,
+  then deletes them after releasing the database writer and publication locks.
+  A slow cleanup no longer blocks another tracker writer; interrupted cleanup
+  is recovered without removing unrelated directories.
+
+- Tracker queries now read a single committed, read-only SQLite snapshot and
+  remain available while a writer publishes discovery. Queries no longer
+  initialize a missing store, enroll a checkout or repair generated views.
+  Run `whip issue bootstrap` explicitly for plain native tracker setup and
+  recovery; mutations still enroll and publish synchronously. Readiness and
+  lease overlays share one query boundary instant (DR-0196).
+
+- `whip auth set openai-generic <base-url> <key>` stores a key for one
+  OpenAI-compatible endpoint, under its base URL, and a call to that endpoint
+  uses it after `OPENAI_API_KEY` and before the stored `openai` key.
+  `whip auth status` lists each stored endpoint redacted, and the new
+  `whip auth clear` removes a stored credential (WS-297).
+
+- The hosted Durable Object runtime admits, executes and reads back governed
+  host actions through its Worker (DR-0197). Proofs verify against action
+  authorities the deployment pins in `WHIP_ACTION_TRUST`; without it every
+  action route refuses.
+
+- Breaking for embedding hosts: `GovernedHostFacade` now refuses hosted
+  program opens, changed-IR re-attestation, and ordinary and materialized
+  host-action admission unless the host's shipped standard registry is
+  configured, with "... requires the host's shipped standard registry". Before,
+  an unconfigured facade admitted with no construct witness. An embedding host
+  must call
+  `.with_embedded_std_manifests(whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS)`
+  on its facade, or pass an explicit empty set if it ships no standard
+  vocabulary. This needs a middle-number release.
+
 ## [0.10.0] — 2026-10-06
 
 A minor release, because three published crates changed public types that a

@@ -1,0 +1,69 @@
+use std.coercion
+
+workflow Digest
+
+// The cache-efficiency warning (language reference, "Prompt-cache checks"):
+// `summarize` interpolates `requested_at`, a timestamp that differs on every
+// call, on its first line. Every provider caches a prompt by its fixed
+// prefix, so the instructions after that line are paid for in full on every
+// call. The program is correct, so this is a WARNING and the program is
+// accepted, which is why it lives here and not under examples/invalid/. Move
+// the `Requested at` line to the end of the prompt and the warning goes away.
+
+output result Done
+
+class Report {
+  id string
+  requested_at string
+  log string
+}
+
+class Summary {
+  headline string
+}
+
+class Done {
+  note string
+}
+
+coerce summarize(requested_at string, log string) -> Summary {
+  prompt """
+  Requested at {{ requested_at }}.
+
+  You summarize build logs for an on-call engineer. Read the log below and
+  write one headline that names the failing step and the first error that it
+  printed. Do not speculate about causes that the log does not show, and do
+  not repeat the log back.
+
+  Log:
+  {{ log }}
+
+  {{ ctx.output_format }}
+  """
+}
+
+table reports as Report [
+  {
+    id "r1"
+    requested_at "2026-10-06T09:00:00Z"
+    log "step build: error E0425"
+  }
+]
+
+rule digest
+  when Report as r
+=> {
+  coerce summarize(r.requested_at, r.log) as summary
+
+  after summary succeeds {
+    complete result {
+      note summary.headline
+    }
+  }
+
+  after summary fails {
+    complete result {
+      note "the log could not be summarized"
+    }
+  }
+}

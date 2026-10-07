@@ -215,6 +215,20 @@ fn unknown_and_optional_field_accesses_cannot_infer_any_result_type() {
                 diagnostic.code == diagnostic_code!("type.unknown_field")
                     && diagnostic.message.contains("`x` has no field `missing`")
             }));
+        } else if params == "x int" && expr == "x.missing" {
+            // A field read through a scalar names the scalar, rather than
+            // leaving the consumer to report an undeterminable type.
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == diagnostic_code!("type.unknown_field")
+                        && diagnostic
+                            .message
+                            .contains("`x` is int and has no field `missing`")
+                        && diagnostic.suggestion.as_deref()
+                            == Some("`x` has no fields; use `x` directly")
+                }),
+                "{diagnostics:?}"
+            );
         } else {
             assert!(diagnostics
                 .iter()

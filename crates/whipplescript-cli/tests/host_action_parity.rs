@@ -3,6 +3,8 @@
 //! schema. It does not claim to exercise the Worker transport or a file sink.
 
 use serde_json::{json, Value};
+#[path = "support/construct_revalidation_parity.rs"]
+mod construct_revalidation_parity;
 #[path = "support/host_action_contract_reports.rs"]
 mod host_action_contract_reports;
 #[path = "support/materialized_action_parity.rs"]

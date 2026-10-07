@@ -985,6 +985,117 @@
       }
     },
     {
+      "id": "runtime.host.action.admit",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/actions/admit",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.action.admit/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.action.admit/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface",
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.action.execute",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/actions/execute",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.action.execute/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.action.execute/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface",
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.action.result",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/actions/result",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.action.result/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.action.result/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface",
+          "src/authenticated-host.integration.test.ts#host-action-worker-transport"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.instance.discard",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",

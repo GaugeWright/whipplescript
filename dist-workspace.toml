@@ -11,8 +11,6 @@ ci = ["github"]
 installers = ["shell", "powershell", "homebrew"]
 # Packages to distribute from this workspace
 packages = ["whipplescript"]
-# Extra reusable workflows to run after local artifacts are built
-global-artifacts-jobs = ["./dist-smoke"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
@@ -25,6 +23,8 @@ publish-jobs = ["homebrew"]
 hosting = ["github"]
 # Whether to install an updater program
 install-updater = false
-# The release workflow includes WhippleScript-specific artifact packaging after
-# cargo-dist's generated global artifact build.
+# No release workflow exists: scripts/release-fleet.sh cuts the release on the
+# company's fleet (GaugeWright DR-0140) and runs dist's build steps itself, so
+# dist must not insist on a generated .github/workflows/release.yml. Removing
+# `ci` above would only drop the GitHub runner matrix from `dist plan`'s output.
 allow-dirty = ["ci"]

@@ -80,6 +80,7 @@ effect.unhandled_failure COVERED
 effect.unhandled_outcome COVERED
 effect.unsatisfiable_dependency COVERED
 effect.unsupported_predicate COVERED
+effect.volatile_prompt_prefix COVERED
 expr.arity_mismatch COVERED
 expr.binding_out_of_scope COVERED
 expr.case_pattern_mismatch COVERED

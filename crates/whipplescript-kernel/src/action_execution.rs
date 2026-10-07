@@ -143,6 +143,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         crate::resolution_recording::run(&mut scope, &instance, &effect, target)
     }
 
+    /// The external-effect family (HA-4): an admitted `signal.emit` reaches
+    /// its sink only here, with the grant consumed by the handler's fresh
+    /// observed dispatch. The removed bare `emit` (`event.emit`) is not an
+    /// admissible action effect and has no verified entry.
+    pub(crate) fn execute_verified_signal_effect(
+        &mut self,
+        verified: VerifiedActionExecution,
+        governance: &dyn crate::effect_handlers::DeliveryGovernance,
+    ) -> StoreResult<StoredEvent> {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        match effect.kind.as_str() {
+            "signal.emit" => crate::effect_handlers::run_notify_effect_generic(
+                &mut scope, &instance, &effect, governance,
+            ),
+            _ => Err(StoreError::Conflict(
+                "execution requires a governed signal effect".into(),
+            )),
+        }
+    }
+
     pub(crate) fn execute_verified_file_effect(
         &mut self,
         verified: VerifiedActionExecution,
@@ -225,6 +248,27 @@ mod tests {
                 kernel.action_execution.is_none(),
                 "a refused use consumes the transient grant"
             );
+        }
+    }
+
+    #[test]
+    fn the_signal_entry_executes_only_signal_effects_and_consumes_its_grant() {
+        struct Unused;
+        impl crate::effect_handlers::DeliveryGovernance for Unused {
+            fn any_internal_workflow(&self, _: &[String]) -> Result<bool, String> {
+                panic!("a refused kind reaches no delivery policy")
+            }
+        }
+        let mut kernel = RuntimeKernel::new(NativeStores::open_in_memory().expect("store"));
+        for kind in ["file.write", "event.emit", "capability.call"] {
+            let error = kernel
+                .execute_verified_signal_effect(verified(kind), &Unused)
+                .expect_err("only signal.emit is a governed signal effect");
+            assert!(
+                format!("{error:?}").contains("execution requires a governed signal effect"),
+                "{kind}: {error:?}"
+            );
+            assert!(kernel.action_execution.is_none(), "{kind}");
         }
     }
 

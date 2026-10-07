@@ -452,3 +452,84 @@ fn invalid_plan_is_refused_before_it_can_mislabel_selection() {
         "{error}"
     );
 }
+
+/// E1 acceptance: a result blocked by a cause this firing never observed is
+/// explained end to end — projection, query selection and the wire form a
+/// consumer reads — as `unknown`, with no invented kind, witness, recovery or
+/// retry, and with the cause still nameable for inspection.
+#[test]
+fn an_unobserved_upstream_cause_is_explained_end_to_end_as_unknown() {
+    let plan = plan("rule run when started => { timer 1s as answer }");
+    let upstream = CauseId("upstream-cause".into());
+    let progression = advance(
+        &plan,
+        "instance-1",
+        &frame("firing-a"),
+        19,
+        &Bindings::new(),
+        &Default::default(),
+        |_| {
+            // The statement's own evaluation is blocked by a cause recorded
+            // outside this firing's owned work, so no observed record exists.
+            Ok(Leaf::Waiting(crate::source_action::arguments::Evaluation {
+                subjects: Default::default(),
+                state: crate::source_action::arguments::State::Blocked {
+                    waiting: BTreeSet::new(),
+                    causes: BTreeSet::from([upstream.clone()]),
+                },
+                reads: BTreeSet::new(),
+                sources: BTreeSet::new(),
+                validity: Default::default(),
+            }))
+        },
+    )
+    .unwrap();
+    let explanation = explain(&plan, &progression, "firing-a", &["upstream-cause"]);
+
+    let response = query::resolve(
+        std::slice::from_ref(&explanation),
+        "instance-1",
+        "answer",
+        None,
+    )
+    .unwrap();
+    let encoded = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        encoded["schema"],
+        json!("whipplescript.action-explanation-query.v2")
+    );
+    let selection = &encoded["outcome"]["selection"];
+    assert_eq!(encoded["outcome"]["kind"], json!("selected"));
+    assert_eq!(selection["evaluated_frontier"], json!(19));
+    assert_eq!(selection["result"]["status"], json!("failed"));
+    assert_eq!(selection["result"]["reasons"], json!(["execution_failure"]));
+    assert_eq!(selection["result"]["cause_ids"], json!(["upstream-cause"]));
+    assert_eq!(
+        selection["causes"],
+        json!([{
+            "cause_id": "upstream-cause",
+            "kind": "unknown",
+            "recovered": false,
+            "dependents": [selection["result"]["result_id"]],
+            "witness_refs": [],
+            "witnesses_complete": false,
+        }]),
+        "an unobserved cause carries no kind, witness or recovery it was never given"
+    );
+    assert_eq!(
+        selection["next_action"],
+        json!({
+            "code": "inspect_cause",
+            "result_id": null,
+            "operation_id": null,
+            "binding": null,
+            "cause_id": "upstream-cause",
+            "authorizes_work": false,
+            "retry_permitted": false,
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<query::Response>(encoded).unwrap(),
+        response
+    );
+}

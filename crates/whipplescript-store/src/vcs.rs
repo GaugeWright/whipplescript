@@ -1121,6 +1121,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         &self.branches
     }
 
+    /// A manifest by its content-addressed hash, for a caller that already
+    /// holds an exact recorded state (a review revision) rather than a cut.
+    pub(crate) fn manifest_by_hash(&self, hash: &str) -> StoreResult<BTreeMap<String, String>> {
+        self.load_manifest(Some(hash))
+    }
+
     /// Install the host's declaration-granularity source merger (the
     /// kernel's parser-backed implementation). Fail-closed default: no
     /// merger, no source-aware refinement.
@@ -5197,7 +5203,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         branch_id: source_branch_id,
                     });
                 }
-                CreateBranchOutcome::ParentNotActive { .. } => {
+                CreateBranchOutcome::ParentNotActive { .. }
+                | CreateBranchOutcome::ParentAdmissionDisabled
+                | CreateBranchOutcome::ParentFlowingTopology => {
                     return Ok(InstanceForkBinding::SourceBranchUnavailable {
                         branch_id: source_branch_id,
                     });
@@ -5385,7 +5393,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     branch_id: holder_branch_id,
                 })
             }
-            CreateBranchOutcome::ParentMissing | CreateBranchOutcome::ParentNotActive { .. } => {
+            CreateBranchOutcome::ParentMissing
+            | CreateBranchOutcome::ParentNotActive { .. }
+            | CreateBranchOutcome::ParentAdmissionDisabled
+            | CreateBranchOutcome::ParentFlowingTopology => {
                 return Ok(ExactInstanceForkBinding::SourceBranchUnavailable {
                     branch_id: source_branch_id,
                 })
@@ -5583,6 +5594,9 @@ impl MainlineGate for NoNormLedger {
         Ok(GateCommit::Committed)
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+mod review_findings_tests;
 
 #[cfg(all(test, feature = "native"))]
 mod tests {

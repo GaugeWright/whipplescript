@@ -223,6 +223,7 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
         CompiledHostAction::compile("file.save", SOURCE, None).expect("compiled file action");
     let mut facade = GovernedHostFacade::from_verified_store(store, 7, envelope(7))
         .expect("admission facade")
+        .with_embedded_std_manifests(whipplescript_host_do::do_packages::EMBEDDED_STD_MANIFESTS)
         .with_compiler_artifact_digest(
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         );
@@ -408,6 +409,23 @@ fn journey<S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead
             assert!(error
                 .to_string()
                 .contains("fixture execution authentication"));
+            // The signal door is not a second way into a file effect: a file
+            // input names no delivery target, so it refuses before dispatch.
+            let error = facade
+                .execute_action_signal_effect(
+                    request.clone(),
+                    &action,
+                    &verifier,
+                    b"execution",
+                    &signal_delivery::OpenDelivery,
+                )
+                .expect_err("the signal door refuses a file effect");
+            assert!(
+                error
+                    .to_string()
+                    .contains("signal effect names no target or signal"),
+                "{error}"
+            );
             verifier.revoked.set(true);
             assert!(
                 facade
@@ -609,5 +627,7 @@ fn execution_fixture_rejects_a_forged_policy_signature() {
 
 #[path = "admitted_file_execution/save_reconciliation.rs"]
 mod save_reconciliation;
+#[path = "admitted_file_execution/signal_delivery.rs"]
+mod signal_delivery;
 #[path = "admitted_file_execution/versioned_save.rs"]
 mod versioned_save;

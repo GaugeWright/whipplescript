@@ -2,9 +2,10 @@
 # Every third-party action this repository runs is pinned to a full 40-hex
 # commit SHA, not a floating tag. A tag can be re-pointed after review to a
 # different commit; a job that runs a re-pointed tag runs whatever that tag now
-# resolves to. That is worst in publish-crates.yml, whose job holds
-# CARGO_REGISTRY_TOKEN and performs the one release step with no undo, which is
-# where a floating `actions/checkout@v4` sat unnoticed (SOC 2 3.1 / 6.6).
+# resolves to. That is worst in a job that holds a credential: docs-deploy.yml
+# holds the Cloudflare Pages token, and the deleted publish-crates.yml held
+# CARGO_REGISTRY_TOKEN, which is where a floating `actions/checkout@v4` sat
+# unnoticed (SOC 2 3.1 / 6.6).
 #
 # This lints the whole workflow tree so a future floating tag re-fails here
 # rather than at audit time. A local reusable workflow reference (`./...`) is

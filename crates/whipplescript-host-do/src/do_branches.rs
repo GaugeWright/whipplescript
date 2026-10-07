@@ -15,6 +15,7 @@
 //! defensively for stores that predate it.
 
 mod flowing_admission;
+mod flowing_close_roster;
 mod flowing_fence;
 mod flowing_parking;
 mod flowing_rewrite;
@@ -59,6 +60,24 @@ impl<S: DoSql> DoBranches<S> {
         Ok(())
     }
 
+    fn require_open_flowing_member(&self, branch_id: &str) -> StoreResult<()> {
+        let Some(branch) = self.row_by_id(branch_id)? else {
+            return Ok(());
+        };
+        let Some(parent_id) = branch.parent_branch_id.as_deref() else {
+            return Ok(());
+        };
+        if flowing_fence::read_state(&self.sql, parent_id)?.is_some()
+            && flowing_fence::read_state(&self.sql, branch_id)?.is_none()
+        {
+            // MUTATION-SUCCESS-EXPR: Ok(())
+            return Err(StoreError::Conflict(
+                "flowing member has no source fence".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn advance_head_leased(
         &mut self,
         lease: Option<&str>,
@@ -87,6 +106,7 @@ impl<S: DoSql> DoBranches<S> {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        self.require_open_flowing_member(branch_id)?;
         if let Some(state) = flowing_fence::read_state(&self.sql, branch_id)? {
             let cut = self.get_cut(cut_id)?;
             whipplescript_store::branches::flowing_fence::require_head_move(
@@ -318,6 +338,32 @@ impl<S: DoSql> DoBranches<S> {
             .map_err(sql_err)?;
         rows.first().map(|row| Self::decode_row(row)).transpose()
     }
+
+    /// Nearest-first flowing ancestors. A closing parent cannot gain members
+    /// through a child that was already present when its fence advanced.
+    fn flowing_ancestry(
+        &self,
+        parent_id: &str,
+    ) -> StoreResult<Vec<whipplescript_store::branches::flowing_fence::FlowingFenceState>> {
+        let mut cursor = Some(parent_id.to_owned());
+        let mut visited = BTreeSet::new();
+        let mut states = Vec::new();
+        while let Some(id) = cursor {
+            if !visited.insert(id.clone()) {
+                // MUTATION-SUCCESS-EXPR: Ok(Vec::new())
+                return Err(StoreError::Conflict("cyclic branch ancestry".into()));
+            }
+            if let Some(state) = flowing_fence::read_state(&self.sql, &id)? {
+                states.push(state);
+            }
+            let Some(row) = self.row_by_id(&id)? else {
+                // MUTATION-SUCCESS-EXPR: Ok(Vec::new())
+                return Err(StoreError::Conflict("missing branch ancestor".into()));
+            };
+            cursor = row.parent_branch_id;
+        }
+        Ok(states)
+    }
 }
 
 impl<S: DoSql> Branches for DoBranches<S> {
@@ -349,6 +395,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 WritePreparation::Ready { after, deltas } => (after, deltas),
                 WritePreparation::Refused(outcome) => return Ok(outcome),
             };
+            self.require_open_flowing_member(cut.branch_id)?;
             self.sql
                 .execute(
                     write_commit::INSERT_CUT,
@@ -453,6 +500,18 @@ impl<S: DoSql> Branches for DoBranches<S> {
             return Ok(CreateBranchOutcome::ParentNotActive {
                 status: parent.status,
             });
+        }
+        let ancestry = self.flowing_ancestry(request.parent_branch_id)?;
+        if ancestry.iter().any(|state| !state.admission_enabled) {
+            return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+        }
+        if ancestry.first().is_some_and(|state| {
+            state.source_branch_id != request.parent_branch_id
+                || state.kind
+                    != whipplescript_store::branches::flowing_fence::FlowingSourceKind::Branch
+                || request.name.is_some()
+        }) {
+            return Ok(CreateBranchOutcome::ParentFlowingTopology);
         }
         if let Some(name) = request.name {
             let rows = self
@@ -579,6 +638,9 @@ impl<S: DoSql> Branches for DoBranches<S> {
             return Ok(RetargetOutcome::ParentNotActive {
                 status: parent.status,
             });
+        }
+        if !self.flowing_ancestry(new_parent_branch_id)?.is_empty() {
+            return Ok(RetargetOutcome::ParentFlowingSource);
         }
         // Parent pointers must stay a tree: refuse if the new parent's
         // lineage passes through the branch itself (self-parent is the
@@ -946,6 +1008,10 @@ impl<S: DoSql> Branches for DoBranches<S> {
                  WHERE released_at IS NULL \
                  UNION SELECT source_cut_id FROM flowing_handoffs \
                  UNION SELECT target_after_cut_id FROM flowing_handoffs \
+                 UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
+                 JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
+                 UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
+                 JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
                  UNION SELECT source_cut_id FROM flowing_attempt_pins \
                  WHERE released_at IS NULL \
                  UNION SELECT candidate_cut_id FROM flowing_attempt_pins \

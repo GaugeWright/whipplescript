@@ -1,11 +1,14 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    decide, missing_open_field, missing_transition_field, FlowingFence, FlowingFenceOutcome,
-    FlowingFenceReceipt, FlowingFenceRefusal, FlowingFenceState, FlowingFenceTransition,
-    FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
+    decide, initial_state, member_point_is_ancestor, missing_member_field, missing_open_field,
+    missing_transition_field, validate_member_opening_receipt, validate_source_opening_receipt,
+    FlowingFence, FlowingFenceOutcome, FlowingFenceReceipt, FlowingFenceRefusal, FlowingFenceState,
+    FlowingFenceTransition, FlowingMemberOpeningReceipt, FlowingMemberOpeningRequest,
+    FlowingSourceKind, FlowingSourceOpeningReceipt, OpenFlowingMemberOutcome,
+    OpenFlowingMemberRefusal, OpenFlowingSource, OpenFlowingSourceOutcome,
 };
-use crate::branches::{BranchStatus, BranchStore, MAINLINE_BRANCH_ID};
+use crate::branches::{BranchStatus, BranchStore, CreateBranch, MAINLINE_BRANCH_ID};
 use crate::StoreResult;
 
 type FenceOutcome = FlowingFenceOutcome;
@@ -42,7 +45,181 @@ fn read_receipt(connection: &Connection, op_id: &str) -> StoreResult<Option<Flow
         .transpose()
 }
 
+fn read_member_opening(
+    connection: &Connection,
+    branch_id: &str,
+) -> StoreResult<Option<FlowingMemberOpeningReceipt>> {
+    let receipt: Option<FlowingMemberOpeningReceipt> = connection
+        .query_row(
+            "SELECT request_json, branch_json, state_json FROM flowing_member_openings WHERE branch_id = ?1",
+            [branch_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        )
+        .optional()?
+        .map(|(request, branch, source)| -> StoreResult<_> {
+            Ok(FlowingMemberOpeningReceipt {
+                request: serde_json::from_str(&request)?,
+                branch: serde_json::from_str(&branch)?,
+                source: serde_json::from_str(&source)?,
+            })
+        })
+        .transpose()?;
+    if let Some(receipt) = &receipt {
+        validate_member_opening_receipt(branch_id, receipt)?;
+    }
+    Ok(receipt)
+}
+
+fn read_source_opening(
+    connection: &Connection,
+    source_branch_id: &str,
+) -> StoreResult<Option<FlowingSourceOpeningReceipt>> {
+    let receipt: Option<FlowingSourceOpeningReceipt> = connection
+        .query_row(
+            "SELECT request_json, state_json FROM flowing_source_openings WHERE source_branch_id = ?1",
+            [source_branch_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .map(|(request, state)| -> StoreResult<_> {
+            Ok(FlowingSourceOpeningReceipt {
+                request: serde_json::from_str(&request)?,
+                state: serde_json::from_str(&state)?,
+            })
+        })
+        .transpose()?;
+    if let Some(receipt) = &receipt {
+        validate_source_opening_receipt(source_branch_id, receipt)?;
+    }
+    Ok(receipt)
+}
+
 impl FlowingFence for BranchStore {
+    fn open_flowing_member(
+        &mut self,
+        branch: CreateBranch<'_>,
+        source: &OpenFlowingSource,
+    ) -> StoreResult<OpenFlowingMemberOutcome> {
+        use OpenFlowingMemberOutcome as Outcome;
+        use OpenFlowingMemberRefusal as Refusal;
+
+        if let Some(field) = missing_member_field(&branch, source) {
+            return Ok(Outcome::Refused(Refusal::Invalid { field }));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let opening_request = FlowingMemberOpeningRequest::new(&branch, source);
+        if let Some(receipt) = read_member_opening(&tx, branch.branch_id)? {
+            if receipt.request != opening_request {
+                // MUTATION-SUCCESS-EXPR: Ok(Outcome::Existing { branch: receipt.branch, source: receipt.source })
+                return Ok(Outcome::Refused(Refusal::IdentityMismatch));
+            }
+            let current_branch = BranchStore::row_by_id(&tx, branch.branch_id)?;
+            let current_source = read_state(&tx, branch.branch_id)?;
+            if current_branch.is_none()
+                || current_source
+                    .as_ref()
+                    .is_none_or(|state| state.incarnation_id != receipt.source.incarnation_id)
+            {
+                return Err(crate::StoreError::Conflict(
+                    "flowing member opening lost current authority".into(),
+                ));
+            }
+            return Ok(Outcome::Existing {
+                branch: receipt.branch,
+                source: receipt.source,
+            });
+        }
+        if let Some(_existing) = BranchStore::row_by_id(&tx, branch.branch_id)? {
+            if read_state(&tx, branch.branch_id)?.is_none() {
+                // MUTATION-SUCCESS-EXPR: Ok(Outcome::Opened { branch: _existing, source: initial_state(source) })
+                return Ok(Outcome::Refused(Refusal::ExistingBranchWithoutSource));
+            }
+            // A legacy two-step opening cannot acquire a receipt retroactively.
+            // MUTATION-SUCCESS-EXPR: Ok(Outcome::Opened { branch: _existing, source: initial_state(source) })
+            return Ok(Outcome::Refused(Refusal::IdentityMismatch));
+        }
+        if let Some(key) = branch.idempotency_key {
+            let used: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM branches WHERE idempotency_key = ?1)",
+                [key],
+                |row| row.get(0),
+            )?;
+            if used {
+                return Ok(Outcome::Refused(Refusal::IdentityMismatch));
+            }
+        }
+        let Some(parent) = BranchStore::row_by_id(&tx, branch.parent_branch_id)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(Outcome::Opened { branch: BranchStore::row_by_id(&tx, MAINLINE_BRANCH_ID)?.expect("mainline"), source: initial_state(source) })
+            return Ok(Outcome::Refused(Refusal::ParentMissing));
+        };
+        if parent.status != BranchStatus::Active {
+            return Ok(Outcome::Refused(Refusal::ParentNotActive));
+        }
+        let Some(parent_source) = read_state(&tx, branch.parent_branch_id)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(Outcome::Opened { branch: parent, source: initial_state(source) })
+            return Ok(Outcome::Refused(Refusal::ParentNotFlowing));
+        };
+        if parent_source.kind != FlowingSourceKind::Branch
+            || parent.parent_branch_id.as_deref() != Some(MAINLINE_BRANCH_ID)
+        {
+            return Ok(Outcome::Refused(Refusal::ParentNotFlowing));
+        }
+        if !parent_source.admission_enabled {
+            return Ok(Outcome::Refused(Refusal::ParentAdmissionDisabled));
+        }
+        if let Some((cut_id, manifest_hash)) = branch.at_cut {
+            if !member_point_is_ancestor(
+                parent.head_cut_id.as_deref(),
+                cut_id,
+                manifest_hash,
+                |id| BranchStore::cut_by_id(&tx, id),
+            )? {
+                return Ok(Outcome::Refused(Refusal::Invalid { field: "at_cut" }));
+            }
+        }
+        let (point_cut, point_manifest) = match branch.at_cut {
+            Some((cut, manifest)) => (Some(cut.to_owned()), Some(manifest.to_owned())),
+            None => (parent.head_cut_id, parent.head_manifest_hash),
+        };
+        tx.execute(
+            "INSERT INTO branches \
+             (branch_id, name, parent_branch_id, branch_point_cut_id, \
+              branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
+              status, created_at, updated_at, idempotency_key) \
+             VALUES (?1, NULL, ?2, ?3, ?4, ?3, ?4, 'active', ?5, ?5, ?6)",
+            params![
+                branch.branch_id,
+                branch.parent_branch_id,
+                point_cut,
+                point_manifest,
+                branch.created_at,
+                branch.idempotency_key,
+            ],
+        )?;
+        let state = initial_state(source);
+        tx.execute(
+            "INSERT INTO flowing_source_fences (source_branch_id, state_json) VALUES (?1, ?2)",
+            params![branch.branch_id, serde_json::to_string(&state)?],
+        )?;
+        tx.execute(
+            "INSERT INTO flowing_source_openings (source_branch_id, request_json, state_json) VALUES (?1, ?2, ?3)",
+            params![branch.branch_id, serde_json::to_string(source)?, serde_json::to_string(&state)?],
+        )?;
+        let created = BranchStore::row_by_id(&tx, branch.branch_id)?
+            .expect("created member row exists in transaction");
+        tx.execute(
+            "INSERT INTO flowing_member_openings (branch_id, request_json, branch_json, state_json) VALUES (?1, ?2, ?3, ?4)",
+            params![branch.branch_id, serde_json::to_string(&opening_request)?, serde_json::to_string(&created)?, serde_json::to_string(&state)?],
+        )?;
+        tx.commit()?;
+        Ok(Outcome::Opened {
+            branch: created,
+            source: state,
+        })
+    }
+
     fn open_flowing_source(
         &mut self,
         request: &OpenFlowingSource,
@@ -58,6 +235,23 @@ impl FlowingFence for BranchStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = read_source_opening(&tx, &request.source_branch_id)? {
+            if receipt.request != *request {
+                // MUTATION-SUCCESS-EXPR: Ok(OpenFlowingSourceOutcome::Existing(receipt.state))
+                return Ok(OpenFlowingSourceOutcome::IdentityMismatch);
+            }
+            let current = read_state(&tx, &request.source_branch_id)?;
+            if BranchStore::row_by_id(&tx, &request.source_branch_id)?.is_none()
+                || current
+                    .as_ref()
+                    .is_none_or(|state| state.incarnation_id != receipt.state.incarnation_id)
+            {
+                return Err(crate::StoreError::Conflict(
+                    "flowing source opening lost current authority".into(),
+                ));
+            }
+            return Ok(OpenFlowingSourceOutcome::Existing(receipt.state));
+        }
         if let Some(existing) = read_state(&tx, &request.source_branch_id)? {
             return Ok(
                 if existing.incarnation_id == request.incarnation_id
@@ -134,12 +328,30 @@ impl FlowingFence for BranchStore {
             "INSERT INTO flowing_source_fences (source_branch_id, state_json) VALUES (?1, ?2)",
             params![request.source_branch_id, serde_json::to_string(&state)?],
         )?;
+        tx.execute(
+            "INSERT INTO flowing_source_openings (source_branch_id, request_json, state_json) VALUES (?1, ?2, ?3)",
+            params![request.source_branch_id, serde_json::to_string(request)?, serde_json::to_string(&state)?],
+        )?;
         tx.commit()?;
         Ok(OpenFlowingSourceOutcome::Opened(state))
     }
 
     fn flowing_source(&self, source_branch_id: &str) -> StoreResult<Option<FlowingFenceState>> {
         read_state(&self.connection, source_branch_id)
+    }
+
+    fn flowing_source_opening(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingSourceOpeningReceipt>> {
+        read_source_opening(&self.connection, source_branch_id)
+    }
+
+    fn flowing_member_opening(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<FlowingMemberOpeningReceipt>> {
+        read_member_opening(&self.connection, branch_id)
     }
 
     fn transition_flowing_source(
@@ -205,6 +417,7 @@ mod tests {
     use crate::branches::flowing_fence::{FlowingFenceAction, FlowingRevision};
     use crate::branches::{
         AdvanceOutcome, Branches, CreateBranch, CreateBranchOutcome, CutRecord, CutRow,
+        RetargetOutcome,
     };
     use crate::StoreError;
 
@@ -242,6 +455,622 @@ mod tests {
             actor: "mediator".into(),
             action,
             recorded_at: op_id.into(),
+        }
+    }
+
+    fn member_request<'a>(id: &'a str, parent: &'a str, key: Option<&'a str>) -> CreateBranch<'a> {
+        CreateBranch {
+            branch_id: id,
+            name: None,
+            parent_branch_id: parent,
+            at_cut: None,
+            created_at: "t3",
+            idempotency_key: key,
+        }
+    }
+
+    fn member_opening(id: &str) -> OpenFlowingSource {
+        OpenFlowingSource {
+            source_branch_id: id.into(),
+            incarnation_id: format!("{id}-inc"),
+            kind: FlowingSourceKind::Twig,
+            owner: "mediator".into(),
+            opened_at: "t3".into(),
+        }
+    }
+
+    #[test]
+    fn atomic_member_refusals_leave_no_partial_membership() {
+        use OpenFlowingMemberOutcome::Refused;
+        use OpenFlowingMemberRefusal as Why;
+
+        let mut store = source();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    CreateBranch {
+                        name: Some("named"),
+                        ..member_request("invalid", "branch", None)
+                    },
+                    &member_opening("invalid"),
+                )
+                .unwrap(),
+            Refused(Why::Invalid { field: "name" })
+        );
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("missing", "absent", None),
+                    &member_opening("missing")
+                )
+                .unwrap(),
+            Refused(Why::ParentMissing)
+        );
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("legacy", "branch", None),
+                    &member_opening("legacy")
+                )
+                .unwrap(),
+            Refused(Why::ParentNotFlowing)
+        );
+        store
+            .create_branch(CreateBranch {
+                branch_id: "inactive",
+                name: Some("inactive"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t1",
+                idempotency_key: None,
+            })
+            .unwrap();
+        store.discard_branch("inactive", "t2").unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("closed", "inactive", None),
+                    &member_opening("closed")
+                )
+                .unwrap(),
+            Refused(Why::ParentNotActive)
+        );
+        store
+            .create_branch(member_request("twig-parent", MAINLINE_BRANCH_ID, None))
+            .unwrap();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "twig-parent".into(),
+                incarnation_id: "twig-parent-inc".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "mediator".into(),
+                opened_at: "t3".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("nested", "twig-parent", None),
+                    &member_opening("nested")
+                )
+                .unwrap(),
+            Refused(Why::ParentNotFlowing)
+        );
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "mediator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    CreateBranch {
+                        at_cut: Some(("missing-cut", "missing-manifest")),
+                        ..member_request("bad-cut", "branch", None)
+                    },
+                    &member_opening("bad-cut"),
+                )
+                .unwrap(),
+            Refused(Why::Invalid { field: "at_cut" })
+        );
+        store
+            .create_branch(member_request("preexisting", "branch", None))
+            .unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("preexisting", "branch", None),
+                    &member_opening("preexisting")
+                )
+                .unwrap(),
+            Refused(Why::ExistingBranchWithoutSource)
+        );
+        assert!(matches!(
+            store
+                .open_flowing_source(&member_opening("preexisting"))
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("preexisting", "branch", None),
+                    &member_opening("preexisting")
+                )
+                .unwrap(),
+            Refused(Why::IdentityMismatch)
+        );
+        store
+            .create_branch(member_request(
+                "used-key",
+                MAINLINE_BRANCH_ID,
+                Some("collision"),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("new", "branch", Some("collision")),
+                    &member_opening("new")
+                )
+                .unwrap(),
+            Refused(Why::IdentityMismatch)
+        );
+        assert!(matches!(
+            store
+                .open_flowing_member(
+                    member_request("member", "branch", None),
+                    &member_opening("member")
+                )
+                .unwrap(),
+            OpenFlowingMemberOutcome::Opened { .. }
+        ));
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("member", "branch", None),
+                    &OpenFlowingSource {
+                        owner: "different".into(),
+                        ..member_opening("member")
+                    },
+                )
+                .unwrap(),
+            Refused(Why::IdentityMismatch)
+        );
+        let disable = request(&store, "disable", FlowingFenceAction::DisableAdmission);
+        store.transition_flowing_source(&disable).unwrap();
+        assert_eq!(
+            store
+                .open_flowing_member(
+                    member_request("late", "branch", None),
+                    &member_opening("late")
+                )
+                .unwrap(),
+            Refused(Why::ParentAdmissionDisabled)
+        );
+        for id in [
+            "invalid", "missing", "legacy", "closed", "nested", "bad-cut", "new", "late",
+        ] {
+            assert!(store.get_branch(id).unwrap().is_none(), "{id}");
+            assert!(store.flowing_source(id).unwrap().is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn disabled_flowing_branch_refuses_new_members_and_retargets() {
+        let mut store = source();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "mediator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        let original = CreateBranch {
+            branch_id: "member",
+            name: None,
+            parent_branch_id: "branch",
+            at_cut: None,
+            created_at: "t3",
+            idempotency_key: Some("original-member"),
+        };
+        assert!(matches!(
+            store.create_branch(original.clone()).unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "nested-name",
+                    name: Some("nested"),
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t3",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentFlowingTopology
+        );
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "nested-child",
+                    name: None,
+                    parent_branch_id: "member",
+                    at_cut: None,
+                    created_at: "t3",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentFlowingTopology
+        );
+        store
+            .create_branch(CreateBranch {
+                branch_id: "outsider",
+                name: None,
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t3",
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.retarget_branch("outsider", "branch", "t3").unwrap(),
+            RetargetOutcome::ParentFlowingSource
+        );
+        assert_eq!(
+            store.retarget_branch("outsider", "member", "t3").unwrap(),
+            RetargetOutcome::ParentFlowingSource
+        );
+        let disable = request(&store, "disable", FlowingFenceAction::DisableAdmission);
+        assert!(matches!(
+            store.transition_flowing_source(&disable).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "late-member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentAdmissionDisabled
+        );
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "late-grandchild",
+                    name: None,
+                    parent_branch_id: "member",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentAdmissionDisabled
+        );
+        assert!(matches!(
+            store.create_branch(original).unwrap(),
+            CreateBranchOutcome::Existing(_)
+        ));
+        assert_eq!(
+            store.retarget_branch("outsider", "branch", "t4").unwrap(),
+            RetargetOutcome::ParentFlowingSource
+        );
+        assert_eq!(
+            store
+                .get_branch("outsider")
+                .unwrap()
+                .unwrap()
+                .parent_branch_id
+                .as_deref(),
+            Some(MAINLINE_BRANCH_ID)
+        );
+        assert!(store.get_branch("late-member").unwrap().is_none());
+    }
+
+    #[test]
+    fn unopened_flowing_member_cannot_acquire_private_work() {
+        let mut store = source();
+        assert!(matches!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "inc-1".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "mediator".into(),
+                    opened_at: "t2".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        assert!(matches!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t3",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert!(matches!(
+            store.advance_head("member", None, "unopened", "manifest", "t3"),
+            Err(StoreError::Conflict(message)) if message == "flowing member has no source fence"
+        ));
+        assert!(matches!(
+            store.commit_write_with_evidence(
+                CutRecord {
+                    cut_id: "unopened",
+                    change_id: "unopened",
+                    branch_id: "member",
+                    manifest_hash: "manifest",
+                    parent_cut_id: None,
+                    origin: None,
+                    actor: None,
+                    intent: None,
+                    recorded_at: "t3",
+                },
+                None,
+            ),
+            Err(StoreError::Conflict(message)) if message == "flowing member has no source fence"
+        ));
+        assert!(store.get_cut("unopened").unwrap().is_none());
+        assert!(matches!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "member".into(),
+                    incarnation_id: "member-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "mediator".into(),
+                    opened_at: "t3".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+    }
+
+    #[test]
+    fn member_open_rolls_back_branch_when_fence_insert_fails() {
+        let mut store = source();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "mediator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        store
+            .test_connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_member_fence BEFORE INSERT ON flowing_source_fences \
+                 WHEN NEW.source_branch_id = 'member' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let member = CreateBranch {
+            branch_id: "member",
+            name: None,
+            parent_branch_id: "branch",
+            at_cut: None,
+            created_at: "t3",
+            idempotency_key: Some("member-key"),
+        };
+        let opening = OpenFlowingSource {
+            source_branch_id: "member".into(),
+            incarnation_id: "member-inc".into(),
+            kind: FlowingSourceKind::Twig,
+            owner: "mediator".into(),
+            opened_at: "t3".into(),
+        };
+        assert!(store.open_flowing_member(member.clone(), &opening).is_err());
+        assert!(store.get_branch("member").unwrap().is_none());
+        assert!(store.flowing_source("member").unwrap().is_none());
+        store
+            .test_connection()
+            .execute_batch("DROP TRIGGER reject_member_fence")
+            .unwrap();
+        assert!(matches!(
+            store.open_flowing_member(member, &opening).unwrap(),
+            OpenFlowingMemberOutcome::Opened { .. }
+        ));
+        store
+            .test_connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_member_receipt BEFORE INSERT ON flowing_member_openings \
+             WHEN NEW.branch_id = 'member2' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let second = member_request("member2", "branch", Some("member-key-2"));
+        let second_opening = member_opening("member2");
+        assert!(store
+            .open_flowing_member(second.clone(), &second_opening)
+            .is_err());
+        assert!(store.get_branch("member2").unwrap().is_none());
+        assert!(store.flowing_source("member2").unwrap().is_none());
+        store
+            .test_connection()
+            .execute_batch("DROP TRIGGER reject_member_receipt")
+            .unwrap();
+        assert!(matches!(
+            store.open_flowing_member(second, &second_opening).unwrap(),
+            OpenFlowingMemberOutcome::Opened { .. }
+        ));
+        store
+            .test_connection()
+            .execute(
+                "DELETE FROM flowing_source_openings WHERE source_branch_id = 'member2'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::branches::flowing_open_host::read_member_opening_evidence(&store, "member2"),
+            Err(StoreError::Conflict(message)) if message == "flowing opening host evidence refuses: member source opening receipt is missing"
+        ));
+        let mut retained = store.flowing_member_opening("member").unwrap().unwrap();
+        retained.branch.name = Some("forged".into());
+        store
+            .test_connection()
+            .execute(
+                "UPDATE flowing_member_openings SET branch_json = ?1 WHERE branch_id = 'member'",
+                [serde_json::to_string(&retained.branch).unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_member_opening("member"),
+            Err(StoreError::Conflict(message)) if message == "flowing member opening receipt is inconsistent"
+        ));
+    }
+
+    #[test]
+    fn source_open_rolls_back_fence_when_opening_receipt_insert_fails() {
+        let mut store = source();
+        assert!(matches!(
+            crate::branches::flowing_open_host::read_source_opening_evidence(&store, ""),
+            Err(StoreError::Conflict(message)) if message == "flowing opening host evidence refuses: source identity is empty"
+        ));
+        assert!(matches!(
+            crate::branches::flowing_open_host::read_member_opening_evidence(&store, ""),
+            Err(StoreError::Conflict(message)) if message == "flowing opening host evidence refuses: member identity is empty"
+        ));
+        store
+            .test_connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_source_opening BEFORE INSERT ON flowing_source_openings \
+             WHEN NEW.source_branch_id = 'branch' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let opening = OpenFlowingSource {
+            source_branch_id: "branch".into(),
+            incarnation_id: "inc".into(),
+            kind: FlowingSourceKind::Branch,
+            owner: "mediator".into(),
+            opened_at: "t2".into(),
+        };
+        assert!(store.open_flowing_source(&opening).is_err());
+        assert!(store.flowing_source("branch").unwrap().is_none());
+        store
+            .test_connection()
+            .execute_batch("DROP TRIGGER reject_source_opening")
+            .unwrap();
+        assert!(matches!(
+            store.open_flowing_source(&opening).unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        store
+            .test_connection()
+            .execute(
+                "DELETE FROM flowing_source_fences WHERE source_branch_id = 'branch'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.open_flowing_source(&opening),
+            Err(StoreError::Conflict(message)) if message == "flowing source opening lost current authority"
+        ));
+        let mut retained = store.flowing_source_opening("branch").unwrap().unwrap();
+        retained.state.held = true;
+        store.test_connection().execute(
+            "UPDATE flowing_source_openings SET state_json = ?1 WHERE source_branch_id = 'branch'",
+            [serde_json::to_string(&retained.state).unwrap()],
+        ).unwrap();
+        assert!(matches!(
+            store.flowing_source_opening("branch"),
+            Err(StoreError::Conflict(message)) if message == "flowing source opening receipt is inconsistent"
+        ));
+    }
+
+    #[test]
+    fn member_open_replay_requires_current_source_authority() {
+        let mut store = source();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "mediator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        let member = member_request("member", "branch", None);
+        let opening = member_opening("member");
+        assert!(matches!(
+            store.open_flowing_member(member.clone(), &opening).unwrap(),
+            OpenFlowingMemberOutcome::Opened { .. }
+        ));
+        store
+            .test_connection()
+            .execute(
+                "DELETE FROM flowing_source_fences WHERE source_branch_id = 'member'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.open_flowing_member(member, &opening),
+            Err(crate::StoreError::Conflict(message))
+                if message == "flowing member opening lost current authority"
+        ));
+    }
+
+    #[test]
+    fn corrupt_flowing_parent_ancestry_cannot_admit_a_member() {
+        for (corruption, expected) in [
+            (
+                "UPDATE branches SET parent_branch_id = 'member' WHERE branch_id = 'branch'",
+                "cyclic branch ancestry",
+            ),
+            (
+                "DELETE FROM branches WHERE branch_id = 'branch'",
+                "missing branch ancestor",
+            ),
+        ] {
+            let mut store = source();
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "inc-1".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "mediator".into(),
+                    opened_at: "t2".into(),
+                })
+                .unwrap();
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t3",
+                    idempotency_key: None,
+                })
+                .unwrap();
+            store.connection.execute(corruption, []).unwrap();
+            let error = store
+                .create_branch(CreateBranch {
+                    branch_id: "late-member",
+                    name: None,
+                    parent_branch_id: "member",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap_err();
+            assert!(format!("{error:?}").contains(expected));
+            assert!(store.get_branch("late-member").unwrap().is_none());
         }
     }
 
@@ -343,7 +1172,7 @@ mod tests {
         assert_eq!(first.eligibility_epoch, 0);
         assert_eq!(
             store.open_flowing_source(&opening).unwrap(),
-            OpenFlowingSourceOutcome::Existing(first)
+            OpenFlowingSourceOutcome::Existing(first.clone())
         );
         for (branch_id, parent_branch_id) in [
             ("member-twig", "branch"),
@@ -372,28 +1201,20 @@ mod tests {
                 OpenFlowingSourceOutcome::Opened(_)
             ));
         }
-        store
-            .create_branch(CreateBranch {
-                branch_id: "nested-twig",
-                name: None,
-                parent_branch_id: "member-twig",
-                at_cut: None,
-                created_at: "t2",
-                idempotency_key: None,
-            })
-            .unwrap();
         assert_eq!(
             store
-                .open_flowing_source(&OpenFlowingSource {
-                    source_branch_id: "nested-twig".into(),
-                    incarnation_id: "nested-inc".into(),
-                    kind: FlowingSourceKind::Twig,
-                    owner: "coordinator-a".into(),
-                    opened_at: "t2".into(),
+                .create_branch(CreateBranch {
+                    branch_id: "nested-twig",
+                    name: None,
+                    parent_branch_id: "member-twig",
+                    at_cut: None,
+                    created_at: "t2",
+                    idempotency_key: None,
                 })
                 .unwrap(),
-            OpenFlowingSourceOutcome::InvalidKindParent
+            CreateBranchOutcome::ParentFlowingTopology
         );
+        assert!(store.get_branch("nested-twig").unwrap().is_none());
 
         let hold = request(&store, "hold-1", FlowingFenceAction::Hold);
         let FlowingFenceOutcome::Applied(held) = store.transition_flowing_source(&hold).unwrap()
@@ -550,6 +1371,10 @@ mod tests {
         assert_eq!(taken.state.owner, "coordinator-b");
         assert_eq!(taken.state.owner_epoch, 1);
         assert_eq!(taken.state.eligibility_epoch, 8);
+        assert_eq!(
+            store.open_flowing_source(&opening).unwrap(),
+            OpenFlowingSourceOutcome::Existing(first.clone())
+        );
         let disable = request(&store, "close-1", FlowingFenceAction::DisableAdmission);
         let FlowingFenceOutcome::Applied(closed) =
             store.transition_flowing_source(&disable).unwrap()
@@ -557,6 +1382,10 @@ mod tests {
             panic!("admission must disable at the ref authority")
         };
         assert!(!closed.state.admission_enabled);
+        assert_eq!(
+            store.open_flowing_source(&opening).unwrap(),
+            OpenFlowingSourceOutcome::Existing(first)
+        );
         let later = request(
             &store,
             "late-revision",

@@ -12852,6 +12852,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn do_external_effect_handlers_take_fresh_observed_dispatch() {
+        whipplescript_kernel::effect_handlers::external_conformance::check(|| {
+            DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema())
+        });
+    }
+
+    #[test]
     fn do_file_settlement_and_replay() {
         for kind in ["file.read", "file.write", "file.import", "file.export"] {
             for status in ["completed", "failed"] {

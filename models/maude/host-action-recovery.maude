@@ -91,3 +91,55 @@ mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-COMPENSATION is
   rl [borrow-original-authority] : compensate(K:Key, L:Key, false)
     => authorizedCompensation(L:Key, K:Key) .
 endm
+
+--- The file adapter's declared recovery ceiling (spec/host-actions.md, External
+--- disposition). The file execution door records every dispatch marker as
+--- `unverifiable`; a stronger ceiling claimed in run metadata cannot promote
+--- it. The versioned-save reader proves only application, from an exact
+--- committed cut; a missing cut is an observation, never absence. A new
+--- attempt therefore needs separately authenticated absence evidence, which
+--- the file sink itself cannot produce once a write may have crossed. The file
+--- target does not deduplicate: a second write is a second application.
+mod WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING is
+  sorts Key Ceiling Disposition Cfg .
+  ops k1 k2 : -> Key [ctor] .
+  ops repeatableRead transactional deduplicated reconcilable unverifiable : -> Ceiling [ctor] .
+  ops ready unknown applied notApplied : -> Disposition [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op work : Key Disposition -> Cfg [ctor] .
+  op claimed : Key Ceiling -> Cfg [ctor] .
+  op marker : Key Ceiling -> Cfg [ctor] .
+  op invoke : Key -> Cfg [ctor] .
+  op written : Key -> Cfg [ctor] .
+  op committedCut : Key -> Cfg [ctor] .
+  op missingCut : Key -> Cfg [ctor] .
+  op absenceRecord : Key -> Cfg [ctor] .
+  op retry : Key -> Cfg [ctor] .
+  op refused : Key -> Cfg [ctor] .
+  var K : Key .
+  --- The entry point fixes the marker's ceiling; `claimed` is never read.
+  rl [dispatch-file-write] : work(K, ready)
+    => work(K, unknown) marker(K, unverifiable) invoke(K) .
+  rl [apply-write] : invoke(K) => written(K) committedCut(K) .
+  rl [crash-before-write] : invoke(K) => none .
+  rl [reconcile-committed-cut] : work(K, unknown) committedCut(K)
+    => work(K, applied) committedCut(K) .
+  rl [refuse-missing-cut] : work(K, unknown) missingCut(K)
+    => work(K, unknown) refused(K) .
+  rl [record-proved-absence] : work(K, unknown) absenceRecord(K)
+    => work(K, notApplied) .
+  rl [retry-proved-absence] : work(K, notApplied) retry(K) => work(K, ready) .
+  rl [refuse-unproved-retry] : work(K, unknown) marker(K, unverifiable) retry(K)
+    => work(K, unknown) marker(K, unverifiable) refused(K) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING-PROMOTED is
+  including WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING .
+  rl [resubmit-on-claimed-ceiling] : work(K:Key, unknown) claimed(K:Key, deduplicated) retry(K:Key)
+    => work(K:Key, unknown) claimed(K:Key, deduplicated) invoke(K:Key) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING-MISSING is
+  including WHIPPLESCRIPT-HOST-ACTION-FILE-CEILING .
+  rl [read-missing-cut-as-absence] : work(K:Key, unknown) missingCut(K:Key)
+    => work(K:Key, notApplied) .
+endm

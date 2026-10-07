@@ -86,6 +86,8 @@ pub mod skill_frontmatter;
 #[cfg(feature = "native")]
 pub mod source_review;
 #[cfg(feature = "native")]
+pub mod source_review_findings;
+#[cfg(feature = "native")]
 pub mod source_review_git;
 #[cfg(feature = "native")]
 pub mod source_review_native;

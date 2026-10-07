@@ -118,6 +118,7 @@ pub struct DurableEffectPorts {
     /// Live inspection labels supplied by the authenticated owning host. They
     /// are kept only in this attached worker and never written to the event log.
     pub initial_model_provenance: Option<whipplescript_kernel::sansio::InitialModelProvenance>,
+    pub skill_catalogue: Option<crate::skill_catalogue::HostedSkillCatalogue>,
     pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     pub external_tool_bindings: Vec<(String, String)>,
     /// Version-pinned Agent `AGENTS.md` from an authored package. The hosted
@@ -164,6 +165,7 @@ pub struct DurableInstance<Sql: DoSql> {
     agent_tools: Box<dyn ToolExecutor>,
     agent_workspace_resources: Option<Vec<ResourceRef>>,
     initial_model_provenance: Option<whipplescript_kernel::sansio::InitialModelProvenance>,
+    skill_catalogue: Option<crate::skill_catalogue::HostedSkillCatalogue>,
     agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     exec: Option<ExecutorSidecarConfig>,
     turn: Option<TurnContainerConfig>,
@@ -296,6 +298,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tools,
             agent_workspace_resources: ports.agent_workspace_resources,
             initial_model_provenance: ports.initial_model_provenance,
+            skill_catalogue: ports.skill_catalogue,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -646,6 +649,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
             agent_workspace_resources: ports.agent_workspace_resources,
             initial_model_provenance: ports.initial_model_provenance,
+            skill_catalogue: ports.skill_catalogue,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -766,6 +770,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tools: self.agent_tools.as_ref(),
             agent_workspace_resources: self.agent_workspace_resources.as_deref(),
             initial_model_provenance: self.initial_model_provenance.as_ref(),
+            skill_catalogue: self.skill_catalogue.as_ref(),
             agent_tool_specs: self.agent_tool_specs.as_deref(),
             exec: self.exec.as_ref(),
             turn: self.turn.as_ref(),

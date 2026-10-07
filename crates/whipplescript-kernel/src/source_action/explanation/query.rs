@@ -12,7 +12,7 @@ use super::{
     SourceReference,
 };
 
-pub const SCHEMA: &str = "whipplescript.action-explanation-query.v1";
+pub const SCHEMA: &str = "whipplescript.action-explanation-query.v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +77,10 @@ pub enum NextActionCode {
     InspectResult,
     InspectBinding,
     AwaitOperation,
+    /// The operation is held by missing configuration or a refused grant.
+    /// Inspecting the recorded block is observational; only an operator who
+    /// owns that configuration or authority can change it.
+    InspectOperationBlock,
     AwaitCancellationAcknowledgement,
     ObserveRecovery,
     ReconcileUncertainOperation,
@@ -299,6 +303,26 @@ fn next_action(result: &ResultExplanation) -> Option<NextAction> {
             return Some(action);
         }
         action.code = NextActionCode::AwaitOperation;
+        action.operation_id = result.operation_id.clone();
+        return action.operation_id.is_some().then_some(action);
+    }
+    if result.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReasonCode::WaitingCapacity | ReasonCode::WaitingBackoff
+        )
+    }) {
+        action.code = NextActionCode::AwaitOperation;
+        action.operation_id = result.operation_id.clone();
+        return action.operation_id.is_some().then_some(action);
+    }
+    if result.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReasonCode::MissingConfiguration | ReasonCode::MissingAuthority
+        )
+    }) {
+        action.code = NextActionCode::InspectOperationBlock;
         action.operation_id = result.operation_id.clone();
         return action.operation_id.is_some().then_some(action);
     }

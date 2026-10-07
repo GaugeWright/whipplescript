@@ -594,6 +594,7 @@ rule echo
             envelope(7, "product"),
         )
         .unwrap()
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest(COMPILER_DIGEST);
         (action, command, facade)
     }
@@ -837,6 +838,32 @@ rule echo
             .expect("import operations")
             .operations
             .is_empty());
+    }
+
+    #[test]
+    fn host_action_refuses_an_unconfigured_standard_registry_before_version_admission() {
+        let (action, command, facade) = fixture();
+        let mut facade = GovernedHostFacade::from_verified_store(
+            facade.into_kernel().into_store(),
+            7,
+            envelope(7, "product"),
+        )
+        .expect("facade without shipped registry")
+        .with_compiler_artifact_digest(COMPILER_DIGEST);
+        let verifier = ExactAdmission(command.signing_bytes().expect("command"));
+        assert!(facade
+            .admit_action(command, &action, &verifier, b"authenticated fixture")
+            .unwrap_err()
+            .to_string()
+            .contains("host action admission requires the host's shipped standard registry"));
+        assert!(facade
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("import operations")
+            .operations
+            .is_empty());
+        assert!(facade.kernel().store().list_instances().unwrap().is_empty());
     }
 
     #[test]

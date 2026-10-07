@@ -200,6 +200,9 @@ impl WorkItemStore {
     /// The store's own clock, in the canonical instant shape. Used only as the
     /// CLI's boundary instant — the kernel always supplies its own.
     pub fn store_now(&self) -> StoreResult<String> {
+        if let Some(at) = &self.query_instant {
+            return Ok(at.clone());
+        }
         Ok(self
             .connection
             .query_row("SELECT datetime('now')", [], |row| row.get(0))?)

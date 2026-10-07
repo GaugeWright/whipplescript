@@ -96,6 +96,14 @@ impl From<io::Error> for FileWriteFailure {
 /// The byte-I/O operations a file effect performs, abstracted over the physical
 /// backing. Object-safe so a durable-object backend can be used as `&dyn`.
 pub trait FileStore {
+    /// The recovery ceiling this realization's adapter and target have been
+    /// qualified for (`spec/host-actions.md`, External disposition). Absent a
+    /// conformance harness for the actual adapter it is `unverifiable`, and a
+    /// wrapper that does not forward it falls back to that.
+    fn recovery_ceiling(&self) -> crate::effect_recovery::RecoveryCeiling {
+        crate::effect_recovery::RecoveryCeiling::Unverifiable
+    }
+
     /// Pure declaration of a scoped versioned-save realization. Wrappers must
     /// forward it unchanged. It describes the actual binding used by their I/O;
     /// neither the descriptor nor this query grants authority to access it.

@@ -236,10 +236,12 @@ The current scope is **experimental**:
   `WHIPPLESCRIPT_HARNESS_WORKSPACE` variable. The default is the current
   directory.
 - To drive the loop with a **live** model, set the
-  `WHIPPLESCRIPT_HARNESS_PROVIDER` variable to `openai` or to `anthropic`. Also
-  set the `WHIPPLESCRIPT_HARNESS_MODEL` variable. The system uses the
-  credentials from the resolver for the coercions. The sequence is the
-  environment variable, then the `whip auth` store, then the Codex OAuth token.
+  `WHIPPLESCRIPT_HARNESS_PROVIDER` variable to `openai`, `openai-generic`,
+  `anthropic` or `xai`. Also set the `WHIPPLESCRIPT_HARNESS_MODEL` variable. The
+  system uses the credentials from the resolver for the coercions. The sequence
+  is the environment variable, then the `whip auth` store, then the Codex OAuth
+  token. For `openai-generic`, `WHIPPLESCRIPT_HARNESS_BASE_URL` selects the key
+  stored for that endpoint.
   The other controls are `WHIPPLESCRIPT_HARNESS_BASE_URL`,
   `WHIPPLESCRIPT_HARNESS_MAX_TOKENS`, and
   `WHIPPLESCRIPT_HARNESS_TIMEOUT_SECS`.
@@ -520,20 +522,48 @@ selects the system.
 > where the version is in the `base_url` value. Thus use
 > `http://localhost:11434/v1`. Do **not** use `http://localhost:11434`.
 
+### The credential for an endpoint
+
+Each `openai-generic` endpoint is a different service, so whip stores its key
+under the endpoint's base URL rather than once for the provider:
+
+```sh
+whip auth set openai-generic http://localhost:11434/v1 ollama
+whip auth set openai-generic https://openrouter.ai/api/v1 sk-or-...
+whip auth status                      # one redacted row per stored endpoint
+whip auth clear openai-generic http://localhost:11434/v1
+```
+
+A call to an endpoint uses the key stored for exactly that base URL. Write the
+base URL as you write it in the configuration, with the version segment; a
+trailing `/` and the case of the scheme and host do not matter. An endpoint
+that does not check the token, such as Ollama, accepts any value that is not
+empty.
+
+The `OPENAI_API_KEY` variable still overrides a stored key, as it does for the
+`openai` provider, and `whip auth status` says so on the endpoint's row when it
+does. With neither, the endpoint falls back to the `openai` credential chain:
+the stored `openai` key, then the Codex OAuth token. Storing a key for the
+endpoint keeps your stored OpenAI key and Codex token away from a third-party
+endpoint, but only while `OPENAI_API_KEY` is unset for that call: an
+`OPENAI_API_KEY` exported for OpenAI still overrides the endpoint's stored key
+and is what the endpoint receives.
+
 ### Coerce / decide (structured output)
 
 ```sh
-# A local Ollama model making a typed `coerce` decision:
+# A local Ollama model making a typed `coerce` decision, after
+# `whip auth set openai-generic http://localhost:11434/v1 ollama`:
 WHIPPLESCRIPT_COERCE_PROVIDER=openai-generic \
 WHIPPLESCRIPT_COERCE_BASE_URL=http://localhost:11434/v1 \
 WHIPPLESCRIPT_COERCE_MODEL=llama3.1:8b \
-OPENAI_API_KEY=ollama \
   whip run workflow.whip --provider fixture --until idle
 ```
 
-The `OPENAI_API_KEY` variable carries the bearer token. An endpoint that does
-not check the token, such as Ollama, accepts a value that is not empty. Confirm
-the resolved configuration with the `whip --json coercion status` command.
+The base URL can come from the variable or from the `base_url` of the registry
+binding; either one selects the stored key. Confirm the resolved configuration
+and the source of its credential with the `whip --json coercion status`
+command.
 
 The system sends the declared output type of the `coerce` declaration as a
 `response_format: json_schema` constraint. An endpoint that supports the
@@ -626,7 +656,13 @@ whip auth status                           # show what resolves (redacted) + sou
 whip auth set anthropic sk-ant-api03-...   # store an explicit coerce credential
 whip auth set openai     sk-proj-...
 whip auth set xai        xai-...
+whip auth set openai-generic http://localhost:11434/v1 ollama   # one key per endpoint
+whip auth clear xai                        # remove a stored credential
+whip auth clear openai-generic http://localhost:11434/v1
 ```
+
+An `openai-generic` key is stored under its endpoint's base URL; see
+[the credential for an endpoint](#the-credential-for-an-endpoint).
 
 The `whip auth set` command writes a configuration file that only the owner can
 read. The permissions are `0600`. The path is
@@ -634,7 +670,9 @@ read. The permissions are `0600`. The path is
 is in `$XDG_CONFIG_HOME/whipplescript/` or in `~/.config/whipplescript/`.
 
 The precedence of a credential for a coercion is the **environment variable,
-then the stored configuration, then the Codex OAuth token**. The OAuth token
+then the stored configuration, then the Codex OAuth token**. For an
+`openai-generic` endpoint the stored configuration means the key stored for that
+endpoint first, then the stored `openai` key. The OAuth token
 applies to OpenAI only. Thus an environment variable always overrides a stored
 key.
 

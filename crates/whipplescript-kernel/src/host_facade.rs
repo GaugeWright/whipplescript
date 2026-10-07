@@ -50,6 +50,8 @@ pub use tracker_recovery::TrackerRecoveryAuthority;
 
 mod tracker_wait;
 pub use tracker_wait::TrackerWaitAuthority;
+mod signal_delivery;
+pub use signal_delivery::SignalDeliveryAuthority;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InstanceMetadata {
@@ -283,6 +285,52 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         self
     }
 
+    /// The checked construct registry this facade admits `program` under.
+    /// An unconfigured facade has no shipped vocabulary to resolve against,
+    /// so it refuses rather than record an admission whose construct and
+    /// declaration classes are unknown. A host that ships no standard
+    /// manifests says so with an explicit empty set.
+    fn shipped_construct_registry(
+        &self,
+        program: &whipplescript_parser::IrProgram,
+        admission: &str,
+    ) -> Result<whipplescript_core::ContractRegistry, HostFacadeError> {
+        let manifests = self.embedded_std_manifests.ok_or_else(|| {
+            HostFacadeError::Resolver(format!(
+                "{admission} requires the host's shipped standard registry"
+            ))
+        })?;
+        embedded_std_registry_for_program(program, manifests).map_err(HostFacadeError::Resolver)
+    }
+
+    /// Judge a retained admission's construct and declaration edges against
+    /// the basis this host would admit the same checked `program` under now:
+    /// its shipped registry and compiler artifact. Registry or source drift
+    /// makes an edge unknown; nothing here re-resolves or rewrites evidence.
+    /// The caller supplies the program checked for the witness's version.
+    pub fn revalidate_retained_constructs(
+        &self,
+        program: &whipplescript_parser::IrProgram,
+        witness: &whipplescript_store::program_imports::ProgramImportWitness,
+    ) -> Result<crate::construct_revalidation::RetainedConstructStanding, HostFacadeError> {
+        let compiler_artifact_digest =
+            self.compiler_artifact_digest.as_deref().ok_or_else(|| {
+                HostFacadeError::Resolver(
+                    "construct revalidation requires the exact compiler artifact digest".to_owned(),
+                )
+            })?;
+        let registry = self.shipped_construct_registry(program, "construct revalidation")?;
+        crate::construct_revalidation::revalidate(
+            witness,
+            &crate::construct_revalidation::CurrentConstructBasis {
+                registry: &registry,
+                compiler_artifact_digest,
+                sources: &[],
+            },
+        )
+        .map_err(HostFacadeError::Resolver)
+    }
+
     pub fn from_signed_store_with_verifier<V: GovernanceAttestationVerifier + ?Sized>(
         store: S,
         epoch: u64,
@@ -372,22 +420,17 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     "host action admission requires the exact compiler artifact digest".to_owned(),
                 )
             })?;
-        let construct_registry = self
-            .embedded_std_manifests
-            .map(|manifests| embedded_std_registry_for_program(action.program(), manifests))
-            .transpose()
-            .map_err(HostFacadeError::Resolver)?;
-        let construct_basis = construct_registry
-            .as_ref()
-            .map(|registry| CheckedConstructBasis {
-                registry,
-                sources: &[],
-            });
+        let registry =
+            self.shipped_construct_registry(action.program(), "host action admission")?;
+        let construct_basis = CheckedConstructBasis {
+            registry: &registry,
+            sources: &[],
+        };
         self.kernel.admit_compiled_host_action(
             action,
             &admission,
             compiler_artifact_digest,
-            construct_basis.as_ref(),
+            Some(&construct_basis),
             journal,
         )
     }
@@ -692,15 +735,12 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             compiler_artifact_digest,
             packages: &[],
         };
-        let registry = self
-            .embedded_std_manifests
-            .map(|manifests| embedded_std_registry_for_program(&package.program, manifests))
-            .transpose()
-            .map_err(HostFacadeError::Resolver)?;
-        let construct_basis = registry.as_ref().map(|registry| CheckedConstructBasis {
-            registry,
+        let registry =
+            self.shipped_construct_registry(&package.program, "hosted program admission")?;
+        let construct_basis = CheckedConstructBasis {
+            registry: &registry,
             sources: &[],
-        });
+        };
         let operation_id = journal
             .as_mut()
             .map(|journal| {
@@ -720,41 +760,28 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     ir_hash: &package.ir_hash,
                     compiler_artifact_digest,
                     policy: &command.policy,
-                    construct_basis: construct_basis.as_ref(),
+                    construct_basis: Some(&construct_basis),
                 })
             })
             .transpose()?;
-        let admission = match (construct_basis.as_ref(), operation_id.as_deref()) {
-            (Some(constructs), Some(operation_id)) => self
+        let admission = match operation_id.as_deref() {
+            Some(operation_id) => self
                 .kernel
                 .create_program_version_for_program_with_imports_and_constructs_at_id(
                     input,
                     &package.program,
                     &import_basis,
-                    constructs,
+                    &construct_basis,
                     operation_id,
                 ),
-            (Some(constructs), None) => self
+            None => self
                 .kernel
                 .create_program_version_for_program_with_imports_and_constructs(
                     input,
                     &package.program,
                     &import_basis,
-                    constructs,
+                    &construct_basis,
                 ),
-            (None, Some(operation_id)) => self
-                .kernel
-                .create_program_version_for_program_with_imports_at_id(
-                    input,
-                    &package.program,
-                    &import_basis,
-                    operation_id,
-                ),
-            (None, None) => self.kernel.create_program_version_for_program_with_imports(
-                input,
-                &package.program,
-                &import_basis,
-            ),
         }
         .map_err(HostFacadeError::Store)?;
         if let Some(journal) = journal.as_mut() {
@@ -1194,15 +1221,14 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     compiler_artifact_digest,
                     packages: &[],
                 };
-                let registry = self
-                    .embedded_std_manifests
-                    .map(|manifests| embedded_std_registry_for_program(&package.program, manifests))
-                    .transpose()
-                    .map_err(HostFacadeError::Resolver)?;
-                let construct_basis = registry.as_ref().map(|registry| CheckedConstructBasis {
-                    registry,
+                let registry = self.shipped_construct_registry(
+                    &package.program,
+                    "hosted program re-attestation",
+                )?;
+                let construct_basis = CheckedConstructBasis {
+                    registry: &registry,
                     sources: &[],
-                });
+                };
                 let operation_id = journal
                     .as_mut()
                     .map(|journal| {
@@ -1221,7 +1247,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                             ir_hash: &package.ir_hash,
                             compiler_artifact_digest,
                             policy: &command.policy,
-                            construct_basis: construct_basis.as_ref(),
+                            construct_basis: Some(&construct_basis),
                         })
                     })
                     .transpose()?;
@@ -1232,25 +1258,18 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                             input,
                             &package.program,
                             &import_basis,
-                            construct_basis.as_ref(),
+                            Some(&construct_basis),
                             operation_id,
                         )
-                } else if let Some(constructs) = construct_basis.as_ref() {
+                } else {
                     self.kernel
                         .reattest_instance_program_with_imports_and_constructs(
                             &instance.instance_id,
                             input,
                             &package.program,
                             &import_basis,
-                            constructs,
+                            &construct_basis,
                         )
-                } else {
-                    self.kernel.reattest_instance_program_with_imports(
-                        &instance.instance_id,
-                        input,
-                        &package.program,
-                        &import_basis,
-                    )
                 }
                 .map_err(HostFacadeError::Store)?;
                 if let Some(journal) = journal.as_mut() {
@@ -1519,6 +1538,7 @@ workflow Method {
             envelope(),
         )
         .expect("host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
@@ -1610,6 +1630,7 @@ workflow Method {
             envelope(),
         )
         .expect("first host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
@@ -1629,6 +1650,7 @@ workflow Method {
             envelope(),
         )
         .expect("replacement host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         assert_ne!(
             replacement.kernel().store().store_incarnation().unwrap(),
@@ -1676,6 +1698,7 @@ workflow Method {
             envelope(),
         )
         .expect("host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -1715,6 +1738,7 @@ workflow Method {
             envelope(),
         )
         .expect("host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
@@ -1803,6 +1827,68 @@ workflow Method {
     }
 
     #[test]
+    fn construct_revalidation_refuses_a_facade_without_its_compiler_identity() {
+        let compiled = whipplescript_parser::compile_program(
+            r#"
+workflow Method
+file store project {
+  root "."
+  allow read ["**"]
+}
+"#,
+        );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let program = compiled.ir.expect("program");
+        let compiler_digest = "c".repeat(64);
+        let registry = crate::construct_coverage::embedded_std_registry_for_program(
+            &program,
+            crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS,
+        )
+        .expect("shipped registry");
+        let mut witness = crate::import_coverage::capture(
+            &program,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &compiler_digest,
+            &[],
+        )
+        .expect("imports");
+        witness.constructs = Some(
+            crate::construct_coverage::capture(&program, &registry, &witness, &[])
+                .expect("constructs"),
+        );
+        witness.declarations = Some(
+            crate::construct_coverage::capture_declarations(&program, &registry, &witness)
+                .expect("declarations"),
+        );
+        let host = GovernedHostFacade::from_verified_store(
+            SqliteStore::open_in_memory().expect("store"),
+            7,
+            envelope(),
+        )
+        .expect("host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS);
+        let Err(refusal) = host.revalidate_retained_constructs(&program, &witness) else {
+            panic!("a facade without its compiler identity judged retained edges");
+        };
+        assert!(refusal
+            .to_string()
+            .contains("construct revalidation requires the exact compiler artifact digest"));
+        // The same witness is judged, and holds, once the facade names the
+        // compiler it would admit under now.
+        let host = host.with_compiler_artifact_digest(&compiler_digest);
+        let standing = host
+            .revalidate_retained_constructs(&program, &witness)
+            .expect("judged");
+        assert_eq!(standing.declarations.as_ref().map(Vec::len), Some(1));
+        assert!(standing.all_current(), "{standing:?}");
+    }
+
+    #[test]
     fn store_generic_facade_opens_and_admits_an_idempotent_turn() {
         let package = package();
         let mut host = GovernedHostFacade::from_verified_store(
@@ -1824,6 +1910,26 @@ workflow Method {
             .contains("hosted program admission requires the exact compiler artifact digest"));
         let compiler_digest = "a".repeat(64);
         let mut host = host.with_compiler_artifact_digest(&compiler_digest);
+        assert!(host
+            .open_instance(&open, &package)
+            .unwrap_err()
+            .to_string()
+            .contains("hosted program admission requires the host's shipped standard registry"));
+        assert!(host
+            .kernel()
+            .store()
+            .program_import_operation_roster()
+            .expect("operations after registry refusal")
+            .operations
+            .is_empty());
+        assert!(host
+            .kernel()
+            .store()
+            .list_instances()
+            .expect("instances after registry refusal")
+            .is_empty());
+        let mut host =
+            host.with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS);
         let opened = host.open_instance(&open, &package).expect("opened");
         assert_eq!(
             host.open_instance(&open, &package).expect("replayed"),
@@ -1917,6 +2023,7 @@ workflow Method {
             envelope(),
         )
         .expect("host")
+        .with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS)
         .with_compiler_artifact_digest("a".repeat(64));
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
@@ -1973,7 +2080,23 @@ workflow Method {
                 .version_id,
             drifted.version_id
         );
+        // A compiler identity alone is not a construct basis: without the
+        // shipped registry the re-attestation would retain unknown classes.
         let mut host = host.with_compiler_artifact_digest("a".repeat(64));
+        assert!(host
+            .open_instance(&open, &package)
+            .unwrap_err()
+            .to_string()
+            .contains("re-attestation requires the host's shipped standard registry"));
+        assert_eq!(
+            host.kernel()
+                .store()
+                .program_import_operation_roster()
+                .expect("operations after registry refusal"),
+            before
+        );
+        let mut host =
+            host.with_embedded_std_manifests(crate::construct_coverage::TEST_SHIPPED_STD_MANIFESTS);
         assert_eq!(
             host.open_instance(&open, &package).expect("checked replay"),
             opened

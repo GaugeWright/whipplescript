@@ -155,22 +155,12 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                 "host action admission requires the exact compiler artifact digest".to_owned(),
             )
         })?;
-        let construct_registry = self
-            .embedded_std_manifests
-            .map(|manifests| {
-                crate::construct_coverage::embedded_std_registry_for_program(
-                    action.program(),
-                    manifests,
-                )
-            })
-            .transpose()
-            .map_err(HostFacadeError::Resolver)?;
-        let construct_basis = construct_registry.as_ref().map(|registry| {
-            crate::construct_coverage::CheckedConstructBasis {
-                registry,
-                sources: &[],
-            }
-        });
+        let registry =
+            self.shipped_construct_registry(action.program(), "host action admission")?;
+        let construct_basis = crate::construct_coverage::CheckedConstructBasis {
+            registry: &registry,
+            sources: &[],
+        };
         resolver
             .with_inputs(&admission, |values| {
                 // Even an empty declaration is closed: the legacy untyped startup
@@ -189,7 +179,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     &admission,
                     facts,
                     &compiler_artifact_digest,
-                    construct_basis.as_ref(),
+                    Some(&construct_basis),
                     journal,
                 )
             })

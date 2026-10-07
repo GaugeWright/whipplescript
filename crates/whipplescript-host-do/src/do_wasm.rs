@@ -542,6 +542,28 @@ fn hosted_facade(
     .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
+/// [`hosted_facade`] over a shared SQL handle, for kernel passes whose
+/// coordination store clones its handle.
+fn hosted_shared_facade(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    retained_policy_json: Option<&str>,
+) -> Result<GovernedHostFacade<crate::do_store::DoSqliteStore<std::rc::Rc<JsDoSql>>>, JsValue> {
+    let verified = hosted_root(expected_signer, public_key_hex, retained_policy_json)?
+        .verify(signed_envelope)
+        .map_err(|error| JsValue::from_str(&error))?;
+    let epoch = verified.policy.epoch;
+    GovernedHostFacade::from_verified_store(
+        crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge })),
+        epoch,
+        verified.envelope,
+    )
+    .map(|facade| facade.with_embedded_std_manifests(crate::do_packages::EMBEDDED_STD_MANIFESTS))
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 fn authored_package(
     manifest: &str,
     source: &str,
@@ -941,6 +963,96 @@ pub fn host_external_delete_collected(bridge: DoSqlBridge, id: &str) -> Result<(
     blobs
         .external_delete_collected(id)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+}
+
+/// The program identity a caller signs into a host action command. Pure.
+#[wasm_bindgen]
+pub fn host_action_identity(operation: &str, source: &str) -> Result<String, JsValue> {
+    crate::hosted_actions::action_identity(operation, source).map_err(|e| JsValue::from_str(&e))
+}
+
+/// The exact hex bytes a `command` or `read` proof signs. Pure.
+#[wasm_bindgen]
+pub fn host_action_signing_bytes(kind: &str, body: &str) -> Result<String, JsValue> {
+    crate::hosted_actions::signing_bytes_hex(kind, body).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Admit one signed governed action under the placement's verified policy and
+/// the deployment's pinned action authority (HA-5).
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_admit_action(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    retained_policy_json: Option<String>,
+    action_trust: &str,
+    command_json: &str,
+    source: &str,
+    proof: &str,
+    compiler_artifact_digest: &str,
+) -> Result<String, JsValue> {
+    let trust = crate::hosted_actions::HostedActionTrust::parse(action_trust)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let mut facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .with_compiler_artifact_digest(compiler_artifact_digest);
+    crate::hosted_actions::admit(&mut facade, &trust, command_json, source, proof)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// Run the ordinary rule pass of one admitted action with its admitted program.
+#[wasm_bindgen]
+pub fn host_execute_action(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    retained_policy_json: Option<String>,
+    instance_ref: &str,
+    source: &str,
+) -> Result<String, JsValue> {
+    let mut facade = hosted_shared_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
+    crate::hosted_actions::execute(&mut facade, instance_ref, source)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// Read recorded action evidence under a current, separately signed read.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_read_action_result(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    retained_policy_json: Option<String>,
+    action_trust: &str,
+    query_json: &str,
+    proof: &str,
+) -> Result<String, JsValue> {
+    let trust = crate::hosted_actions::HostedActionTrust::parse(action_trust)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let facade = hosted_facade(
+        bridge,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?;
+    crate::hosted_actions::read_result(&facade, &trust, query_json, proof)
+        .map_err(|e| JsValue::from_str(&e))
 }
 
 /// Resolve one authored managed result through the same host-neutral
@@ -1829,6 +1941,12 @@ impl WasmDurableInstance {
             .transpose()
             .map_err(|error| JsValue::from_str(&error))?
             .flatten();
+        let skill_catalogue = agent_config_json
+            .as_deref()
+            .map(crate::skill_catalogue::from_agent_config)
+            .transpose()
+            .map_err(|error| JsValue::from_str(&error))?
+            .flatten();
         let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
             match agent_config_json {
                 Some(config) => Some(Box::new(
@@ -1847,6 +1965,7 @@ impl WasmDurableInstance {
                 agent_workspace_resources,
                 record_root_renames,
                 initial_model_provenance,
+                skill_catalogue,
                 agent_tool_specs: Some(resolved.tools),
                 external_tool_bindings: package.external_tool_bindings(),
                 agent_project_context: resolved.project_context,

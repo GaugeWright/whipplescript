@@ -928,3 +928,175 @@ fn executable_program_loader_refuses_damaged_capture_without_recompiling_valid_s
         std::fs::remove_file(path).unwrap();
     }
 }
+
+/// An untagged legacy version written before the typed source default, whose
+/// action uses the historical DR-0023 success alias. The current compiler
+/// refuses this source; a firing pinned to it before a revision still settles
+/// under its recorded semantics, from its stored source, and is not reread as
+/// typed composition.
+#[test]
+fn revised_instance_settles_a_pinned_legacy_success_alias_firing() {
+    const OLD: &str = r#"@service
+workflow LegacyPinned
+class Note { label string }
+action note(label string) {
+  timer 1s as delay
+  after delay succeeds as fired {
+    record Note { label label }
+  }
+}
+rule start when started => { note("old") }
+"#;
+    const NEW: &str = r#"@service
+workflow LegacyPinned
+class Note { label string }
+class Never { value string }
+rule idle when Never => { record Note { label "new" } }
+"#;
+    let current = compile_program(OLD);
+    assert!(
+        current.ir.is_none(),
+        "the source default refuses the old form"
+    );
+    assert!(
+        current
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("needs a result contract")),
+        "{:?}",
+        current.diagnostics
+    );
+
+    let stores = whipplescript_store::native_stores::NativeStores {
+        runtime: SqliteStore::open_in_memory().unwrap(),
+        coord: whipplescript_store::coordination::CoordinationStore::open_in_memory().unwrap(),
+        items: whipplescript_store::items::WorkItemStore::open_in_memory().unwrap(),
+        frontier: None,
+    };
+    let mut kernel = RuntimeKernel::new(stores);
+    let source_hash = kernel.store().put_content(OLD).unwrap();
+    // The analysis an old compiler wrote: today's legacy summary with the
+    // execution-semantics tag, which postdates it, removed.
+    let recorded =
+        compile_recorded_program_with_root(OLD, None, ExecutionSemantics::LegacyActionChainsV1)
+            .ir
+            .expect("the recorded path compiles the old source");
+    let mut analysis: Value =
+        serde_json::from_str(&program_analysis_summary_json(&recorded)).unwrap();
+    assert!(analysis
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_semantics")
+        .is_some());
+    let analysis = analysis.to_string();
+    let old_version = kernel
+        .store_mut()
+        .create_program_version(NewProgramVersion {
+            program_name: "LegacyPinned",
+            source_hash: &source_hash,
+            ir_hash: "old-legacy-ir",
+            ir_snapshot: None,
+            compiler_version: "pre-typed-default",
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: &analysis,
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        })
+        .unwrap();
+    let instance = kernel.create_instance(&old_version, "{}").unwrap();
+    let old_program = load_version_ir(&mut kernel, &instance, &old_version.version_id)
+        .unwrap()
+        .expect("the untagged snapshot opens on its recorded path");
+    assert_eq!(
+        old_program.execution_semantics,
+        ExecutionSemantics::LegacyActionChainsV1
+    );
+    assert!(old_program.rules[0]
+        .body
+        .contains("after delay__act0 succeeds as fired__act0"));
+    kernel
+        .ingest_external_event(&instance, "external.started", "{}", Some("started"))
+        .unwrap();
+    let started = step_instance_generic(
+        &mut kernel,
+        &instance,
+        &old_program,
+        None,
+        Some(&old_version.version_id),
+    )
+    .unwrap();
+    assert_eq!(started.effects_created, 1);
+
+    let new = compile_program(NEW);
+    assert!(new.diagnostics.is_empty(), "{:?}", new.diagnostics);
+    let new_program = new.ir.unwrap();
+    let new_identity =
+        whipplescript_parser::snapshot::identity_projection(&new_program.to_snapshot());
+    let new_version = kernel
+        .create_program_version_for_program(
+            ProgramVersionInput {
+                program_name: &new_program.workflow,
+                source_hash: "new-legacy-source",
+                ir_hash: &crate::stable_hash_hex(&new_identity),
+                compiler_version: "test",
+                ir_snapshot: Some(&new_identity),
+            },
+            &new_program,
+        )
+        .unwrap();
+    kernel
+        .store_mut()
+        .activate_revision(RevisionActivation {
+            instance_id: &instance,
+            from_version_id: &old_version.version_id,
+            to_version_id: &new_version.version_id,
+            activation_policy_json: "{}",
+            cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
+            idempotency_key: Some("legacy-alias-revision"),
+        })
+        .unwrap();
+    crate::time_pass::resolve_due_time_effects(&mut kernel, &instance, "2099-01-01T00:00:00Z")
+        .unwrap();
+    let completed = step_instance_generic(
+        &mut kernel,
+        &instance,
+        &new_program,
+        None,
+        Some(&new_version.version_id),
+    )
+    .unwrap();
+    assert_eq!(completed.committed_rules, 1);
+    let notes = kernel
+        .store()
+        .list_facts(&instance)
+        .unwrap()
+        .into_iter()
+        .filter(|fact| fact.name == "Note")
+        .collect::<Vec<_>>();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let value: Value = serde_json::from_str(&notes[0].value_json).unwrap();
+    assert_eq!(
+        value["label"], "old",
+        "the pinned legacy continuation settles"
+    );
+    assert!(kernel
+        .store()
+        .list_diagnostics(Some(&instance))
+        .unwrap()
+        .is_empty());
+    let old_row = kernel
+        .store()
+        .get_program_version(&old_version.version_id)
+        .unwrap()
+        .unwrap();
+    let stored: Value = serde_json::from_str(&old_row.analysis_summary_json).unwrap();
+    assert!(
+        stored.get("execution_semantics").is_none(),
+        "the old version is not retagged"
+    );
+}

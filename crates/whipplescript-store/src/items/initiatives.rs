@@ -333,7 +333,13 @@ impl super::WorkItemStore {
         let at = super::readiness::canonical_instant(at).ok_or_else(|| {
             StoreError::Conflict("initiative inspection needs a UTC instant".into())
         })?;
-        let tx = self.connection.unchecked_transaction()?;
+        // A canonical query handle already owns its response snapshot. Keep
+        // that snapshot alive; standalone inspection still takes its own cut.
+        let owned_tx = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
         if let Some(allowed) = allowed_queues {
             let queue: Option<String> = self
                 .connection
@@ -385,7 +391,9 @@ impl super::WorkItemStore {
                 unready_reasons,
             });
         }
-        tx.commit()?;
+        if let Some(tx) = owned_tx {
+            tx.commit()?;
+        }
         Ok(inspection(initiative, members, at))
     }
 }
@@ -755,6 +763,67 @@ mod tests {
                 .title,
             "later task"
         );
+    }
+
+    #[test]
+    fn inspection_reuses_query_snapshot_without_losing_read_set_checks() {
+        let path = crate::scratch::path("whip-initiative-query-snapshot");
+        let mut writer = WorkItemStore::open(&path).unwrap();
+        let group = file(&mut writer, "company", "group", "initiative");
+        let member = file(&mut writer, "product", "member", "task");
+        writer
+            .add_relation(&member.id, &group.id, "belongs-to", None)
+            .unwrap();
+        let reader = WorkItemStore::open_read_snapshot(&path).unwrap();
+        let at = reader.store_now().unwrap();
+        assert_eq!(
+            reader
+                .inspect_initiative_at(&group.id, &at)
+                .unwrap()
+                .members
+                .len(),
+            1
+        );
+        let allowed = std::collections::BTreeSet::from(["company".to_owned()]);
+        let error = reader
+            .inspect_initiative_for_queues_at(&group.id, &at, &allowed)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("outside the readable tracker set"));
+        let later = file(&mut writer, "product", "later", "task");
+        writer
+            .add_relation(&later.id, &group.id, "belongs-to", None)
+            .unwrap();
+        assert_eq!(
+            reader
+                .inspect_initiative_at(&group.id, &at)
+                .unwrap()
+                .members
+                .len(),
+            1
+        );
+        assert!(!reader.connection.is_autocommit());
+        let fresh = WorkItemStore::open_read_snapshot(&path).unwrap();
+        assert_eq!(
+            fresh
+                .inspect_initiative_at(&group.id, &at)
+                .unwrap()
+                .members
+                .len(),
+            2
+        );
+        assert_eq!(
+            writer
+                .inspect_initiative_at(&group.id, &at)
+                .unwrap()
+                .members
+                .len(),
+            2
+        );
+        assert!(writer.connection.is_autocommit());
+        drop(fresh);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

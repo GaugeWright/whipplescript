@@ -68,6 +68,7 @@ impl WorkItemStore {
             protection,
             event_effect_id: None,
             discovery_writer,
+            query_instant: None,
         })
     }
 

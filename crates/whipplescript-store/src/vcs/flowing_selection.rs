@@ -3122,6 +3122,97 @@ mod tests {
     }
 
     #[test]
+    fn native_gate_binds_coverage_premises_before_running_checks() {
+        use crate::branches::flowing_admission::FlowingAdmissions;
+        use crate::branches::flowing_coverage::tests::{basis_for, premises};
+
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let prepared = reviews
+            .prepare_native_candidate(&mut vcs, native_candidate_request("candidate-a", "t7"))
+            .expect("prepare exact prefix");
+        let NativeCandidateOutcome::Prepared(candidate) = prepared else {
+            panic!("complete prefix must prepare: {prepared:?}")
+        };
+        assert!(matches!(
+            vcs.retain_review_attempt("gate-coverage", &candidate.candidate_witness_digest, "t7")
+                .expect("pin exact gate attempt"),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .expect("read witness")
+            .expect("witness retained");
+        let current = premises();
+        let plan = NativeGatePlan {
+            attempt_op_id: "gate-coverage".into(),
+            candidate_witness_digest: candidate.candidate_witness_digest.clone(),
+            coordinator: "coordinator".into(),
+            policy_digest: "policy-v1".into(),
+            rules_digest: "rules-v1".into(),
+            graph_coverage_digest: "coverage".into(),
+            coverage: Some(basis_for(&current, &witness.candidate_manifest_hash)),
+            checks: vec![NativeGateCommand {
+                check_id: "cut-content".into(),
+                program: "sh".into(),
+                args: vec!["-c".into(), "true".into()],
+            }],
+        };
+        let scratch = std::env::temp_dir().join(format!(
+            "whip-native-gate-coverage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut executor = LocalProcessFixture;
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "coverage premises refuse: CoverageUnavailable",
+        );
+        assert!(!scratch.exists(), "no check runs on unavailable coverage");
+        vcs.branches
+            .record_flowing_coverage_premises(&current)
+            .expect("record premises");
+        let run = run_fixture_gate(
+            &mut vcs,
+            &candidate.candidate_witness_digest,
+            &plan,
+            &scratch,
+            &mut executor,
+        )
+        .expect("run against current premises");
+        std::fs::remove_dir_all(&scratch).expect("remove test scratch");
+        assert_eq!(run.certificate.coverage, plan.coverage);
+        assert_eq!(run.certificate.admission_refusal(), None);
+
+        let mut moved = current.clone();
+        moved.lock_epoch += 1;
+        vcs.branches
+            .record_flowing_coverage_premises(&moved)
+            .expect("advance lock epoch");
+        expect_gate_refusal(
+            run_fixture_gate(
+                &mut vcs,
+                &candidate.candidate_witness_digest,
+                &plan,
+                &scratch,
+                &mut executor,
+            ),
+            "coverage premises refuse: CoverageStale { premise: \"lock\" }",
+        );
+        assert!(!scratch.exists());
+    }
+
+    #[test]
     fn native_gate_runs_the_retained_cut_and_records_each_result() {
         let (mut vcs, mut reviews) = reviewed_two_unit_twig();
         upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
@@ -3145,6 +3236,7 @@ mod tests {
             policy_digest: "policy-v1".into(),
             rules_digest: "rules-v1".into(),
             graph_coverage_digest: "full-prefix-v1".into(),
+            coverage: None,
             checks: vec![
                 NativeGateCommand {
                     check_id: "cut-content".into(),
@@ -3361,6 +3453,7 @@ mod tests {
             policy_digest: "policy".into(),
             rules_digest: "rules".into(),
             graph_coverage_digest: "coverage".into(),
+            coverage: None,
             checks: vec![NativeGateCommand {
                 check_id: "check".into(),
                 program: "sh".into(),
@@ -3627,6 +3720,7 @@ mod tests {
             policy_digest: "policy".into(),
             rules_digest: "rules".into(),
             graph_coverage_digest: "coverage".into(),
+            coverage: None,
             checks: vec![NativeGateCommand {
                 check_id: "check".into(),
                 program: "sh".into(),

@@ -59,7 +59,8 @@ journey, which forwards through the placement root, so it names
 `#managed-host-lifecycle` rather than a journey of its own.
 `scripts/check-production-canaries.mjs` reports how many routes have runners
 awaiting production identity and how many still need one; local runner tests, a
-disabled workflow, or a credential-free run never count as deployed evidence.
+suite the fleet job does not run, or a credential-free run never count as
+deployed evidence.
 
 Adding a route trips three pins at once. A critical route with no deployed
 evidence must be mapped to exactly one suite in

@@ -18,6 +18,7 @@ use std::{
 pub(super) const SCHEMA: &str =
     "CREATE TABLE IF NOT EXISTS tracker_discovery_roots (root TEXT PRIMARY KEY);";
 const OWNER: &str = ".whipplescript-discovery-owner";
+const OWNER_MARKER_REFUSAL: &str = "tracker cleanup refuses a symlinked ownership marker";
 const VIEW_SCHEMA: &str = "whipplescript.tracker.discovery/v2";
 const SEARCH: &str = "\n# WhippleScript generated tracker discovery\n!tracker/\n!tracker/**\n";
 static SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -252,19 +253,206 @@ struct Generation {
     /// those whose records left, as paths relative to the view.
     incremental: Option<(Vec<String>, Vec<String>)>,
 }
-impl Drop for Generation {
+/// Garbage is detached by atomic rename while publication is serialized. Its
+/// recursive deletion happens only after both the SQL and publisher locks are
+/// released, including when preparation, authority checking or commit fails.
+struct DiscoveryCleanup {
+    owner: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+}
+struct PendingStages {
+    owner: Option<PathBuf>,
+    paths: Vec<PathBuf>,
+}
+impl Drop for PendingStages {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.stage);
+        if let Some(owner) = &self.owner {
+            for stage in &self.paths {
+                let _ = retire(stage, owner);
+            }
+        }
+    }
+}
+/// An ownership write that fails before creating a file leaves an empty stage.
+/// Release that stage without recursive work inside publication's critical section.
+fn write_stage_owner(stage: &Path, owner: &Path) -> StoreResult<()> {
+    if let Err(error) = fs::write(stage.join(OWNER), owner.to_string_lossy().as_bytes()) {
+        let _ = fs::remove_dir(stage);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn retire(path: &Path, owner: &Path) -> std::io::Result<()> {
+    let Some(root) = path.parent() else {
+        return Ok(());
+    };
+    if fs::canonicalize(root)? != root {
+        return Err(std::io::Error::other(
+            "tracker cleanup root changed through a symlink",
+        ));
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || fs::read_to_string(path.join(OWNER)).ok().as_deref() != owner.to_str()
+    {
+        return Err(std::io::Error::other(
+            "tracker cleanup refuses an unrelated or symlinked directory",
+        ));
+    }
+    // Reserve a container atomically: PID reuse or a foreign name must never
+    // cause rename to replace an existing directory, even an empty one.
+    let retired = loop {
+        let retired = root.join(format!(
+            ".tracker-retired-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&retired) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            result => {
+                result?;
+                break retired;
+            }
+        }
+    };
+    if let Err(error) = fs::rename(path, retired.join("view")) {
+        let _ = fs::remove_dir(&retired);
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // Ownership becomes visible atomically with the payload. A concurrent
+    // cleaner may collect it now; no post-rename write depends on it surviving.
+    #[cfg(test)]
+    RETIRE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = &mut *hook.borrow_mut() {
+            hook();
+        }
+    });
+    Ok(())
+}
+fn retired_owned(path: &Path, owner: &Path) -> bool {
+    match fs::read_to_string(path.join(OWNER)) {
+        Ok(marker) => Some(marker.as_str()) == owner.to_str(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let view = path.join("view");
+            fs::symlink_metadata(&view)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                && fs::read_to_string(view.join(OWNER)).ok().as_deref() == owner.to_str()
+        }
+        Err(_) => false,
+    }
+}
+/// Keep ownership outside the recursively removed payload, so interrupted or
+/// refused deletion can be retried without borrowing publication's lock.
+fn collect_retired(path: &Path, owner: &Path) -> std::io::Result<()> {
+    let marker = path.join(OWNER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            use std::io::Write;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)?
+                .write_all(owner.to_string_lossy().as_bytes())?;
+        }
+        _ => {
+            // MUTATION-SUCCESS-EXPR: Ok(())
+            return Err(std::io::Error::other(OWNER_MARKER_REFUSAL));
+        }
+    }
+    #[cfg(test)]
+    CLEANUP_PAYLOAD_TEST_HOOK.with(|hook| {
+        if let Some(hook) = &mut *hook.borrow_mut() {
+            hook()?;
+        }
+        Ok::<_, std::io::Error>(())
+    })?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() == OWNER {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::remove_file(marker)?;
+    fs::remove_dir(path)
+}
+#[cfg(test)]
+type CleanupPayloadHook = Box<dyn FnMut() -> std::io::Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    static RETIRE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    static CLEANUP_PAYLOAD_TEST_HOOK: std::cell::RefCell<Option<CleanupPayloadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+impl Drop for DiscoveryCleanup {
+    fn drop(&mut self) {
+        let Some(owner) = &self.owner else { return };
+        let Ok(lock) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(owner.with_extension("discovery-cleanup.lock"))
+        else {
+            return;
+        };
+        // A slow cleaner never holds up another writer. The next cleanup also
+        // collects retired directories left by interruption or failed deletion.
+        if lock.try_lock().is_err() {
+            return;
+        }
+        for root in &self.roots {
+            if fs::canonicalize(root).ok().as_ref() != Some(root) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tracker-retired-")
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && retired_owned(&entry.path(), owner)
+                {
+                    #[cfg(test)]
+                    CLEANUP_TEST_HOOK.with(|hook| {
+                        if let Some(hook) = &mut *hook.borrow_mut() {
+                            hook();
+                        }
+                    });
+                    let _ = collect_retired(&entry.path(), owner);
+                }
+            }
+        }
     }
 }
 impl Generation {
     /// Before commit: what this write changes stops being visible, so an
     /// interruption leaves it unavailable rather than stale.
-    fn invalidate(&self) -> StoreResult<()> {
+    fn invalidate(&self, owner: &Path) -> StoreResult<()> {
         match &self.incremental {
             None => {
                 if self.destination.exists() {
-                    fs::remove_dir_all(&self.destination)?;
+                    retire(&self.destination, owner)?;
                 }
             }
             Some((changed, removed)) => {
@@ -314,7 +502,26 @@ impl DiscoveryTransaction<'_> {
         self,
         check: &mut dyn FnMut() -> StoreResult<()>,
     ) -> StoreResult<()> {
+        let mut cleanup = DiscoveryCleanup {
+            owner: self.owner.clone(),
+            roots: Vec::new(),
+        };
+        self.commit_prepared(check, &mut cleanup)
+    }
+
+    fn commit_prepared(
+        self,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+        cleanup: &mut DiscoveryCleanup,
+    ) -> StoreResult<()> {
         let enrolled = roots(&self.tx)?;
+        cleanup.roots = enrolled.clone();
+        // This local guard retires remaining stages by rename before self's
+        // publisher guard drops. The outer cleanup only deletes retired views.
+        let mut pending = PendingStages {
+            owner: self.owner.clone(),
+            paths: Vec::new(),
+        };
         let mut staged = Vec::new();
         if let Some(owner) = &self.owner {
             if !enrolled.is_empty() {
@@ -360,7 +567,7 @@ impl DiscoveryTransaction<'_> {
                         continue;
                     }
                     // Our per-store lock excludes any live generation of this
-                    // owner. Remove only its abandoned staging directories.
+                    // owner. Retire only its abandoned staging directories.
                     for entry in fs::read_dir(&root)? {
                         let entry = entry?;
                         if entry
@@ -371,7 +578,7 @@ impl DiscoveryTransaction<'_> {
                             && fs::read_to_string(entry.path().join(OWNER)).ok().as_deref()
                                 == owner.to_str()
                         {
-                            fs::remove_dir_all(entry.path())?;
+                            retire(&entry.path(), owner)?;
                         }
                     }
                     let stage = root.join(format!(
@@ -380,6 +587,8 @@ impl DiscoveryTransaction<'_> {
                         SERIAL.fetch_add(1, Ordering::Relaxed)
                     ));
                     fs::create_dir(&stage)?;
+                    write_stage_owner(&stage, owner)?;
+                    pending.paths.push(stage.clone());
                     let incremental = published.map(|published| {
                         let changed = records
                             .iter()
@@ -401,10 +610,6 @@ impl DiscoveryTransaction<'_> {
                         destination,
                         incremental,
                     };
-                    fs::write(
-                        generation.stage.join(OWNER),
-                        owner.to_string_lossy().as_bytes(),
-                    )?;
                     fs::create_dir(generation.stage.join("initiatives"))?;
                     fs::create_dir(generation.stage.join("tasks"))?;
                     let paths: Vec<&String> = match &generation.incremental {
@@ -427,8 +632,8 @@ impl DiscoveryTransaction<'_> {
                 (generation.destination.parent(), self.owner.as_deref())
             {
                 check_destination(root, owner)?;
+                generation.invalidate(owner)?;
             }
-            generation.invalidate()?;
         }
         // Discovery preparation can take time. Original embedding access must
         // still hold at the actual durable database boundary.
@@ -450,6 +655,11 @@ impl DiscoveryTransaction<'_> {
 
 impl WorkItemStore {
     pub(super) fn discovery_transaction(&self) -> StoreResult<DiscoveryTransaction<'_>> {
+        if self.query_instant.is_some() {
+            return Err(StoreError::Conflict(
+                "tracker query snapshot cannot mutate the store".to_owned(),
+            ));
+        }
         let owner = if self.protection.is_some() {
             None
         } else {
@@ -526,11 +736,18 @@ impl WorkItemStore {
                 "protected tracker cannot publish plaintext discovery".into(),
             ));
         }
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let now = super::tx_now(&tx)?;
-        let records = snapshot(&tx)?;
+        let owned_tx = if self.connection.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                &self.connection,
+                TransactionBehavior::Deferred,
+            )?)
+        } else {
+            None
+        };
+        let now = self.store_now()?;
+        let records = snapshot(&self.connection)?;
         let mut ready = Vec::new();
-        let source = super::readiness_native::NativeReadiness(&tx);
+        let source = super::readiness_native::NativeReadiness(&self.connection);
         for (_, _, record) in &records.records {
             let item = &record["issue"];
             if item["kind"] == "task" && ready.len() < limit {
@@ -546,7 +763,9 @@ impl WorkItemStore {
         }
         context["ready_tasks"] = json!(ready);
         context["at"] = json!(now);
-        tx.commit()?;
+        if let Some(tx) = owned_tx {
+            tx.commit()?;
+        }
         Ok(context)
     }
 }
@@ -625,6 +844,10 @@ fn enroll_checkout_with_git(
     append(
         &exclude,
         "\n# WhippleScript local discovery (never commit)\n/tracker/\n/.tracker-stage-*\n",
+    )?;
+    append(
+        &exclude,
+        "\n# WhippleScript retired discovery (never commit)\n/.tracker-retired-*\n",
     )?;
     if new_ignore {
         append(&exclude, "\n/.rgignore\n")?;
@@ -846,11 +1069,393 @@ mod tests {
         .expect("file")
         .id
     }
+
+    #[test]
+    fn summary_reuses_query_snapshot_and_boundary_clock() {
+        let fixture = Fixture::new();
+        let mut writer = WorkItemStore::open(fixture.db()).unwrap();
+        let before = file(&mut writer, "before", "task");
+        let reader = WorkItemStore::open_read_snapshot(fixture.db()).unwrap();
+        let at = reader.store_now().unwrap();
+        let initial = reader.discovery_summary(10).unwrap();
+        assert_eq!(initial["at"], at);
+        assert_eq!(initial["ready_tasks"][0]["id"], before);
+        file(&mut writer, "later", "task");
+        assert_eq!(reader.discovery_summary(10).unwrap(), initial);
+        assert!(!reader.connection.is_autocommit());
+        let fresh = WorkItemStore::open_read_snapshot(fixture.db()).unwrap();
+        assert_eq!(
+            fresh.discovery_summary(10).unwrap()["ready_tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            writer.discovery_summary(10).unwrap()["ready_tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(writer.connection.is_autocommit());
+    }
     fn read(root: &Path, kind: &str, id: &str) -> Value {
         serde_json::from_slice(
             &fs::read(root.join(format!("tracker/{kind}/{id}.hjson"))).expect("view"),
         )
         .expect("HJSON JSON subset")
+    }
+    /// A deterministic pause at the expensive deletion boundary must permit a
+    /// second connection's SQL writer and another publisher to acquire locks.
+    fn assert_cleanup_locks_free(db: PathBuf, calls: Arc<AtomicU64>) {
+        CLEANUP_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let publisher = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(db.with_extension("discovery.lock"))
+                    .expect("publisher lock");
+                publisher
+                    .try_lock()
+                    .expect("recursive deletion must not hold publisher lock");
+                let mut conn = Connection::open(&db).expect("second SQL connection");
+                conn.busy_timeout(std::time::Duration::ZERO)
+                    .expect("do not wait");
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                    .expect("recursive deletion must not hold SQL writer");
+                drop(conn);
+                drop(publisher);
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let (send, receive) = std::sync::mpsc::channel();
+                    let db = db.clone();
+                    let writer = std::thread::spawn(move || {
+                        let mut store = WorkItemStore::open_existing(db).expect("concurrent store");
+                        let id = file(&mut store, "writer finished while cleanup paused", "task");
+                        send.send(id).expect("report completed write");
+                    });
+                    receive
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("a real tracker write must finish before cleanup resumes");
+                    writer.join().expect("concurrent writer");
+                }
+            }));
+        });
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discovery_cleanup_refuses_symlinked_owner_without_touching_payload() {
+        let root = Fixture::new();
+        let owner = root.db();
+        let retired = root.0.join(".tracker-retired-symlink-owner");
+        let payload = retired.join("view");
+        fs::create_dir_all(&payload).expect("retired payload");
+        let outside = root.0.join("outside-owner");
+        fs::write(&outside, owner.to_string_lossy().as_bytes()).expect("outside owner");
+        fs::write(payload.join("retained"), "must survive refusal").expect("payload");
+        std::os::unix::fs::symlink(&outside, retired.join(OWNER)).expect("symlink owner");
+        let error = collect_retired(&retired, &owner).expect_err("symlink owner must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            fs::read_to_string(payload.join("retained")).expect("retained payload"),
+            "must survive refusal"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside unchanged"),
+            owner.to_string_lossy()
+        );
+        assert!(fs::symlink_metadata(retired.join(OWNER))
+            .expect("marker remains")
+            .file_type()
+            .is_symlink());
+        drop(DiscoveryCleanup {
+            owner: Some(owner.clone()),
+            roots: vec![root.0.clone()],
+        });
+        assert!(
+            retired.exists(),
+            "automatic cleanup must preserve refused retirement"
+        );
+        assert_eq!(
+            fs::read_to_string(payload.join("retained")).expect("payload after cleanup"),
+            "must survive refusal"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside after cleanup"),
+            owner.to_string_lossy()
+        );
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn discovery_stage_owner_write_error_removes_empty_stage_and_allows_retry() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Fixture::new();
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        store.enroll_discovery(&root.0).expect("enroll");
+        let task = file(&mut store, "before owner write failure", "task");
+        let owner = identity(&store.connection)
+            .expect("owner query")
+            .expect("owner");
+        let paths = [
+            root.0.join("tracker").join(MANIFEST),
+            root.0.join("tracker/context.hjson"),
+            root.0.join(format!("tracker/tasks/{task}.hjson")),
+        ];
+        let published = paths
+            .iter()
+            .map(|p| fs::read(p).expect("published bytes"))
+            .collect::<Vec<_>>();
+        // Valid directories near the OS path bound make the real ownership-file
+        // open fail before creating anything, independently of user permissions.
+        #[cfg(target_os = "macos")]
+        let path_max = 1024;
+        #[cfg(target_os = "linux")]
+        let path_max = 4096;
+        let wanted = path_max - 8;
+        let mut parent = fs::canonicalize(&root.0).expect("canonical fixture");
+        while parent.as_os_str().as_bytes().len() + 65 < wanted - 1 {
+            parent = parent.join("x".repeat(64));
+            fs::create_dir(&parent).expect("valid long parent");
+        }
+        let remaining = wanted - parent.as_os_str().as_bytes().len() - 1;
+        let stage = parent.join("s".repeat(remaining));
+        fs::create_dir(&stage).expect("valid empty stage");
+        assert_eq!(stage.as_os_str().as_bytes().len(), wanted);
+        let error = write_stage_owner(&stage, &owner).expect_err("real file write must fail");
+        let StoreError::Io(error) = error else {
+            panic!("ownership write must preserve the I/O error")
+        };
+        #[cfg(target_os = "macos")]
+        assert_eq!(error.raw_os_error(), Some(63)); // ENAMETOOLONG
+        #[cfg(target_os = "linux")]
+        assert_eq!(error.raw_os_error(), Some(36)); // ENAMETOOLONG
+        assert!(!stage.exists(), "failed empty stage must be removed");
+        for (path, before) in paths.iter().zip(published) {
+            assert_eq!(fs::read(path).expect("published view preserved"), before);
+        }
+        store
+            .set_field(&task, "title", "retry published")
+            .expect("normal publication retries");
+        assert_eq!(
+            read(&root.0, "tasks", &task)["issue"]["title"],
+            "retry published"
+        );
+        assert!(!stage.exists(), "retry must not resurrect the failed stage");
+    }
+    #[test]
+    fn discovery_cleanup_releases_locks_on_success_and_authority_failure() {
+        let root = Fixture::new();
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        store.enroll_discovery(&root.0).expect("enroll");
+        let task = file(&mut store, "before", "task");
+        // An obsolete full view and an abandoned stage can both be large.
+        fs::remove_file(root.0.join("tracker").join(MANIFEST)).expect("damage manifest");
+        let abandoned = root.0.join(".tracker-stage-abandoned");
+        fs::create_dir(&abandoned).expect("abandoned stage");
+        fs::write(
+            abandoned.join(OWNER),
+            identity(&store.connection)
+                .unwrap()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .expect("owner");
+        let calls = Arc::new(AtomicU64::new(0));
+        assert_cleanup_locks_free(root.db(), calls.clone());
+        store
+            .set_field(&task, "title", "after")
+            .expect("full regeneration");
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "full view and abandoned stage deleted"
+        );
+        assert_eq!(read(&root.0, "tasks", &task)["issue"]["title"], "after");
+        let before = calls.load(Ordering::Relaxed);
+        let tx = store.discovery_transaction().expect("writer");
+        // Force preparation without changing canonical facts, then refuse at
+        // the final authority boundary. The prepared stage must also be freed.
+        fs::remove_file(root.0.join("tracker").join(MANIFEST)).expect("damage manifest");
+        tx.commit_guarded(&mut || Err(StoreError::Conflict("authority withdrawn".into())))
+            .expect_err("final guard refuses");
+        assert!(calls.load(Ordering::Relaxed) > before);
+        CLEANUP_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+        store.repair_discovery().expect("repair after rollback");
+        assert_eq!(read(&root.0, "tasks", &task)["issue"]["title"], "after");
+    }
+    #[test]
+    fn discovery_cleanup_skips_busy_cleaner_and_recovers_owned_retired_views() {
+        let root = Fixture::new();
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        store.enroll_discovery(&root.0).expect("enroll");
+        let owner = identity(&store.connection).unwrap().unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(owner.with_extension("discovery-cleanup.lock"))
+            .expect("cleanup lock");
+        lock.lock().expect("another cleaner");
+        file(&mut store, "a write does not wait for cleanup", "task");
+        let retired = root.0.join(".tracker-retired-crash");
+        fs::create_dir(&retired).expect("interrupted cleanup");
+        fs::write(retired.join(OWNER), owner.to_str().unwrap()).expect("owner");
+        let unrelated = root.0.join(".tracker-retired-foreign");
+        fs::create_dir(&unrelated).expect("foreign directory");
+        fs::write(unrelated.join(OWNER), "foreign store").expect("foreign owner");
+        let foreign_payload = unrelated.join("view");
+        fs::create_dir(&foreign_payload).expect("foreign container payload");
+        fs::write(foreign_payload.join(OWNER), owner.to_str().unwrap())
+            .expect("same-store payload cannot override foreign container");
+        let unstamped = root.0.join(".tracker-retired-unstamped");
+        fs::create_dir(&unstamped).expect("interrupted stamping");
+        fs::create_dir(unstamped.join("view")).expect("retired view");
+        fs::write(unstamped.join("view").join(OWNER), owner.to_str().unwrap())
+            .expect("retained payload owner");
+        drop(lock);
+        store.repair_discovery().expect("reopen cleanup");
+        assert!(!unstamped.exists());
+        assert!(!retired.exists());
+        assert!(unrelated.exists());
+        assert!(fs::read_dir(&root.0).unwrap().flatten().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tracker-retired-")
+                || entry.path() == unrelated
+        }));
+    }
+    #[test]
+    fn discovery_cleanup_retries_after_payload_ownership_was_deleted() {
+        let root = Fixture::new();
+        let store = WorkItemStore::open(root.db()).expect("store");
+        let owner = identity(&store.connection).unwrap().unwrap();
+        let project = fs::canonicalize(&root.0).unwrap();
+        let retired = project.join(".tracker-retired-interrupted");
+        let payload = retired.join("view");
+        fs::create_dir_all(&payload).expect("retired payload");
+        fs::write(payload.join(OWNER), owner.to_str().unwrap()).expect("payload owner");
+        fs::write(payload.join("remaining"), "not yet deleted").expect("remaining payload");
+        CLEANUP_PAYLOAD_TEST_HOOK.with(|hook| {
+            let payload = payload.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(payload.join(OWNER)).expect("simulate partial recursive deletion");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected interrupted cleanup",
+                ))
+            }));
+        });
+        drop(DiscoveryCleanup {
+            owner: Some(owner.clone()),
+            roots: vec![project.clone()],
+        });
+        assert!(payload.join("remaining").exists());
+        assert_eq!(
+            fs::read_to_string(retired.join(OWNER)).unwrap(),
+            owner.to_str().unwrap()
+        );
+        CLEANUP_PAYLOAD_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+        drop(DiscoveryCleanup {
+            owner: Some(owner),
+            roots: vec![project],
+        });
+        assert!(
+            !retired.exists(),
+            "stable outer owner survives partial payload deletion"
+        );
+    }
+    #[test]
+    fn discovery_retirement_can_be_collected_before_the_writer_returns() {
+        let root = Fixture::new();
+        let mut store = WorkItemStore::open(root.db()).expect("store");
+        store.enroll_discovery(&root.0).expect("enroll");
+        let task = file(&mut store, "before", "task");
+        let owner = identity(&store.connection).unwrap().unwrap();
+        let project = fs::canonicalize(&root.0).unwrap();
+        fs::remove_file(project.join("tracker").join(MANIFEST)).expect("force full retirement");
+        RETIRE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(DiscoveryCleanup {
+                    owner: Some(owner.clone()),
+                    roots: vec![project.clone()],
+                });
+            }));
+        });
+        store
+            .set_field(&task, "title", "after")
+            .expect("older cleaner cannot abort the writer");
+        RETIRE_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(read(&root.0, "tasks", &task)["issue"]["title"], "after");
+    }
+    #[test]
+    fn discovery_cleanup_preserves_foreign_stages_and_retirement_name_collisions() {
+        let root = Fixture::new();
+        let store = WorkItemStore::open(root.db()).expect("store");
+        let project = fs::canonicalize(&root.0).expect("canonical root");
+        let owner = identity(&store.connection).unwrap().unwrap();
+        let stage = project.join(".tracker-stage-owned");
+        fs::create_dir(&stage).expect("stage");
+        fs::write(stage.join(OWNER), owner.to_str().unwrap()).expect("owner");
+        let first = SERIAL.load(Ordering::Relaxed);
+        let collisions: Vec<_> = (first..first + 16)
+            .map(|serial| {
+                let path = root
+                    .0
+                    .join(format!(".tracker-retired-{}-{serial}", std::process::id()));
+                fs::create_dir(&path).expect("occupied retirement name");
+                path
+            })
+            .collect();
+        retire(&stage, &owner).expect("reserve another name");
+        assert!(
+            collisions.iter().all(|path| path.is_dir()),
+            "never overwrite an empty foreign directory"
+        );
+        let foreign = project.join(".tracker-stage-foreign");
+        fs::create_dir(&foreign).expect("foreign stage");
+        fs::write(foreign.join(OWNER), "foreign owner").expect("marker");
+        drop(PendingStages {
+            owner: Some(owner.clone()),
+            paths: vec![foreign.clone()],
+        });
+        drop(DiscoveryCleanup {
+            owner: Some(owner),
+            roots: vec![project.clone()],
+        });
+        assert!(foreign.is_dir());
+        assert!(collisions.iter().all(|path| path.is_dir()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discovery_cleanup_does_not_follow_a_replaced_root() {
+        let root = Fixture::new();
+        let other = Fixture::new();
+        let store = WorkItemStore::open(root.db()).expect("store");
+        let owner = identity(&store.connection).unwrap().unwrap();
+        let project = fs::canonicalize(&root.0).unwrap().join("project");
+        fs::create_dir(&project).expect("project");
+        let stage = project.join(".tracker-stage-owned");
+        fs::create_dir(&stage).expect("stage");
+        fs::write(stage.join(OWNER), owner.to_str().unwrap()).expect("owner");
+        fs::rename(&project, root.0.join("original-project")).expect("replace root");
+        std::os::unix::fs::symlink(&other.0, &project).expect("replacement symlink");
+        let replacement = other.0.join(".tracker-stage-owned");
+        fs::create_dir(&replacement).expect("replacement stage");
+        fs::write(replacement.join(OWNER), owner.to_str().unwrap()).expect("same marker");
+        drop(PendingStages {
+            owner: Some(owner.clone()),
+            paths: vec![stage],
+        });
+        drop(DiscoveryCleanup {
+            owner: Some(owner),
+            roots: vec![project],
+        });
+        assert!(
+            replacement.is_dir(),
+            "root identity is required even with matching ownership"
+        );
     }
     #[test]
     fn discovery_publishes_cross_handle_sets_import_rebuild_and_recovery() {
@@ -1219,6 +1824,18 @@ mod tests {
         fs::write(root.0.join(".ignore"), "ignored.txt\n").expect("ignore");
         let mut s = WorkItemStore::open(root.db()).expect("store");
         assert!(enroll_checkout(&s, &root.0).expect("automatic enroll"));
+        let retired = root.0.join(".tracker-retired-git-ignore-proof");
+        fs::create_dir(&retired).expect("retired directory");
+        fs::write(retired.join("payload"), "searchable-body-marker").expect("retired payload");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("Git status");
+        assert!(status.status.success());
+        assert!(!String::from_utf8_lossy(&status.stdout).contains(".tracker-retired-"));
+
         let group = file(&mut s, "initiative-search-marker", "initiative");
         let task = file(&mut s, "task-search-marker", "task");
         s.add_relation(&task, &group, "belongs-to", None)
@@ -1232,6 +1849,7 @@ mod tests {
         let paths = String::from_utf8_lossy(&matches.stdout);
         assert!(paths.contains(&format!("tracker/initiatives/{group}.hjson")));
         assert!(paths.contains(&format!("tracker/tasks/{task}.hjson")));
+        assert!(!paths.contains(".tracker-retired-"));
         let ignored = std::process::Command::new("git")
             .arg("-C")
             .arg(&root.0)

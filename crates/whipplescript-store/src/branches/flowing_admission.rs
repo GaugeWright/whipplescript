@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::flowing_fence::FlowingFenceState;
 
-pub const SCHEMA: [&str; 9] = [
+pub const SCHEMA: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS flowing_admissions (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
@@ -55,6 +55,10 @@ pub const SCHEMA: [&str; 9] = [
     "CREATE TABLE IF NOT EXISTS flowing_attempt_finishes (
         op_id TEXT PRIMARY KEY,
         receipt_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_coverage_premises (
+        domain TEXT PRIMARY KEY,
+        premises_json TEXT NOT NULL
     )",
 ];
 
@@ -264,13 +268,19 @@ pub struct FlowingGateCertificate {
     pub policy_digest: String,
     pub rules_digest: String,
     pub graph_coverage_digest: String,
+    /// The reference-coverage premise vector the plan was derived under
+    /// (RC-5). Ref admission refuses a certificate without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<super::flowing_coverage::FlowingCoverageBasis>,
     pub required_checks: Vec<String>,
     pub checks: Vec<FlowingGateCheck>,
 }
 
 impl FlowingGateCertificate {
     pub fn handle(&self) -> crate::StoreResult<String> {
-        let version = if !self.unit_holders.is_empty() {
+        let version = if self.coverage.is_some() {
+            "native-gate-certificate-v4"
+        } else if !self.unit_holders.is_empty() {
             "native-gate-certificate-v3"
         } else if self.lineage_fences.is_empty() {
             "native-gate-certificate-v1"
@@ -316,6 +326,10 @@ impl FlowingGateCertificate {
             || self.coordinator.trim().is_empty()
             || self.required_checks.is_empty()
             || self.required_checks.len() != self.checks.len()
+            || self
+                .coverage
+                .as_ref()
+                .is_some_and(|coverage| !coverage.is_well_formed())
         {
             return Some(FlowingAdmissionRefusal::GatePlanIncomplete);
         }
@@ -417,14 +431,20 @@ pub struct FlowingAdmissionReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FlowingAdmissionRefusal {
     IdentityMismatch,
-    Invalid { field: &'static str },
+    Invalid {
+        field: &'static str,
+    },
     SourceMissing,
     SourceNotActive,
     SourceNotTrunkChild,
     SourceNotDirectTwig,
     WrongIncarnation,
-    StaleEligibilityEpoch { current: i64 },
-    StaleOwnerEpoch { current: i64 },
+    StaleEligibilityEpoch {
+        current: i64,
+    },
+    StaleOwnerEpoch {
+        current: i64,
+    },
     WrongOwner,
     Held,
     RevisionPending,
@@ -435,7 +455,9 @@ pub enum FlowingAdmissionRefusal {
     TrunkMissing,
     TrunkNotActive,
     TrunkReserved,
-    TrunkStale { current: Option<String> },
+    TrunkStale {
+        current: Option<String>,
+    },
     CandidateMissing,
     CandidateMismatch,
     CandidateWitnessMissing,
@@ -450,18 +472,55 @@ pub enum FlowingAdmissionRefusal {
     LineageChanged,
     HolderUnavailable,
     HolderChanged,
+    /// No coverage basis on the certificate, or no recorded premises.
+    CoverageUnavailable,
+    /// The certificate's premise vector is not the current one.
+    CoverageStale {
+        premise: &'static str,
+    },
+    /// A required scope is unknown and no owner can be routed to validate it.
+    CoverageScopeUnknown {
+        scope_id: String,
+    },
+    /// A scope that must route every owner lacks this owner's validation of
+    /// the exact candidate at the current graph epoch.
+    CoverageOwnerUnvalidated {
+        scope_id: String,
+        owner: String,
+    },
     GateFailed,
     GateUnrun,
-    UnitMissing { unit_id: String },
-    UnitBasisMissing { unit_id: String },
-    UnitBasisMismatch { unit_id: String },
-    UnitPinMissing { unit_id: String },
-    UnitPinReleased { unit_id: String },
-    UnitNotHeldBySource { unit_id: String },
-    UnverifiedLineage { unit_id: String },
-    UnitAlreadyAdmitted { unit_id: String },
-    UnitParked { unit_id: String, park_op_id: String },
-    AttemptCancelled { cancel_op_id: String },
+    UnitMissing {
+        unit_id: String,
+    },
+    UnitBasisMissing {
+        unit_id: String,
+    },
+    UnitBasisMismatch {
+        unit_id: String,
+    },
+    UnitPinMissing {
+        unit_id: String,
+    },
+    UnitPinReleased {
+        unit_id: String,
+    },
+    UnitNotHeldBySource {
+        unit_id: String,
+    },
+    UnverifiedLineage {
+        unit_id: String,
+    },
+    UnitAlreadyAdmitted {
+        unit_id: String,
+    },
+    UnitParked {
+        unit_id: String,
+        park_op_id: String,
+    },
+    AttemptCancelled {
+        cancel_op_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -563,6 +622,16 @@ pub trait FlowingAdmissions {
         &self,
         admission_op_id: &str,
     ) -> crate::StoreResult<Option<FlowingCancelReceipt>>;
+    /// Trusted coverage-authority writer for this Home's current premise
+    /// vector. Epochs never move backwards; a host must not expose this to an
+    /// untrusted caller.
+    fn record_flowing_coverage_premises(
+        &mut self,
+        premises: &super::flowing_coverage::FlowingCoveragePremises,
+    ) -> crate::StoreResult<super::flowing_coverage::RecordCoveragePremisesOutcome>;
+    fn flowing_coverage_premises(
+        &self,
+    ) -> crate::StoreResult<Option<super::flowing_coverage::FlowingCoveragePremises>>;
 }
 
 pub fn validate_cancel_request(request: &FlowingCancelRequest) -> Result<(), FlowingCancelRefusal> {
@@ -729,6 +798,7 @@ mod tests {
             policy_digest: "sha256:policy".into(),
             rules_digest: "sha256:rules".into(),
             graph_coverage_digest: "sha256:coverage".into(),
+            coverage: None,
             required_checks: vec!["all-targets".into()],
             checks: vec![FlowingGateCheck {
                 check_id: "all-targets".into(),
@@ -846,6 +916,32 @@ mod tests {
             changed.admission_refusal(),
             Some(FlowingAdmissionRefusal::GatePlanIncomplete)
         );
+    }
+
+    #[test]
+    fn coverage_certificate_keeps_legacy_identity_and_requires_a_well_formed_basis() {
+        use crate::branches::flowing_coverage::tests::{basis_for, premises};
+        let legacy = gate_certificate(&request());
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("coverage")
+            .is_none());
+        let mut bound = legacy.clone();
+        bound.coverage = Some(basis_for(&premises(), &request().candidate_manifest_hash));
+        assert_eq!(bound.admission_refusal(), None);
+        assert_ne!(bound.handle().unwrap(), legacy.handle().unwrap());
+        let restored: FlowingGateCertificate =
+            serde_json::from_value(serde_json::to_value(&bound).unwrap()).unwrap();
+        assert_eq!(restored.handle().unwrap(), bound.handle().unwrap());
+        let mut malformed = bound.clone();
+        malformed.coverage.as_mut().unwrap().premises_digest.clear();
+        assert_eq!(
+            malformed.admission_refusal(),
+            Some(FlowingAdmissionRefusal::GatePlanIncomplete)
+        );
+        let mut changed = bound.clone();
+        changed.coverage.as_mut().unwrap().graph_epoch += 1;
+        assert_ne!(changed.handle().unwrap(), bound.handle().unwrap());
     }
 
     #[test]

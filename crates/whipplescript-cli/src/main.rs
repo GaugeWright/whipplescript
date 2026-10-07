@@ -1531,7 +1531,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "auth",
         group: "config",
-        usage: "usage: whip auth <status | set <openai|anthropic> <key>>",
+        usage: "usage: whip auth <status | set <openai|anthropic|xai> <key> | set openai-generic <base-url> <key> | clear <openai|anthropic|xai> | clear openai-generic <base-url>>",
         run: auth_command,
     },
     CommandSpec {
@@ -23792,7 +23792,7 @@ fn coercion(options: &CliOptions) -> ExitCode {
 
 /// `whip auth`: manage coerce credentials and delegate harness OAuth.
 fn auth_command(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip auth <status | set <openai|anthropic> <key>>";
+    let usage = command_usage("auth").unwrap_or_default();
     let mut positional = Vec::new();
     for arg in &options.args {
         if arg.starts_with('-') {
@@ -23804,6 +23804,7 @@ fn auth_command(options: &CliOptions) -> ExitCode {
     match positional.first().copied() {
         Some("status") => auth_status(options),
         Some("set") => auth_set(&positional[1..]),
+        Some("clear") => auth_clear(&positional[1..]),
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)
@@ -24242,7 +24243,34 @@ fn auth_status(options: &CliOptions) -> ExitCode {
                 ),
                 None => ("none".to_owned(), None, None),
             };
-        rows.push((provider.to_owned(), source, reference, redacted));
+        rows.push(((*provider).to_owned(), None, source, reference, redacted));
+    }
+    // One row per `openai-generic` endpoint holding a stored key (WS-297),
+    // resolved exactly as a call to that endpoint would resolve it — so an
+    // `OPENAI_API_KEY` in the environment shows up here as the source that
+    // wins, rather than the stored key reading as the one in use.
+    let stored_endpoints = auth::auth_config_path()
+        .map(|path| auth::stored_endpoints(&auth::read_auth_config(&path)))
+        .unwrap_or_default();
+    for base_url in stored_endpoints {
+        let (source, reference, redacted) = match model_auth::resolve_credential_for_endpoint(
+            whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat,
+            &base_url,
+        ) {
+            Some((key, source)) => (
+                source.label(),
+                Some(source.credential_ref()),
+                Some(auth::redact(&key)),
+            ),
+            None => ("none".to_owned(), None, None),
+        };
+        rows.push((
+            auth::GENERIC_PROVIDER.to_owned(),
+            Some(base_url),
+            source,
+            reference,
+            redacted,
+        ));
     }
     // Phase 4 auth relocation: when the policy channel hands whip resolved
     // credentials inside provider profiles, the host owns auth and the rows
@@ -24253,9 +24281,10 @@ fn auth_status(options: &CliOptions) -> ExitCode {
     if options.json {
         let providers: Vec<Value> = rows
             .iter()
-            .map(|(provider, source, reference, redacted)| {
+            .map(|(provider, base_url, source, reference, redacted)| {
                 json!({
                     "provider": provider,
+                    "base_url": base_url,
                     "source": source,
                     "credential": redacted,
                     "configured": redacted.is_some(),
@@ -24284,10 +24313,17 @@ fn auth_status(options: &CliOptions) -> ExitCode {
                 "host-resolved provider profiles: {path} (whip's own credentials below are the fallback path)"
             );
         }
-        for (provider, source, reference, redacted) in &rows {
+        for (provider, base_url, source, reference, redacted) in &rows {
+            let provider = match base_url {
+                Some(base_url) => format!("{provider} {base_url}"),
+                None => provider.clone(),
+            };
             match redacted {
                 Some(redacted) => {
                     println!("{provider}: {redacted} (from {source})");
+                    if base_url.is_some() && source.starts_with("env:") {
+                        println!("  the environment overrides the key stored for this endpoint");
+                    }
                     if let Some(reference) = reference {
                         if reference.is_legacy() {
                             println!("  {}", reference.status_line());
@@ -24302,28 +24338,90 @@ fn auth_status(options: &CliOptions) -> ExitCode {
 }
 
 fn auth_set(args: &[&str]) -> ExitCode {
-    let [provider, key] = args else {
-        eprintln!("usage: whip auth set <openai|anthropic|xai> <key>");
-        return ExitCode::from(2);
-    };
-    if !auth::KNOWN_PROVIDERS.contains(provider) {
-        eprintln!(
-            "unknown provider `{provider}`; expected one of {}",
-            auth::KNOWN_PROVIDERS.join(", ")
-        );
-        return ExitCode::from(2);
-    }
     let Some(path) = auth::auth_config_path() else {
         eprintln!("could not determine a config path (set WHIPPLESCRIPT_CONFIG_DIR or HOME)");
         return ExitCode::FAILURE;
     };
-    match auth::store_credential(&path, provider, key) {
+    let (label, key, stored) = match args {
+        [provider, base_url, key] if *provider == auth::GENERIC_PROVIDER => (
+            format!("{provider} credential for {}", base_url.trim()),
+            *key,
+            auth::store_endpoint_credential(&path, base_url, key),
+        ),
+        [provider, _] if *provider == auth::GENERIC_PROVIDER => {
+            // A generic endpoint is a different service per base URL, so a
+            // key with no endpoint has nowhere to go.
+            eprintln!("usage: whip auth set openai-generic <base-url> <key>");
+            return ExitCode::from(2);
+        }
+        [provider, key] => {
+            if !auth::KNOWN_PROVIDERS.contains(provider) {
+                eprintln!(
+                    "unknown provider `{provider}`; expected one of {}, or {}",
+                    auth::KNOWN_PROVIDERS.join(", "),
+                    auth::GENERIC_PROVIDER
+                );
+                return ExitCode::from(2);
+            }
+            (
+                format!("{provider} credential"),
+                *key,
+                auth::store_credential(&path, provider, key),
+            )
+        }
+        _ => {
+            eprintln!(
+                "usage: whip auth set <openai|anthropic|xai> <key>\n       whip auth set openai-generic <base-url> <key>"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    match stored {
         Ok(()) => {
             println!(
-                "stored {provider} credential ({}) in {}",
+                "stored {label} ({}) in {}",
                 auth::redact(key),
                 path.display()
             );
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn auth_clear(args: &[&str]) -> ExitCode {
+    let Some(path) = auth::auth_config_path() else {
+        eprintln!("could not determine a config path (set WHIPPLESCRIPT_CONFIG_DIR or HOME)");
+        return ExitCode::FAILURE;
+    };
+    let (label, cleared) = match args {
+        [provider, base_url] if *provider == auth::GENERIC_PROVIDER => (
+            format!("{provider} credential for {}", base_url.trim()),
+            auth::clear_endpoint_credential(&path, base_url),
+        ),
+        [provider] if auth::KNOWN_PROVIDERS.contains(provider) => (
+            format!("{provider} credential"),
+            auth::clear_credential(&path, provider),
+        ),
+        _ => {
+            eprintln!(
+                "usage: whip auth clear <openai|anthropic|xai>\n       whip auth clear openai-generic <base-url>"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    match cleared {
+        Ok(true) => {
+            println!("cleared stored {label} from {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            // Nothing to remove is the state the operator asked for, so it is
+            // not a failure — but say so, because a mistyped base URL lands here.
+            println!("no stored {label} in {}", path.display());
             ExitCode::SUCCESS
         }
         Err(message) => {
@@ -34062,7 +34160,7 @@ anchor <id> \"<region>\" --replace <anchor-id>|\
 anchors <id>|\
 attest <id> [--kind K --ref R --note N] [--basis \"<region>\"]|\
 export [--to DIR]|import <path|->|import --from DIR|sync DIR|\
-rebuild>";
+rebuild|bootstrap>";
 
 /// Words other issue trackers use for what `whip issue` names differently.
 /// `gh issue`'s verbs lead, since that is what an agent reaches for first.
@@ -34613,7 +34711,12 @@ fn assert_command(options: &CliOptions) -> ExitCode {
     let usage = ASSERT_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
-    let mut store = match WorkItemStore::open(items_store_path()) {
+    let opened = if matches!(command, "list" | "show" | "anchors") {
+        WorkItemStore::open_read_snapshot(items_store_path())
+    } else {
+        WorkItemStore::open(items_store_path())
+    };
+    let mut store = match opened {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
@@ -34776,10 +34879,27 @@ fn issue(options: &CliOptions) -> ExitCode {
     let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
-    // Durable backup observes the ledger even when a local search destination
-    // is unavailable. Export must neither enroll nor repair filesystem views.
-    let opened = if command == "export" {
-        WorkItemStore::open_read_only(items_store_path())
+    if command == "bootstrap" && args.len() != 1 {
+        return subcommand_refusal::refuse(usage, "bootstrap", "takes no arguments");
+    }
+    let query = matches!(
+        command,
+        "list"
+            | "show"
+            | "ready"
+            | "why"
+            | "waits"
+            | "review"
+            | "conflicts"
+            | "comments"
+            | "anchors"
+            | "export"
+    ) || (command == "evidence"
+        && ["--kind", "--ref", "--note"]
+            .iter()
+            .all(|flag| flag_value(args, flag).is_none()));
+    let opened = if query {
+        WorkItemStore::open_read_snapshot(items_store_path())
     } else {
         WorkItemStore::open(items_store_path())
     };
@@ -34787,11 +34907,14 @@ fn issue(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
-    if command != "export" {
-        if let Err(error) = whipplescript_store::items::discovery::enroll_checkout(
-            &store,
-            &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ) {
+    if !query {
+        let checkout = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let enrolled = if command == "bootstrap" {
+            store.bootstrap_discovery(&checkout)
+        } else {
+            whipplescript_store::items::discovery::enroll_checkout(&store, &checkout).map(|_| ())
+        };
+        if let Err(error) = enrolled {
             return report_store_error("failed to establish tracker discovery", error);
         }
     }
@@ -34799,6 +34922,14 @@ fn issue(options: &CliOptions) -> ExitCode {
         return code;
     }
     match command {
+        "bootstrap" => {
+            if options.json {
+                emit_json(json!({"bootstrapped": true}))
+            } else {
+                println!("tracker discovery bootstrapped");
+                ExitCode::SUCCESS
+            }
+        }
         "new" | "add" => {
             let mut queue = None;
             let mut title = None;

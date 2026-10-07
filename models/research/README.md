@@ -304,6 +304,21 @@ receipt. The gate and CAS are abstracted;
 not prove real cut retention, rehome mechanics, abandonment content, dependency
 repair, external settlement, or native and hosted storage transactions.
 
+`flowing_final_close.py` adds a live gate attempt and explicit parking,
+private-pin, member-resolution, and final-close receipts to that closure seam:
+
+```sh
+python3 models/research/flowing_final_close.py
+```
+
+It reaches 268 safe states. Its positive traces include a CAS before the close
+request, a CAS between the topology fence and ref disable, a prepared attempt
+refused after disable, and recovery on either side of ref disable. Sixteen
+weakenings expose missing fences, lost work or retention, unresolved attempts
+and members, omitted receipts, early acknowledgement and duplicate retry.
+The model abstracts receipt contents, member rehome mechanics, dependency
+proofs, and the native and hosted ref transactions.
+
 `flowing_abandonment.py` isolates the explicit abandonment transaction before
 that operation is composed into the full admission model:
 
@@ -330,8 +345,9 @@ disable with the ref-owned Hold epoch:
 python3 models/research/flowing_full_seam.py
 ```
 
-It explores 109,723 safe branch states and 67,591 safe abstract mixed-transport
-states through twelve transitions, plus 3,477 direct-twig states through nine.
+It explores 249,640 safe branch states and 189,794 safe abstract
+mixed-transport states through twelve transitions, plus 3,477 direct-twig
+states through nine.
 Scenarios show a CAS winning before close disable, a second member's unit
 parked at close, and disable blocking a passed candidate. A later member
 handoff extends active source ancestry without invalidating the selected
@@ -365,18 +381,75 @@ candidate with the norm or ref authority unavailable. These are availability
 states, not a physical cross-store crash or lock implementation. Four earlier
 weakenings admit a CAS without unit accounting, omit the ref fence at disable,
 trust a rewritten source prefix, or close before recovering an accepted receipt.
-The mixed mode carries one selected unit's atom through B→C→D beside the same
+The mixed mode carries selected units' atoms through B→C→D beside the same
 norm/ref CAS, pin and accounting state. It checks every recorded origin's
 current Hold and policy epoch there. A Hold blocks a passed candidate, and a
 release needs a fresh certificate. Three weakenings lose B on transport,
 check only D at CAS, or reuse the pre-Hold epoch; each reaches a forbidden
 admission. The transport events do not derive real output cuts or persist
-lineage, and the fixed atom is the only transported unit in this mode.
+lineage; its bounded domain contains two units and three fixed source atoms.
+The ref CAS now also checks an issuer-bound gate receipt. Only the gate
+authority mints one, binding the certificate digest it verified; an
+embedding-supplied candidate whose digest is self-consistent carries a
+caller-issued receipt and is refused, and a weakening that checks only
+digest equality admits it.
+
+A cross-store mode splits the admission into three durable writes in separate
+stores: the norm ledger's commit under its write exclusion, the ref store's
+CAS, and the review store's per-unit source receipt. The coordinator can crash
+between any two. Recovery after a norm commit retakes the exclusion, reads the
+durable commit and either completes the same ref CAS with the commit-time norm
+premises or aborts it; it never revalidates or commits again. Recovery after
+the CAS replays the ref entry into the source receipt. Until that receipt
+lands, the ref entry is authoritative for its units: abandonment, park,
+closure and attempt-pin release wait. Traces cover takeover and restart after
+a norm-commit crash, a Hold that fences a committed CAS and forces an abort
+before close, and a CAS-then-crash replayed by the new owner. The search
+reaches 183,765 branch states through eleven transitions and 23,176 direct-twig
+states through twelve, and also refuses any reachable state where owed
+cross-store work has no recovery step. Three weakenings reach forbidden
+histories: skipping norm-commit recovery closes the branch over an unresolved
+commit, recovery that trusts the review store over the ref entry abandons
+ref-admitted units, and accepting an unauthenticated certificate admits a
+candidate the gate never checked.
+
+The mixed-transport cross-store composition explores 482,532 safe states from
+the initial lifecycle through thirteen transitions, and 1,260,719 safe states
+through thirteen transitions after both exact source handoffs. Its positive
+traces retain the exact B→C→D source cuts, atom and certificate through a
+norm-commit crash and takeover,
+and through restart after a norm grant was revoked following the durable
+commit. The norm commit keeps its commit-time authority, while an independent
+origin Hold still fences the ref CAS. Releasing Hold cannot revive the old
+policy epoch; recovery can abort the commit while leaving the unit and its
+source pin owed. A ref-CAS crash retains the candidate pins and replays exactly
+one unit receipt before frontier reconciliation and pin release. Reopening the
+reconciled result offers no second CAS or source receipt.
+
+Ten weakenings reach forbidden mixed cross-store histories: missing origin,
+current-holder-only policy checking, stale origin epoch, missing transported
+atom or parent cut, output id substituted for source atoms, a candidate swap
+after the norm commit, omitted norm-commit recovery, conflicting parking
+before source-receipt recovery, and candidate collection before reconciliation.
+The two-unit composition additionally carries three source atoms through both
+outputs. Its dependent neutralizes the predecessor's x write while applying
+y; both the neutralized and applied units remain owed through the norm-commit
+and ref-CAS crash windows. Recovery retains their exact candidate, dependent
+read basis and outcome vector, then writes one receipt naming both units.
+Six further weakenings omit one dependent atom during transport, omit the
+neutralized predecessor's certificate atom or content effect, admit a false
+dependent basis or outcome, or abandon the ref-admitted units before receipt
+recovery. The same invariant judges the normal and weakened histories. This
+is the model's abstract three-store protocol; it does not exercise physical
+native or hosted transactions.
+
 The source atoms and read relation are fixed model inputs: actual cut-to-atom
 derivation, actual blob-closure and collector transactions, semantic edge
 discovery, failed/cancelled attempt pin release, source revisions through all
-mutation doors, certificate authenticity at the ref authority, physical
-lock scheduling and independently failing store transactions remain open.
+mutation doors, the cryptography and key management behind receipt
+authentication, physical lock scheduling, larger source graphs, and the
+native and hosted store transactions themselves
+remain open.
 The model does not prove the native or hosted transactions implement these
 synchronized transitions.
 

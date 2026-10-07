@@ -51,7 +51,7 @@ use whipplescript_store::{
 };
 
 use crate::coerce_runtime::UreqCoerceTransport;
-use crate::model_auth::{resolve_credential_with_source, CredentialSource};
+use crate::model_auth::{resolve_credential_for_endpoint, CredentialSource};
 
 pub const TOOL_READ: &str = "read";
 pub const TOOL_WRITE: &str = "write";
@@ -5055,7 +5055,18 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
         return Ok(None);
     };
     let provider = harness_provider_for(&provider_name)?;
-    let (api_key, source) = resolve_credential_with_source(provider).ok_or_else(|| {
+    // Read before the credential: an `openai-generic` key is stored per
+    // endpoint, so the base URL decides which stored key applies.
+    let explicit_base_url = std::env::var("WHIPPLESCRIPT_HARNESS_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (api_key, source) = resolve_credential_for_endpoint(
+        provider,
+        explicit_base_url
+            .as_deref()
+            .unwrap_or_else(|| provider.default_base_url()),
+    )
+    .ok_or_else(|| {
         format!("WHIPPLESCRIPT_HARNESS_PROVIDER={provider_name} is set but no credential resolved")
     })?;
     // A ChatGPT-plan Codex OAuth token is not an API key, and the endpoint that
@@ -5072,16 +5083,13 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
             "WHIPPLESCRIPT_HARNESS_MODEL is required when WHIPPLESCRIPT_HARNESS_PROVIDER is set"
                 .to_string()
         })?;
-    let base_url = std::env::var("WHIPPLESCRIPT_HARNESS_BASE_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            if codex_account_id.is_some() {
-                "https://chatgpt.com".to_owned()
-            } else {
-                provider.default_base_url().to_string()
-            }
-        });
+    let base_url = explicit_base_url.unwrap_or_else(|| {
+        if codex_account_id.is_some() {
+            "https://chatgpt.com".to_owned()
+        } else {
+            provider.default_base_url().to_string()
+        }
+    });
     let max_tokens = std::env::var("WHIPPLESCRIPT_HARNESS_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())

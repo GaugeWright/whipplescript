@@ -1222,7 +1222,10 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
                 .query(
                     "SELECT 1 FROM flowing_contributions AS unit \
                      LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
-                     WHERE unit.pin_id = ?1 AND handoff.unit_id IS NULL LIMIT 1",
+                     LEFT JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
+                     LEFT JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+                     WHERE unit.pin_id = ?1 AND handoff.unit_id IS NULL \
+                       AND admitted.unit_id IS NULL AND parked.unit_id IS NULL LIMIT 1",
                     &[text(request.pin_id)],
                 )
                 .map_err(sql_err)?;

@@ -331,6 +331,8 @@ pub struct WorkItemStore {
     /// them tests that have no effect to name.
     event_effect_id: Option<String>,
     discovery_writer: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// One boundary clock for an explicitly opened read snapshot.
+    query_instant: Option<String>,
 }
 
 #[cfg(feature = "native")]
@@ -344,6 +346,55 @@ impl WorkItemStore {
         connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
         crate::native_existing::validate(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
         Self::from_existing_connection(connection, None)
+    }
+
+    /// Read one committed ledger snapshot for the lifetime of this handle.
+    /// Validation and custody checks are inside that snapshot; no writer or
+    /// discovery lock, initialization, migration or publication is performed.
+    pub fn open_read_snapshot(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| {
+                    if matches!(&error, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::CannotOpen) {
+                        StoreError::Conflict(
+                            "tracker query requires an existing readable store; check WHIPPLESCRIPT_ITEMS_STORE and its permissions; run whip issue bootstrap for initialization".to_owned(),
+                        )
+                    } else {
+                        StoreError::from(error)
+                    }
+                })?;
+
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        connection.execute_batch("BEGIN DEFERRED")?;
+        crate::native_existing::validate(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
+        let mut store = Self::from_existing_connection(connection, None)?;
+        store.query_instant = Some(store.store_now()?);
+        Ok(store)
+    }
+
+    /// Explicitly establish discovery for this checkout, reporting whether
+    /// setup/recovery is actually permitted rather than treating read-only
+    /// fallback under a newer writer protocol as successful bootstrap.
+    pub fn bootstrap_discovery(&self, checkout: &Path) -> StoreResult<()> {
+        if self.connection.is_readonly(rusqlite::MAIN_DB)? {
+            return Err(StoreError::Conflict(
+                "tracker discovery bootstrap requires a writable store".to_owned(),
+            ));
+        }
+        Self::require_plain_before_initialize(&self.connection)?;
+        if let Some(error) = discovery::write_refusal(&self.connection)? {
+            return Err(error);
+        }
+        if !discovery::enroll_checkout(self, checkout)? {
+            return Err(StoreError::Conflict(
+                "tracker discovery bootstrap requires an available Git checkout".to_owned(),
+            ));
+        }
+        self.repair_discovery()?;
+        if let Some(error) = discovery::write_refusal(&self.connection)? {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Open only a current existing work-item store. Checks its owning stamp and
@@ -1322,9 +1373,7 @@ impl WorkItemStore {
     /// on (DR-0084 I1: the intent stamp's lookup — exactly one active claim
     /// is an unambiguous intent; zero or several stamp nothing).
     pub fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>> {
-        let now: String = self
-            .connection
-            .query_row("SELECT datetime('now')", [], |row| row.get(0))?;
+        let now = self.store_now()?;
         let mut statement = self.connection.prepare(&format!(
             "SELECT a.content_id FROM tracker_leases l \
              JOIN tracker_aliases a ON a.alias = l.issue_id \
@@ -2381,9 +2430,9 @@ impl WorkItemStore {
                 &format!(
                     "SELECT actor FROM tracker_leases WHERE issue_id = ?1 AND {} \
                      ORDER BY acquired_at DESC LIMIT 1",
-                    ACTIVE_LEASE.replace('?', "datetime('now')")
+                    ACTIVE_LEASE.replace('?', "?2")
                 ),
-                [item_id],
+                params![item_id, self.store_now()?],
                 |row| row.get(0),
             )
             .optional()
@@ -2393,10 +2442,10 @@ impl WorkItemStore {
     fn active_holders(&self) -> StoreResult<std::collections::HashMap<String, String>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT issue_id, actor FROM tracker_leases WHERE {}",
-            ACTIVE_LEASE.replace('?', "datetime('now')")
+            ACTIVE_LEASE.replace('?', "?1")
         ))?;
         let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([self.store_now()?], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<std::collections::HashMap<String, String>, _>>()?;
         Ok(rows)
     }
@@ -4495,6 +4544,142 @@ fn insert_norm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_repairs_missing_records_on_an_already_open_writer() {
+        let root = crate::scratch::path("whip-bootstrap-existing-writer");
+        std::fs::create_dir(&root).unwrap();
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .status()
+            .unwrap()
+            .success());
+        let mut writer = WorkItemStore::open(root.join("items.sqlite")).unwrap();
+        writer.bootstrap_discovery(&checkout).unwrap();
+        let item = writer
+            .file_item("q", "repair", "", &[], &json!({}), None, None)
+            .unwrap();
+        let record = checkout.join(format!("tracker/tasks/{}.hjson", item.id));
+        let before = std::fs::read(&record).unwrap();
+        let events = writer.export_events().unwrap();
+        std::fs::remove_file(&record).unwrap();
+        writer.bootstrap_discovery(&checkout).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), before);
+        assert_eq!(writer.export_events().unwrap(), events);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_bootstrap_refuses_before_touching_checkout_configuration() {
+        let root = crate::scratch::path("whip-query-bootstrap-read-only");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("items.sqlite");
+        drop(WorkItemStore::open(&path).unwrap());
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .status()
+            .unwrap()
+            .success());
+        let exclude = checkout.join(".git/info/exclude");
+        let before = std::fs::read(&exclude).unwrap();
+        for reader in [
+            WorkItemStore::open_read_only(&path).unwrap(),
+            WorkItemStore::open_read_snapshot(&path).unwrap(),
+        ] {
+            assert!(
+                matches!(reader.bootstrap_discovery(&checkout), Err(StoreError::Conflict(message)) if message.contains("writable store"))
+            );
+            assert_eq!(std::fs::read(&exclude).unwrap(), before);
+            assert!(!checkout.join(".rgignore").exists());
+            assert!(!checkout.join("tracker").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_snapshot_keeps_related_records_and_one_boundary_clock() {
+        let path = crate::scratch::path("whip-tracker-query-snapshot");
+        let mut writer = WorkItemStore::open(&path).unwrap();
+        let id = writer
+            .file_item("q", "before", "", &[], &json!({}), None, None)
+            .unwrap()
+            .id;
+        let leased = writer
+            .file_item("q", "leased", "", &[], &json!({}), None, None)
+            .unwrap()
+            .id;
+        writer
+            .claim_item(&leased, "holder", Some("2090-01-01 00:00:00"))
+            .unwrap();
+        let mut reader = WorkItemStore::open_read_snapshot(&path).unwrap();
+        let at = reader.store_now().unwrap();
+        assert_eq!(reader.get_item(&id).unwrap().unwrap().title, "before");
+        assert!(reader.comments(&id).unwrap().is_empty());
+        writer
+            .add_comment(&id, Some("writer"), "after snapshot")
+            .unwrap();
+        writer.claim_item(&id, "writer", None).unwrap();
+        assert!(reader.comments(&id).unwrap().is_empty());
+        assert!(reader.get_item(&id).unwrap().unwrap().claimed_by.is_none());
+        assert!(reader.unready_reasons_at(&id, &at).unwrap().is_empty());
+        // Force the SQLite clock function to change without sleeping. Every
+        // time-dependent query on this handle must still use its boundary.
+        reader
+            .connection
+            .create_scalar_function(
+                "datetime",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_| Ok("2099-01-01 00:00:00".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(reader.store_now().unwrap(), at);
+        assert_eq!(
+            reader
+                .get_item(&leased)
+                .unwrap()
+                .unwrap()
+                .claimed_by
+                .as_deref(),
+            Some("holder")
+        );
+        assert_eq!(
+            reader
+                .list_items(Some("q"), None)
+                .unwrap()
+                .iter()
+                .find(|item| item.id == leased)
+                .unwrap()
+                .claimed_by
+                .as_deref(),
+            Some("holder")
+        );
+        assert!(!reader
+            .unready_reasons_at(&leased, &reader.store_now().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(reader.get_item(&id).unwrap().unwrap().claimed_by.is_none());
+        assert!(
+            matches!(reader.add_comment(&id, None, "must refuse"), Err(StoreError::Conflict(message)) if message.contains("query snapshot cannot mutate"))
+        );
+        drop(reader);
+        let fresh = WorkItemStore::open_read_snapshot(&path).unwrap();
+        assert_eq!(fresh.comments(&id).unwrap().len(), 1);
+        assert_eq!(
+            fresh.get_item(&id).unwrap().unwrap().claimed_by.as_deref(),
+            Some("writer")
+        );
+        drop(fresh);
+        drop(writer);
+        std::fs::remove_file(&path).unwrap();
+    }
 
     struct NoNormVerifier;
 

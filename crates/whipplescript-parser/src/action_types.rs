@@ -1008,6 +1008,7 @@ impl Checker<'_> {
                 let Some((parent, field, candidates)) =
                     environment.unknown_member(path, self.semantic)
                 else {
+                    self.scalar_projection(path, environment, span);
                     return;
                 };
                 let suggestion = crate::closest_name(&field, candidates.iter()).map_or_else(
@@ -1031,6 +1032,45 @@ impl Checker<'_> {
                     .with_suggestion(suggestion),
                 );
             }
+        }
+    }
+
+    /// A field read through a scalar value. In managed source this is most
+    /// often recorded DR-0023 source that projected a field from an effect
+    /// handle (`turn.summary`), where the operation binding now denotes the
+    /// checked successful value itself. Name that instead of leaving the
+    /// consumer to report an undeterminable type.
+    fn scalar_projection(&mut self, path: &[String], environment: &Environment, span: SourceSpan) {
+        for index in (1..path.len()).rev() {
+            let Some(ty) = environment.path_type(&path[..index], self.semantic) else {
+                continue;
+            };
+            if !matches!(ty, IrType::Primitive(_) | IrType::LiteralString(_)) {
+                return;
+            }
+            let parent = path[..index].join(".");
+            let field = &path[index];
+            let suggestion = if index == 1 && environment.is_operation(&path[0]) {
+                format!(
+                    "managed operation `{parent}` denotes its successful {} value, not an effect handle; use `{parent}` directly",
+                    type_label(&ty)
+                )
+            } else {
+                format!("`{parent}` has no fields; use `{parent}` directly")
+            };
+            self.diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("type.unknown_field"),
+                    span,
+                    format!(
+                        "action expression has invalid field path `{}`: `{parent}` is {} and has no field `{field}`",
+                        path.join("."),
+                        type_label(&ty)
+                    ),
+                )
+                .with_suggestion(suggestion),
+            );
+            return;
         }
     }
 

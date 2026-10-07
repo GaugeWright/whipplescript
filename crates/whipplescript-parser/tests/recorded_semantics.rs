@@ -5,6 +5,10 @@ use whipplescript_parser::{compile_program, ExecutionSemantics};
 // fixed bytes, not a comparison with whatever today's source default emits.
 const SOURCE: &str = include_str!("fixtures/recorded-actions-v1.whip");
 const SNAPSHOT: &str = include_str!("fixtures/recorded-actions-v1.ir");
+// Captured from 4b3fe5cf: a DR-0023 action whose continuation names the
+// effect's payload through a second success alias.
+const ALIAS_SOURCE: &str = include_str!("fixtures/recorded-success-alias-v1.whip");
+const ALIAS_SNAPSHOT: &str = include_str!("fixtures/recorded-success-alias-v1.ir");
 
 #[test]
 fn missing_and_explicit_legacy_tags_retain_recorded_action_identity() {
@@ -131,5 +135,86 @@ fn recorded_legacy_path_does_not_silently_execute_typed_actions() {
             .any(|d| d.message.contains("scope lowering is not implemented")),
         "{:?}",
         output.diagnostics
+    );
+}
+
+#[test]
+fn recorded_success_alias_keeps_its_historical_payload_binding() {
+    for tag in [None, Some("dr0023-action-chains-v1")] {
+        let semantics = ExecutionSemantics::from_recorded_tag(tag).unwrap();
+        let output = compile_recorded_program_with_root(ALIAS_SOURCE, None, semantics);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let ir = output.ir.unwrap();
+        assert_eq!(
+            ir.execution_semantics,
+            ExecutionSemantics::LegacyActionChainsV1
+        );
+        assert_eq!(ir.to_snapshot(), ALIAS_SNAPSHOT);
+        let body = &ir.rules[0].body;
+        for call in ["0", "1"] {
+            assert!(body.contains(&format!(
+                "after turn__act{call} succeeds as reply__act{call}"
+            )));
+            assert!(body.contains(&format!("summary reply__act{call}.summary")));
+        }
+    }
+}
+
+/// Each mechanical half-step of migrating the recorded alias source is refused
+/// with a diagnostic naming that step, never accepted with a new meaning.
+#[test]
+fn partial_success_alias_migration_is_refused_at_every_step() {
+    fn refused(source: &str, code: &str, message: &str, suggestion: &str) {
+        let output = compile_program(source);
+        assert!(output.ir.is_none(), "{source}");
+        assert!(
+            output.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_str() == code
+                    && diagnostic.message.contains(message)
+                    && diagnostic
+                        .suggestion
+                        .as_deref()
+                        .is_some_and(|text| text.contains(suggestion))
+            }),
+            "{source}: {:?}",
+            output.diagnostics
+        );
+    }
+    refused(
+        ALIAS_SOURCE,
+        "construct.invalid_expansion",
+        "action `note` needs a result contract",
+        "-> null",
+    );
+    let contracted = ALIAS_SOURCE
+        .replace(
+            "action note(label string) {",
+            "action note(label string) -> null {",
+        )
+        .replace(
+            "    }\n  }\n}\n\nrule",
+            "    }\n    return null\n  }\n}\n\nrule",
+        );
+    refused(
+        &contracted,
+        "construct.redundant_success_alias",
+        "success alias `reply` is redundant",
+        "use `turn` directly",
+    );
+    let unaliased = contracted
+        .replace(" succeeds as reply", " succeeds")
+        .replace("reply.summary", "turn.summary");
+    refused(
+        &unaliased,
+        "type.unknown_field",
+        "`turn.summary`: `turn` is string and has no field `summary`",
+        "managed operation `turn` denotes its successful string value, not an effect handle",
+    );
+    let migrated = unaliased.replace("turn.summary", "turn");
+    let output = compile_program(&migrated);
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    assert_eq!(
+        output.ir.unwrap().execution_semantics,
+        ExecutionSemantics::TypedActionsV1
     );
 }

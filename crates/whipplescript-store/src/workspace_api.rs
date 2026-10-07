@@ -363,6 +363,12 @@ fn create_outcome(outcome: CreateBranchOutcome) -> WorkspaceOpOutcome {
         CreateBranchOutcome::ParentNotActive { status } => {
             refused(format!("parent branch is not active ({})", status.as_str()))
         }
+        CreateBranchOutcome::ParentAdmissionDisabled => {
+            refused("parent flowing source no longer accepts members".to_owned())
+        }
+        CreateBranchOutcome::ParentFlowingTopology => {
+            refused("flowing branch accepts only direct unnamed twigs".to_owned())
+        }
         CreateBranchOutcome::NameTaken { holder_branch_id } => {
             WorkspaceOpOutcome::NameTaken { holder_branch_id }
         }

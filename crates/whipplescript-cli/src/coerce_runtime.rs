@@ -33,7 +33,7 @@ use whipplescript_kernel::harness_model::assemble_codex_responses_sse as assembl
 
 use crate::model_auth::{
     anthropic_oauth_rejection, codex_account_id, codex_config_model, env_nonempty,
-    resolve_credential_with_source, CredentialSource,
+    resolve_credential_for_endpoint, CredentialSource,
 };
 
 /// Rung 3's input: the `schema.coerce` capability binding row's provider name
@@ -195,10 +195,15 @@ impl OperatorEnv {
     }
 }
 
+/// A credential lookup for a backend at a base URL.
+type CredentialProbe = dyn Fn(CoerceProvider, &str) -> Option<(String, CredentialSource)>;
+
 /// The credential/codex probes the resolution consults, injectable for tests
 /// (the real set reads env, `whip auth`, and `~/.codex`).
 struct CredentialProbes<'a> {
-    credential: &'a dyn Fn(CoerceProvider) -> Option<(String, CredentialSource)>,
+    /// The credential for a backend at a base URL. The URL matters only to
+    /// `openai-generic`, whose stored keys are per endpoint.
+    credential: &'a CredentialProbe,
     codex_model: &'a dyn Fn() -> Option<String>,
     codex_account: &'a dyn Fn() -> Option<String>,
 }
@@ -206,7 +211,7 @@ struct CredentialProbes<'a> {
 impl CredentialProbes<'_> {
     fn real() -> CredentialProbes<'static> {
         CredentialProbes {
-            credential: &resolve_credential_with_source,
+            credential: &resolve_credential_for_endpoint,
             codex_model: &codex_config_model,
             codex_account: &codex_account_id,
         }
@@ -482,8 +487,22 @@ fn native_selection(
     registry_config: Option<&Value>,
     probes: &CredentialProbes<'_>,
 ) -> Result<CoerceSelection, String> {
-    let (api_key, source) =
-        (probes.credential)(backend).ok_or_else(|| missing_credential_message(backend))?;
+    let empty = Value::Object(serde_json::Map::new());
+    let registry_config = registry_config.unwrap_or(&empty);
+    // The base URL an operator or the registry named, resolved BEFORE the
+    // credential: an `openai-generic` key is stored per endpoint, so which key
+    // applies depends on where the call is going.
+    let explicit_base_url = env
+        .base_url
+        .clone()
+        .or_else(|| config_string(registry_config, "base_url"));
+    let (api_key, source) = (probes.credential)(
+        backend,
+        explicit_base_url
+            .as_deref()
+            .unwrap_or_else(|| backend.default_base_url()),
+    )
+    .ok_or_else(|| missing_credential_message(backend))?;
     if backend == CoerceProvider::Anthropic {
         // Anthropic coerce uses a console API key only (model_auth owns the rule).
         if let Some(rejection) = anthropic_oauth_rejection(&api_key) {
@@ -496,19 +515,13 @@ fn native_selection(
         && source == CredentialSource::CodexOAuth)
         .then(|| (probes.codex_account)())
         .flatten();
-    let empty = Value::Object(serde_json::Map::new());
-    let registry_config = registry_config.unwrap_or(&empty);
-    let base_url = env
-        .base_url
-        .clone()
-        .or_else(|| config_string(registry_config, "base_url"))
-        .unwrap_or_else(|| {
-            if codex_account_id.is_some() {
-                "https://chatgpt.com".to_owned()
-            } else {
-                backend.default_base_url().to_owned()
-            }
-        });
+    let base_url = explicit_base_url.unwrap_or_else(|| {
+        if codex_account_id.is_some() {
+            "https://chatgpt.com".to_owned()
+        } else {
+            backend.default_base_url().to_owned()
+        }
+    });
     // Model is not hard-coded: `WHIPPLESCRIPT_COERCE_MODEL` wins, then the
     // registry row's `model`, then (codex path only) `~/.codex/config.toml`.
     let model = env
@@ -562,11 +575,15 @@ fn missing_credential_message(provider: CoerceProvider) -> String {
              `whip auth set anthropic <key>`"
                 .to_owned()
         }
-        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
+        CoerceProvider::OpenAi => {
             "coerce provider `openai` needs a credential: set OPENAI_API_KEY, run \
              `whip auth set openai <key>`, or sign in with `codex login`"
                 .to_owned()
         }
+        CoerceProvider::OpenAiCompat => "coerce provider `openai-generic` needs a credential: run \
+             `whip auth set openai-generic <base-url> <key>` for the endpoint, or set \
+             OPENAI_API_KEY"
+            .to_owned(),
         CoerceProvider::Xai => "coerce provider `xai` needs an API key: set XAI_API_KEY or run \
              `whip auth set xai <key>`"
             .to_owned(),
@@ -695,11 +712,11 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 7);
     }
 
-    fn no_credential(_: CoerceProvider) -> Option<(String, CredentialSource)> {
+    fn no_credential(_: CoerceProvider, _: &str) -> Option<(String, CredentialSource)> {
         None
     }
 
-    fn api_key_credential(_: CoerceProvider) -> Option<(String, CredentialSource)> {
+    fn api_key_credential(_: CoerceProvider, _: &str) -> Option<(String, CredentialSource)> {
         Some((
             "sk-test".to_owned(),
             CredentialSource::Env("OPENAI_API_KEY"),
@@ -714,9 +731,7 @@ mod tests {
         None
     }
 
-    fn test_probes(
-        credential: &'static dyn Fn(CoerceProvider) -> Option<(String, CredentialSource)>,
-    ) -> CredentialProbes<'static> {
+    fn test_probes(credential: &'static CredentialProbe) -> CredentialProbes<'static> {
         CredentialProbes {
             credential,
             codex_model: &no_codex_model,
@@ -777,7 +792,7 @@ mod tests {
             model: Some("claude-test".to_owned()),
             ..OperatorEnv::empty()
         };
-        let credential = |_: CoerceProvider| {
+        let credential = |_: CoerceProvider, _: &str| {
             Some((
                 "sk-ant-api03-x".to_owned(),
                 CredentialSource::Env("ANTHROPIC_API_KEY"),
@@ -918,8 +933,9 @@ mod tests {
             model: Some("claude-test".to_owned()),
             ..OperatorEnv::empty()
         };
-        let oauth_credential =
-            |_: CoerceProvider| Some(("sk-ant-oat01-abc".to_owned(), CredentialSource::Stored));
+        let oauth_credential = |_: CoerceProvider, _: &str| {
+            Some(("sk-ant-oat01-abc".to_owned(), CredentialSource::Stored))
+        };
         let error = resolve_selection_inner(
             None,
             &env,
@@ -932,6 +948,62 @@ mod tests {
         )
         .expect_err("oauth token rejected for anthropic");
         assert!(error.contains("console API key"), "{error}");
+    }
+
+    /// WS-297: the credential is resolved for the endpoint the call goes to,
+    /// so an `openai-generic` key stored for one base URL is found there and
+    /// nowhere else — the registry's `base_url` counts as much as the env's.
+    #[test]
+    fn openai_generic_credential_is_resolved_for_the_named_base_url() {
+        fn per_endpoint(
+            provider: CoerceProvider,
+            base_url: &str,
+        ) -> Option<(String, CredentialSource)> {
+            (provider == CoerceProvider::OpenAiCompat && base_url == "http://localhost:11434/v1")
+                .then(|| ("ollama".to_owned(), CredentialSource::StoredEndpoint))
+        }
+        let env = OperatorEnv {
+            provider: Some("openai-generic".to_owned()),
+            model: Some("llama3.1:8b".to_owned()),
+            base_url: Some("http://localhost:11434/v1".to_owned()),
+            ..OperatorEnv::empty()
+        };
+        let selection = resolve_selection_inner(None, &env, None, &test_probes(&per_endpoint))
+            .expect("resolves for the stored endpoint");
+        let config = selection.config.expect("native config");
+        assert_eq!(config.api_key, "ollama");
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        assert_eq!(
+            selection.credential_source,
+            Some(CredentialSource::StoredEndpoint)
+        );
+
+        let registry = CoerceRegistryDefault {
+            provider: "native".to_owned(),
+            config_json: Some(
+                json!({"backend": "openai-generic", "base_url": "http://localhost:11434/v1"})
+                    .to_string(),
+            ),
+        };
+        let selection = resolve_selection_inner(
+            None,
+            &env_with_model("llama3.1:8b"),
+            Some(&registry),
+            &test_probes(&per_endpoint),
+        )
+        .expect("the registry base_url selects the stored key");
+        assert_eq!(selection.config.expect("native config").api_key, "ollama");
+
+        let elsewhere = OperatorEnv {
+            base_url: Some("https://openrouter.ai/api/v1".to_owned()),
+            ..env
+        };
+        let error = resolve_selection_inner(None, &elsewhere, None, &test_probes(&per_endpoint))
+            .expect_err("another endpoint has no key");
+        assert!(
+            error.contains("whip auth set openai-generic <base-url> <key>"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -35,11 +35,11 @@ export function validateProductionCanaries(manifest, canaries, localJourneys = [
   // that no longer orchestrated -- true of the assertion and the manifest
   // together, and false of the world.
   assert.equal(canaries.activation.orchestratorRepository, "whipplescript-src");
-  assert.equal(
-    canaries.activation.enabledVariable,
-    "GW_WHIPPLESCRIPT_PRODUCTION_WIRING_CANARIES_ENABLED",
-  );
-  assert.match(canaries.activation.workflow, /^\.github\/workflows\/[a-z-]+\.yml$/);
+  // The fleet's cadence job of this name (GaugeWright tools/vmr/manifest.json)
+  // runs `runner` on the host holding the canary capability. It replaced a
+  // GitHub workflow gated on a repository variable, which never ran (WS-49).
+  assert.equal(canaries.activation.fleetJob, "production-wiring-canary");
+  assert.match(canaries.activation.runner, /^scripts\/[a-z-]+\.sh$/);
   assert.equal(canaries.activation.infisicalPath, "/synthetics/wiring");
   assert.match(canaries.activation.namespace, /^[a-z0-9-]+$/);
 
@@ -128,14 +128,14 @@ async function main() {
     import(pathToFileURL(resolve(root, localRunner)).href),
   ]);
   const result = validateProductionCanaries(manifest, canaries, Object.keys(runners));
-  // A lane cannot be declared into being. The workflow the manifest names has to
+  // A lane cannot be declared into being. The runner the manifest names has to
   // exist, or the declaration is the same kind of true-on-paper the orchestrator
   // field was before this: agreeing with its own assertion and with nothing else.
   //
   // The public mirror is the one place that cannot hold. It is a curated
   // projection that carries this contract -- `crates` ships wholesale -- but not
-  // `.github/workflows/`, so the read found nothing there and took the whole
-  // `hosted-runtime-contracts` job down on every sync. Publishing the workflow
+  // the runner, so the read found nothing there and took the whole
+  // `hosted-runtime-contracts` job down on every sync. Publishing the runner
   // to fix that would be the wrong direction twice: it puts this runtime's
   // production wiring in a public repository, and it contradicts
   // `activation.orchestratorRepository`, which says `whipplescript-src` owns
@@ -143,8 +143,8 @@ async function main() {
   // projection identifies itself -- the same discriminator three checks in
   // `scripts/check-mirror-projection.mjs` already rely on.
   if (existsSync(resolve(root, "../../../AGENTS.md"))) {
-    const workflow = resolve(root, "../../..", canaries.activation.workflow);
-    await readFile(workflow, "utf8");
+    const runner = resolve(root, "../../..", canaries.activation.runner);
+    await readFile(runner, "utf8");
   }
   console.log(
     `Production canary contract tracks ${result.covered} critical routes in `

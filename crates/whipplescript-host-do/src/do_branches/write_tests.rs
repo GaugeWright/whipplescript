@@ -94,8 +94,8 @@ fn hosted_retained_publication_rolls_back_every_sql_boundary() {
     }
     assert!(completed);
     assert_eq!(
-        refused, 9,
-        "two availability reads, the source-fence read, and six branch publication statements"
+        refused, 10,
+        "two availability reads, the member row and source-fence reads, and six branch publication statements"
     );
 }
 
@@ -198,14 +198,21 @@ fn hosted_write_commit_rolls_back_every_sql_boundary() {
     }
     assert!(reached_success);
     assert_eq!(
-        refused, 6,
-        "the branch, reservation and source-fence reads and all three mutations must be exercised"
+        refused, 7,
+        "the branch, reservation, member and source-fence reads and all three mutations must be exercised"
     );
 }
 
 #[test]
 fn hosted_versioned_save_binding() {
     whipplescript_store::vcs_file_save::conformance::check(|| {
+        super::compose_vcs(&RusqliteDoSql::with_runtime_schema()).expect("hosted workspace")
+    });
+}
+
+#[test]
+fn hosted_versioned_save_disposition_conformance() {
+    whipplescript_store::vcs_file_save::disposition_conformance::check(|| {
         super::compose_vcs(&RusqliteDoSql::with_runtime_schema()).expect("hosted workspace")
     });
 }
@@ -261,8 +268,8 @@ fn hosted_write_evidence_rolls_back_every_sql_boundary() {
     }
     assert!(reached_success);
     assert_eq!(
-        refused, 7,
-        "three reads and all four writes must be exercised"
+        refused, 8,
+        "the member read, three existing reads and all four writes must be exercised"
     );
 }
 

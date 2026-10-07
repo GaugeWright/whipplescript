@@ -11,15 +11,29 @@ pub(crate) mod native;
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeSet;
+
+use crate::branches::{BranchRow, CreateBranch, CutRow};
 use crate::{StoreError, StoreResult};
 
-pub const SCHEMA: [&str; 2] = [
+pub const SCHEMA: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS flowing_source_fences (
         source_branch_id TEXT PRIMARY KEY,
         state_json TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS flowing_source_fence_ops (
         op_id TEXT PRIMARY KEY,
+        request_json TEXT NOT NULL,
+        state_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_member_openings (
+        branch_id TEXT PRIMARY KEY,
+        request_json TEXT NOT NULL,
+        branch_json TEXT NOT NULL,
+        state_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_source_openings (
+        source_branch_id TEXT PRIMARY KEY,
         request_json TEXT NOT NULL,
         state_json TEXT NOT NULL
     )",
@@ -62,9 +76,101 @@ pub struct OpenFlowingSource {
     pub opened_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingSourceOpeningReceipt {
+    pub request: OpenFlowingSource,
+    pub state: FlowingFenceState,
+}
+
+pub fn validate_source_opening_receipt(
+    key: &str,
+    receipt: &FlowingSourceOpeningReceipt,
+) -> StoreResult<()> {
+    if receipt.request.source_branch_id != key
+        || missing_open_field(&receipt.request).is_some()
+        || receipt.state != initial_state(&receipt.request)
+    {
+        return Err(StoreError::Conflict(
+            "flowing source opening receipt is inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Immutable identity and result of the transaction that created a member.
+/// Current branch and fence rows are intentionally absent from retry matching:
+/// both can change after the member opens.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingMemberOpeningRequest {
+    pub branch_id: String,
+    pub parent_branch_id: String,
+    pub at_cut: Option<(String, String)>,
+    pub created_at: String,
+    pub idempotency_key: Option<String>,
+    pub source: OpenFlowingSource,
+}
+
+impl FlowingMemberOpeningRequest {
+    pub fn new(branch: &CreateBranch<'_>, source: &OpenFlowingSource) -> Self {
+        Self {
+            branch_id: branch.branch_id.to_owned(),
+            parent_branch_id: branch.parent_branch_id.to_owned(),
+            at_cut: branch
+                .at_cut
+                .map(|(cut, manifest)| (cut.to_owned(), manifest.to_owned())),
+            created_at: branch.created_at.to_owned(),
+            idempotency_key: branch.idempotency_key.map(str::to_owned),
+            source: source.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowingMemberOpeningReceipt {
+    pub request: FlowingMemberOpeningRequest,
+    pub branch: BranchRow,
+    pub source: FlowingFenceState,
+}
+
+pub fn validate_member_opening_receipt(
+    key: &str,
+    receipt: &FlowingMemberOpeningReceipt,
+) -> StoreResult<()> {
+    let request = &receipt.request;
+    let branch = &receipt.branch;
+    if request.branch_id != key
+        || request.parent_branch_id.is_empty()
+        || request.created_at.is_empty()
+        || request.source.source_branch_id != key
+        || request.source.kind != FlowingSourceKind::Twig
+        || missing_open_field(&request.source).is_some()
+        || receipt.source != initial_state(&request.source)
+        || branch.branch_id != key
+        || branch.name.is_some()
+        || branch.parent_branch_id.as_deref() != Some(request.parent_branch_id.as_str())
+        || branch.created_at != request.created_at
+        || branch.updated_at != request.created_at
+        || branch.status != crate::branches::BranchStatus::Active
+        || branch.adopted_merge_cut_id.is_some()
+        || branch.head_cut_id != branch.branch_point_cut_id
+        || branch.head_manifest_hash != branch.branch_point_manifest_hash
+        || request.at_cut.as_ref().is_some_and(|(cut, manifest)| {
+            branch.branch_point_cut_id.as_deref() != Some(cut)
+                || branch.branch_point_manifest_hash.as_deref() != Some(manifest)
+        })
+    {
+        return Err(StoreError::Conflict(
+            "flowing member opening receipt is inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenFlowingSourceOutcome {
     Opened(FlowingFenceState),
+    /// The original opening state when its immutable receipt exists. Stores
+    /// opened before that receipt was introduced can return current state.
     Existing(FlowingFenceState),
     IdentityMismatch,
     BranchMissing,
@@ -73,7 +179,102 @@ pub enum OpenFlowingSourceOutcome {
     BranchAlreadyHasChildren,
     InvalidKindParent,
     InvalidKindName,
+    Invalid {
+        field: &'static str,
+    },
+}
+
+/// One ref-authority transaction creates a direct twig member and opens its
+/// source fence. The caller never observes a newly created writable member
+/// without its source identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpenFlowingMemberOutcome {
+    Opened {
+        branch: BranchRow,
+        source: FlowingFenceState,
+    },
+    /// The original opening result. These snapshots are evidence of that
+    /// opening, not a read of the member's current head or source fence.
+    Existing {
+        branch: BranchRow,
+        source: FlowingFenceState,
+    },
+    Refused(OpenFlowingMemberRefusal),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpenFlowingMemberRefusal {
     Invalid { field: &'static str },
+    ParentMissing,
+    ParentNotActive,
+    ParentNotFlowing,
+    ParentAdmissionDisabled,
+    ExistingBranchWithoutSource,
+    IdentityMismatch,
+}
+
+pub fn missing_member_field(
+    branch: &CreateBranch<'_>,
+    source: &OpenFlowingSource,
+) -> Option<&'static str> {
+    if branch.branch_id.is_empty() || source.source_branch_id != branch.branch_id {
+        return Some("branch_id");
+    }
+    if branch.name.is_some() {
+        return Some("name");
+    }
+    if branch.parent_branch_id.is_empty() {
+        return Some("parent_branch_id");
+    }
+    if branch.created_at.is_empty() {
+        return Some("created_at");
+    }
+    if source.kind != FlowingSourceKind::Twig {
+        return Some("kind");
+    }
+    missing_open_field(source)
+}
+
+pub fn initial_state(request: &OpenFlowingSource) -> FlowingFenceState {
+    FlowingFenceState {
+        source_branch_id: request.source_branch_id.clone(),
+        incarnation_id: request.incarnation_id.clone(),
+        kind: request.kind.clone(),
+        owner: request.owner.clone(),
+        owner_epoch: 0,
+        eligibility_epoch: 0,
+        held: false,
+        revision: None,
+        admission_enabled: true,
+        opened_at: request.opened_at.clone(),
+    }
+}
+
+/// An explicit member point must be on the parent's current cut ancestry.
+/// An unrelated but extant cut would silently import content into a member.
+pub fn member_point_is_ancestor(
+    current_head: Option<&str>,
+    requested_cut: &str,
+    requested_manifest: &str,
+    mut read_cut: impl FnMut(&str) -> StoreResult<Option<CutRow>>,
+) -> StoreResult<bool> {
+    let mut cursor = current_head.map(str::to_owned);
+    let mut seen = BTreeSet::new();
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            // MUTATION-SUCCESS-EXPR: Ok(true)
+            return Err(StoreError::Conflict("cyclic member cut ancestry".into()));
+        }
+        let Some(cut) = read_cut(&id)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(true)
+            return Err(StoreError::Conflict("missing member cut ancestor".into()));
+        };
+        if id == requested_cut {
+            return Ok(cut.manifest_hash == requested_manifest);
+        }
+        cursor = cut.parent_cut_id;
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,11 +346,24 @@ pub enum FlowingFenceOutcome {
 }
 
 pub trait FlowingFence {
+    fn open_flowing_member(
+        &mut self,
+        branch: CreateBranch<'_>,
+        source: &OpenFlowingSource,
+    ) -> StoreResult<OpenFlowingMemberOutcome>;
     fn open_flowing_source(
         &mut self,
         request: &OpenFlowingSource,
     ) -> StoreResult<OpenFlowingSourceOutcome>;
     fn flowing_source(&self, source_branch_id: &str) -> StoreResult<Option<FlowingFenceState>>;
+    fn flowing_source_opening(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingSourceOpeningReceipt>>;
+    fn flowing_member_opening(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<FlowingMemberOpeningReceipt>>;
     fn transition_flowing_source(
         &mut self,
         request: &FlowingFenceTransition,
@@ -356,6 +570,58 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cut(id: &str, parent: Option<&str>, manifest: &str) -> CutRow {
+        CutRow {
+            cut_id: id.into(),
+            change_id: id.into(),
+            branch_id: "branch".into(),
+            manifest_hash: manifest.into(),
+            parent_cut_id: parent.map(str::to_owned),
+            origin: None,
+            actor: None,
+            intent: None,
+            recorded_at: "t0".into(),
+        }
+    }
+
+    #[test]
+    fn member_point_requires_current_ancestry_and_complete_history() {
+        let rows = [
+            ("root", cut("root", None, "m-root")),
+            ("head", cut("head", Some("root"), "m-head")),
+            ("unrelated", cut("unrelated", None, "m-other")),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        let read = |id: &str| Ok(rows.get(id).cloned());
+        assert!(member_point_is_ancestor(Some("head"), "root", "m-root", read).unwrap());
+        assert!(!member_point_is_ancestor(Some("head"), "root", "wrong", read).unwrap());
+        assert!(!member_point_is_ancestor(Some("head"), "unrelated", "m-other", read).unwrap());
+        assert!(!member_point_is_ancestor(None, "root", "m-root", read).unwrap());
+
+        let missing = [("head", cut("head", Some("absent"), "m-head"))]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(matches!(
+            member_point_is_ancestor(Some("head"), "root", "m-root", |id| {
+                Ok(missing.get(id).cloned())
+            }),
+            Err(StoreError::Conflict(message)) if message == "missing member cut ancestor"
+        ));
+        let cycle = [
+            ("head", cut("head", Some("root"), "m-head")),
+            ("root", cut("root", Some("head"), "m-root")),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(matches!(
+            member_point_is_ancestor(Some("head"), "absent", "m", |id| {
+                Ok(cycle.get(id).cloned())
+            }),
+            Err(StoreError::Conflict(message)) if message == "cyclic member cut ancestry"
+        ));
+    }
 
     fn state() -> FlowingFenceState {
         FlowingFenceState {

@@ -286,6 +286,7 @@ pub(crate) fn lower_program(
     warn_inert_memory_grant_on_native_adapter(&ir, &mut warnings);
     warn_counter_without_timezone(&ir, &mut warnings);
     warn_near_miss_semantic_tags(&ir, &mut warnings);
+    prompt_cache::warn_volatile_prompt_prefixes(&ir, &rule_bodies, &mut warnings);
     warn_unhandled_effect_failures(&ir, typed_actions.as_ref(), &mut warnings);
     validate_improve_declarations(&ir, &mut diagnostics);
 

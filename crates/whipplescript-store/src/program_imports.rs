@@ -3,8 +3,11 @@
 //! A program version can be reused under a changed package lock. Checked
 //! version creation retains an immutable witness basis, while each call to
 //! the version-creation API records a separate operation. A changed-IR
-//! re-attestation records an unwitnessed operation. Other accepting paths
-//! still need coverage before this population can describe a Home.
+//! re-attestation records an unwitnessed operation. `admission_inventory`
+//! classifies every store method that admits a version, and its tests refuse
+//! an unclassified one; one store's population still cannot describe a Home.
+
+pub mod admission_inventory;
 
 use std::collections::{BTreeMap, BTreeSet};
 

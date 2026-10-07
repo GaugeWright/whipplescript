@@ -528,6 +528,7 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub agent_workspace_resources: Option<&'a [ResourceRef]>,
     /// Transient host attestation for the current model input planes.
     pub initial_model_provenance: Option<&'a whipplescript_kernel::sansio::InitialModelProvenance>,
+    pub skill_catalogue: Option<&'a crate::skill_catalogue::HostedSkillCatalogue>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
     /// `None` if no sidecar is configured (an `exec.command` then errors).
     pub exec: Option<&'a ExecutorSidecarConfig>,
@@ -856,6 +857,89 @@ fn discover_workspace_skills<Sql: DoSql>(
     }
     skills.sort_by(|left, right| left.entry.name.cmp(&right.entry.name));
     skills.dedup_by(|left, right| left.entry.name == right.entry.name);
+    Ok(skills)
+}
+
+fn selected_workspace_skills<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+    input: &serde_json::Value,
+    resources: Option<&[ResourceRef]>,
+    catalogue: &crate::skill_catalogue::HostedSkillCatalogue,
+) -> Result<Vec<DiscoveredSkill>, StoreError> {
+    let refuse = || {
+        StoreError::Conflict(
+            "hosted skill catalogue does not match this admitted request or current files".into(),
+        )
+    };
+    if catalogue.instance_id != instance_id
+        || catalogue.command_id != effect_id
+        || input.get("actor_ref").and_then(serde_json::Value::as_str)
+            != Some(catalogue.actor_ref.as_str())
+        || !is_governed_host_model_input(input, effect_id)
+    {
+        return Err(refuse());
+    }
+    let view = resources.and_then(|resources| {
+        whipplescript_kernel::file_view::FileView::from_resources(resources).ok()
+    });
+    let mut names = std::collections::BTreeSet::new();
+    let mut skills = Vec::new();
+    for selected in &catalogue.entries {
+        let path = &selected.path;
+        if path.starts_with('/')
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !path.ends_with("/SKILL.md")
+            || !workspace_path_is_admitted(resources, path)
+            || !names.insert(selected.name.clone())
+        {
+            return Err(refuse());
+        }
+        let rows = sql
+            .query(
+                "SELECT content FROM files WHERE key = ?1",
+                &[crate::do_store::SqlValue::Text(format!(
+                    "{instance_id}/{path}"
+                ))],
+            )
+            .map_err(StoreError::Conflict)?;
+        let Some(row) = rows.first() else {
+            // MUTATION-SUCCESS-EXPR: Ok(Vec::new())
+            return Err(refuse());
+        };
+        let body = crate::do_store::as_text(&row[0]);
+        if whipplescript_kernel::exec_http::sha256_hex(body.as_bytes()) != selected.body_sha256 {
+            return Err(refuse());
+        }
+        let frontmatter = parse_skill_frontmatter(&body).map_err(|_| refuse())?;
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .ok_or_else(refuse)?;
+        let directory_name = parent.rsplit('/').next().unwrap_or(parent);
+        if frontmatter.name != selected.name
+            || frontmatter.name != directory_name
+            || frontmatter.description != selected.description
+            || (selected.source.complete && selected.source.source_handles.is_empty())
+        {
+            return Err(refuse());
+        }
+        let location = match &view {
+            Some(view) => view.presented(path).ok_or_else(refuse)?,
+            None => path.clone(),
+        };
+        skills.push(DiscoveredSkill {
+            entry: SkillCatalogueEntry {
+                name: frontmatter.name,
+                description: frontmatter.description,
+                location,
+            },
+            body_digest: whipplescript_store::stable_hash_bytes_hex(body.as_bytes()),
+        });
+    }
     Ok(skills)
 }
 
@@ -1656,11 +1740,23 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .agent_tool_specs
                     .map(<[_]>::to_vec)
                     .unwrap_or_else(crate::do_tools::do_tool_specs);
-                let skills = discover_workspace_skills(
-                    &self.kernel.store().sql,
-                    self.instance_id,
-                    self.agent_workspace_resources,
-                )?;
+                let host_command = is_governed_host_model_input(&input, &effect.effect_id);
+                let selected_catalogue = self.skill_catalogue.filter(|_| host_command);
+                let skills = match selected_catalogue {
+                    Some(catalogue) => selected_workspace_skills(
+                        &self.kernel.store().sql,
+                        self.instance_id,
+                        &effect.effect_id,
+                        &input,
+                        self.agent_workspace_resources,
+                        catalogue,
+                    )?,
+                    None => discover_workspace_skills(
+                        &self.kernel.store().sql,
+                        self.instance_id,
+                        self.agent_workspace_resources,
+                    )?,
+                };
                 let skills_in_prompt =
                     !skills.is_empty() && tools.iter().any(|tool| tool.name == "read");
                 if skills_in_prompt {
@@ -1723,7 +1819,6 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // A package may start its own agent.tell effect while this
                 // worker is attached. The host's labels certify only the
                 // exact governed command, never that authored effect's input.
-                let host_command = is_governed_host_model_input(&input, &effect.effect_id);
                 let mut model_provenance = if host_command {
                     self.initial_model_provenance.cloned().unwrap_or_default()
                 } else {
@@ -1744,11 +1839,21 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     &docs,
                 );
                 if skills_in_prompt {
-                    let catalogue = skill_catalogue_model_provenance(
-                        &skills,
-                        self.initial_model_provenance
-                            .map(|initial| &initial.workspace_content),
-                    );
+                    let catalogue = match selected_catalogue {
+                        Some(selected) => {
+                            let witnesses = selected
+                                .entries
+                                .iter()
+                                .map(|entry| &entry.source)
+                                .collect::<Vec<_>>();
+                            ModelContentProvenance::derived_from(witnesses)
+                        }
+                        None => skill_catalogue_model_provenance(
+                            &skills,
+                            self.initial_model_provenance
+                                .map(|initial| &initial.workspace_content),
+                        ),
+                    };
                     model_provenance.system = ModelContentProvenance::derived_from([
                         &model_provenance.system,
                         &catalogue,
@@ -3210,6 +3315,7 @@ mod tests {
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
                 initial_model_provenance: None,
+                skill_catalogue: None,
                 exec: None,
                 turn: None,
                 ir: &ir,
@@ -3376,6 +3482,7 @@ mod tests {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3473,6 +3580,7 @@ mod tests {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3565,6 +3673,7 @@ mod tests {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3662,6 +3771,7 @@ complete result { text selected.text } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3812,6 +3922,7 @@ rule finish when started => {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3958,6 +4069,7 @@ rule finish when started => {
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
                 initial_model_provenance: None,
+                skill_catalogue: None,
                 exec: None,
                 turn: None,
                 ir: &ir,
@@ -4171,6 +4283,7 @@ rule finish when Ticket as ticket => {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4268,6 +4381,7 @@ rule finish when started => { during empty(Stop) { timer 1h as held } on lapse a
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4564,6 +4678,7 @@ rule finish when started => {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4684,6 +4799,7 @@ rule finish when started => {
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5013,6 +5129,7 @@ complete result verdict }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5155,6 +5272,7 @@ complete result { text report.text } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -5274,6 +5392,7 @@ complete result { text content } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5389,6 +5508,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5529,6 +5649,7 @@ complete result { event event } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5647,6 +5768,7 @@ complete result { remaining remaining } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5770,6 +5892,7 @@ complete result result }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5897,6 +6020,7 @@ complete result result }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6058,6 +6182,7 @@ complete result result }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6186,6 +6311,7 @@ complete result { text digest } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6308,6 +6434,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6579,6 +6706,7 @@ complete result { count count } }
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
                 initial_model_provenance: None,
+                skill_catalogue: None,
                 exec: Some(&exec_cfg),
                 turn: None,
                 ir: &ir,
@@ -6959,6 +7087,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -7334,6 +7463,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -7515,6 +7645,14 @@ complete result { count count } }
             tools: known("package:one"),
             workspace_content: known("workspace:chat-one"),
         };
+        // A host-command-only selection must neither restrict this authored
+        // agent.tell nor lend it the host's source witnesses.
+        let host_only_catalogue = crate::skill_catalogue::HostedSkillCatalogue {
+            instance_id: "another-instance".into(),
+            command_id: "another-host-command".into(),
+            actor_ref: "another-actor".into(),
+            entries: Vec::new(),
+        };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
             norm_gate: None,
@@ -7527,6 +7665,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: Some(&initial),
+            skill_catalogue: Some(&host_only_catalogue),
             exec: None,
             turn: None,
             ir: &ir,
@@ -7706,6 +7845,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -7968,6 +8108,7 @@ complete result { count count } }
             agent_tool_specs: Some(&tool_specs),
             agent_workspace_resources: Some(&workspace_resources),
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -8186,6 +8327,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,
@@ -8297,6 +8439,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,
@@ -8424,6 +8567,7 @@ complete result { count count } }
             agent_tool_specs: None,
             agent_workspace_resources: None,
             initial_model_provenance: None,
+            skill_catalogue: None,
             exec: None,
             turn: None,
             ir: &ir,

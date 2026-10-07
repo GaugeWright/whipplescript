@@ -53,22 +53,40 @@ pub fn run_event_effect_generic<S: RuntimeStore>(
         .get("payload")
         .cloned()
         .unwrap_or_else(|| json!({"effect_id": effect.effect_id, "event_type": event_type}));
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "event-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "event-lease"]);
-    kernel.start_run(RunStart {
+    // Fresh observed dispatch (HA-4): a recorded run-start is never
+    // permission to inject again, and an admitted action instance reaches
+    // this sink only with the facade's single-use execution grant, whose
+    // principal/delegation/observation evidence lands in the run metadata.
+    let LocalAttemptKeys {
+        run_id,
+        lease_id,
+        terminal_key,
+        fact_key,
+        ..
+    } = local_attempt_keys(
+        kernel,
         instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: &config.provider,
-        worker_id: "whip-worker",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({
-            "event_type": event_type,
-            "input": input,
-        })
-        .to_string(),
-    })?;
+        &effect.effect_id,
+        ["event-run", "event-lease", "event.emit.succeeded"],
+    )?;
+    let lease_expires_at = kernel.local_effect_lease_deadline()?;
+    kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: &config.provider,
+            worker_id: "whip-worker",
+            lease_id: &lease_id,
+            lease_expires_at: &lease_expires_at,
+            metadata_json: &json!({
+                "event_type": event_type,
+                "input": input,
+            })
+            .to_string(),
+        },
+        effect,
+    )?;
 
     let emitted = kernel.ingest_external_event(
         instance_id,
@@ -98,11 +116,7 @@ pub fn run_event_effect_generic<S: RuntimeStore>(
         exit_code: Some(0),
         summary: Some("fixture event emitted"),
         metadata_json: &metadata_json,
-        idempotency_key: Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "terminal",
-        ])),
+        idempotency_key: Some(&terminal_key),
     })?;
     let mut emitted_value = payload.as_object().cloned().unwrap_or_default();
     emitted_value.insert(
@@ -130,11 +144,7 @@ pub fn run_event_effect_generic<S: RuntimeStore>(
         &effect.effect_id,
         &value_json,
         Some(&terminal.event_id),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "event.emit.succeeded",
-        ])),
+        Some(&fact_key),
     )?;
     kernel.derive_fact(
         instance_id,
@@ -464,6 +474,31 @@ pub(crate) struct LocalAttemptKeys {
     pub lease_id: String,
     pub terminal_key: String,
     pub fact_key: String,
+    /// Prior runs of this effect; zero keeps the shipped first-attempt keys.
+    pub attempt: usize,
+}
+
+impl LocalAttemptKeys {
+    /// Another attempt-scoped key, minted under the same ordinal rule.
+    pub(crate) fn purpose(&self, instance_id: &str, effect_id: &str, purpose: &str) -> String {
+        attempt_key(instance_id, effect_id, purpose, self.attempt)
+    }
+}
+
+fn attempt_key(instance_id: &str, effect_id: &str, purpose: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        // Preserve the shipped first-attempt coordinates. A later
+        // authorized retry must not collide with that attempt's terminal.
+        idempotency_key(&[instance_id, effect_id, purpose])
+    } else {
+        idempotency_key(&[
+            instance_id,
+            effect_id,
+            purpose,
+            "attempt",
+            &attempt.to_string(),
+        ])
+    }
 }
 type FileAttemptKeys = LocalAttemptKeys;
 
@@ -492,16 +527,7 @@ pub(crate) fn local_attempt_keys<S: RuntimeStore>(
         .iter()
         .filter(|run| run.effect_id == effect_id)
         .count();
-    let ordinal = count.to_string();
-    let key = |purpose| {
-        if count == 0 {
-            // Preserve the shipped first-attempt coordinates. A later
-            // authorized retry must not collide with that attempt's terminal.
-            idempotency_key(&[instance_id, effect_id, purpose])
-        } else {
-            idempotency_key(&[instance_id, effect_id, purpose, "attempt", &ordinal])
-        }
-    };
+    let key = |purpose| attempt_key(instance_id, effect_id, purpose, count);
     // This read selects identities, not authority. The atomic start_dispatch
     // still rejects reuse, a non-claimable effect or any unresolved attempt.
     Ok(FileAttemptKeys {
@@ -509,6 +535,7 @@ pub(crate) fn local_attempt_keys<S: RuntimeStore>(
         lease_id: key(purposes[1]),
         terminal_key: key("terminal"),
         fact_key: key(purposes[2]),
+        attempt: count,
     })
 }
 
@@ -545,6 +572,7 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
         lease_id,
         terminal_key,
         fact_key,
+        ..
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
     let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
@@ -689,6 +717,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         lease_id,
         terminal_key,
         fact_key,
+        ..
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
     let lease_expires_at = kernel.file_lease_deadline()?;
     let started = kernel.start_dispatch_observed(
@@ -1015,6 +1044,7 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
         lease_id,
         terminal_key,
         fact_key,
+        ..
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
     let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
@@ -1313,6 +1343,7 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
         lease_id,
         terminal_key,
         fact_key,
+        ..
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
     let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
@@ -2995,18 +3026,30 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
     let payload = input.get("payload").cloned().unwrap_or(Value::Null);
     let shape = input.get("shape").cloned().unwrap_or(Value::Null);
 
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "notify-lease"]);
-    kernel.start_run(RunStart {
+    // Fresh observed dispatch (HA-4); see `run_event_effect_generic`. The
+    // target-side keys stay attempt-independent, so the delivered signal
+    // itself is admitted at most once whatever the attempt.
+    let keys = local_attempt_keys(
+        kernel,
         instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "notify",
-        worker_id: "whip-notify",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({"target": target, "event": event_name}).to_string(),
-    })?;
+        &effect.effect_id,
+        ["notify-run", "notify-lease", "notify-fact"],
+    )?;
+    let run_id = keys.run_id.clone();
+    let lease_expires_at = kernel.local_effect_lease_deadline()?;
+    kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "notify",
+            worker_id: "whip-notify",
+            lease_id: &keys.lease_id,
+            lease_expires_at: &lease_expires_at,
+            metadata_json: &json!({"target": target, "event": event_name}).to_string(),
+        },
+        effect,
+    )?;
 
     let mut errors = Vec::new();
     validate_ingest_value(&payload, &shape, "$", &mut errors);
@@ -3032,11 +3075,7 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
             metadata_json:
                 &json!({"failure": {"error_kind": "notify_rejected", "message": reason}})
                     .to_string(),
-            idempotency_key: Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
+            idempotency_key: Some(&keys.terminal_key),
         })?;
         // DR-0032: derive the `.failed` fact so `after <notify> fails as f` has
         // something to bind (previously this path emitted no fact at all). `value`
@@ -3054,11 +3093,7 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
             })
             .to_string(),
             Some(&terminal.event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "notify-fact",
-            ])),
+            Some(&keys.fact_key),
         )?;
         return Ok(terminal);
     }
@@ -3092,11 +3127,7 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
         exit_code: Some(0),
         summary: Some(&format!("notified {target} with `{event_name}`")),
         metadata_json: &json!({"target": target, "event": event_name}).to_string(),
-        idempotency_key: Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "terminal",
-        ])),
+        idempotency_key: Some(&keys.terminal_key),
     })?;
     kernel.derive_fact(
         instance_id,
@@ -3110,11 +3141,7 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
         })
         .to_string(),
         Some(&terminal.event_id),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "notify-self-fact",
-        ])),
+        Some(&keys.purpose(instance_id, &effect.effect_id, "notify-self-fact")),
     )?;
     Ok(terminal)
 }
@@ -7422,5 +7449,19 @@ fn reference_codec_refusals_and_outcomes() {
     reference_conformance::check(|| {
         whipplescript_store::native_stores::NativeStores::open_in_memory()
             .expect("native reference fixture")
+    });
+}
+
+/// Shared native/DO fixture for the external-effect handler family (HA-4).
+#[cfg(any(test, feature = "test-support"))]
+#[path = "effect_handlers/external_conformance.rs"]
+pub mod external_conformance;
+
+#[cfg(all(test, feature = "native"))]
+#[test]
+fn external_effect_handlers_take_fresh_observed_dispatch() {
+    external_conformance::check(|| {
+        whipplescript_store::native_stores::NativeStores::open_in_memory()
+            .expect("native external-effect fixture")
     });
 }

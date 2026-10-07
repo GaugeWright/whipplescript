@@ -312,7 +312,7 @@ action review_change(who AgentRef<reviewer>, item ChangeRequest) -> null {
   after turn succeeds {
     done item -> record ReviewedChange {
       id item.id
-      summary turn.summary
+      summary turn
       status "reviewed"
     }
     return null

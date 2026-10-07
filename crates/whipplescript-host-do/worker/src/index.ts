@@ -143,6 +143,19 @@ const verifyHostPolicy = (
   }
 ).verify_host_policy;
 const hostFunctions = bindings as unknown as {
+  host_admit_action: (
+    bridge: unknown, signedEnvelope: string, expectedSigner: string, publicKeyHex: string,
+    retainedPolicyJson: string | undefined, actionTrust: string, commandJson: string,
+    source: string, proof: string, compilerArtifactDigest: string,
+  ) => string;
+  host_execute_action: (
+    bridge: unknown, signedEnvelope: string, expectedSigner: string, publicKeyHex: string,
+    retainedPolicyJson: string | undefined, instanceRef: string, source: string,
+  ) => string;
+  host_read_action_result: (
+    bridge: unknown, signedEnvelope: string, expectedSigner: string, publicKeyHex: string,
+    retainedPolicyJson: string | undefined, actionTrust: string, queryJson: string, proof: string,
+  ) => string;
   host_norm_provision: (
     bridge: unknown,
     objectId: string,
@@ -329,6 +342,10 @@ export interface Env {
   // Applies to this deployment's ledgers; never sourced from request headers,
   // session labels, product-policy roots, or command JSON.
   WHIP_NORM_TRUST?: string;
+  // The deployment's pinned governed-action authorities (HA-5): which P-256
+  // keys may sign a host action command or result read for which authority.
+  // Unset, every action route refuses.
+  WHIP_ACTION_TRUST?: string;
   WHIP_NORM_PLANNING?: string;
   WHIP_NORM_IMAGE_BINDING?: string;
   WHIP_NORM_DEPLOYMENT_IMAGE?: string;
@@ -1295,6 +1312,8 @@ interface HostCommandRequest {
   image_bodies: unknown[];
   /** Ephemeral source labels from the authenticated owning host. */
   initial_model_provenance?: unknown;
+  /** Exact offered entries and source witnesses from the authenticated owner. */
+  skill_catalogue?: unknown;
   /** `"recorded"` when the authenticated host ratifies presented-root renames
    *  after the command (DR-0148); anything else refuses them. */
   workspace_root_renames?: unknown;
@@ -1932,6 +1951,15 @@ export class WorkflowInstance implements DurableObject {
     }
     if (url.pathname === "/host/forks/import") {
       return this.importHostFork(parsed);
+    }
+    if (url.pathname === "/host/actions/admit") {
+      return this.admitHostAction(parsed);
+    }
+    if (url.pathname === "/host/actions/execute") {
+      return this.executeHostAction(parsed);
+    }
+    if (url.pathname === "/host/actions/result") {
+      return this.readHostActionResult(parsed);
     }
     const body = parsed as Partial<Bootstrap> & { command?: string; cut_id?: string };
     // Operator commands (P3): checkpoint / restore an existing instance. The
@@ -5272,6 +5300,7 @@ export class WorkflowInstance implements DurableObject {
       package: candidate as HostPackageDocuments,
       image_bodies: Array.isArray(parsed.image_bodies) ? parsed.image_bodies : [],
       initial_model_provenance: parsed.initial_model_provenance,
+      skill_catalogue: parsed.skill_catalogue,
       workspace_root_renames: parsed.workspace_root_renames,
     };
   }
@@ -5558,6 +5587,7 @@ export class WorkflowInstance implements DurableObject {
           // neither the command nor WhippleScript evidence stores them.
           initial_model_provenance: this.isPublicSession()
             ? undefined : request.initial_model_provenance,
+          skill_catalogue: this.isPublicSession() ? undefined : request.skill_catalogue,
           // DR-0148: only an authenticated host can take back and ratify the
           // renames this placement records; a public visitor never can.
           workspace_root_renames: !this.isPublicSession()
@@ -5774,6 +5804,129 @@ export class WorkflowInstance implements DurableObject {
       return Response.json(forked, { status: 201 });
     } catch (error) {
       return Response.json({ error: `fork import rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
+  /**
+   * Governed host actions through the Worker transport (HA-5). The command is
+   * admitted under the placement's verified policy and a proof the
+   * deployment's pinned action authority signed; the action's source is kept
+   * beside the admission so execution can only ever run the admitted program.
+   * Admission and execution are separate requests, so a lost response or an
+   * evicted object between them is recovered by repeating the same request.
+   */
+  private actionTrust(): string | Response {
+    const trust = this.env.WHIP_ACTION_TRUST?.trim();
+    return trust
+      ? trust
+      : Response.json({ error: "placement has no pinned action authority" }, { status: 503 });
+  }
+
+  private async admitHostAction(parsed: Record<string, unknown>): Promise<Response> {
+    const command = parsed.command;
+    const source = parsed.source;
+    const proof = parsed.proof;
+    if (!command || typeof command !== "object" || Array.isArray(command)
+      || typeof source !== "string" || typeof proof !== "string") {
+      return Response.json(
+        { error: "action admission requires command, source and proof" },
+        { status: 400 },
+      );
+    }
+    const trust = this.actionTrust();
+    if (trust instanceof Response) return trust;
+    const policy = await this.hostPolicy(command as Record<string, unknown>);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot(policy);
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    let receipt: { instance_ref?: unknown };
+    try {
+      receipt = JSON.parse(hostFunctions.host_admit_action(
+        makeBridge(this.ctx.storage),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        root.retainedPolicyJson,
+        trust,
+        JSON.stringify(command),
+        source,
+        proof,
+        wasmArtifactDigest,
+      ));
+    } catch (error) {
+      return Response.json({ error: `action rejected: ${String(error)}` }, { status: 403 });
+    }
+    // Written after the admission commits and rewritten on every replay, so
+    // an interruption between the two is repaired by repeating the request.
+    // Execution compares this source with the admitted program identity.
+    await this.ctx.storage.put(`host-action:${String(receipt.instance_ref)}`, source);
+    return Response.json(receipt, { status: 201 });
+  }
+
+  private async executeHostAction(parsed: Record<string, unknown>): Promise<Response> {
+    const instanceRef = parsed.instance_ref;
+    const policyRef = parsed.policy;
+    if (typeof instanceRef !== "string" || !policyRef || typeof policyRef !== "object") {
+      return Response.json(
+        { error: "action execution requires instance_ref and policy" },
+        { status: 400 },
+      );
+    }
+    // Removing the authority revokes execution too, including of an action
+    // admitted while it was still pinned.
+    const trust = this.actionTrust();
+    if (trust instanceof Response) return trust;
+    const source = await this.ctx.storage.get<string>(`host-action:${instanceRef}`);
+    if (typeof source !== "string") {
+      return Response.json({ error: "no admitted action" }, { status: 404 });
+    }
+    const policy = await this.hostPolicy({ policy: policyRef });
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot(policy);
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      return Response.json(JSON.parse(hostFunctions.host_execute_action(
+        makeBridge(this.ctx.storage),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        root.retainedPolicyJson,
+        instanceRef,
+        source,
+      )));
+    } catch (error) {
+      return Response.json({ error: `action execution refused: ${String(error)}` }, { status: 409 });
+    }
+  }
+
+  private async readHostActionResult(parsed: Record<string, unknown>): Promise<Response> {
+    const query = parsed.query;
+    const proof = parsed.proof;
+    if (!query || typeof query !== "object" || Array.isArray(query) || typeof proof !== "string") {
+      return Response.json({ error: "action result read requires query and proof" }, { status: 400 });
+    }
+    const trust = this.actionTrust();
+    if (trust instanceof Response) return trust;
+    const policy = await this.hostPolicy(query as Record<string, unknown>);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot(policy);
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      return Response.json(JSON.parse(hostFunctions.host_read_action_result(
+        makeBridge(this.ctx.storage),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        root.retainedPolicyJson,
+        trust,
+        JSON.stringify(query),
+        proof,
+      )));
+    } catch (error) {
+      return Response.json({ error: `action read refused: ${String(error)}` }, { status: 403 });
     }
   }
 
@@ -6484,6 +6637,9 @@ export default {
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
+        url.pathname === "/host/actions/admit" ||
+        url.pathname === "/host/actions/execute" ||
+        url.pathname === "/host/actions/result" ||
         /^\/host\/instances\/[^/]+\/discard$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/(events|evidence|explain|files|position|pending|checkpoint|restore|stats)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||

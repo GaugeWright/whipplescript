@@ -205,7 +205,7 @@ coerce        ::= "coerce" Ident "(" params? ")" "->" Type (block | string)
 rule          ::= "rule" Ident when* "=>" block
 pattern       ::= "pattern" Ident ("<" TypeName ("," TypeName)* ">")? block
 apply         ::= "apply" Ident type_args? "as" Ident block
-action        ::= "action" Ident "(" params? ")" block
+action        ::= "action" Ident "(" params? ")" "->" Type ("!" Type)? block
 assert        ::= "assert" expr
 when          ::= "when" readiness
 block         ::= "{" statement* "}"
@@ -474,7 +474,7 @@ action review_change(who AgentRef<reviewer>, item ChangeRequest) -> null {
   Review {{ item.title }}.
   """
 
-  after turn succeeds as reviewed {
+  after turn succeeds {
     done item -> record ReviewedChange {
       id item.id
       summary "reviewed"
@@ -2705,6 +2705,41 @@ rule import_ticket
   when ExternalTicket as ticket
 => { ... }
 ```
+
+### Prompt-cache checks
+
+A model provider caches a prompt by its fixed prefix. The provider reads the
+cached part of a later call at a lower cost and with less latency. The cache
+stops at the first byte that is different from the earlier call. Thus a value
+that changes on each call makes all of the text after it uncacheable. Examples
+of such values are a run or effect id, a timestamp, and a random value.
+
+The `whip check` command gives the `effect.volatile_prompt_prefix` warning when
+a prompt interpolates such a value before a large quantity of fixed text. The
+check applies to the prompt of a `tell`, `prompt`, or `decide` statement and to
+the prompt of a `coerce` declaration. The check identifies a volatile value by
+its name: `run_id`, `effect_id`, `instance_id`, `request_id`, a name that ends
+in `_at`, `now()`, `random()`, and other names of this type. The program stays
+valid, and the check does not change the prompt for you. A change to the
+sequence of a prompt changes the text that the model reads:
+
+<!-- render: examples/diagnostics/volatile-prompt-prefix.whip code effect.volatile_prompt_prefix -->
+```text
+warning[effect.volatile_prompt_prefix]: coerce `summarize`'s prompt interpolates `{{ requested_at }}`, which changes on every call, ahead of 209 characters of fixed text; the provider's prompt cache cannot reuse anything after it
+   --> examples/diagnostics/volatile-prompt-prefix.whip:29:8
+   |
+29 | coerce summarize(requested_at string, log string) -> Summary {
+   |        ^^^^^^^^^
+   = help: move `{{ requested_at }}` to the end of the prompt, after the fixed text, so the text before it is a stable prefix the cache can reuse
+```
+
+Move the volatile value to the end of the prompt. Then the fixed text before it
+is a stable prefix that the cache can use again.
+
+WhippleScript source cannot write the system prompt of an agent. The harness
+assembles that prompt from skills and project instructions, and these sources
+do not interpolate values. Thus each prompt that the check reads is a user
+turn.
 
 ### Not Gherkin
 

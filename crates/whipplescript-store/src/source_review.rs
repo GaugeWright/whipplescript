@@ -1,6 +1,8 @@
 //! The reviewed-contribution record under DR-0141 and DR-0145. WhippleScript
 //! source cuts and units are the primary candidate authority. Git is a
 //! compatibility source; authenticated transport and admission remain open.
+//! Content-anchored findings, approvals and read/diff APIs over native
+//! revisions live in `source_review_findings`.
 
 use std::path::Path;
 
@@ -9,7 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::source_review_git::{GitCandidatePins, GitPin};
 use crate::StoreError;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
@@ -39,6 +41,8 @@ pub enum ReviewError {
     Invalid(String),
     Missing(String),
     Conflict(String),
+    /// Content-bound evidence for a superseded revision.
+    Stale(String),
     Corrupt(String),
     Git(String),
     Sqlite(rusqlite::Error),
@@ -166,7 +170,52 @@ impl ReviewStore {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                 PRIMARY KEY (contribution_id, sequence),
                 UNIQUE (contribution_id, upload_id)
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS review_findings (
+                contribution_id TEXT NOT NULL REFERENCES contributions(id),
+                finding_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                path TEXT NOT NULL,
+                blob_digest TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (contribution_id, finding_id),
+                FOREIGN KEY (contribution_id, sequence)
+                    REFERENCES native_revisions(contribution_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS review_approvals (
+                contribution_id TEXT NOT NULL REFERENCES contributions(id),
+                approval_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (contribution_id, approval_id),
+                FOREIGN KEY (contribution_id, sequence)
+                    REFERENCES native_revisions(contribution_id, sequence)
+            );
+            CREATE TRIGGER IF NOT EXISTS native_revisions_no_update
+                BEFORE UPDATE ON native_revisions
+                BEGIN SELECT RAISE(ABORT, 'native review revisions are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS native_revisions_no_delete
+                BEFORE DELETE ON native_revisions
+                BEGIN SELECT RAISE(ABORT, 'native review revisions are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS review_findings_no_update
+                BEFORE UPDATE ON review_findings
+                BEGIN SELECT RAISE(ABORT, 'review findings are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS review_findings_no_delete
+                BEFORE DELETE ON review_findings
+                BEGIN SELECT RAISE(ABORT, 'review findings are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS review_approvals_no_update
+                BEFORE UPDATE ON review_approvals
+                BEGIN SELECT RAISE(ABORT, 'review approvals are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS review_approvals_no_delete
+                BEFORE DELETE ON review_approvals
+                BEGIN SELECT RAISE(ABORT, 'review approvals are append-only'); END;",
         )?;
         let migration = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_source_kind = migration

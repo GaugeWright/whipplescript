@@ -95,6 +95,63 @@ pub fn embedded_std_registry_for_program(
     Ok(registry)
 }
 
+/// The provider-free shipped standard set, for kernel fixtures that admit
+/// through a product facade. The kernel cannot name a product's set; this
+/// mirrors the hosted one, which `whipplescript-host-do` guards for drift.
+#[cfg(test)]
+pub(crate) const TEST_SHIPPED_STD_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "std.agent",
+        include_str!("../../../std/manifests/agent.json"),
+    ),
+    (
+        "std.coercion",
+        include_str!("../../../std/manifests/coercion.json"),
+    ),
+    (
+        "std.coord",
+        include_str!("../../../std/manifests/coord.json"),
+    ),
+    (
+        "std.files",
+        include_str!("../../../std/manifests/files.json"),
+    ),
+    (
+        "std.image",
+        include_str!("../../../std/manifests/image.json"),
+    ),
+    (
+        "std.ingress",
+        include_str!("../../../std/manifests/ingress.json"),
+    ),
+    (
+        "std.custody",
+        include_str!("../../../std/manifests/custody.json"),
+    ),
+    (
+        "std.memory",
+        include_str!("../../../std/manifests/memory.json"),
+    ),
+    ("std.vcs", include_str!("../../../std/manifests/vcs.json")),
+    (
+        "std.messaging",
+        include_str!("../../../std/manifests/messaging.json"),
+    ),
+    (
+        "std.script",
+        include_str!("../../../std/manifests/script.json"),
+    ),
+    (
+        "std.telemetry",
+        include_str!("../../../std/manifests/telemetry.json"),
+    ),
+    ("std.time", include_str!("../../../std/manifests/time.json")),
+    (
+        "std.tracker",
+        include_str!("../../../std/manifests/tracker.json"),
+    ),
+];
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value

@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import mutation_sweep as sweep
+import cold_refusal_proof as cold
 
 
 class TypedRefusalTests(unittest.TestCase):
@@ -431,6 +432,29 @@ class TestOnlyModule(unittest.TestCase):
             sweep.test_only_module(self.crate("// nothing declares it\n")),
             "an undeclared file must stay in the sweep",
         )
+
+
+class ColdProofSelectionTests(unittest.TestCase):
+    def test_real_guards_are_exact_and_stale_or_duplicate_selection_refuses(self):
+        source = (cold.ROOT / cold.TARGET).read_text()
+        self.assertEqual(len(cold.selected_lines(source)), 2)
+        for bad in (source.replace('// MUTATION-SUCCESS-EXPR:', '// removed:', 1),
+                    source + source, ''):
+            with self.subTest(source_length=len(bad)):
+                with self.assertRaisesRegex(ValueError, 'exactly both'):
+                    cold.selected_lines(bad)
+
+    def test_preexisting_output_cannot_supply_a_cold_witness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'old.json').write_text('cached success')
+            with mock.patch.dict('os.environ', {'WHIPPLESCRIPT_COLD_REFUSAL_TARGET_DIR': directory}):
+                with self.assertRaisesRegex(ValueError, 'empty'):
+                    cold.main()
+
+    def test_relative_output_cannot_activate_a_proof(self):
+        with mock.patch.dict('os.environ', {'WHIPPLESCRIPT_COLD_REFUSAL_TARGET_DIR': 'target'}):
+            with self.assertRaisesRegex(ValueError, 'absolute'):
+                cold.main()
 
 
 if __name__ == '__main__':

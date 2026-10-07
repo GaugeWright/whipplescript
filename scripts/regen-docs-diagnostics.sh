@@ -169,6 +169,7 @@ SAMPLE_HEAD = re.compile(
 # an error, more is a deliberate edit here.
 EXPECTED = {
     "docs/diagnostics.md": 10,
+    "docs/language-reference.md": 1,
     "docs/manual/06-error-handling.md": 1,
     "docs/manual/07-case.md": 1,
     "docs/manual/13-agent-patterns.md": 1,

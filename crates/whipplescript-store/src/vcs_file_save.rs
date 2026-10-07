@@ -2,8 +2,14 @@
 //! binds this descriptor to the command and current authority; this storage
 //! adapter neither authenticates a caller nor turns dispatch coordinates into
 //! a grant. It preserves the existing merge engine and atomic write receipt.
+mod disposition;
 mod recovery;
 mod scoped;
+pub use disposition::conformance as disposition_conformance;
+pub use disposition::{
+    observe_save_disposition, SaveDisposition, SAVE_ABSENCE_PROOF_SCHEMA,
+    VERSIONED_SAVE_RECOVERY_CEILING,
+};
 pub use recovery::{read_committed_save, RecoveredSave, SaveResultBinding};
 pub use scoped::conformance as scoped_conformance;
 pub use scoped::{read_committed_scoped_save, ScopedSaveReceipt, SCOPED_SAVE_RECEIPT_SCHEMA};
@@ -204,6 +210,10 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
 }
 
 impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
+    fn recovery_ceiling(&self) -> crate::effect_recovery::RecoveryCeiling {
+        self.declared_recovery_ceiling()
+    }
+
     fn scoped_save_binding(&self) -> Option<(&VersionedSaveBinding, &ResolutionMemoryScope)> {
         self.scoped
             .as_ref()
@@ -898,6 +908,74 @@ pub mod conformance {
 
 #[cfg(all(test, feature = "native"))]
 mod tests {
+    #[test]
+    fn native_versioned_save_disposition_conformance() {
+        super::disposition_conformance::check(|| {
+            crate::vcs::WorkspaceVcs::from_parts(
+                crate::branches::BranchStore::open_in_memory().expect("branches"),
+                crate::content::ContentStore::open(":memory:").expect("content"),
+            )
+        });
+    }
+
+    #[test]
+    fn an_operation_without_its_cut_is_not_absence() {
+        use super::conformance::{binding, context, seed, DRAFT};
+        use crate::branches::Branches;
+        let mut branches = crate::branches::BranchStore::open_in_memory().expect("branches");
+        let cut_id = super::save_cut_id("action-instance", "save");
+        branches
+            .record_op(&format!("op-{cut_id}"), "save", &[], None, "t0")
+            .expect("stray operation");
+        let mut workspace = crate::vcs::WorkspaceVcs::from_parts(
+            branches,
+            crate::content::ContentStore::open(":memory:").expect("content"),
+        );
+        seed(&mut workspace);
+        let error = super::observe_save_disposition(
+            &workspace,
+            &super::SaveResultBinding::from(&binding(DRAFT)),
+            &super::SaveAttempt::from(context()),
+        )
+        .expect_err("an operation under the key is not proved absence");
+        assert!(
+            error
+                .to_string()
+                .contains("save operation exists without its committed cut"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_save_declares_and_observes_nothing_stronger() {
+        use super::conformance::{binding, context, seed, DRAFT};
+        let mut workspace = crate::vcs::WorkspaceVcs::from_parts(
+            crate::branches::BranchStore::open_in_memory().expect("branches"),
+            crate::content::ContentStore::open(":memory:").expect("content"),
+        );
+        seed(&mut workspace);
+        let files = super::VersionedSaveFileStore::new_in_resolution_scope(
+            workspace,
+            binding(DRAFT),
+            super::scoped_conformance::scope(),
+            std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+        )
+        .expect("scoped store");
+        assert_eq!(
+            files.declared_recovery_ceiling(),
+            crate::effect_recovery::RecoveryCeiling::Unverifiable
+        );
+        let error = files
+            .observe_disposition(&super::SaveAttempt::from(context()))
+            .expect_err("scoped saves are not qualified");
+        assert!(
+            error
+                .to_string()
+                .contains("scoped saves require scoped recovery"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn native_versioned_save_binding() {
         super::conformance::check(|| {

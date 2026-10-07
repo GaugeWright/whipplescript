@@ -25,6 +25,7 @@ mod body_print;
 mod format;
 mod lowering;
 mod measure;
+mod prompt_cache;
 pub mod rule_dependencies;
 mod rule_roots;
 pub mod snapshot;

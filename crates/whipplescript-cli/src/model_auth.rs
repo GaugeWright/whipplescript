@@ -8,7 +8,10 @@
 //! are deliberately NOT rehomed here.
 //!
 //! Precedence is env var → `whip auth` stored config → (OpenAI only) the Codex
-//! OAuth token in `~/.codex/auth.json`. Credentials are operator-plane
+//! OAuth token in `~/.codex/auth.json`. For `openai-generic` the stored config
+//! is consulted per endpoint first: the key stored for the resolved base URL
+//! (`whip auth set openai-generic <base-url> <key>`) comes before the
+//! provider-wide `openai` entry. Credentials are operator-plane
 //! secrets: they never enter facts, evidence, labels, or fingerprints —
 //! surfaces report only the [`CredentialSource`] label.
 
@@ -31,6 +34,9 @@ pub enum CredentialSource {
     Env(&'static str),
     /// The `whip auth set` config file.
     Stored,
+    /// The `whip auth set openai-generic <base-url>` entry for the endpoint
+    /// being called.
+    StoredEndpoint,
     /// The Codex OAuth token in `~/.codex/auth.json`.
     CodexOAuth,
 }
@@ -40,6 +46,7 @@ impl CredentialSource {
         match self {
             CredentialSource::Env(name) => format!("env:{name}"),
             CredentialSource::Stored => "stored (whip auth)".to_owned(),
+            CredentialSource::StoredEndpoint => "stored (whip auth, this endpoint)".to_owned(),
             CredentialSource::CodexOAuth => "~/.codex/auth.json".to_owned(),
         }
     }
@@ -63,9 +70,11 @@ impl CredentialSource {
             CredentialSource::Env(name) => CredentialRef::LegacyEnv {
                 var: name.to_owned(),
             },
-            CredentialSource::Stored => CredentialRef::LegacyTag {
-                tag: "secret:whip-auth".to_owned(),
-            },
+            CredentialSource::Stored | CredentialSource::StoredEndpoint => {
+                CredentialRef::LegacyTag {
+                    tag: "secret:whip-auth".to_owned(),
+                }
+            }
             CredentialSource::CodexOAuth => CredentialRef::LegacyTag {
                 tag: "secret:codex-oauth".to_owned(),
             },
@@ -80,6 +89,9 @@ impl CredentialSource {
 pub struct CredentialCandidates {
     /// The provider's environment variable value, if set and non-empty.
     pub env: Option<String>,
+    /// The `whip auth set openai-generic <base-url>` credential stored for the
+    /// endpoint being called, if any (consulted for `openai-generic` only).
+    pub stored_endpoint: Option<String>,
     /// The `whip auth set` stored credential, if any.
     pub stored: Option<String>,
     /// The Codex OAuth access token, if present (consulted for OpenAI only).
@@ -105,6 +117,11 @@ pub fn resolve_credential_from(
     if let Some(key) = candidates.env {
         return Some((key, CredentialSource::Env(env_var)));
     }
+    if provider == CoerceProvider::OpenAiCompat {
+        if let Some(key) = candidates.stored_endpoint {
+            return Some((key, CredentialSource::StoredEndpoint));
+        }
+    }
     if let Some(key) = candidates.stored {
         return Some((key, CredentialSource::Stored));
     }
@@ -122,8 +139,20 @@ pub fn resolve_credential_from(
 /// Resolve the model credential and report where it came from, in precedence
 /// order: environment variable, then `whip auth` stored config, then (OpenAI
 /// only) the Codex OAuth token. `None` means no credential is available.
+///
+/// Resolves for the provider's default endpoint; a caller that knows the base
+/// URL it will call uses [`resolve_credential_for_endpoint`], which is what
+/// lets an `openai-generic` endpoint find the key stored for it.
 pub fn resolve_credential_with_source(
     provider: CoerceProvider,
+) -> Option<(String, CredentialSource)> {
+    resolve_credential_for_endpoint(provider, provider.default_base_url())
+}
+
+/// [`resolve_credential_with_source`] for the endpoint at `base_url`.
+pub fn resolve_credential_for_endpoint(
+    provider: CoerceProvider,
+    base_url: &str,
 ) -> Option<(String, CredentialSource)> {
     let stored_provider = match provider {
         CoerceProvider::Anthropic => "anthropic",
@@ -134,6 +163,9 @@ pub fn resolve_credential_with_source(
         provider,
         CredentialCandidates {
             env: env_nonempty(credential_env_var(provider)),
+            stored_endpoint: (provider == CoerceProvider::OpenAiCompat)
+                .then(|| crate::auth::stored_endpoint_credential(base_url))
+                .flatten(),
             stored: crate::auth::stored_credential(stored_provider),
             codex_oauth: codex_oauth_token(),
         },
@@ -215,6 +247,7 @@ mod tests {
     ) -> CredentialCandidates {
         CredentialCandidates {
             env: env.map(str::to_owned),
+            stored_endpoint: None,
             stored: stored.map(str::to_owned),
             codex_oauth: codex.map(str::to_owned),
         }
@@ -289,6 +322,50 @@ mod tests {
         }
     }
 
+    /// WS-297: an `openai-generic` endpoint's own stored key sits between the
+    /// environment variable and the provider-wide stored `openai` key, and it
+    /// never satisfies any other provider.
+    #[test]
+    fn endpoint_key_precedence_for_openai_generic() {
+        let with_endpoint = |env: Option<&str>, endpoint: Option<&str>, stored: Option<&str>| {
+            CredentialCandidates {
+                env: env.map(str::to_owned),
+                stored_endpoint: endpoint.map(str::to_owned),
+                stored: stored.map(str::to_owned),
+                codex_oauth: Some("c".to_owned()),
+            }
+        };
+        let compat = CoerceProvider::OpenAiCompat;
+        // The environment variable still wins.
+        assert_eq!(
+            resolve_credential_from(compat, with_endpoint(Some("e"), Some("p"), Some("s"))),
+            Some(("e".to_owned(), CredentialSource::Env("OPENAI_API_KEY")))
+        );
+        // Then the key stored for this endpoint, ahead of the openai-wide one.
+        assert_eq!(
+            resolve_credential_from(compat, with_endpoint(None, Some("p"), Some("s"))),
+            Some(("p".to_owned(), CredentialSource::StoredEndpoint))
+        );
+        // No key for this endpoint: the previous chain, unchanged.
+        assert_eq!(
+            resolve_credential_from(compat, with_endpoint(None, None, Some("s"))),
+            Some(("s".to_owned(), CredentialSource::Stored))
+        );
+        // An endpoint key is meaningless to every other provider.
+        for provider in [
+            CoerceProvider::OpenAi,
+            CoerceProvider::Anthropic,
+            CoerceProvider::Xai,
+        ] {
+            let resolved = resolve_credential_from(provider, with_endpoint(None, Some("p"), None));
+            assert_ne!(
+                resolved.map(|(_, source)| source),
+                Some(CredentialSource::StoredEndpoint),
+                "{provider:?}"
+            );
+        }
+    }
+
     #[test]
     fn anthropic_oauth_tokens_are_rejected_with_the_console_key_message() {
         // The rule lives HERE (the credential layer owns provider-specific
@@ -328,6 +405,7 @@ mod tests {
                 "env:OPENAI_API_KEY",
             ),
             (CredentialSource::Stored, "secret:whip-auth"),
+            (CredentialSource::StoredEndpoint, "secret:whip-auth"),
             (CredentialSource::CodexOAuth, "secret:codex-oauth"),
         ] {
             let reference = source.credential_ref();

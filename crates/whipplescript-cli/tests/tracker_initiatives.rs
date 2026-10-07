@@ -227,14 +227,18 @@ fn durable_export_does_not_depend_on_a_writable_discovery_view() {
         "foreign owner",
     )
     .expect("simulate unavailable view");
-    assert!(
-        !run(root.path(), &["show", task["id"].as_str().expect("id")])
-            .status
-            .success()
-    );
+    // DR-0188: canonical queries remain available while publication refuses;
+    // they must not repair or overwrite somebody else's discovery destination.
+    let id = task["id"].as_str().expect("id");
+    assert_eq!(good(root.path(), &["show", id])["title"], "backup-marker");
+    assert!(!run(root.path(), &["note", id, "must not commit"])
+        .status
+        .success());
+    assert!(!run(root.path(), &["bootstrap"]).status.success());
     let events = good(root.path(), &["export"]);
     assert!(!events.as_array().expect("events").is_empty());
     assert!(events.to_string().contains("backup-marker"));
+    assert!(!events.to_string().contains("must not commit"));
     assert_eq!(
         std::fs::read_to_string(root.path().join("tracker/.whipplescript-discovery-owner"))
             .expect("preserved"),

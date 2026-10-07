@@ -14,6 +14,7 @@ use crate::branches::flowing_admission::{
     FlowingAdmissions, FlowingCandidateWitness, FlowingGateCertificate, FlowingGateCheck,
     FlowingGateEvidence,
 };
+use crate::branches::flowing_coverage::FlowingCoverageBasis;
 use crate::branches::flowing_fence::FlowingFence;
 use crate::branches::{Branches, MAINLINE_BRANCH_ID};
 use crate::materialize::materialize_manifest;
@@ -37,6 +38,11 @@ pub struct NativeGatePlan {
     pub policy_digest: String,
     pub rules_digest: String,
     pub graph_coverage_digest: String,
+    /// The reference-coverage premise vector and per-scope claims this plan
+    /// was derived under. Without it the runner still records its results,
+    /// but ref admission refuses the certificate as coverage-unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<FlowingCoverageBasis>,
     pub checks: Vec<NativeGateCommand>,
 }
 
@@ -81,6 +87,28 @@ fn invalid(reason: &str) -> StoreError {
 }
 
 impl NativeWorkspaceVcs {
+    /// A plan that claims coverage must match the recorded premises for this
+    /// exact candidate before checks run and again before a certificate is
+    /// issued. The ref transaction compares them once more under CAS.
+    fn check_plan_coverage(
+        &self,
+        plan: &NativeGatePlan,
+        witness: &FlowingCandidateWitness,
+    ) -> StoreResult<()> {
+        let Some(coverage) = plan.coverage.as_ref() else {
+            return Ok(());
+        };
+        let current = self.branches.flowing_coverage_premises()?;
+        match crate::branches::flowing_coverage::check(
+            Some(coverage),
+            current.as_ref(),
+            &witness.candidate_manifest_hash,
+        )? {
+            Ok(()) => Ok(()),
+            Err(refusal) => Err(invalid(&format!("coverage premises refuse: {refusal:?}"))),
+        }
+    }
+
     /// Native compatibility spelling for the shared owning reader.
     pub fn capture_native_gate_subject(
         &self,
@@ -143,6 +171,7 @@ impl NativeWorkspaceVcs {
             .ok_or_else(|| invalid("source lineage is unknown or ineligible"))?;
         let unit_holders = crate::branches::flowing_holders::capture(&self.branches, &witness)?
             .ok_or_else(|| invalid("unit holder is unknown or changed"))?;
+        self.check_plan_coverage(&plan, &witness)?;
         let manifest = self.load_manifest(Some(&witness.candidate_manifest_hash))?;
         std::fs::create_dir(scratch).map_err(|error| {
             invalid(&format!(
@@ -221,6 +250,7 @@ impl NativeWorkspaceVcs {
         if authority.required_plan(self, &witness, attempt_op_id)? != plan {
             return Err(invalid("required plan changed during checks"));
         }
+        self.check_plan_coverage(&plan, &witness)?;
         let certificate = FlowingGateCertificate {
             candidate_witness_digest: witness_digest.to_owned(),
             expected_trunk_cut_id: witness.expected_trunk_cut_id,
@@ -234,6 +264,7 @@ impl NativeWorkspaceVcs {
             policy_digest: plan.policy_digest.clone(),
             rules_digest: plan.rules_digest.clone(),
             graph_coverage_digest: plan.graph_coverage_digest.clone(),
+            coverage: plan.coverage.clone(),
             required_checks: plan
                 .checks
                 .iter()

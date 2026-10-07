@@ -14,6 +14,7 @@ pub mod coerce_native;
 #[cfg(all(test, feature = "native"))]
 mod coerce_settlement_tests;
 pub mod construct_coverage;
+pub mod construct_revalidation;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;

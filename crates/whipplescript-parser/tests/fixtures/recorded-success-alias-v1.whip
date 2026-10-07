@@ -1,0 +1,26 @@
+@service
+workflow RecordedSuccessAlias
+
+class Note {
+  label string
+  summary string
+}
+
+agent reviewer { provider fixture profile "r" capacity 1 }
+
+action note(label string) {
+  tell reviewer as turn "Review {{ label }}."
+  after turn succeeds as reply {
+    record Note {
+      label label
+      summary reply.summary
+    }
+  }
+}
+
+rule review
+  when started
+=> {
+  note("first")
+  note("second")
+}

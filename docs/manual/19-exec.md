@@ -152,8 +152,8 @@ The same single-result form composes inside an action:
 ```whip
 action greet_once(request Request) -> Reply {
   exec greet with request -> Reply as call
-  after call succeeds as reply {
-    return reply
+  after call succeeds {
+    return call
   }
 }
 ```

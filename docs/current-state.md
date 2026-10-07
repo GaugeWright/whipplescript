@@ -79,9 +79,11 @@ not a different compatibility version.
   native notification; `stdio`; and `fixture`, where the `whip message` command
   injects an inbound message. Live delivery through Slack or email stays
   deferred.
-- The management of the credentials. The commands are `whip auth status` and
-  `whip auth set <openai|anthropic> <key>`. These commands store the credentials
-  of a model for the native `coerce` path. Only the owner can read the
+- The management of the credentials. The commands are `whip auth status`,
+  `whip auth set <openai|anthropic|xai> <key>`,
+  `whip auth set openai-generic <base-url> <key>`, and `whip auth clear`. These
+  commands store the credentials of a model for the native `coerce` path and
+  the owned harness, with one key per `openai-generic` endpoint. Only the owner can read the
   configuration.
 - The controls for the lifecycle. The commands are `pause`, `resume`, `cancel`,
   and `retry`. The `whip revise` command revises a workflow of an instance that

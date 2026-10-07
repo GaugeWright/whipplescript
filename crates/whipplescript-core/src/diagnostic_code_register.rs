@@ -69,6 +69,7 @@ pub const DIAGNOSTIC_CODES: &[DiagnosticCode] = &[
     DiagnosticCode("effect.unhandled_outcome"),
     DiagnosticCode("effect.unsatisfiable_dependency"),
     DiagnosticCode("effect.unsupported_predicate"),
+    DiagnosticCode("effect.volatile_prompt_prefix"),
     DiagnosticCode("expr.arity_mismatch"),
     DiagnosticCode("expr.binding_out_of_scope"),
     DiagnosticCode("expr.case_pattern_mismatch"),

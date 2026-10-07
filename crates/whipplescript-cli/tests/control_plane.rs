@@ -8124,7 +8124,7 @@ rule wait
     );
     assert_eq!(
         explanation.get("schema").and_then(Value::as_str),
-        Some("whipplescript.action-explanation-query.v1")
+        Some("whipplescript.action-explanation-query.v2")
     );
     assert_eq!(
         explanation.pointer("/outcome/kind").and_then(Value::as_str),
@@ -8275,6 +8275,172 @@ rule wait
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
     let _ = fs::remove_file(revised_path);
+}
+
+/// DR-0100 E1 cross-consumer selection. One authored result name that two
+/// firings of the same rule both bind is returned as explicit candidates by
+/// the CLI and by the editor command alike, and selecting either candidate by
+/// its exact result identity gives byte-identical answers on both surfaces.
+/// Neither consumer picks the newest firing.
+#[test]
+fn managed_explanation_candidates_are_identical_for_cli_and_editor_across_firings() {
+    const SOURCE: &str = r#"
+use std.ingress
+@service
+workflow ExplainFirings
+
+signal ticket.opened {
+  id string
+}
+
+action wait_for_pause(id string) -> string {
+  timer 300s as pause
+  return id
+}
+
+rule review
+  when ticket.opened as opened
+=> {
+  wait_for_pause(opened.id) as done
+}
+"#;
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("managed-explanation-firings");
+    fs::write(&workflow_path, SOURCE).expect("workflow writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let program = workflow_path.to_str().expect("utf-8 workflow path");
+    let started = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store", store, "--json", "start", program, "--input", "{}",
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    for id in ["T1", "T2"] {
+        let data = json!({ "id": id }).to_string();
+        run_json_isolated(
+            bin,
+            &store_path,
+            &[
+                "--store",
+                store,
+                "--json",
+                "signal",
+                &instance_id,
+                "--name",
+                "ticket.opened",
+                "--data",
+                &data,
+                "--program",
+                program,
+            ],
+        );
+    }
+    let stepped = whip(bin, &store_path)
+        .args(["--store", store, "step", &instance_id, "--program", program])
+        .output()
+        .expect("step runs");
+    assert!(
+        stepped.status.success(),
+        "step failed: {}",
+        String::from_utf8_lossy(&stepped.stderr)
+    );
+
+    let cli = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json", "explain", instance_id.as_str()];
+        full.extend_from_slice(args);
+        run_json_isolated(bin, &store_path, &full)
+    };
+    let editor = |requests: &[Value]| {
+        let mut input = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
+        for (index, arguments) in requests.iter().enumerate() {
+            input += &frame(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": index + 1,
+                    "method": "workspace/executeCommand",
+                    "params": {
+                        "command": "whip.explainResult",
+                        "arguments": [arguments],
+                    },
+                })
+                .to_string(),
+            );
+        }
+        input += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown","params":{}}"#);
+        input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
+        let messages = lsp_messages(&lsp_stdout(bin, &store_path, &input));
+        (1..=requests.len())
+            .map(|id| {
+                messages
+                    .iter()
+                    .find(|message| message["id"] == json!(id))
+                    .map(|message| message["result"].clone())
+                    .expect("editor answers every request")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let ambiguous = cli(&["done"]);
+    assert_eq!(
+        ambiguous.pointer("/outcome/kind").and_then(Value::as_str),
+        Some("ambiguous"),
+        "{ambiguous}"
+    );
+    let candidates = ambiguous
+        .pointer("/outcome/candidates")
+        .and_then(Value::as_array)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 2, "{ambiguous}");
+    assert_ne!(
+        candidates[0]["firing"], candidates[1]["firing"],
+        "each candidate names its own firing"
+    );
+    let ids: Vec<String> = candidates
+        .iter()
+        .map(|candidate| {
+            candidate["result_id"]
+                .as_str()
+                .expect("candidate result id")
+                .to_owned()
+        })
+        .collect();
+    let selected: Vec<Value> = ids.iter().map(|id| cli(&[id.as_str()])).collect();
+    for (selection, candidate) in selected.iter().zip(candidates) {
+        assert_eq!(
+            selection.pointer("/outcome/kind").and_then(Value::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            selection.pointer("/outcome/selection/firing"),
+            Some(&candidate["firing"])
+        );
+    }
+
+    let mut requests = vec![json!({ "instance": instance_id, "result": "done" })];
+    requests.extend(
+        ids.iter()
+            .map(|id| json!({ "instance": instance_id, "result": id })),
+    );
+    let answers = editor(&requests);
+    assert_eq!(
+        answers[0], ambiguous,
+        "CLI and editor return the same candidates"
+    );
+    assert_eq!(
+        answers[1..],
+        selected[..],
+        "CLI and editor select each firing identically"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
 }
 
 /// DR-0100 I1 production comparison. The inline and extracted sources admit

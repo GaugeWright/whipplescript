@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# dispatch: scripts/release-fleet.sh runs it on the packaged Linux and Windows archives before a release is published; it needs built archives, so it is outside the bar.
 set -euo pipefail
 
 if [[ "$#" -ne 1 ]]; then
