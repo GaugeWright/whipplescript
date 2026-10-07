@@ -789,7 +789,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
             protected_stores::create(&root, protected),
             |_| {},
         );
-        protected_stores::assert_sealed(&root, protected);
+        protected_stores::assert_sealed(&root, protected, protected_stores::FILING_CANARIES);
         let authority = Authority::new(&f);
         let fault = rusqlite::Connection::open(root.join("runtime.sqlite")).unwrap();
         fault
@@ -1051,7 +1051,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
                 .iter()
                 .any(|fact| fact.name == "tracker.file.completed"));
             drop(f);
-            protected_stores::assert_sealed(&root, protected);
+            protected_stores::assert_sealed(&root, protected, protected_stores::FILING_CANARIES);
             std::fs::remove_dir_all(root).unwrap();
             continue;
         }
@@ -1193,7 +1193,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
             after
         );
         drop(f);
-        protected_stores::assert_sealed(&root, protected);
+        protected_stores::assert_sealed(&root, protected, protected_stores::FILING_CANARIES);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

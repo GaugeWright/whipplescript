@@ -435,7 +435,7 @@ fn governed_tracker_wait_interruption_leaves_no_run_and_retries_after_disk_reope
                 |_| {},
             );
             close_and_project(&mut f, &issue);
-            protected_stores::assert_sealed(&root, protected);
+            protected_stores::assert_sealed(&root, protected, protected_stores::WAIT_CANARIES);
             let authority = Authority::new(&f);
             let instance = f.request.admission.instance_ref.clone();
             let before = f.facade.kernel().store().chain_prefix(&instance).unwrap();
@@ -545,7 +545,7 @@ fn governed_tracker_wait_interruption_leaves_no_run_and_retries_after_disk_reope
                 "completed"
             );
             drop(f);
-            protected_stores::assert_sealed(&root, protected);
+            protected_stores::assert_sealed(&root, protected, protected_stores::WAIT_CANARIES);
             std::fs::remove_dir_all(root).unwrap();
         }
     }

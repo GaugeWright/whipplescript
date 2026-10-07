@@ -93,31 +93,49 @@ pub(super) fn reopen(root: &Path, protected: bool) -> NativeStores {
     }
 }
 
+/// Customer content each governed fixture places in its workflow source,
+/// issue, input or closure. A canary is only evidence when the plaintext run
+/// of the same scenario shows that it reached storage.
+pub(super) const FILING_CANARIES: &[&str] = &["PRIVATE_TASK_BODY", "Create a chat"];
+pub(super) const CONTROL_CANARIES: &[&str] = &["PRIVATE_TASK_BODY", "Create a chat"];
+pub(super) const CLOSURE_CANARIES: &[&str] = &[
+    "PRIVATE_TASK_BODY",
+    "Create a chat",
+    "Self-reported completion",
+];
+pub(super) const WAIT_CANARIES: &[&str] = &["Complete this task", "Instructions", "Self-reported"];
+
 /// Inspect the real files, including live WAL copies. Logical decoded reads
 /// are asserted by the caller; this checks that those bytes did not also escape
 /// into the underlying runtime, tracker, or otherwise unused coordination store.
-pub(super) fn assert_sealed(root: &Path, protected: bool) {
-    if !protected {
-        return;
-    }
+/// The plaintext variant of the same scenario must contain every canary, so a
+/// canary the fixture never wrote cannot pass as protection.
+pub(super) fn assert_sealed(root: &Path, protected: bool, canaries: &[&str]) {
     let mut files = 0;
+    let mut seen = vec![false; canaries.len()];
     for entry in std::fs::read_dir(root).expect("list native fixture files") {
         let path = entry.expect("native fixture file").path();
         let bytes = std::fs::read(&path).expect("read native fixture bytes");
         files += 1;
-        for canary in [
-            "PRIVATE_TASK_BODY",
-            "Self-reported completion",
-            "Instructions",
-        ] {
+        for (index, canary) in canaries.iter().enumerate() {
+            let found = bytes
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes());
+            seen[index] |= found;
             assert!(
-                !bytes
-                    .windows(canary.len())
-                    .any(|window| window == canary.as_bytes()),
+                !(protected && found),
                 "private payload {canary:?} escaped into {}",
                 path.display(),
             );
         }
     }
     assert!(files >= 3, "fixture must inspect the actual native stores");
+    if !protected {
+        for (canary, seen) in canaries.iter().zip(seen) {
+            assert!(
+                seen,
+                "canary {canary:?} never reached plaintext storage, so it proves nothing"
+            );
+        }
+    }
 }

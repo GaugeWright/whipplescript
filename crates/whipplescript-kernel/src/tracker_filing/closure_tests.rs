@@ -549,7 +549,7 @@ fn governed_tracker_closure_recovers_its_committed_target_across_interrupted_pub
             |_| {},
             protected_stores::create(&root, protected),
         );
-        protected_stores::assert_sealed(&root, protected);
+        protected_stores::assert_sealed(&root, protected, protected_stores::CLOSURE_CANARIES);
         let fault = rusqlite::Connection::open(root.join("runtime.sqlite")).unwrap();
         fault.execute_batch("CREATE TRIGGER closure_settlement_fault AFTER INSERT ON events WHEN NEW.event_type = 'effect.terminal' BEGIN SELECT RAISE(ABORT, 'injected closure terminal fault'); END").unwrap();
         let error = f
@@ -653,7 +653,7 @@ fn governed_tracker_closure_recovers_its_committed_target_across_interrupted_pub
         );
         recovery::recover_and_continue(&mut f, &binding, expire);
         drop(f);
-        protected_stores::assert_sealed(&root, protected);
+        protected_stores::assert_sealed(&root, protected, protected_stores::CLOSURE_CANARIES);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

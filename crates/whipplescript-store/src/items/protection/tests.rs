@@ -803,3 +803,43 @@ fn discovery_never_exports_a_protected_tracker() {
     );
     assert!(!fixture.0.join(".rgignore").exists());
 }
+
+#[test]
+fn not_ready_control_receipt_seals_label_gated_reasons() {
+    use crate::tracker_control::{TrackerControlOutcome, TrackerControls};
+    let fixture = Fixture::new();
+    let codec = Arc::new(Codec::default());
+    let mut original =
+        WorkItemStore::create_protected(fixture.path(), protection(codec.clone())).unwrap();
+    let request = crate::tracker_control::conformance::setup(&mut original);
+    original
+        .add_wait(
+            &request.item_id,
+            &crate::items::readiness::WaitCondition::Count {
+                label: "demand-label-canary".into(),
+                at_least: 2,
+            },
+            "2090-01-01 00:00:00",
+            None,
+        )
+        .unwrap();
+    let receipt = original.control_issue_once(&request).unwrap();
+    let TrackerControlOutcome::NotReady { reasons } = &receipt.outcome else {
+        panic!("a label-gated claim is refused as not ready: {receipt:?}");
+    };
+    assert!(reasons.iter().any(|r| r.contains("demand-label-canary")));
+    for path in [fixture.path(), fixture.path().with_extension("sqlite-wal")] {
+        let raw = std::fs::read(path).unwrap();
+        assert!(!raw
+            .windows(b"demand-label-canary".len())
+            .any(|w| w == b"demand-label-canary"));
+    }
+    assert_eq!(
+        original.control_receipt(&request.operation_id).unwrap(),
+        Some(receipt.clone())
+    );
+    drop(original);
+    let mut reopened =
+        WorkItemStore::open_existing_protected(fixture.path(), protection(codec)).unwrap();
+    assert_eq!(reopened.control_issue_once(&request).unwrap(), receipt);
+}

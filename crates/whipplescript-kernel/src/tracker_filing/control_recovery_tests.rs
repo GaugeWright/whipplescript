@@ -426,7 +426,11 @@ fn governed_tracker_control_recovers_original_positive_and_negative_outcomes_aft
                     None
                 );
                 drop(f);
-                protected_stores::assert_sealed(&root, protected);
+                protected_stores::assert_sealed(
+                    &root,
+                    protected,
+                    protected_stores::CONTROL_CANARIES,
+                );
                 std::fs::remove_dir_all(root).unwrap();
             }
         }

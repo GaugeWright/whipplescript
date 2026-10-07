@@ -328,6 +328,9 @@ fn operational(kind: &str, payload: &Value) -> Value {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod inventory;
+
 // Shared native/hosted SQL stays portable. Native readers of those bounded
 // result sets open their payload cell through the same connection authority.
 pub(crate) fn read_event_payload(

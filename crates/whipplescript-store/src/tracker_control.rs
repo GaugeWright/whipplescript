@@ -140,6 +140,7 @@ impl TrackerControlReceipt {
             | (A::Renew { expires_at: want }, O::Renewed { expires_at: actual }) => want == actual,
             (A::Claim { .. }, O::AlreadyClaimed { holder })
             | (A::Release { .. }, O::HeldByOther { holder }) => !holder.trim().is_empty(),
+            (A::Claim { .. }, O::NotReady { reasons }) => !reasons.is_empty(),
             (A::Assign { .. }, O::AssignmentChanged { assignee }) => assignee
                 .as_ref()
                 .is_none_or(|actor| !actor.trim().is_empty()),

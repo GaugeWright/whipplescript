@@ -8,7 +8,11 @@ use crate::tracker_control::{
 fn receipt(connection: &Connection, operation: &str) -> StoreResult<Option<TrackerControlReceipt>> {
     let value: Option<String> = connection
         .query_row(
-            "SELECT receipt_json FROM tracker_control_receipts WHERE operation_id = ?1",
+            // A protected store seals the receipt: a NotReady outcome carries
+            // readiness reasons, which can name customer labels. A text row is
+            // plaintext, written by a plain store or before receipts were sealed.
+            "SELECT CASE typeof(receipt_json) WHEN 'blob' THEN whip_payload_open('tracker.control.receipt', operation_id, receipt_json) ELSE receipt_json END
+             FROM tracker_control_receipts WHERE operation_id = ?1",
             [operation],
             |row| row.get(0),
         )
@@ -194,7 +198,7 @@ impl WorkItemStore {
         };
         receipt.validate_for(request)?;
         tx.execute(
-            "INSERT INTO tracker_control_receipts (operation_id, receipt_json) VALUES (?1, ?2)",
+            "INSERT INTO tracker_control_receipts (operation_id, receipt_json) VALUES (?1, whip_payload_seal('tracker.control.receipt', ?1, ?2))",
             params![request.operation_id, serde_json::to_string(&receipt)?],
         )?;
         tx.commit()?;
