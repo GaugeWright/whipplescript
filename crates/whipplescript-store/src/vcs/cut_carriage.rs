@@ -30,7 +30,8 @@
 
 use super::*;
 use crate::branches::carried_cuts::{
-    CarriageDirection, CarriedCutRow, CarriedCuts, RecordCarriageOutcome,
+    CarriageDirection, CarriedCutRow, CarriedCuts, RecordCarriageOutcome, SeedCarriedTwig,
+    SeedCarriedTwigOutcome,
 };
 use crate::bundle::BundleBlob;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,21 @@ fn refuse<T>(reason: impl Into<String>) -> StoreResult<T> {
     )))
 }
 
+fn retained_manifest<C: ContentBlobs>(
+    content: &C,
+    root_hash: &str,
+) -> StoreResult<BTreeMap<String, String>> {
+    let Some(body) = content.get_text(root_hash)?.text() else {
+        return refuse(format!(
+            "carried step manifest `{root_hash}` is unavailable"
+        ));
+    };
+    if let Some(root) = crate::manifest_tree::parse_node(&body) {
+        return crate::manifest_tree::load_from(content, root);
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
 impl CarriedHeader {
     /// The canonical bytes the digest covers and a store records. Every map is
     /// a `BTreeMap`, so serialization order is the content's own order.
@@ -319,6 +335,83 @@ fn verify_blobs(header: &CarriedHeader, blobs: &[BundleBlob]) -> StoreResult<Ver
 }
 
 impl<B: Branches + CarriedCuts, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Seed one peer-local direct twig from a received carriage. The carriage
+    /// itself owns no ref; this operation publishes the twig, its local seed
+    /// cut, and a recoverable receipt together while all carried bytes are
+    /// retained. The peer mainline is only the local lineage parent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_peer_twig(
+        &mut self,
+        digest: &str,
+        twig_branch_id: &str,
+        expected_parent_cut_id: Option<&str>,
+        seed_cut_id: &str,
+        actor: &str,
+        intent: &str,
+        at: &str,
+    ) -> StoreResult<SeedCarriedTwigOutcome> {
+        if twig_branch_id.is_empty()
+            || twig_branch_id == MAINLINE_BRANCH_ID
+            || seed_cut_id.is_empty()
+            || actor.trim().is_empty()
+            || intent.trim().is_empty()
+        {
+            return refuse("twig seed requires a distinct twig, local cut, actor and intent");
+        }
+        let (row, header) = self.recorded_carriage(digest)?;
+        if row.direction != CarriageDirection::Received || header.kind == CarriedKind::PeerLine {
+            return refuse("a peer twig can be seeded only from a received cut or prefix");
+        }
+        self.verified_carried_steps(digest)?;
+        let head_manifest_hash = row
+            .step_manifest_hashes
+            .last()
+            .expect("recorded_carriage checked a nonempty step registry");
+        let mut retained = vec![row.record_id.clone()];
+        retained.extend(row.step_manifest_hashes.iter().cloned());
+        retained.extend(header.file_digests.keys().cloned());
+        let content = &self.content;
+        let branches = &mut self.branches;
+        content.publish_retained(&retained, || {
+            let Some(stored_header) = content.get(&row.record_id)? else {
+                return refuse("carried twig seed lost its recorded header");
+            };
+            if sha256_hex(&stored_header) != digest || stored_header != header.canonical_bytes()? {
+                return refuse("carried twig seed header differs from its digest");
+            }
+            for (step, hash) in header.steps.iter().zip(&row.step_manifest_hashes) {
+                if retained_manifest(content, hash)? != *step {
+                    return refuse("carried twig seed has a mismatched retained step");
+                }
+            }
+            for (id, expected) in &header.file_digests {
+                let Some(bytes) = content.get(id)? else {
+                    return refuse(format!("carried content `{id}` is unavailable"));
+                };
+                if &sha256_hex(&bytes) != expected {
+                    return refuse(format!("carried content `{id}` differs from the carriage"));
+                }
+            }
+            branches
+                .seed_carried_twig(SeedCarriedTwig {
+                    twig_branch_id,
+                    expected_parent_cut_id,
+                    seed_cut_id,
+                    carriage_digest: digest,
+                    head_manifest_hash,
+                    actor,
+                    intent,
+                    recorded_at: at,
+                })
+                .map_err(|error| match error {
+                    StoreError::Conflict(reason) => {
+                        StoreError::Conflict(format!("carried cut refused: {reason}"))
+                    }
+                    other => other,
+                })
+        })
+    }
+
     /// Ship one exact recorded cut. The carriage is registered here as sent,
     /// so a line a peer returns against it can be checked against what this
     /// host actually supplied. Moves no ref.
@@ -370,7 +463,7 @@ impl<B: Branches + CarriedCuts, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {
             return refuse(format!("branch `{branch_id}` does not exist"));
         };
-        let head = branch.head_cut_id.unwrap_or_default();
+        let head = branch.head_cut_id.clone().unwrap_or_default();
         if head == from_cut_id {
             return refuse("the line has no cut after its base");
         }

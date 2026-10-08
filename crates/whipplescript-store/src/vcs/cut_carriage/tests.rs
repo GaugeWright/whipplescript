@@ -1,4 +1,5 @@
 use super::*;
+use crate::branches::carried_cuts::SeedCarriedTwigOutcome;
 use crate::chunking::ChunkingConfig;
 use crate::vcs::NativeWorkspaceVcs;
 
@@ -63,14 +64,243 @@ fn peer_with_line(
         .expect("record")
         .receipt()
         .clone();
-    let base = peer.carried_head_manifest(&received.digest).expect("head");
-    peer.create_branch("twig", None, "main", "p1")
-        .expect("twig");
-    peer.import_diff("twig", &base, &[], "p_base", "p2")
-        .expect("seed the twig with the carried content");
+    peer.seed_peer_twig(
+        &received.digest,
+        "twig",
+        None,
+        "p_base",
+        "agent:peer",
+        "turn:one",
+        "p2",
+    )
+    .expect("seed the twig with the carried content");
     peer.write("twig", "c.md", Some("written on the peer"), "p_c1", "p3")
         .expect("write");
     (peer, received, carried)
+}
+
+#[test]
+fn a_received_cut_seeds_one_atomic_peer_local_twig_and_exact_retry() {
+    let mut home = seeded_home("seed-home");
+    let (carried, _) = home.export_carried_cut("h3", "t5").expect("export");
+    let dir = crate::scratch::path("whipplescript-carriage-seed-peer-reopen");
+    let open_peer = || {
+        let mut peer =
+            NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+                .expect("open peer");
+        peer.init("p0").expect("init peer");
+        peer
+    };
+    let mut peer = open_peer();
+    peer.record_carried_cut(&wire(&carried), "p0")
+        .expect("receive");
+    let before = refs(&peer);
+    assert_eq!(before.len(), 1, "receipt alone creates no twig");
+    let first = peer
+        .seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:one",
+            "turn:one",
+            "p1",
+        )
+        .expect("seed");
+    let SeedCarriedTwigOutcome::Seeded(receipt) = first else {
+        panic!("first seed must publish")
+    };
+    assert_eq!(receipt.carriage_digest, carried.digest);
+    assert_eq!(receipt.seed_cut_id, "p_base");
+    assert_eq!(receipt.parent_cut_id, None);
+    let twig = peer.get_branch("twig").expect("read").expect("twig");
+    assert_eq!(twig.parent_branch_id.as_deref(), Some("main"));
+    assert_eq!(twig.head_cut_id.as_deref(), Some("p_base"));
+    assert_eq!(
+        peer.cut_manifest("p_base").expect("manifest").expect("cut"),
+        carried.header.steps[0]
+    );
+    let cut = peer.branches.get_cut("p_base").expect("cut").expect("seed");
+    assert_eq!(
+        cut.origin.as_deref(),
+        Some(format!("carried-seed:{}", carried.digest).as_str())
+    );
+    let op = peer
+        .branches
+        .get_op("op-p_base")
+        .expect("op")
+        .expect("receipt");
+    assert_eq!(op.kind, "carried-seed");
+    drop(peer);
+    let mut peer = open_peer();
+    let retry = peer
+        .seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:one",
+            "turn:one",
+            "p2",
+        )
+        .expect("exact retry");
+    assert_eq!(
+        retry,
+        SeedCarriedTwigOutcome::AlreadySeeded(receipt.clone())
+    );
+    peer.write("twig", "later.md", Some("more"), "p_later", "p3")
+        .expect("later peer work");
+    assert_eq!(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:one",
+            "turn:one",
+            "p4"
+        )
+        .expect("retry after later work"),
+        SeedCarriedTwigOutcome::AlreadySeeded(receipt)
+    );
+    refused(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "changed",
+            "agent:one",
+            "turn:one",
+            "p5",
+        ),
+        "partial custody",
+    );
+    refused(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:other",
+            "turn:one",
+            "p5",
+        ),
+        "retry changes its meaning",
+    );
+    assert!(peer.branches.get_cut("changed").expect("cut").is_none());
+
+    let db = rusqlite::Connection::open(dir.join("branches.sqlite")).expect("open branch file");
+    let original_deltas: String = db
+        .query_row(
+            "SELECT deltas FROM ops WHERE op_id = 'op-p_base'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("original seed operation");
+    db.execute("UPDATE ops SET deltas = '[]' WHERE op_id = 'op-p_base'", [])
+        .expect("inject empty seed receipt");
+    refused(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:one",
+            "turn:one",
+            "p6",
+        ),
+        "no operation delta",
+    );
+    db.execute(
+        "UPDATE ops SET deltas = ?1 WHERE op_id = 'op-p_base'",
+        [&original_deltas],
+    )
+    .expect("restore original receipt");
+}
+
+#[test]
+fn a_colliding_seed_cut_rolls_back_the_new_twig_and_receipt() {
+    let mut home = seeded_home("seed-collision-home");
+    let (carried, _) = home.export_carried_cut("h3", "t5").expect("export");
+    let mut peer = vcs("seed-collision-peer");
+    peer.record_carried_cut(&wire(&carried), "p0")
+        .expect("receive");
+    peer.create_branch("other", None, "main", "p1")
+        .expect("other");
+    peer.write("other", "other.md", Some("old"), "taken", "p2")
+        .expect("other cut");
+    assert!(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "taken",
+            "agent:one",
+            "turn:one",
+            "p3"
+        )
+        .is_err(),
+        "a cut id already owned by another branch must not seed a twig"
+    );
+    assert!(peer.get_branch("twig").expect("twig").is_none());
+    assert_eq!(
+        peer.branches
+            .get_cut("taken")
+            .expect("cut")
+            .unwrap()
+            .branch_id,
+        "other"
+    );
+}
+
+#[test]
+fn twig_seeding_refuses_unreceived_missing_and_stale_inputs_without_partial_custody() {
+    let mut home = seeded_home("seed-refuse-home");
+    let (carried, _) = home.export_carried_cut("h3", "t5").expect("export");
+    refused(
+        home.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "h-seed",
+            "agent:one",
+            "turn:one",
+            "t6",
+        ),
+        "received cut or prefix",
+    );
+    let mut peer = vcs("seed-refuse-peer");
+    refused(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p-seed",
+            "agent:one",
+            "turn:one",
+            "p0",
+        ),
+        "not recorded",
+    );
+    peer.record_carried_cut(&wire(&carried), "p1")
+        .expect("receive");
+    peer.write("main", "local.md", Some("local"), "p-main", "p2")
+        .expect("move local parent");
+    refused(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p-seed",
+            "agent:one",
+            "turn:one",
+            "p3",
+        ),
+        "stale local parent",
+    );
+    assert!(peer.get_branch("twig").expect("branch").is_none());
+    assert!(peer.branches.get_cut("p-seed").expect("cut").is_none());
+    assert!(peer.branches.get_op("op-p-seed").expect("op").is_none());
 }
 
 #[test]
