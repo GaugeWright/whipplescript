@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::harness_loop::ToolSpec;
 use crate::host_protocol::HOST_PROTOCOL;
+use crate::import_coverage::{CurrentConstructBasis, CurrentImportBasis, NO_LOCK_DIGEST};
 use whipplescript_parser::IrProgram;
+use whipplescript_store::ProgramVersionView;
 
 pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
 pub const AGENT_PACKAGE_SCHEMA: &str = "whipplescript.agent_package.v0";
@@ -456,6 +458,44 @@ pub struct ResolvedPackage {
 }
 
 impl ResolvedPackage {
+    /// Recapture the std-only host import basis from this resolver's current
+    /// checked source and the host's shipped compiler and registry. The Home
+    /// supplies `expected_ref` from its journal; a stored witness is never a
+    /// source for these inputs. Native and hosted facades use the same check.
+    pub fn current_import_basis(
+        self,
+        expected_ref: &str,
+        view: &ProgramVersionView,
+        compiler_artifact_digest: &str,
+        embedded_std_manifests: &[(&str, &str)],
+    ) -> Result<CurrentImportBasis, String> {
+        if self.version_ref != expected_ref
+            || view.compiler_version != HOST_PROTOCOL
+            || self.source_hash != view.source_hash
+            || self.ir_hash != view.ir_hash
+            || self.agent != view.program_name
+        {
+            return Err("current host package differs from the admitted version".into());
+        }
+        let source_digest = self.checked_import_source_digest()?;
+        let registry = crate::construct_coverage::embedded_std_registry_for_program(
+            &self.program,
+            embedded_std_manifests,
+        )?;
+        Ok(CurrentImportBasis {
+            program: self.program,
+            program_source_digest: source_digest,
+            version_source_digest: Some(self.source_hash),
+            lock_digest: NO_LOCK_DIGEST.to_owned(),
+            compiler_artifact_digest: compiler_artifact_digest.to_owned(),
+            packages: Vec::new(),
+            construct_basis: Some(CurrentConstructBasis {
+                registry,
+                sources: Vec::new(),
+            }),
+        })
+    }
+
     /// The exact source that produced this checked IR. Public fields can be
     /// changed by a custom resolver, so they must still match the compiler's
     /// private snapshot before an accepting operation can claim a witness.
@@ -917,6 +957,46 @@ mod tests {
             .checked_import_source_digest()
             .unwrap_err()
             .contains("differs from its checked source"));
+    }
+
+    #[test]
+    fn current_host_import_basis_refuses_a_different_stored_version() {
+        let source = "workflow Method { agent assistant { provider owned profile \"repo-reader\" capacity 1 capabilities [] } }";
+        let resolved = ResolvedPackage::compile(
+            "package:v1",
+            source,
+            Some("Method"),
+            "assistant",
+            "Instructions.",
+            Vec::new(),
+            4,
+        )
+        .expect("checked package");
+        let admitted = ProgramVersionView {
+            program_id: "program".into(),
+            program_name: resolved.agent.clone(),
+            version_id: "version".into(),
+            source_hash: resolved.source_hash.clone(),
+            ir_hash: resolved.ir_hash.clone(),
+            compiler_version: HOST_PROTOCOL.into(),
+            analysis_summary_json: "{}".into(),
+        };
+        let current = resolved
+            .clone()
+            .current_import_basis("package:v1", &admitted, &"a".repeat(64), &[])
+            .expect("matching current basis");
+        assert_eq!(current.program_source_digest, sha256_hex(source.as_bytes()));
+
+        let changed = ProgramVersionView {
+            source_hash: "b".repeat(64),
+            ..admitted
+        };
+        assert_eq!(
+            resolved
+                .current_import_basis("package:v1", &changed, &"a".repeat(64), &[])
+                .expect_err("changed stored version must refuse"),
+            "current host package differs from the admitted version"
+        );
     }
 
     #[test]

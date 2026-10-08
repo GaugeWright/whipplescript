@@ -30,8 +30,8 @@
 
 use super::*;
 use crate::branches::carried_cuts::{
-    CarriageDirection, CarriedCutRow, CarriedCuts, RecordCarriageOutcome, SeedCarriedTwig,
-    SeedCarriedTwigOutcome,
+    existing_seed, CarriageDirection, CarriedCutRow, CarriedCuts, RecordCarriageOutcome,
+    SeedCarriedTwig, SeedCarriedTwigOutcome,
 };
 use crate::bundle::BundleBlob;
 use serde::{Deserialize, Serialize};
@@ -478,6 +478,33 @@ impl<B: Branches + CarriedCuts, C: ContentBlobs> WorkspaceVcs<B, C> {
             return refuse(format!(
                 "`{from_cut_id}` does not hold the carriage the line names as its base"
             ));
+        }
+        let Some(seed_cut) = self.branches.get_cut(from_cut_id)? else {
+            return refuse(format!("peer line base cut `{from_cut_id}` is missing"));
+        };
+        let seed_op = self.branches.get_op(&format!("op-{from_cut_id}"))?;
+        let (Some(actor), Some(intent)) = (seed_cut.actor.as_deref(), seed_cut.intent.as_deref())
+        else {
+            return refuse("peer line base has no authenticated seed actor and intent");
+        };
+        if existing_seed(
+            Some(&branch),
+            Some(&seed_cut),
+            seed_op.as_ref(),
+            SeedCarriedTwig {
+                twig_branch_id: branch_id,
+                expected_parent_cut_id: seed_cut.parent_cut_id.as_deref(),
+                seed_cut_id: from_cut_id,
+                carriage_digest: base_digest,
+                head_manifest_hash: &seed_cut.manifest_hash,
+                actor,
+                intent,
+                recorded_at: &seed_cut.recorded_at,
+            },
+        )
+        .is_err()
+        {
+            return refuse("peer line base has no exact atomic seed receipt");
         }
         self.export_carriage(
             CarriedKind::PeerLine,

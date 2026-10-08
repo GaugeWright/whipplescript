@@ -216,6 +216,35 @@ fn a_received_cut_seeds_one_atomic_peer_local_twig_and_exact_retry() {
         [&original_deltas],
     )
     .expect("restore original receipt");
+    db.execute(
+        "UPDATE branches SET parent_branch_id = 'unrelated' WHERE branch_id = 'twig'",
+        [],
+    )
+    .expect("inject broken seed lineage");
+    refused(
+        peer.export_peer_line("twig", "p_base", &carried.digest, "p7"),
+        "no exact atomic seed receipt",
+    );
+}
+
+#[test]
+fn a_matching_legacy_import_cannot_impersonate_a_carried_twig_seed() {
+    let mut home = seeded_home("legacy-seed-home");
+    let (carried, _) = home.export_carried_cut("h3", "t5").expect("export");
+    let mut peer = vcs("legacy-seed-peer");
+    peer.record_carried_cut(&wire(&carried), "p0")
+        .expect("receive");
+    let base = peer.carried_head_manifest(&carried.digest).expect("base");
+    peer.create_branch("rogue", None, "main", "p1")
+        .expect("branch");
+    peer.import_diff("rogue", &base, &[], "rogue-base", "p2")
+        .expect("legacy import");
+    peer.write("rogue", "later.md", Some("work"), "rogue-work", "p3")
+        .expect("work");
+    refused(
+        peer.export_peer_line("rogue", "rogue-base", &carried.digest, "p4"),
+        "authenticated seed actor and intent",
+    );
 }
 
 #[test]

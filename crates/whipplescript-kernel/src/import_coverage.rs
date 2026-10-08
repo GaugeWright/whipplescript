@@ -750,7 +750,17 @@ rule notify
             .program_import_witness(&admitted.version_id, &admitted.witness_digest)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.resource_fields.as_ref().unwrap().examined.len(), 3);
+        assert_eq!(
+            stored
+                .resource_fields
+                .as_ref()
+                .unwrap()
+                .examined
+                .iter()
+                .filter(|field| field.owner == "notes_store")
+                .count(),
+            3
+        );
         assert!(stored
             .resource_fields
             .as_ref()
@@ -805,7 +815,7 @@ rule notify
         let fields = stored.resource_fields.as_ref().unwrap();
         assert_eq!(
             fields.scope,
-            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2
+            ProgramResourceFieldScope::DeclaredFieldsAgentEffectAndTurnAccessV5
         );
         assert!(fields.examined.iter().any(|field| {
             field.owner == "worker"
@@ -821,6 +831,156 @@ rule notify
             .unwrap()
             .skills
             .clear();
+        assert!(!current_basis(&stored, &changed, &basis));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn checked_native_admission_revalidates_turn_access_narrowing() {
+        use whipplescript_store::program_imports::ProgramResourceField;
+
+        let source = include_str!("../../../examples/least-privilege-subagent.whip");
+        let compiled = whipplescript_parser::compile_program_with_root(source, Some("ReviewDocs"));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let source_digest = sha256_hex(source.as_bytes());
+        let basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: B,
+            packages: &[],
+        };
+        let mut kernel = crate::RuntimeKernel::new(
+            whipplescript_store::SqliteStore::open_in_memory().expect("store"),
+        );
+        let admitted = kernel
+            .create_program_version_for_compiled_program_with_imports(
+                crate::CompiledProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &crate::stable_hash_hex(source),
+                    compiler_version: "test",
+                },
+                &ir,
+                None,
+                &basis,
+                None,
+            )
+            .expect("checked admission");
+        let stored = kernel
+            .store()
+            .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+            .unwrap()
+            .unwrap();
+        assert!(stored
+            .resource_fields
+            .as_ref()
+            .unwrap()
+            .examined
+            .iter()
+            .any(|field| {
+                field.field == ProgramResourceField::EffectTurnAccessGrants
+                    && !field.values.is_empty()
+            }));
+        assert!(current_basis(&stored, &ir, &basis));
+        let mut changed = ir;
+        let grant = changed
+            .rules
+            .iter_mut()
+            .flat_map(|rule| &mut rule.metadata.effects)
+            .flat_map(|effect| &mut effect.access_grants)
+            .next()
+            .unwrap();
+        grant.operations[0].globs = vec!["private/**".into()];
+        assert!(!current_basis(&stored, &changed, &basis));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn checked_native_admission_revalidates_mint_endpoint_and_parent() {
+        use whipplescript_store::program_imports::ProgramResourceField;
+
+        let source = r#"
+@service
+workflow MintEgress
+
+use std.custody
+use std.ingress
+
+credential stripe_api { kind bearer }
+signal charge.disputed { note string }
+output result R
+class R { v string }
+
+rule scoped
+  when charge.disputed as charge
+=> {
+  mint credential from stripe_api {
+    at POST "https://connect.stripe.com/oauth/token"
+    header "Authorization" basic stripe_api
+    body "grant_type=client_credentials"
+    token at "access_token"
+  } as token
+  after token succeeds { complete result { v "minted" } }
+}
+"#;
+        let ir = program(source);
+        let source_digest = sha256_hex(source.as_bytes());
+        let basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: B,
+            packages: &[],
+        };
+        let mut kernel = crate::RuntimeKernel::new(
+            whipplescript_store::SqliteStore::open_in_memory().expect("store"),
+        );
+        let admitted = kernel
+            .create_program_version_for_compiled_program_with_imports(
+                crate::CompiledProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &crate::stable_hash_hex(source),
+                    compiler_version: "test",
+                },
+                &ir,
+                None,
+                &basis,
+                None,
+            )
+            .expect("checked admission");
+        let stored = kernel
+            .store()
+            .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+            .unwrap()
+            .unwrap();
+        let fields = &stored.resource_fields.as_ref().unwrap().examined;
+        assert!(fields.iter().any(|field| {
+            field.field == ProgramResourceField::EffectMintParent && field.values == ["stripe_api"]
+        }));
+        assert!(current_basis(&stored, &ir, &basis));
+        let mut changed_capability = ir.clone();
+        changed_capability
+            .rules
+            .iter_mut()
+            .flat_map(|rule| rule.metadata.effects.iter_mut())
+            .find(|effect| effect.mint_credential.is_some())
+            .unwrap()
+            .required_capabilities
+            .push("new.capability".into());
+        assert!(!current_basis(&stored, &changed_capability, &basis));
+        let mut changed = ir;
+        let mint = changed
+            .rules
+            .iter_mut()
+            .flat_map(|rule| rule.metadata.effects.iter_mut())
+            .find_map(|effect| effect.mint_credential.as_mut())
+            .unwrap();
+        mint.exchange.url = "https://other.invalid/token".into();
         assert!(!current_basis(&stored, &changed, &basis));
     }
 

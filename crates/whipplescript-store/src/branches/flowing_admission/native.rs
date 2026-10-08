@@ -842,8 +842,13 @@ impl FlowingAdmissions for BranchStore {
         let Some(fence) = flowing_fence::native::read_state(&tx, &request.source_branch_id)? else {
             return Ok(Refused(R::SourceMissing));
         };
-        if fence.kind != FlowingSourceKind::Twig {
-            return Ok(Refused(R::SourceNotDirectTwig));
+        let expected_kind = if source.name.is_some() {
+            FlowingSourceKind::Branch
+        } else {
+            FlowingSourceKind::Twig
+        };
+        if fence.kind != expected_kind {
+            return Ok(Refused(R::SourceKindMismatch));
         }
         if let Err(refusal) = check_fence(&fence, request) {
             return Ok(Refused(refusal));
@@ -957,7 +962,7 @@ impl FlowingAdmissions for BranchStore {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if handoff.is_some() {
+            if handoff.is_some() && source.name.is_none() {
                 return Ok(Refused(R::UnverifiedLineage {
                     unit_id: unit.unit_id.clone(),
                 }));
@@ -4324,7 +4329,7 @@ mod tests {
     }
 
     #[test]
-    fn handed_units_and_named_branches_wait_for_transitive_lineage_fencing() {
+    fn malformed_handoff_and_unrelated_named_source_cannot_admit() {
         let mut store = fixture();
         store
             .connection
@@ -4368,13 +4373,37 @@ mod tests {
         branch_request.source_incarnation_id = "branch-inc".into();
         assert_eq!(
             store.admit_flowing_prefix(&branch_request).unwrap(),
-            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::SourceNotDirectTwig)
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::SourceCutMismatch)
         );
         assert!(store
             .get_branch(MAINLINE_BRANCH_ID)
             .unwrap()
             .unwrap()
             .head_cut_id
+            .is_none());
+    }
+
+    #[test]
+    fn source_kind_mismatch_refuses_before_trunk_admission() {
+        let mut store = fixture();
+        let mut state = store.flowing_source("twig").unwrap().unwrap();
+        state.kind = FlowingSourceKind::Branch;
+        store
+            .connection
+            .execute(
+                "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'twig'",
+                [serde_json::to_string(&state).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .admit_flowing_prefix(&request("unit-a", "admission-a"))
+                .unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::SourceKindMismatch)
+        );
+        assert!(store
+            .flowing_admission_receipt("admission-a")
+            .unwrap()
             .is_none());
     }
 }

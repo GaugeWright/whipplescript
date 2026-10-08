@@ -1998,7 +1998,14 @@ rule finish
         let fields = witness
             .resource_fields
             .expect("resource fields inventoried");
-        assert_eq!(fields.examined.len(), 3);
+        assert_eq!(
+            fields
+                .examined
+                .iter()
+                .filter(|field| field.owner == "notes_store")
+                .count(),
+            3
+        );
         assert!(fields.examined.iter().any(|use_site| {
             use_site.owner == "notes_store"
                 && use_site.field == ProgramResourceField::FileStoreRoot
@@ -2046,13 +2053,94 @@ rule finish
             .expect("agent selectors inventoried");
         assert_eq!(
             fields.scope,
-            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2
+            ProgramResourceFieldScope::DeclaredFieldsAgentEffectAndTurnAccessV5
         );
         assert!(fields.examined.iter().any(|field| {
             field.owner == "worker"
                 && field.field == ProgramResourceField::AgentSkills
                 && field.values == ["whipplescript-author"]
         }));
+        assert!(fields.examined.iter().any(|field| {
+            field.field == ProgramResourceField::EffectHttpUrl && field.values.is_empty()
+        }));
+    }
+
+    #[test]
+    fn hosted_worker_persists_mint_exchange_reference_fields() {
+        use crate::do_store::{as_text, SqlValue};
+        use whipplescript_store::program_imports::ProgramResourceField;
+
+        let source = r#"
+@service
+workflow MintEgress
+
+use std.custody
+use std.ingress
+
+credential stripe_api { kind bearer }
+signal charge.disputed { note string }
+output result R
+class R { v string }
+
+rule scoped
+  when charge.disputed as charge
+=> {
+  mint credential from stripe_api {
+    at POST "https://connect.stripe.com/oauth/token"
+    header "Authorization" basic stripe_api
+    body "grant_type=client_credentials"
+    token at "access_token"
+  } as token
+  after token succeeds { complete result { v "minted" } }
+}
+"#;
+        let sql = store().sql;
+        let instance = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/MintEgress",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some("d".repeat(64)),
+                ..test_ports()
+            },
+            &[],
+            &[],
+        )
+        .expect("hosted mint source admits");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let version_id = &kernel.store().list_instances().unwrap()[0].version_id;
+        let rows = sql
+            .query(
+                "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+                &[SqlValue::Text(version_id.clone())],
+            )
+            .unwrap();
+        let witness = kernel
+            .store()
+            .program_import_witness(version_id, &as_text(&rows[0][0]))
+            .unwrap()
+            .unwrap();
+        let fields = witness.resource_fields.expect("mint fields inventoried");
+        assert!(fields.examined.iter().any(|field| {
+            field.field == ProgramResourceField::EffectMintParent && field.values == ["stripe_api"]
+        }));
+        assert!(fields.examined.iter().any(|field| {
+            field.field == ProgramResourceField::EffectMintExchangeUrl
+                && field.values == ["https://connect.stripe.com/oauth/token"]
+        }));
+        assert!(fields.examined.iter().any(|field| {
+            field.field == ProgramResourceField::EffectMintExchangeHeaderCredentials
+                && field.values == ["stripe_api"]
+        }));
+        assert!(fields
+            .examined
+            .iter()
+            .any(|field| { field.field == ProgramResourceField::EffectRequiredCapabilities }));
+        assert!(fields
+            .examined
+            .iter()
+            .any(|field| { field.field == ProgramResourceField::EffectResources }));
     }
 
     #[test]

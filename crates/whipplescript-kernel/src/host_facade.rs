@@ -331,6 +331,35 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         .map_err(HostFacadeError::Resolver)
     }
 
+    /// Recheck a Home-sealed import selection from package references retained
+    /// by the authenticated Home. This reads one target store and returns its
+    /// outside operations and gaps; the Home still owns the sealed population,
+    /// later-epoch use fence, and final ref-CAS recapture.
+    pub fn revalidate_selected_imports<P, F>(
+        &self,
+        selected_ids: &[String],
+        packages: &P,
+        mut package_ref_for_version: F,
+    ) -> Result<crate::import_coverage::SelectedImportCoverage, HostFacadeError>
+    where
+        P: PackageResolver + ?Sized,
+        F: FnMut(&whipplescript_store::ProgramVersionView) -> Option<String>,
+    {
+        crate::import_coverage::revalidate_selected(self.kernel.store(), selected_ids, |view| {
+            let package_ref = package_ref_for_version(view)?;
+            let package = packages.resolve_package(&package_ref).ok()?;
+            package
+                .current_import_basis(
+                    &package_ref,
+                    view,
+                    self.compiler_artifact_digest.as_deref()?,
+                    self.embedded_std_manifests?,
+                )
+                .ok()
+        })
+        .map_err(HostFacadeError::Store)
+    }
+
     pub fn from_signed_store_with_verifier<V: GovernanceAttestationVerifier + ?Sized>(
         store: S,
         epoch: u64,

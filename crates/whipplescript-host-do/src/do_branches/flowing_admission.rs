@@ -698,8 +698,13 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
             else {
                 return Ok(Refused(R::SourceMissing));
             };
-            if fence.kind != FlowingSourceKind::Twig {
-                return Ok(Refused(R::SourceNotDirectTwig));
+            let expected_kind = if source.name.is_some() {
+                FlowingSourceKind::Branch
+            } else {
+                FlowingSourceKind::Twig
+            };
+            if fence.kind != expected_kind {
+                return Ok(Refused(R::SourceKindMismatch));
             }
             if let Err(refusal) = check_fence(&fence, request) {
                 return Ok(Refused(refusal));
@@ -807,7 +812,7 @@ impl<S: DoSql> FlowingAdmissions for DoBranches<S> {
                         &[text(&unit.unit_id)],
                     )
                     .map_err(sql_err)?;
-                if !handoffs.is_empty() {
+                if !handoffs.is_empty() && source.name.is_none() {
                     return Ok(Refused(R::UnverifiedLineage {
                         unit_id: unit.unit_id.clone(),
                     }));
@@ -1770,6 +1775,75 @@ mod tests {
                     }
                     .unwrap();
                     assert_eq!(mismatch, NativeCandidateOutcome::CandidateMismatch);
+                }
+                if named {
+                    let witness = refs
+                        .candidate_witness(&candidate.candidate_witness_digest)
+                        .unwrap()
+                        .unwrap();
+                    refs.record_flowing_coverage_premises(&coverage_premises())
+                        .unwrap();
+                    let mut request = FlowingAdmissionRequest {
+                        op_id: "verify-attempt".into(),
+                        certificate_handle: String::new(),
+                        candidate_witness_digest: candidate.candidate_witness_digest.clone(),
+                        contribution_id: witness.contribution_id.clone(),
+                        revision_sequence: witness.revision_sequence,
+                        source_branch_id: witness.source_branch_id.clone(),
+                        source_incarnation_id: witness.source_incarnation_id.clone(),
+                        source_cut_id: witness.source_cut_id.clone(),
+                        source_manifest_hash: witness.source_manifest_hash.clone(),
+                        expected_eligibility_epoch: 0,
+                        expected_owner_epoch: 0,
+                        coordinator: "coordinator".into(),
+                        expected_trunk_cut_id: witness.expected_trunk_cut_id.clone(),
+                        candidate_cut_id: witness.candidate_cut_id.clone(),
+                        candidate_manifest_hash: witness.candidate_manifest_hash.clone(),
+                        units: witness.units.clone(),
+                        recorded_at: "t12".into(),
+                    };
+                    let mut certificate = certificate_for(&request);
+                    certificate.lineage_fences =
+                        whipplescript_store::branches::flowing_lineage::capture(&refs, &witness)
+                            .unwrap()
+                            .unwrap();
+                    certificate.unit_holders =
+                        whipplescript_store::branches::flowing_holders::capture(&refs, &witness)
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        certificate.unit_holders[0].handoff_op_id.as_deref(),
+                        Some("handoff")
+                    );
+                    request.certificate_handle = certificate.handle().unwrap();
+                    insert_gate_certificate(&sql, &certificate);
+                    if !no_op {
+                        let original = refs.contribution_handoff("unit").unwrap().unwrap();
+                        sql.execute(
+                            "UPDATE flowing_handoffs SET source_basis_digest = 'wrong' WHERE unit_id = 'unit'",
+                            &[],
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            refs.admit_flowing_prefix(&request).unwrap(),
+                            FlowingAdmissionOutcome::Refused(
+                                FlowingAdmissionRefusal::HolderUnavailable
+                            )
+                        );
+                        sql.execute(
+                            "UPDATE flowing_handoffs SET source_basis_digest = ?1 WHERE unit_id = 'unit'",
+                            &[text(&original.source_basis_digest)],
+                        )
+                        .unwrap();
+                    }
+                    assert!(matches!(
+                        refs.admit_flowing_prefix(&request).unwrap(),
+                        FlowingAdmissionOutcome::Admitted(_)
+                    ));
+                    assert_eq!(
+                        refs.admitted_unit_operation("unit").unwrap().as_deref(),
+                        Some("verify-attempt")
+                    );
                 }
             }
         }
@@ -4027,6 +4101,28 @@ mod tests {
                 .unwrap(),
             FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::UnverifiedLineage { .. })
         ));
+        assert!(store
+            .flowing_admission_receipt("admission-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn hosted_source_kind_mismatch_refuses_before_trunk_admission() {
+        let (sql, mut store) = fixture();
+        let mut state = store.flowing_source("twig").unwrap().unwrap();
+        state.kind = FlowingSourceKind::Branch;
+        sql.execute(
+            "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'twig'",
+            &[text(&serde_json::to_string(&state).unwrap())],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .admit_flowing_prefix(&request("unit-a", "admission-a"))
+                .unwrap(),
+            FlowingAdmissionOutcome::Refused(FlowingAdmissionRefusal::SourceKindMismatch)
+        );
         assert!(store
             .flowing_admission_receipt("admission-a")
             .unwrap()

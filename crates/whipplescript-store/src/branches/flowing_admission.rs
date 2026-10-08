@@ -3,10 +3,10 @@
 //! A gate attempt is disposable; an accepted unit is not. The ref entry and
 //! per-unit uniqueness index must commit with the trunk CAS so a second
 //! coordinator cannot admit a still-visible source prefix after a crash.
-//! This first store slice accepts only a direct twig: member-twig handoffs
-//! and named branches need transitive Hold/lineage checks. No host exposes
-//! this operation until candidate construction, gate certification and
-//! recovery are wired.
+//! The ref entry accepts a direct twig or one exact member-twig handoff into
+//! its named parent branch. Further transfers need an ordered transitive
+//! holder proof. The host does not expose admission until candidate
+//! construction, gate certification and recovery are wired.
 
 mod issuer;
 #[cfg(feature = "native")]
@@ -461,7 +461,7 @@ pub enum FlowingAdmissionRefusal {
     SourceMissing,
     SourceNotActive,
     SourceNotTrunkChild,
-    SourceNotDirectTwig,
+    SourceKindMismatch,
     WrongIncarnation,
     StaleEligibilityEpoch {
         current: i64,

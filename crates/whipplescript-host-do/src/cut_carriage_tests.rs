@@ -4,8 +4,12 @@
 
 use std::rc::Rc;
 
-use crate::do_branches::compose_vcs;
-use crate::do_store::test_support::RusqliteDoSql;
+use crate::do_branches::{compose_vcs, DoBranches};
+use crate::do_store::{test_support::RusqliteDoSql, DoSql};
+use whipplescript_store::branches::carried_cuts::{
+    CarriageDirection, CarriedCutRow, CarriedCuts, SeedCarriedTwig, SeedCarriedTwigOutcome,
+};
+use whipplescript_store::branches::Branches;
 use whipplescript_store::vcs::cut_carriage::{CarriageOutcome, CarriedCut, CarriedKind};
 use whipplescript_store::vcs::NativeWorkspaceVcs;
 
@@ -89,12 +93,38 @@ fn a_native_home_and_a_hosted_peer_carry_cuts_both_ways_by_content() {
         "{error:?}"
     );
 
-    // The peer writes a twig on the carried content and returns it.
-    let base = peer.carried_head_manifest(&received.digest).expect("head");
-    peer.create_branch("twig", None, "main", "p1")
-        .expect("twig");
-    peer.import_diff("twig", &base, &[], "p_base", "p2")
+    // Receipt moves no ref; the peer's local twig, cut and seed receipt move
+    // together, then a retry after a simulated crash returns that receipt.
+    let seeded = peer
+        .seed_peer_twig(
+            &received.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:peer",
+            "turn:one",
+            "p2",
+        )
         .expect("seed");
+    let SeedCarriedTwigOutcome::Seeded(seed_receipt) = seeded else {
+        panic!("first seed must publish")
+    };
+    assert_eq!(seed_receipt.carriage_digest, received.digest);
+    drop(peer);
+    let mut peer = compose_vcs(&sql).expect("reopen peer after seed");
+    assert_eq!(
+        peer.seed_peer_twig(
+            &received.digest,
+            "twig",
+            None,
+            "p_base",
+            "agent:peer",
+            "turn:one",
+            "p2-retry"
+        )
+        .expect("retry"),
+        SeedCarriedTwigOutcome::AlreadySeeded(seed_receipt)
+    );
     peer.write("twig", "notes.md", Some("peer notes"), "p1c", "p3")
         .expect("write");
     let (line, _) = peer
@@ -124,4 +154,172 @@ fn a_native_home_and_a_hosted_peer_carry_cuts_both_ways_by_content() {
         Some("home notes")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hosted_seed_rolls_back_twig_and_cut_when_its_receipt_fails() {
+    let dir = std::env::temp_dir().join(format!(
+        "do-carriage-seed-rollback-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let mut home =
+        NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+            .expect("home");
+    home.init("t0").expect("init");
+    home.create_branch("work", None, "main", "t1")
+        .expect("branch");
+    home.write("work", "a.whip", Some("flow a {}\n"), "h1", "t2")
+        .expect("write");
+    let (carried, _) = home.export_carried_cut("h1", "t3").expect("export");
+    let sql = Rc::new(RusqliteDoSql::in_memory());
+    let mut peer = compose_vcs(&sql).expect("peer");
+    peer.init("p0").expect("init");
+    peer.record_carried_cut(&wire(&carried), "p1")
+        .expect("receive");
+    sql.execute(
+        "CREATE TRIGGER fail_seed_receipt BEFORE INSERT ON ops \
+         WHEN NEW.kind = 'carried-seed' BEGIN SELECT RAISE(FAIL, 'injected receipt failure'); END",
+        &[],
+    )
+    .expect("install fault");
+    assert!(peer
+        .seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p-seed",
+            "agent:peer",
+            "turn:one",
+            "p2"
+        )
+        .is_err());
+    assert!(peer.get_branch("twig").expect("twig").is_none());
+    assert!(peer.get_cut("p-seed").expect("cut").is_none());
+    assert!(peer.get_op("op-p-seed").expect("op").is_none());
+    sql.execute("DROP TRIGGER fail_seed_receipt", &[])
+        .expect("remove fault");
+    assert!(matches!(
+        peer.seed_peer_twig(
+            &carried.digest,
+            "twig",
+            None,
+            "p-seed",
+            "agent:peer",
+            "turn:one",
+            "p3"
+        )
+        .expect("retry after rollback"),
+        SeedCarriedTwigOutcome::Seeded(_)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hosted_seed_backend_refuses_incomplete_or_stale_custody() {
+    let sql = Rc::new(RusqliteDoSql::in_memory());
+    let mut peer = compose_vcs(&sql).expect("peer");
+    peer.init("p0").expect("mainline");
+    let mut branches = DoBranches::observe(sql.clone());
+    let request = SeedCarriedTwig {
+        twig_branch_id: "twig",
+        expected_parent_cut_id: None,
+        seed_cut_id: "seed",
+        carriage_digest: "received",
+        head_manifest_hash: "manifest",
+        actor: "agent:peer",
+        intent: "turn:one",
+        recorded_at: "p1",
+    };
+    let refused = |result: whipplescript_store::StoreResult<SeedCarriedTwigOutcome>, text: &str| {
+        let error = result.expect_err("backend must refuse");
+        assert!(format!("{error:?}").contains(text), "{error:?}");
+    };
+
+    refused(branches.seed_carried_twig(request), "no received carriage");
+    branches
+        .record_carriage(&CarriedCutRow {
+            digest: "received".into(),
+            record_id: "header".into(),
+            kind: "cut".into(),
+            direction: CarriageDirection::Received,
+            step_manifest_hashes: vec!["manifest".into()],
+            recorded_at: "p0".into(),
+        })
+        .expect("record backend carriage");
+    refused(
+        branches.seed_carried_twig(SeedCarriedTwig {
+            head_manifest_hash: "other",
+            ..request
+        }),
+        "does not match a received cut or prefix",
+    );
+    sql.execute(
+        "UPDATE branches SET head_cut_id = 'later' WHERE branch_id = 'main'",
+        &[],
+    )
+    .expect("move mainline");
+    refused(branches.seed_carried_twig(request), "stale local parent");
+    assert!(branches.get_branch("twig").expect("twig").is_none());
+
+    let empty_sql = Rc::new(RusqliteDoSql::in_memory());
+    let mut empty = DoBranches::new(empty_sql).expect("schema without mainline");
+    empty
+        .record_carriage(&CarriedCutRow {
+            digest: "received".into(),
+            record_id: "header".into(),
+            kind: "cut".into(),
+            direction: CarriageDirection::Received,
+            step_manifest_hashes: vec!["manifest".into()],
+            recorded_at: "p0".into(),
+        })
+        .expect("record backend carriage");
+    refused(empty.seed_carried_twig(request), "no local mainline");
+}
+
+#[test]
+fn hosted_seed_backend_refuses_a_branch_lost_during_the_transaction() {
+    let sql = Rc::new(RusqliteDoSql::in_memory());
+    let mut peer = compose_vcs(&sql).expect("peer");
+    peer.init("p0").expect("mainline");
+    let mut branches = DoBranches::observe(sql.clone());
+    branches
+        .record_carriage(&CarriedCutRow {
+            digest: "received".into(),
+            record_id: "header".into(),
+            kind: "cut".into(),
+            direction: CarriageDirection::Received,
+            step_manifest_hashes: vec!["manifest".into()],
+            recorded_at: "p0".into(),
+        })
+        .expect("record backend carriage");
+    sql.execute(
+        "CREATE TRIGGER lose_seed_branch AFTER INSERT ON branches \
+         WHEN NEW.branch_id = 'twig' BEGIN DELETE FROM branches WHERE branch_id = 'twig'; END",
+        &[],
+    )
+    .expect("inject branch loss");
+    let error = branches
+        .seed_carried_twig(SeedCarriedTwig {
+            twig_branch_id: "twig",
+            expected_parent_cut_id: None,
+            seed_cut_id: "seed",
+            carriage_digest: "received",
+            head_manifest_hash: "manifest",
+            actor: "agent:peer",
+            intent: "turn:one",
+            recorded_at: "p1",
+        })
+        .expect_err("deleted branch must refuse");
+    assert!(
+        format!("{error:?}").contains("branch disappeared"),
+        "{error:?}"
+    );
+    assert!(branches.get_branch("twig").expect("twig").is_none());
+    assert!(branches.get_cut("seed").expect("cut").is_none());
+    assert!(branches.get_op("op-seed").expect("op").is_none());
 }

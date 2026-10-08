@@ -38,7 +38,9 @@ use whipplescript_kernel::host_facade::{
     ForkSourceHomeBasis, HostFacadeError, OpenInstanceHomeJournal, OpenInstanceOperationBasis,
     OpenInstanceOperationEvidence,
 };
-use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
+use whipplescript_kernel::import_coverage::{
+    self, CheckedImportBasis, SelectedImportCoverage, NO_LOCK_DIGEST,
+};
 use whipplescript_kernel::sansio::{
     HostDriver, HttpResponse, IoRequest, IoResult, ModelContentProvenance, TransportError,
 };
@@ -52,7 +54,7 @@ use whipplescript_kernel::{
 };
 use whipplescript_store::{
     payload_protection::PayloadProtection, EffectCancellationRequest, EvidenceRecord, NewEffect,
-    NewEvent, RuleCommit, SkillView, SqliteStore, StoreError,
+    NewEvent, ProgramVersionView, RuleCommit, SkillView, SqliteStore, StoreError,
 };
 
 use crate::host_protocol::{
@@ -2667,6 +2669,37 @@ impl GovernedHostRuntime {
             command_id: command_id.into(),
             protection: self.protection.clone(),
         }
+    }
+
+    /// Recheck one sealed selection against packages resolved now. The caller
+    /// supplies each version's package reference from the authenticated Home
+    /// journal, not from the stored import witness. The returned selection is
+    /// still only one target-store read: the Home must bind its seal, account
+    /// for outside operations, and recapture affected bases through ref CAS.
+    pub fn revalidate_selected_imports<P, F>(
+        &self,
+        selected_ids: &[String],
+        packages: &P,
+        mut package_ref_for_version: F,
+    ) -> Result<SelectedImportCoverage, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        F: FnMut(&ProgramVersionView) -> Option<String>,
+    {
+        import_coverage::revalidate_selected(self.kernel.store(), selected_ids, |view| {
+            let package_ref = package_ref_for_version(view)?;
+            let package = packages.resolve_package(&package_ref).ok()?;
+            let compiler_artifact_digest = native_compiler_artifact_digest().ok()?;
+            package
+                .current_import_basis(
+                    &package_ref,
+                    view,
+                    &compiler_artifact_digest,
+                    crate::std_manifests::EMBEDDED_STD_MANIFESTS,
+                )
+                .ok()
+        })
+        .map_err(HostRuntimeError::Store)
     }
 
     /// Create the durable WhippleScript instance for a chat. The returned opaque
@@ -6293,6 +6326,77 @@ workflow HostChat {
             .edges
             .iter()
             .all(|edge| { edge.provider_source_digest == witness.compiler_artifact_digest }));
+    }
+
+    #[test]
+    fn native_host_revalidates_a_sealed_selection_from_current_package_source() {
+        use whipplescript_kernel::import_coverage::ImportCoverageGap;
+
+        let path = temp_store();
+        let policy = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy).expect("runtime");
+        for request_id in ["first-checked", "second-checked"] {
+            runtime
+                .open_instance(
+                    &OpenInstanceCommand {
+                        protocol: HOST_PROTOCOL.to_owned(),
+                        request_id: request_id.to_owned(),
+                        package_version_ref: "package:v1".to_owned(),
+                        policy: runtime.policy_ref().clone(),
+                    },
+                    &Packages,
+                )
+                .expect("checked admission");
+        }
+        let roster = runtime
+            .kernel
+            .store()
+            .program_import_operation_roster()
+            .expect("roster");
+        assert_eq!(roster.operations.len(), 2);
+        let selected_id = roster.operations[0].operation_id.clone();
+        let selected = runtime
+            .revalidate_selected_imports(std::slice::from_ref(&selected_id), &Packages, |_| {
+                Some("package:v1".into())
+            })
+            .expect("selected coverage");
+        assert_eq!(selected.selected.len(), 1);
+        assert_eq!(selected.outside.len(), 1);
+        assert!(selected.gaps.is_empty());
+
+        for basis in [None, Some("package:v2".to_owned())] {
+            let unknown = runtime
+                .revalidate_selected_imports(std::slice::from_ref(&selected_id), &Packages, |_| {
+                    basis.clone()
+                })
+                .expect("unknown basis is a gap");
+            assert!(matches!(
+                unknown.gaps.as_slice(),
+                [ImportCoverageGap::NoCurrentBasis { operation_id, .. }]
+                    if operation_id == &selected_id
+            ));
+        }
+        let changed = runtime
+            .revalidate_selected_imports(
+                std::slice::from_ref(&selected_id),
+                &UnsafePackages,
+                |_| Some("package:v1".into()),
+            )
+            .expect("changed source is a gap");
+        assert!(matches!(
+            changed.gaps.as_slice(),
+            [ImportCoverageGap::NoCurrentBasis { operation_id, .. }]
+                if operation_id == &selected_id
+        ));
+        let missing = runtime
+            .revalidate_selected_imports(&["absent-operation".into()], &Packages, |_| {
+                panic!("a missing operation has no program basis")
+            })
+            .expect("missing selection is a gap");
+        assert!(matches!(
+            missing.gaps.as_slice(),
+            [ImportCoverageGap::MissingOperation { .. }]
+        ));
     }
 
     struct UnsafePackages;

@@ -1,7 +1,8 @@
 //! A checked, complete handoff prefix from one named branch to trunk.
 //!
-//! This prepares a candidate only. The ref admission path still refuses
-//! handed units until transitive policy and holder accounting are proved.
+//! This prepares a candidate only. The ref admission path accepts an exact
+//! one-hop handoff only after the candidate, source policy, holder receipt and
+//! gate certificate are independently recaptured under ref exclusion.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -325,11 +326,13 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
 mod tests {
     use super::*;
     use crate::branches::flowing_admission::{
-        FlowingCancelOutcome, FlowingCancelRequest, ReleaseFlowingAttemptOutcome,
-        RetainFlowingAttemptOutcome,
+        test_issuer, FlowingAdmissionOutcome, FlowingAdmissionRequest, FlowingAdmissions,
+        FlowingCancelOutcome, FlowingCancelRequest, FlowingGateCertificate, FlowingGateCheck,
+        FlowingGateVerdict, ReleaseFlowingAttemptOutcome, RetainFlowingAttemptOutcome,
     };
     use crate::branches::flowing_fence::{
-        FlowingFence, FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
+        FlowingFence, FlowingFenceAction, FlowingFenceTransition, FlowingSourceKind,
+        OpenFlowingSource, OpenFlowingSourceOutcome,
     };
     use crate::branches::flowing_sources::{
         BindContributionBasisOutcome, DeclareContribution, DeclareContributionOutcome,
@@ -538,6 +541,192 @@ mod tests {
                 .unwrap(),
             HandoffContributionOutcome::Transferred(_)
         ));
+    }
+
+    fn signed_branch_request(
+        vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
+        witness: &crate::branches::flowing_admission::FlowingCandidateWitness,
+        op_id: &str,
+        epoch: i64,
+    ) -> FlowingAdmissionRequest {
+        use crate::branches::flowing_coverage::{tests, FlowingCoveragePremises};
+
+        let premises: FlowingCoveragePremises = tests::premises();
+        vcs.branches
+            .record_flowing_coverage_premises(&premises)
+            .unwrap();
+        let lineage = crate::branches::flowing_lineage::capture(&vcs.branches, witness)
+            .unwrap()
+            .unwrap();
+        let holders = crate::branches::flowing_holders::capture(&vcs.branches, witness)
+            .unwrap()
+            .unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].handoff_op_id.as_deref(), Some("handoff-a"));
+        let certificate = FlowingGateCertificate {
+            candidate_witness_digest: witness.digest().unwrap(),
+            expected_trunk_cut_id: witness.expected_trunk_cut_id.clone(),
+            candidate_cut_id: witness.candidate_cut_id.clone(),
+            candidate_manifest_hash: witness.candidate_manifest_hash.clone(),
+            lineage_fences: lineage,
+            unit_holders: holders,
+            source_eligibility_epoch: epoch,
+            source_owner_epoch: 0,
+            coordinator: "coordinator".into(),
+            policy_digest: "sha256:branch-policy".into(),
+            rules_digest: "sha256:branch-rules".into(),
+            graph_coverage_digest: "sha256:branch-graph".into(),
+            coverage: Some(tests::basis_for(
+                &premises,
+                &witness.candidate_manifest_hash,
+            )),
+            required_checks: vec!["full-workspace-bar".into()],
+            checks: vec![FlowingGateCheck {
+                check_id: "full-workspace-bar".into(),
+                input_digest: "sha256:branch-input".into(),
+                evidence_digest: "sha256:branch-evidence".into(),
+                verdict: FlowingGateVerdict::Passed,
+            }],
+        };
+        let handle = certificate.handle().unwrap();
+        let db = vcs.branches.test_connection();
+        db.execute(
+            "INSERT INTO flowing_gate_certificates (handle, certificate_json) VALUES (?1, ?2)",
+            rusqlite::params![&handle, serde_json::to_string(&certificate).unwrap()],
+        )
+        .unwrap();
+        vcs.branches
+            .configure_flowing_gate_issuer(&test_issuer::trusted(test_issuer::ISSUER, 1, 7))
+            .unwrap();
+        vcs.branches
+            .record_flowing_gate_signature(&test_issuer::sign(&handle, test_issuer::ISSUER, 1, 7))
+            .unwrap();
+        FlowingAdmissionRequest {
+            op_id: op_id.into(),
+            certificate_handle: handle,
+            candidate_witness_digest: witness.digest().unwrap(),
+            contribution_id: witness.contribution_id.clone(),
+            revision_sequence: witness.revision_sequence,
+            source_branch_id: witness.source_branch_id.clone(),
+            source_incarnation_id: witness.source_incarnation_id.clone(),
+            source_cut_id: witness.source_cut_id.clone(),
+            source_manifest_hash: witness.source_manifest_hash.clone(),
+            expected_eligibility_epoch: epoch,
+            expected_owner_epoch: 0,
+            coordinator: "coordinator".into(),
+            expected_trunk_cut_id: witness.expected_trunk_cut_id.clone(),
+            candidate_cut_id: witness.candidate_cut_id.clone(),
+            candidate_manifest_hash: witness.candidate_manifest_hash.clone(),
+            units: witness.units.clone(),
+            recorded_at: "t-admit".into(),
+        }
+    }
+
+    #[test]
+    fn one_hop_named_branch_requires_fresh_holder_and_hold_fences_at_trunk_cas() {
+        let (mut vcs, revision) = handed_branch(None);
+        let NativeCandidateOutcome::Prepared(candidate) = vcs
+            .prepare_named_branch_candidate(&revision, None, "candidate-a", "coordinator", "t7")
+            .unwrap()
+        else {
+            panic!("complete named-branch candidate")
+        };
+        let witness = vcs
+            .branches
+            .candidate_witness(&candidate.candidate_witness_digest)
+            .unwrap()
+            .unwrap();
+        let request = signed_branch_request(&mut vcs, &witness, "admit-a", 0);
+        assert!(matches!(
+            vcs.branches
+                .retain_flowing_attempt("admit-a", &candidate.candidate_witness_digest, "t8")
+                .unwrap(),
+            RetainFlowingAttemptOutcome::Retained(_)
+        ));
+        vcs.verify_retained_native_candidate(
+            &revision,
+            &candidate.candidate_witness_digest,
+            "admit-a",
+        )
+        .unwrap();
+        let original = vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoffs SET source_basis_digest = 'wrong' WHERE unit_id = 'unit-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.branches.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(
+                crate::branches::flowing_admission::FlowingAdmissionRefusal::HolderUnavailable
+            )
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_handoffs SET source_basis_digest = ?1 WHERE unit_id = 'unit-a'",
+                [&original.source_basis_digest],
+            )
+            .unwrap();
+        let transition = |op_id: &str, epoch, action| FlowingFenceTransition {
+            op_id: op_id.into(),
+            source_branch_id: "branch".into(),
+            incarnation_id: "branch-inc".into(),
+            expected_eligibility_epoch: epoch,
+            expected_owner_epoch: 0,
+            actor: "coordinator".into(),
+            action,
+            recorded_at: "t9".into(),
+        };
+        vcs.branches
+            .transition_flowing_source(&transition("hold-a", 0, FlowingFenceAction::Hold))
+            .unwrap();
+        let mut held_request = request.clone();
+        held_request.expected_eligibility_epoch = 1;
+        assert_eq!(
+            vcs.branches.admit_flowing_prefix(&held_request).unwrap(),
+            FlowingAdmissionOutcome::Refused(
+                crate::branches::flowing_admission::FlowingAdmissionRefusal::Held
+            )
+        );
+        vcs.branches
+            .transition_flowing_source(&transition("release-a", 1, FlowingFenceAction::ReleaseHold))
+            .unwrap();
+        assert_eq!(
+            vcs.branches.admit_flowing_prefix(&request).unwrap(),
+            FlowingAdmissionOutcome::Refused(
+                crate::branches::flowing_admission::FlowingAdmissionRefusal::StaleEligibilityEpoch {
+                    current: 2,
+                }
+            )
+        );
+        let fresh = signed_branch_request(&mut vcs, &witness, "admit-a", 2);
+        assert!(matches!(
+            vcs.branches.admit_flowing_prefix(&fresh).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        assert_eq!(
+            vcs.branches
+                .admitted_unit_operation("unit-a")
+                .unwrap()
+                .as_deref(),
+            Some("admit-a")
+        );
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("candidate-a")
+        );
     }
 
     #[test]

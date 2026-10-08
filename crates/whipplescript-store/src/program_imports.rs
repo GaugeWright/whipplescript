@@ -85,6 +85,23 @@ pub enum ProgramResourceField {
     AgentRequires,
     AgentTools,
     AgentReturns,
+    EffectHttpUrl,
+    EffectHttpHeaderCredentials,
+    EffectHttpSignedWith,
+    EffectMintParent,
+    EffectMintExchangeUrl,
+    EffectMintExchangeHeaderCredentials,
+    EffectMintExchangeSignedWith,
+    EffectRequiredCapabilities,
+    EffectPromptResultType,
+    EffectTurnSkills,
+    EffectOnStream,
+    EffectSelectionSource,
+    EffectTransportOnto,
+    EffectResources,
+    EffectWorkflowTarget,
+    EffectExecPrincipal,
+    EffectTurnAccessGrants,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -105,6 +122,15 @@ pub enum ProgramResourceFieldMeaning {
     ProviderFeatureSelector,
     WorkflowToolSelector,
     ResultSchemaSelector,
+    HttpRequestUrlExpression,
+    CredentialHandle,
+    StreamHomingSelector,
+    SelectionExpression,
+    TransportTargetSelector,
+    ResourceSelector,
+    WorkflowSelector,
+    ExecPrincipalSelector,
+    TurnAccessGrant,
 }
 
 impl ProgramResourceField {
@@ -129,6 +155,24 @@ impl ProgramResourceField {
             Self::AgentRequires => ProgramResourceFieldMeaning::ProviderFeatureSelector,
             Self::AgentTools => ProgramResourceFieldMeaning::WorkflowToolSelector,
             Self::AgentReturns => ProgramResourceFieldMeaning::ResultSchemaSelector,
+            Self::EffectHttpUrl | Self::EffectMintExchangeUrl => {
+                ProgramResourceFieldMeaning::HttpRequestUrlExpression
+            }
+            Self::EffectHttpHeaderCredentials
+            | Self::EffectHttpSignedWith
+            | Self::EffectMintParent
+            | Self::EffectMintExchangeHeaderCredentials
+            | Self::EffectMintExchangeSignedWith => ProgramResourceFieldMeaning::CredentialHandle,
+            Self::EffectRequiredCapabilities => ProgramResourceFieldMeaning::CapabilitySelector,
+            Self::EffectPromptResultType => ProgramResourceFieldMeaning::ResultSchemaSelector,
+            Self::EffectTurnSkills => ProgramResourceFieldMeaning::SkillSelector,
+            Self::EffectOnStream => ProgramResourceFieldMeaning::StreamHomingSelector,
+            Self::EffectSelectionSource => ProgramResourceFieldMeaning::SelectionExpression,
+            Self::EffectTransportOnto => ProgramResourceFieldMeaning::TransportTargetSelector,
+            Self::EffectResources => ProgramResourceFieldMeaning::ResourceSelector,
+            Self::EffectWorkflowTarget => ProgramResourceFieldMeaning::WorkflowSelector,
+            Self::EffectExecPrincipal => ProgramResourceFieldMeaning::ExecPrincipalSelector,
+            Self::EffectTurnAccessGrants => ProgramResourceFieldMeaning::TurnAccessGrant,
         }
     }
 
@@ -150,7 +194,43 @@ impl ProgramResourceField {
             | Self::AgentRequires
             | Self::AgentTools
             | Self::AgentReturns => "agent",
+            Self::EffectHttpUrl
+            | Self::EffectHttpHeaderCredentials
+            | Self::EffectHttpSignedWith
+            | Self::EffectMintParent
+            | Self::EffectMintExchangeUrl
+            | Self::EffectMintExchangeHeaderCredentials
+            | Self::EffectMintExchangeSignedWith
+            | Self::EffectRequiredCapabilities
+            | Self::EffectPromptResultType
+            | Self::EffectTurnSkills
+            | Self::EffectOnStream
+            | Self::EffectSelectionSource
+            | Self::EffectTransportOnto
+            | Self::EffectResources
+            | Self::EffectWorkflowTarget
+            | Self::EffectExecPrincipal
+            | Self::EffectTurnAccessGrants => "effect",
         }
+    }
+
+    fn is_v4(self) -> bool {
+        matches!(
+            self,
+            Self::EffectRequiredCapabilities
+                | Self::EffectPromptResultType
+                | Self::EffectTurnSkills
+                | Self::EffectOnStream
+                | Self::EffectSelectionSource
+                | Self::EffectTransportOnto
+                | Self::EffectResources
+                | Self::EffectWorkflowTarget
+                | Self::EffectExecPrincipal
+        )
+    }
+
+    fn is_v5(self) -> bool {
+        self == Self::EffectTurnAccessGrants
     }
 
     fn max_values(self) -> Option<usize> {
@@ -160,10 +240,39 @@ impl ProgramResourceField {
             | Self::AgentSkills
             | Self::AgentCapabilities
             | Self::AgentRequires
-            | Self::AgentTools => None,
+            | Self::AgentTools
+            | Self::EffectRequiredCapabilities
+            | Self::EffectTurnSkills
+            | Self::EffectResources => None,
+            Self::EffectTurnAccessGrants => None,
+            Self::EffectHttpHeaderCredentials | Self::EffectMintExchangeHeaderCredentials => None,
             _ => Some(1),
         }
     }
+}
+
+/// Each value is one canonical JSON tuple of the resource and its ordered
+/// `(operation, target, globs)` clauses. Keep the nested shape visible to a
+/// future host resolver instead of flattening grants into ambiguous strings.
+fn valid_turn_access_grants(values: &[String]) -> bool {
+    let mut resources = BTreeSet::new();
+    values.iter().all(|value| {
+        let Ok((resource, operations)) =
+            serde_json::from_str::<(String, Vec<(String, Option<String>, Vec<String>)>)>(value)
+        else {
+            return false;
+        };
+        !resource.is_empty()
+            && resources.insert(resource.clone())
+            && !operations.is_empty()
+            && operations.iter().all(|(operation, target, globs)| {
+                !operation.is_empty()
+                    && target.as_ref().is_none_or(|target| !target.is_empty())
+                    && globs.iter().all(|glob| !glob.is_empty())
+            })
+            && serde_json::to_string(&(&resource, &operations))
+                .is_ok_and(|canonical| canonical == *value)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -172,6 +281,19 @@ pub enum ProgramResourceFieldScope {
     DeclaredFieldsV1,
     /// V1 resource fields plus the six reference-capable agent selectors.
     DeclaredFieldsAndAgentSelectorsV2,
+    /// V2 plus URL expressions and marked credential handles for every rule
+    /// effect's HTTP request or credential-mint exchange. This does not infer
+    /// endpoint identity from an expression or certify other effect operands.
+    DeclaredFieldsAgentAndHttpCredentialEffectsV3,
+    /// V3 plus the compiler's effect-level capability, schema, skill,
+    /// resource, workflow, stream, selection, transport and exec selectors.
+    /// Access-grant operation details and host-resolved identities remain
+    /// separate unknowns; source spellings are not live dependency edges.
+    DeclaredFieldsAgentAndEffectSelectorsV4,
+    /// V4 plus each effect's exact turn-access resource and operation clauses,
+    /// including target and glob narrowing. This does not resolve the grant
+    /// against a host resource or confer execution authority.
+    DeclaredFieldsAgentEffectAndTurnAccessV5,
 }
 
 /// An empty `values` preserves an omitted optional clause or an empty glob
@@ -742,11 +864,21 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
         let mut by_owner: BTreeMap<(&str, &str), BTreeSet<ProgramResourceField>> = BTreeMap::new();
         let invalid = !is_digest(&resources.digest)
             || resources.examined.iter().enumerate().any(|(index, field)| {
-                field.occurrence != index
-                    || field.owner.is_empty()
-                    || (resources.scope == ProgramResourceFieldScope::DeclaredFieldsV1
-                        && field.field.owner_kind() == "agent")
-                    || field.meaning != field.field.meaning()
+                field.occurrence != index || field.owner.is_empty() || match resources.scope {
+                    ProgramResourceFieldScope::DeclaredFieldsV1 => {
+                        matches!(field.field.owner_kind(), "agent" | "effect")
+                    }
+                    ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2 => {
+                        field.field.owner_kind() == "effect"
+                    }
+                    ProgramResourceFieldScope::DeclaredFieldsAgentAndHttpCredentialEffectsV3 => {
+                        field.field.is_v4() || field.field.is_v5()
+                    }
+                    ProgramResourceFieldScope::DeclaredFieldsAgentAndEffectSelectorsV4 => {
+                        field.field.is_v5()
+                    }
+                    ProgramResourceFieldScope::DeclaredFieldsAgentEffectAndTurnAccessV5 => false,
+                } || field.meaning != field.field.meaning()
                     || field.values.iter().any(String::is_empty)
                     || field
                         .field
@@ -754,6 +886,8 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
                         .is_some_and(|maximum| field.values.len() > maximum)
                     || (field.field == ProgramResourceField::FileStoreRoot
                         && field.values.len() != 1)
+                    || (field.field == ProgramResourceField::EffectTurnAccessGrants
+                        && !valid_turn_access_grants(&field.values))
                     || !by_owner
                         .entry((field.field.owner_kind(), &field.owner))
                         .or_default()
@@ -785,6 +919,62 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
                     ProgramResourceField::AgentRequires,
                     ProgramResourceField::AgentTools,
                     ProgramResourceField::AgentReturns,
+                ],
+                "effect"
+                    if resources.scope
+                        == ProgramResourceFieldScope::DeclaredFieldsAgentEffectAndTurnAccessV5 =>
+                {
+                    &[
+                        ProgramResourceField::EffectHttpUrl,
+                        ProgramResourceField::EffectHttpHeaderCredentials,
+                        ProgramResourceField::EffectHttpSignedWith,
+                        ProgramResourceField::EffectMintParent,
+                        ProgramResourceField::EffectMintExchangeUrl,
+                        ProgramResourceField::EffectMintExchangeHeaderCredentials,
+                        ProgramResourceField::EffectMintExchangeSignedWith,
+                        ProgramResourceField::EffectRequiredCapabilities,
+                        ProgramResourceField::EffectPromptResultType,
+                        ProgramResourceField::EffectTurnSkills,
+                        ProgramResourceField::EffectOnStream,
+                        ProgramResourceField::EffectSelectionSource,
+                        ProgramResourceField::EffectTransportOnto,
+                        ProgramResourceField::EffectResources,
+                        ProgramResourceField::EffectWorkflowTarget,
+                        ProgramResourceField::EffectExecPrincipal,
+                        ProgramResourceField::EffectTurnAccessGrants,
+                    ]
+                }
+                "effect"
+                    if resources.scope
+                        == ProgramResourceFieldScope::DeclaredFieldsAgentAndEffectSelectorsV4 =>
+                {
+                    &[
+                        ProgramResourceField::EffectHttpUrl,
+                        ProgramResourceField::EffectHttpHeaderCredentials,
+                        ProgramResourceField::EffectHttpSignedWith,
+                        ProgramResourceField::EffectMintParent,
+                        ProgramResourceField::EffectMintExchangeUrl,
+                        ProgramResourceField::EffectMintExchangeHeaderCredentials,
+                        ProgramResourceField::EffectMintExchangeSignedWith,
+                        ProgramResourceField::EffectRequiredCapabilities,
+                        ProgramResourceField::EffectPromptResultType,
+                        ProgramResourceField::EffectTurnSkills,
+                        ProgramResourceField::EffectOnStream,
+                        ProgramResourceField::EffectSelectionSource,
+                        ProgramResourceField::EffectTransportOnto,
+                        ProgramResourceField::EffectResources,
+                        ProgramResourceField::EffectWorkflowTarget,
+                        ProgramResourceField::EffectExecPrincipal,
+                    ]
+                }
+                "effect" => &[
+                    ProgramResourceField::EffectHttpUrl,
+                    ProgramResourceField::EffectHttpHeaderCredentials,
+                    ProgramResourceField::EffectHttpSignedWith,
+                    ProgramResourceField::EffectMintParent,
+                    ProgramResourceField::EffectMintExchangeUrl,
+                    ProgramResourceField::EffectMintExchangeHeaderCredentials,
+                    ProgramResourceField::EffectMintExchangeSignedWith,
                 ],
                 _ => unreachable!(),
             };
@@ -1123,6 +1313,223 @@ mod tests {
             encode(&checked),
             Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
         ));
+    }
+
+    #[test]
+    fn effect_http_scope_requires_all_fields_and_refuses_v2_mislabeling() {
+        use ProgramResourceField as Field;
+
+        let fields = [
+            (Field::EffectHttpUrl, vec!["url_expression".into()]),
+            (
+                Field::EffectHttpHeaderCredentials,
+                vec!["request_key".into()],
+            ),
+            (Field::EffectHttpSignedWith, vec![]),
+            (Field::EffectMintParent, vec![]),
+            (Field::EffectMintExchangeUrl, vec![]),
+            (Field::EffectMintExchangeHeaderCredentials, vec![]),
+            (Field::EffectMintExchangeSignedWith, vec![]),
+        ];
+        let examined = fields
+            .into_iter()
+            .enumerate()
+            .map(|(occurrence, (field, values))| ProgramResourceFieldUse {
+                occurrence,
+                owner: "[\"rule\",\"effect\"]".into(),
+                field,
+                meaning: field.meaning(),
+                values,
+            })
+            .collect::<Vec<_>>();
+        let mut checked = witness(LOCK);
+        checked.resource_fields = Some(ProgramResourceFieldCapture {
+            scope: ProgramResourceFieldScope::DeclaredFieldsAgentAndHttpCredentialEffectsV3,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+
+        let mut omitted = checked.clone();
+        let capture = omitted.resource_fields.as_mut().unwrap();
+        capture.examined.pop();
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(matches!(
+            encode(&omitted),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        checked.resource_fields.as_mut().unwrap().scope =
+            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2;
+        assert!(matches!(
+            encode(&checked),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+    }
+
+    #[test]
+    fn effect_selector_scope_keeps_v3_valid_and_refuses_v4_omissions_or_mislabeling() {
+        use ProgramResourceField as Field;
+
+        let fields = [
+            (Field::EffectHttpUrl, vec![]),
+            (Field::EffectHttpHeaderCredentials, vec![]),
+            (Field::EffectHttpSignedWith, vec![]),
+            (Field::EffectMintParent, vec![]),
+            (Field::EffectMintExchangeUrl, vec![]),
+            (Field::EffectMintExchangeHeaderCredentials, vec![]),
+            (Field::EffectMintExchangeSignedWith, vec![]),
+            (Field::EffectRequiredCapabilities, vec!["repo.read".into()]),
+            (Field::EffectPromptResultType, vec![]),
+            (Field::EffectTurnSkills, vec!["reviewer".into()]),
+            (Field::EffectOnStream, vec!["branch".into()]),
+            (Field::EffectSelectionSource, vec![]),
+            (Field::EffectTransportOnto, vec![]),
+            (Field::EffectResources, vec!["repo".into()]),
+            (Field::EffectWorkflowTarget, vec![]),
+            (Field::EffectExecPrincipal, vec![]),
+        ];
+        let examined = fields
+            .into_iter()
+            .enumerate()
+            .map(|(occurrence, (field, values))| ProgramResourceFieldUse {
+                occurrence,
+                owner: "[\"rule\",\"effect\"]".into(),
+                field,
+                meaning: field.meaning(),
+                values,
+            })
+            .collect::<Vec<_>>();
+        let mut checked = witness(LOCK);
+        checked.resource_fields = Some(ProgramResourceFieldCapture {
+            scope: ProgramResourceFieldScope::DeclaredFieldsAgentAndEffectSelectorsV4,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+
+        let mut omitted = checked.clone();
+        let capture = omitted.resource_fields.as_mut().unwrap();
+        capture.examined.pop();
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(matches!(
+            encode(&omitted),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        let mut mislabeled = checked.clone();
+        mislabeled.resource_fields.as_mut().unwrap().scope =
+            ProgramResourceFieldScope::DeclaredFieldsAgentAndHttpCredentialEffectsV3;
+        assert!(matches!(
+            encode(&mislabeled),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        let legacy_capture = checked.resource_fields.as_mut().unwrap();
+        legacy_capture.examined.truncate(7);
+        legacy_capture.scope =
+            ProgramResourceFieldScope::DeclaredFieldsAgentAndHttpCredentialEffectsV3;
+        legacy_capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&legacy_capture.examined).unwrap());
+        assert!(encode(&checked).is_ok());
+    }
+
+    #[test]
+    fn turn_access_scope_keeps_v4_valid_and_requires_canonical_grants() {
+        use ProgramResourceField as Field;
+
+        let mut checked = witness(LOCK);
+        let mut examined = [
+            Field::EffectHttpUrl,
+            Field::EffectHttpHeaderCredentials,
+            Field::EffectHttpSignedWith,
+            Field::EffectMintParent,
+            Field::EffectMintExchangeUrl,
+            Field::EffectMintExchangeHeaderCredentials,
+            Field::EffectMintExchangeSignedWith,
+            Field::EffectRequiredCapabilities,
+            Field::EffectPromptResultType,
+            Field::EffectTurnSkills,
+            Field::EffectOnStream,
+            Field::EffectSelectionSource,
+            Field::EffectTransportOnto,
+            Field::EffectResources,
+            Field::EffectWorkflowTarget,
+            Field::EffectExecPrincipal,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(occurrence, field)| ProgramResourceFieldUse {
+            occurrence,
+            owner: "[\"rule\",\"effect\"]".into(),
+            field,
+            meaning: field.meaning(),
+            values: vec![],
+        })
+        .collect::<Vec<_>>();
+        let digest = crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap());
+        checked.resource_fields = Some(ProgramResourceFieldCapture {
+            scope: ProgramResourceFieldScope::DeclaredFieldsAgentAndEffectSelectorsV4,
+            examined: examined.clone(),
+            digest,
+        });
+        assert!(encode(&checked).is_ok(), "old V4 witnesses stay valid");
+
+        let grant = serde_json::to_string(&(
+            "credential key",
+            vec![("unwrap", Some("Record"), Vec::<String>::new())],
+        ))
+        .unwrap();
+        examined.push(ProgramResourceFieldUse {
+            occurrence: examined.len(),
+            owner: "[\"rule\",\"effect\"]".into(),
+            field: Field::EffectTurnAccessGrants,
+            meaning: Field::EffectTurnAccessGrants.meaning(),
+            values: vec![grant.clone()],
+        });
+        let capture = checked.resource_fields.as_mut().unwrap();
+        capture.scope = ProgramResourceFieldScope::DeclaredFieldsAgentEffectAndTurnAccessV5;
+        capture.examined = examined;
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(encode(&checked).is_ok());
+
+        let mut old_scope = checked.clone();
+        old_scope.resource_fields.as_mut().unwrap().scope =
+            ProgramResourceFieldScope::DeclaredFieldsAgentAndEffectSelectorsV4;
+        assert!(encode(&old_scope).is_err());
+
+        let mut missing = checked.clone();
+        let capture = missing.resource_fields.as_mut().unwrap();
+        capture.examined.pop();
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(encode(&missing).is_err());
+
+        for invalid in [
+            "{\"resource\":\"credential key\"}".to_owned(),
+            format!(" {grant}"),
+            serde_json::to_string(&(
+                "credential key",
+                Vec::<(String, Option<String>, Vec<String>)>::new(),
+            ))
+            .unwrap(),
+        ] {
+            let mut malformed = checked.clone();
+            let capture = malformed.resource_fields.as_mut().unwrap();
+            capture.examined.last_mut().unwrap().values = vec![invalid];
+            capture.digest =
+                crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+            assert!(encode(&malformed).is_err());
+        }
+        let mut duplicate = checked;
+        let capture = duplicate.resource_fields.as_mut().unwrap();
+        capture.examined.last_mut().unwrap().values = vec![grant.clone(), grant];
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(encode(&duplicate).is_err());
     }
 
     #[test]

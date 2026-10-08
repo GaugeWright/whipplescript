@@ -365,6 +365,32 @@ workflow Method {
             .expect("checked declarations")
             .edges
             .is_empty());
+        let selected_id = roster.operations[0].operation_id.clone();
+        let selected = host
+            .revalidate_selected_imports(std::slice::from_ref(&selected_id), &package, |_| {
+                Some(package.version_ref().to_owned())
+            })
+            .expect("hosted current basis");
+        assert_eq!(selected.selected.len(), 1);
+        assert!(selected.outside.is_empty());
+        assert!(selected.gaps.is_empty());
+        let missing = host
+            .revalidate_selected_imports(std::slice::from_ref(&selected_id), &package, |_| None)
+            .expect("missing basis is a gap");
+        let forged = host
+            .revalidate_selected_imports(std::slice::from_ref(&selected_id), &supplied, |_| {
+                Some(package.version_ref().to_owned())
+            })
+            .expect("forged basis is a gap");
+        for gaps in [missing.gaps, forged.gaps] {
+            assert!(matches!(
+                gaps.as_slice(),
+                [whipplescript_kernel::import_coverage::ImportCoverageGap::NoCurrentBasis {
+                    operation_id,
+                    ..
+                }] if operation_id == &selected_id
+            ));
+        }
         let drifted = host
             .kernel_mut()
             .reattest_instance_program(
