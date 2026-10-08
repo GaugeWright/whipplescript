@@ -1,0 +1,169 @@
+{
+  "schema": "whipplescript.host_action_contract_pin.v7",
+  "contract_revision": "whipplescript-host-action/v7.0.0",
+  "authority": "WhippleScript DR-0207",
+  "operations": [
+    "admit_action",
+    "execute_action_file_effect",
+    "read_action_result",
+    "reconcile_effect",
+    "reconcile_versioned_save",
+    "execute_scoped_save_file_effect",
+    "reconcile_scoped_versioned_save",
+    "execute_resolution_recording",
+    "reconcile_resolution_recording",
+    "admit_action_with_inputs",
+    "execute_tracker_filing",
+    "execute_tracker_wait",
+    "execute_tracker_closure",
+    "recover_tracker_filing",
+    "recover_tracker_closure"
+  ],
+  "dispatch_kinds": [
+    "file.read",
+    "file.write",
+    "file.import",
+    "file.export",
+    "capability.call",
+    "tracker.file",
+    "tracker.finish"
+  ],
+  "message_types": [
+    "HostActionCommand",
+    "ActionAdmissionReceipt",
+    "ExecuteActionEffect",
+    "ReadActionResult",
+    "ActionResultSnapshot",
+    "ReconcileEffectCommand",
+    "ReconciliationReceipt",
+    "SaveReceipt",
+    "WriteEvidenceRef",
+    "ResolutionMemoryReceipt",
+    "ResolutionMemoryScope",
+    "ScopedSaveReceipt",
+    "ResolutionRecordingBinding",
+    "ResolutionRecordingInput",
+    "ClosureDispatch",
+    "FilingDispatch",
+    "RecoverTrackerResult",
+    "TrackerBinding",
+    "TrackerClosure",
+    "TrackerClosureBinding",
+    "TrackerClosureReceipt",
+    "TrackerFiling",
+    "TrackerFilingReceipt",
+    "ActionAnchor",
+    "ActFootprint",
+    "ActionFootprint"
+  ],
+  "type_aliases": {
+    "RecoverTrackerFiling": "RecoverTrackerResult",
+    "RecoverTrackerClosure": "RecoverTrackerResult"
+  },
+  "compatibility": {
+    "schema_validity_grants_authority": false,
+    "receipt_handles_grant_authority": false,
+    "reconciliation_advances_workflow": false,
+    "legacy_turn_decoding_changed": false,
+    "save_receipts_may_contain_protected_content": true,
+    "complete_product_mediation": false,
+    "namespace_identity_grants_authority": false,
+    "resolution_receipt_authorizes_recording": false,
+    "recording_inputs_may_contain_protected_content": true,
+    "recording_binding_grants_authority": false,
+    "batch_receipt_proves_input_serialization": false,
+    "reconciliation_rehydrates_content": false,
+    "tracker_requests_may_contain_protected_content": true,
+    "tracker_assignment_grants_authority": false,
+    "tracker_receipt_grants_authority": false,
+    "claim_holder_identifies_closing_actor": false,
+    "tracker_result_delivery_may_advance_workflow": true,
+    "recovery_reopens_expired_attempts": false,
+    "typed_input_materialization_grants_authority": false,
+    "current_read_authority_reissues_history": false,
+    "read_authority_grants_access": false,
+    "legacy_result_read_signing_changed": false,
+    "current_reconciliation_reissues_history": false,
+    "original_issuer_grants_authority": false,
+    "legacy_reconciliation_signing_changed": false,
+    "target_authority_is_original_locator": false,
+    "anchor_presence_grants_authority": false,
+    "footprint_proves_external_delivery": false,
+    "structural_counts_prove_runtime_counts": false,
+    "unanchored_signing_changed": false,
+    "unknown_fields_ignored": false
+  },
+  "canonicalization": {
+    "encoding": "UTF-8",
+    "object_key_order": "Unicode scalar order; not UTF-16 or RFC 8785",
+    "integers": "Exact u64/i64 JSON integers; do not normalize through binary floating point",
+    "optional_fields": "Normalize with the pinned Rust codec before signing; absent and explicit null optional fields share its typed meaning",
+    "signing_domain_terminator": "NUL byte; domains are defined by the pinned runtime protocol"
+  },
+  "tracker_profile": {
+    "provider": "builtin",
+    "filing": "tracker.file",
+    "closing": "tracker.finish",
+    "wait_capability": "tracker.wait_closed",
+    "recovery_protocol": "whipplescript.tracker-result-delivery.v1",
+    "source": "registered ordinary workflow",
+    "original_inputs": "immutable labeled references",
+    "assignment": "advisory; no read grant",
+    "claim_holder": "independent of closing actor"
+  },
+  "read_profile": {
+    "legacy_protocol": "whipplescript.action-result.v1",
+    "current_protocol": "whipplescript.action-result.v2",
+    "historical_coordinates": [
+      "issuer",
+      "scope",
+      "admission"
+    ],
+    "current_authority": "read_authority; exact verified envelope authority",
+    "policy_signer": "independent cryptographic signer; exact PolicyEpochRef",
+    "explicit_null_authority": "refused in both versions",
+    "result_snapshot_protocol": "whipplescript.action-result.v1"
+  },
+  "reconciliation_profile": {
+    "legacy_protocol": "whipplescript.effect-reconciliation.v1",
+    "current_protocol": "whipplescript.effect-reconciliation.v2",
+    "historical_coordinates": [
+      "original_issuer",
+      "scope",
+      "evidence.frame.action_admission"
+    ],
+    "current_authority": "issuer; exact verified envelope authority",
+    "policy_signer": "independent cryptographic signer; exact PolicyEpochRef",
+    "target_authority": "evidence.authority_ref; independent exact target authority",
+    "explicit_null_original_issuer": "refused in both versions",
+    "receipt_protocol": "whipplescript.effect-reconciliation.v1"
+  },
+  "footprint_profile": {
+    "protocol": "whipplescript.action-result.v4",
+    "signing_domain": "whipplescript:action-result:read:v4\u0000",
+    "legacy_anchored_reads": "refused",
+    "anchor_authority": "independent live held-claim verification; never inferred",
+    "counts": "runtime derives from actual acts; structural decoding does not validate totals",
+    "zero_act_share": null,
+    "opaque_and_unknown_kinds": "unobserved",
+    "snapshot_protocol": "whipplescript.action-result.v4"
+  },
+  "base_contract": {
+    "path": "spec/host-action-contract-v6.json",
+    "sha256": "0c6af28922540271ea75994d6e7650b50d18803d31adcab9a06d238dbdccc06d",
+    "contract_digest": "12081b319a28cf05d432708f2f1336732e7cde6e8c6e043726d37c0dfc1af6f0"
+  },
+  "wire_schema": {
+    "path": "spec/report-schemas/host_action_v7.schema.json",
+    "sha256": "5593513fde5b828160c43e914862c65869b61b6d400c012d13251f4d39cd20a4"
+  },
+  "fixtures": {
+    "path": "spec/host-action-contract-fixtures-v7.json",
+    "sha256": "4927d2eefe27776bc3bf5428a8dd898d9d1235266703b277056068c7191be8f1"
+  },
+  "codec_harness": {
+    "path": "crates/whipplescript-kernel/examples/host_action_contract_v7.rs",
+    "sha256": "5561a6b0b24f7588d7c5a314366587795d7d770440097407d418ce441a13b6d4"
+  },
+  "contract_digest": "b9e7fd85cec340210a5a0d97e8f9c5159fac2c42ba1c50d75889a96164b7a197"
+}

@@ -2624,3 +2624,32 @@ fn package_lock_rejects_invalid_field_types_and_hash_shape() {
             "{error}"
         );
 }
+
+#[test]
+fn native_child_refuses_missing_authority_before_opening_its_store() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let program = unique_test_path("missing-child-authority", "whip");
+    let source = fs::read_to_string(examples.join("file-store-demo.whip"))
+        .expect("owning actual example")
+        .replace("use std.files\n", "");
+    fs::write(&program, source).expect("source");
+    let store_path = unique_test_path("missing-child-authority-store", "sqlite");
+    let result = start_child_workflow_instance_in_package(
+        &store_path,
+        &program,
+        "FileStoreDemo",
+        "{}",
+        LOCAL_WORKFLOW_PACKAGE,
+        None,
+        ChildStartAuthority::non_delegating(),
+    );
+    let Err(StoreError::Conflict(message)) = result else {
+        panic!("expected authority refusal: {result:?}");
+    };
+    assert!(message.contains("requires `use std.files`"), "{message}");
+    assert!(
+        !store_path.exists(),
+        "refuse before opening or publishing child state"
+    );
+    fs::remove_file(program).expect("own cleanup");
+}

@@ -36157,7 +36157,7 @@ fn signal(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_for_execution(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -36511,7 +36511,7 @@ fn ingress_command(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_for_execution(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -36701,7 +36701,7 @@ fn message_command(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
-    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_for_execution(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };

@@ -19,6 +19,13 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Apply the settled authority-only admission compile to native signal, resident ingress and local message delivery, including retained legacy instances; preserve replay/schema/source checks, check-only liveness and the script runtime backstop (DR-0233, WS-326).
+
+- Publish the immutable host-action V7 contract for DR-0207 anchors and
+  negotiated V4 result footprints. V1–V6 bundles and unanchored signing bytes
+  remain unchanged; older reads refuse anchored admissions. Structural decoding
+  does not establish a held claim or validate runtime-derived footprint counts.
+
 - Rule-body optional cases route an omitted field to `None`, just like an
   explicit `null`, instead of binding the internal missing-value marker to `Some`.
 
