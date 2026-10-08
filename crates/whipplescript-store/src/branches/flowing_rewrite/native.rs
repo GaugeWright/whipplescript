@@ -43,7 +43,7 @@ fn read_receipt(
     .transpose()
 }
 
-fn read_units(db: &Connection, source: &str) -> StoreResult<Vec<RewriteUnitState>> {
+pub(crate) fn read_units(db: &Connection, source: &str) -> StoreResult<Vec<RewriteUnitState>> {
     let mut statement = db.prepare(
         "SELECT unit_id, pin_id, source_branch_id, source_cut_id, \
          source_manifest_hash, principal, intent, read_basis_digest, \

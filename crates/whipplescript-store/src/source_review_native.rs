@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
+use crate::branches::flowing_abandonment::FlowingAbandonments;
 use crate::branches::flowing_admission::FlowingAdmissions;
 use crate::branches::flowing_fence::{FlowingFence, FlowingSourceKind};
 use crate::branches::flowing_sources::FlowingSources;
@@ -71,7 +72,7 @@ impl ReviewStore {
     /// trunk base. The VCS proves complete source-unit coverage and records
     /// the immutable cut; this review store owns neither cut nor unit state.
     pub fn prepare_native_candidate<
-        B: Branches + FlowingSources + FlowingAdmissions,
+        B: Branches + FlowingSources + FlowingAdmissions + FlowingAbandonments,
         C: ContentBlobs,
     >(
         &self,
@@ -116,7 +117,7 @@ impl ReviewStore {
     /// Verify the retained candidate against this authority's original
     /// immutable review revision. Reading creates no candidate or receipt.
     pub fn verify_retained_native_candidate<
-        B: Branches + FlowingSources + FlowingAdmissions + FlowingFence,
+        B: Branches + FlowingSources + FlowingAdmissions + FlowingAbandonments + FlowingFence,
         C: ContentBlobs,
     >(
         &self,
@@ -347,7 +348,7 @@ impl ReviewStore {
     /// construction repeats the lineage and read-basis proof at its exact
     /// trunk base, and ref admission remains separately fenced.
     pub fn upload_named_branch_revision<
-        B: Branches + FlowingSources + FlowingAdmissions,
+        B: Branches + FlowingSources + FlowingAdmissions + FlowingAbandonments,
         C: ContentBlobs,
     >(
         &mut self,

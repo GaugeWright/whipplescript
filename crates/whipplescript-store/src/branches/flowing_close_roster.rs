@@ -34,6 +34,7 @@ pub enum FlowingCloseUnitState {
     Transferred { target_branch_id: String },
     Parked { op_id: String, holder_id: String },
     Admitted { op_id: String },
+    Abandoned { op_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,6 +226,7 @@ pub fn classify_unit(
     handoff: Option<(String, String)>,
     admitted_op: Option<String>,
     parked: Option<(String, String)>,
+    abandoned_op: Option<String>,
 ) -> StoreResult<FlowingCloseUnitState> {
     if original_source_branch_id.trim().is_empty()
         || handoff
@@ -236,15 +238,23 @@ pub fn classify_unit(
         || parked
             .as_ref()
             .is_some_and(|(op, holder)| op.trim().is_empty() || holder.trim().is_empty())
+        || abandoned_op
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
     {
         return Err(crate::StoreError::Conflict(
             "flowing close unit has an empty ref identity".into(),
         ));
     }
-    if admitted_op.is_some() && parked.is_some() {
+    if (admitted_op.is_some() as u8 + parked.is_some() as u8 + abandoned_op.is_some() as u8) > 1
+        || (abandoned_op.is_some() && handoff.is_some())
+    {
         return Err(crate::StoreError::Conflict(
-            "flowing unit is both admitted and parked".into(),
+            "flowing unit has conflicting terminal dispositions".into(),
         ));
+    }
+    if let Some(op_id) = abandoned_op {
+        return Ok(FlowingCloseUnitState::Abandoned { op_id });
     }
     if let Some(op_id) = admitted_op {
         return Ok(FlowingCloseUnitState::Admitted { op_id });
@@ -275,7 +285,7 @@ mod tests {
     #[test]
     fn classification_keeps_owed_and_terminal_states_distinct() {
         assert_eq!(
-            classify_unit("branch", "member".into(), None, None, None).unwrap(),
+            classify_unit("branch", "member".into(), None, None, None, None).unwrap(),
             FlowingCloseUnitState::OwedByMember {
                 branch_id: "member".into()
             }
@@ -285,6 +295,7 @@ mod tests {
                 "branch",
                 "member".into(),
                 Some(("handoff-1".into(), "branch".into())),
+                None,
                 None,
                 None
             )
@@ -298,6 +309,7 @@ mod tests {
                 None,
                 None,
                 Some(("park-1".into(), "holder-1".into())),
+                None,
             )
             .unwrap(),
             FlowingCloseUnitState::Parked {
@@ -311,13 +323,23 @@ mod tests {
             None,
             Some("admit-1".into()),
             Some(("park-1".into(), "holder-1".into())),
+            None,
         )
         .is_err());
-        assert!(classify_unit("branch", "member".into(), None, Some(" ".into()), None).is_err());
+        assert!(classify_unit(
+            "branch",
+            "member".into(),
+            None,
+            Some(" ".into()),
+            None,
+            None
+        )
+        .is_err());
         assert!(classify_unit(
             "branch",
             "member".into(),
             Some((" ".into(), "branch".into())),
+            None,
             None,
             None
         )

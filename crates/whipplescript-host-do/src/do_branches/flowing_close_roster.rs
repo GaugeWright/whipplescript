@@ -82,11 +82,12 @@ impl<S: DoSql> DoBranches<S> {
                 .sql
                 .query(
                     "SELECT unit.unit_id, unit.source_branch_id, handoff.op_id, handoff.target_branch_id, \
-                            admitted.op_id, parked.op_id, parked.holder_id \
+                            admitted.op_id, parked.op_id, parked.holder_id, abandoned.op_id \
                      FROM flowing_contributions AS unit \
                      LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
                      LEFT JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
                      LEFT JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+                     LEFT JOIN flowing_abandoned_units AS abandoned ON abandoned.unit_id = unit.unit_id \
                      WHERE unit.source_branch_id = ?1 \
                         OR unit.source_branch_id IN \
                            (SELECT branch_id FROM branches WHERE parent_branch_id = ?1) \
@@ -113,6 +114,7 @@ impl<S: DoSql> DoBranches<S> {
                             handoff,
                             as_opt_text(&row[4]),
                             parked,
+                            as_opt_text(&row[7]),
                         )?,
                         original_source_branch_id,
                         handoff_op_id,

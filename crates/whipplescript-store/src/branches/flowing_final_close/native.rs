@@ -9,10 +9,11 @@ use super::{
 };
 use crate::branches::flowing_close_roster::{self, FlowingCloseUnitState};
 use crate::branches::{
-    flowing_admission, flowing_member_parking, flowing_parking, flowing_sources, BranchStatus,
-    BranchStore,
+    flowing_abandonment, flowing_admission, flowing_member_parking, flowing_parking,
+    flowing_sources, BranchStatus, BranchStore,
 };
 use crate::{StoreError, StoreResult};
+use flowing_abandonment::native::read_receipt as read_abandonment_receipt;
 
 fn read_receipt(
     connection: &Connection,
@@ -96,8 +97,11 @@ fn verify_units(
     use FlowingCloseUnitState as S;
     use FlowingFinalCloseRefusal as R;
     let mut admissions = BTreeMap::new();
+    let mut abandonments = BTreeMap::new();
     let mut admitted_unit_ids = BTreeSet::new();
     let mut roster_admitted_unit_ids = BTreeSet::new();
+    let mut abandoned_unit_ids = BTreeSet::new();
+    let mut roster_abandoned_unit_ids = BTreeSet::new();
     let mut parked_units = Vec::new();
     let mut handoffs = Vec::new();
     let mut ancestry_checks = BTreeMap::new();
@@ -132,6 +136,27 @@ fn verify_units(
                 }
                 let key = (op_id.clone(), unit.unit_id.clone());
                 if !admitted_unit_ids.contains(&key) || !roster_admitted_unit_ids.insert(key) {
+                    return Ok(Err(mismatch()));
+                }
+            }
+            S::Abandoned { op_id } => {
+                if !abandonments.contains_key(op_id) {
+                    let receipt = read_abandonment_receipt(connection, "op_id", op_id)?;
+                    let Some(receipt) = receipt else {
+                        return Ok(Err(missing()));
+                    };
+                    if receipt.source_branch_id != roster.source_branch_id
+                        || receipt.source_incarnation_id != roster.source_fence.incarnation_id
+                    {
+                        return Ok(Err(mismatch()));
+                    }
+                    for selected in &receipt.units {
+                        abandoned_unit_ids.insert((op_id.clone(), selected.unit_id().to_owned()));
+                    }
+                    abandonments.insert(op_id.clone(), receipt);
+                }
+                let key = (op_id.clone(), unit.unit_id.clone());
+                if !abandoned_unit_ids.contains(&key) || !roster_abandoned_unit_ids.insert(key) {
                     return Ok(Err(mismatch()));
                 }
             }
@@ -205,8 +230,17 @@ fn verify_units(
             unit_id: unit_id.clone(),
         }));
     }
+    if let Some((_, unit_id)) = abandoned_unit_ids
+        .difference(&roster_abandoned_unit_ids)
+        .next()
+    {
+        return Ok(Err(R::UnitReceiptMismatch {
+            unit_id: unit_id.clone(),
+        }));
+    }
     Ok(Ok(FlowingCloseEvidence {
         admissions: admissions.into_values().collect(),
+        abandonments: abandonments.into_values().collect(),
         parked_units,
         handoffs,
     }))
@@ -724,6 +758,26 @@ mod tests {
         assert_eq!(
             store.get_branch("branch").unwrap().unwrap().status,
             BranchStatus::Active
+        );
+    }
+
+    #[test]
+    fn final_close_refuses_abandoned_unit_without_exact_receipt() {
+        let (mut store, _) = ready_with_head(true);
+        let mut roster = store.flowing_close_roster("branch").unwrap().unwrap();
+        roster.units.push(flowing_close_roster::FlowingCloseUnit {
+            unit_id: "missing-abandon".into(),
+            original_source_branch_id: "branch".into(),
+            handoff_op_id: None,
+            state: FlowingCloseUnitState::Abandoned {
+                op_id: "abandon-missing".into(),
+            },
+        });
+        assert_eq!(
+            verify_units(&store.connection, &roster).unwrap(),
+            Err(FlowingFinalCloseRefusal::UnitReceiptMissing {
+                unit_id: "missing-abandon".into(),
+            })
         );
     }
 

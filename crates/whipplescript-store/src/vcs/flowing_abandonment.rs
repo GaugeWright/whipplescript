@@ -6,6 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::branches::flowing_abandonment::{
+    CommitFlowingAbandonment, FlowingAbandonmentOutcome, FlowingAbandonments,
+};
 use crate::branches::flowing_admission::FlowingAdmissions;
 use crate::branches::flowing_fence::FlowingSourceKind;
 use crate::branches::flowing_sources::FlowingSources;
@@ -15,6 +18,13 @@ use crate::StoreResult;
 
 use super::flowing_selection::FlowingSourceAtom;
 use super::WorkspaceVcs;
+
+mod host;
+mod lineage;
+pub use host::{
+    FlowingHostAbandonedUnitV1, FlowingHostAbandonmentEvidenceV1, FLOWING_ABANDONMENT_EVIDENCE_V1,
+};
+pub use lineage::{FlowingAbandonmentLineage, FlowingAbandonmentLineageOutcome};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WholeTwigAbandonment {
@@ -59,7 +69,8 @@ impl WholeTwigAbandonment {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbandonedUnitBasis {
     unit_id: String,
     basis_digest: String,
@@ -90,7 +101,9 @@ pub enum WholeTwigAbandonmentOutcome {
     UnitBasisMismatch { unit_id: String },
 }
 
-impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> WorkspaceVcs<B, C> {
+impl<B: Branches + FlowingSources + FlowingAdmissions + FlowingAbandonments, C: ContentBlobs>
+    WorkspaceVcs<B, C>
+{
     /// Prove that every effective source atom belongs to exactly one still
     /// owed bound unit, and that replacing the whole twig head with its exact
     /// branch-point manifest removes all of those effects. A later writer
@@ -156,8 +169,37 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
             };
             if cut.branch_id != source_branch_id
                 || expected_manifest.as_deref() != Some(cut.manifest_hash.as_str())
-                || !matches!(cut.origin.as_deref(), Some(origin) if origin.starts_with("write:"))
             {
+                return Ok(R::UnsupportedLineage { cut_id });
+            }
+            if cut.origin.as_deref() == Some("flowing:abandon") {
+                let FlowingAbandonmentLineageOutcome::Verified(lineage) =
+                    self.verify_flowing_abandonment_lineage(&cut_id)?
+                else {
+                    return Ok(R::UnsupportedLineage { cut_id });
+                };
+                let receipt = lineage.receipt();
+                let Some(old) = self.branches.get_cut(&receipt.before_cut_id)? else {
+                    return Ok(R::UnsupportedLineage { cut_id });
+                };
+                if receipt.source_branch_id != source_branch_id
+                    || receipt.source_incarnation_id != fence.incarnation_id
+                    || receipt.branch_point_cut_id != source.branch_point_cut_id
+                    || receipt.branch_point_manifest_hash != source.branch_point_manifest_hash
+                    || receipt.after_manifest_hash != cut.manifest_hash
+                    || receipt.units.is_empty()
+                    || old.branch_id != source_branch_id
+                    || old.manifest_hash != receipt.before_manifest_hash
+                    || self.load_manifest(Some(&cut.manifest_hash))?
+                        != self.load_manifest(source.branch_point_manifest_hash.as_deref())?
+                {
+                    return Ok(R::UnsupportedLineage { cut_id });
+                }
+                expected_manifest = source.branch_point_manifest_hash.clone();
+                cursor = cut.parent_cut_id;
+                continue;
+            }
+            if !matches!(cut.origin.as_deref(), Some(origin) if origin.starts_with("write:")) {
                 return Ok(R::UnsupportedLineage { cut_id });
             }
             cut_manifests.insert(cut.cut_id.clone(), cut.manifest_hash.clone());
@@ -206,6 +248,23 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
         let mut owners = BTreeSet::new();
         let mut units = Vec::new();
         for declaration in self.branches.source_contributions(source_branch_id)? {
+            if let Some(op_id) = self
+                .branches
+                .abandoned_unit_operation(&declaration.unit_id)?
+            {
+                let Some(prior) = self.branches.flowing_abandonment_receipt(&op_id)? else {
+                    return Ok(R::IncompleteUnits);
+                };
+                if prior.source_branch_id != source_branch_id
+                    || !prior
+                        .units
+                        .iter()
+                        .any(|unit| unit.unit_id() == declaration.unit_id)
+                {
+                    return Ok(R::IncompleteUnits);
+                }
+                continue;
+            }
             if self
                 .branches
                 .contribution_handoff(&declaration.unit_id)?
@@ -318,5 +377,53 @@ impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> Workspac
             branch_point_manifest_hash: source.branch_point_manifest_hash,
             units,
         })))
+    }
+}
+
+impl<B: Branches + FlowingAbandonments, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Retain the replacement manifest and all old source evidence while the
+    /// ref authority commits head, operation and every unit disposition.
+    /// The embedding supplies an authenticated final Home/norm check under
+    /// its required exclusion; failure rolls back the entire ref entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_prepared_whole_twig_abandonment(
+        &mut self,
+        plan: &WholeTwigAbandonment,
+        op_id: &str,
+        begin_revision_op_id: &str,
+        after_cut_id: &str,
+        actor: &str,
+        recorded_at: &str,
+        check: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<FlowingAbandonmentOutcome> {
+        let point = self.load_manifest(plan.branch_point_manifest_hash())?;
+        let prepared = crate::content::publication::PreparedBlobs::new(&self.content);
+        let after_manifest_hash = crate::manifest_tree::build(&prepared, &point)?;
+        let mut retained: BTreeSet<String> = prepared.ids().into_iter().collect();
+        retained.extend(point.values().cloned());
+        retained.insert(plan.before_manifest_hash().to_owned());
+        if let Some(hash) = plan.branch_point_manifest_hash() {
+            retained.insert(hash.to_owned());
+        }
+        for atom in plan.units().iter().flat_map(|unit| unit.atoms()) {
+            retained.extend(atom.before.iter().cloned());
+            retained.extend(atom.after.iter().cloned());
+        }
+        let ids: Vec<String> = retained.into_iter().collect();
+        let branches = &mut self.branches;
+        self.content.publish_retained(&ids, || {
+            branches.commit_flowing_abandonment(
+                CommitFlowingAbandonment::new(
+                    op_id,
+                    begin_revision_op_id,
+                    plan,
+                    after_cut_id,
+                    &after_manifest_hash,
+                    actor,
+                    recorded_at,
+                ),
+                check,
+            )
+        })
     }
 }

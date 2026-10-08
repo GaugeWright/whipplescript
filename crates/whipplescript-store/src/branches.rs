@@ -16,6 +16,7 @@
 //! no-destructive-verbs surface).
 
 pub mod carried_cuts;
+pub mod flowing_abandonment;
 pub mod flowing_admission;
 pub mod flowing_close_host;
 pub mod flowing_close_roster;
@@ -1236,7 +1237,8 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// Version 16 adds parked-member receipts and terminal member status; an
 /// older writer could otherwise resume a member whose continuing holder owns it.
 /// Version 17 adds an atomic terminal close receipt and non-writable status.
-const SATELLITE_SCHEMA_VERSION: i64 = 17;
+/// Version 18 records complete flowing abandonment receipts and per-unit indexes.
+const SATELLITE_SCHEMA_VERSION: i64 = 18;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1260,6 +1262,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute(statement, [])?;
     }
     for statement in flowing_admission::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_abandonment::SCHEMA {
         connection.execute(statement, [])?;
     }
     for statement in flowing_parking::SCHEMA {

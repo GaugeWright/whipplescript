@@ -1,4 +1,5 @@
 use super::*;
+use whipplescript_store::branches::flowing_abandonment::FlowingAbandonments;
 use whipplescript_store::branches::flowing_admission::RetainFlowingAttemptOutcome;
 use whipplescript_store::branches::flowing_fence::{
     FlowingFence, FlowingSourceKind, OpenFlowingSource,
@@ -39,6 +40,7 @@ where
         + FlowingFence
         + FlowingRewrites
         + FlowingSources
+        + FlowingAbandonments
         + whipplescript_store::branches::flowing_admission::FlowingAdmissions,
     C: whipplescript_store::content::ContentBlobs,
 {

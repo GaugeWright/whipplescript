@@ -82,11 +82,12 @@ pub(crate) fn read_roster(
     let mut units = Vec::new();
     let mut statement = tx.prepare(
         "SELECT unit.unit_id, unit.source_branch_id, handoff.op_id, handoff.target_branch_id, \
-                    admitted.op_id, parked.op_id, parked.holder_id \
+                    admitted.op_id, parked.op_id, parked.holder_id, abandoned.op_id \
              FROM flowing_contributions AS unit \
              LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
              LEFT JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
              LEFT JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+             LEFT JOIN flowing_abandoned_units AS abandoned ON abandoned.unit_id = unit.unit_id \
              WHERE unit.source_branch_id = ?1 \
                 OR unit.source_branch_id IN \
                    (SELECT branch_id FROM branches WHERE parent_branch_id = ?1) \
@@ -102,6 +103,7 @@ pub(crate) fn read_roster(
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     for row in rows {
@@ -113,6 +115,7 @@ pub(crate) fn read_roster(
             admitted,
             parked_op,
             holder,
+            abandoned_op,
         ) = row?;
         let parked = complete_pair("parking", parked_op, holder)?;
         let handoff = complete_pair("handoff", handoff_op, handoff_target)?;
@@ -125,6 +128,7 @@ pub(crate) fn read_roster(
                 handoff,
                 admitted,
                 parked,
+                abandoned_op,
             )?,
             original_source_branch_id,
             handoff_op_id,

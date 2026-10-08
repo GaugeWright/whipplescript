@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::flowing_sources::exact_atomic;
 use super::DoBranches;
 use crate::do_store::{as_opt_text, as_text, opt_text, sql_err, text, DoSql};
+use whipplescript_store::branches::flowing_abandonment::FlowingAbandonments;
 use whipplescript_store::branches::flowing_admission::FlowingAdmissions;
 use whipplescript_store::branches::flowing_close_roster::{
     FlowingCloseRoster, FlowingCloseUnitState,
@@ -95,8 +96,11 @@ fn verify_units<S: DoSql>(
     use FlowingCloseUnitState as S;
     use FlowingFinalCloseRefusal as R;
     let mut admissions = BTreeMap::new();
+    let mut abandonments = BTreeMap::new();
     let mut admitted_unit_ids = BTreeSet::new();
     let mut roster_admitted_unit_ids = BTreeSet::new();
+    let mut abandoned_unit_ids = BTreeSet::new();
+    let mut roster_abandoned_unit_ids = BTreeSet::new();
     let mut parked_units = Vec::new();
     let mut handoffs = Vec::new();
     let mut ancestry_checks = BTreeMap::new();
@@ -133,8 +137,29 @@ fn verify_units<S: DoSql>(
                     return Ok(Err(mismatch()));
                 }
             }
+            S::Abandoned { op_id } => {
+                if !abandonments.contains_key(op_id) {
+                    let Some(receipt) = store.flowing_abandonment_receipt(op_id)? else {
+                        return Ok(Err(missing()));
+                    };
+                    if receipt.source_branch_id != roster.source_branch_id
+                        || receipt.source_incarnation_id != roster.source_fence.incarnation_id
+                    {
+                        return Ok(Err(mismatch()));
+                    }
+                    for selected in &receipt.units {
+                        abandoned_unit_ids.insert((op_id.clone(), selected.unit_id().to_owned()));
+                    }
+                    abandonments.insert(op_id.clone(), receipt);
+                }
+                let key = (op_id.clone(), unit.unit_id.clone());
+                if !abandoned_unit_ids.contains(&key) || !roster_abandoned_unit_ids.insert(key) {
+                    return Ok(Err(mismatch()));
+                }
+            }
             S::Parked { .. } => {
                 let Some(receipt) = store.parked_flowing_unit(&unit.unit_id)? else {
+                    // MUTATION-SUCCESS-EXPR: Ok(Ok(FlowingCloseEvidence { admissions: Vec::new(), abandonments: Vec::new(), parked_units: Vec::new(), handoffs: Vec::new() }))
                     return Ok(Err(missing()));
                 };
                 // The parked-unit reader checks the row's operation and
@@ -199,8 +224,17 @@ fn verify_units<S: DoSql>(
             unit_id: unit_id.clone(),
         }));
     }
+    if let Some((_, unit_id)) = abandoned_unit_ids
+        .difference(&roster_abandoned_unit_ids)
+        .next()
+    {
+        return Ok(Err(R::UnitReceiptMismatch {
+            unit_id: unit_id.clone(),
+        }));
+    }
     Ok(Ok(FlowingCloseEvidence {
         admissions: admissions.into_values().collect(),
+        abandonments: abandonments.into_values().collect(),
         parked_units,
         handoffs,
     }))
@@ -930,6 +964,29 @@ mod tests {
         };
         assert_eq!(receipt.unit_evidence.parked_units, vec![park.clone()]);
         assert_eq!(store.flowing_park_receipt("park-unit").unwrap(), Some(park));
+    }
+
+    #[test]
+    fn hosted_final_close_rejects_a_parked_roster_without_its_receipt() {
+        let (_, mut store, _) = ready_with_head(true);
+        let mut roster = store.flowing_close_roster("branch").unwrap().unwrap();
+        roster.units.push(
+            whipplescript_store::branches::flowing_close_roster::FlowingCloseUnit {
+                unit_id: "missing-park".into(),
+                original_source_branch_id: "branch".into(),
+                handoff_op_id: None,
+                state: FlowingCloseUnitState::Parked {
+                    op_id: "park-missing".into(),
+                    holder_id: "holder".into(),
+                },
+            },
+        );
+        assert_eq!(
+            verify_units(&store, &roster).unwrap(),
+            Err(FlowingFinalCloseRefusal::UnitReceiptMissing {
+                unit_id: "missing-park".into(),
+            })
+        );
     }
 
     #[test]

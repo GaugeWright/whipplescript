@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::branches::flowing_abandonment::FlowingAbandonments;
 use crate::branches::flowing_admission::{
     FlowingAdmissions, FlowingSelectedUnit, RetainFlowingAttemptOutcome,
 };
@@ -766,7 +767,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         recorded_at: &str,
     ) -> StoreResult<NativeCandidateOutcome>
     where
-        B: FlowingAdmissions,
+        B: FlowingAdmissions + FlowingAbandonments,
     {
         if actor.trim().is_empty() {
             return Ok(NativeCandidateOutcome::CandidateMismatch);
@@ -790,7 +791,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         candidate_cut_id: &str,
     ) -> StoreResult<NativeCandidateOutcome>
     where
-        B: FlowingAdmissions,
+        B: FlowingAdmissions + FlowingAbandonments,
     {
         use NativeCandidateOutcome as R;
         if candidate_cut_id.trim().is_empty() {
@@ -866,6 +867,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
 
         let mut cuts = Vec::new();
+        let mut abandonment_receipt = None;
         let mut cursor = Some(revision.source_cut_id.clone());
         let mut seen = BTreeSet::new();
         while cursor.as_deref() != expected_trunk_cut_id {
@@ -879,11 +881,46 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 return Ok(R::SourceMismatch);
             };
             if cut.branch_id != revision.source_branch_id
-                || !cut
-                    .origin
-                    .as_deref()
-                    .is_some_and(|origin| origin.starts_with("write:"))
                 || self.load_manifest_opt_raw(&cut.manifest_hash)?.is_none()
+            {
+                return Ok(R::SourceMismatch);
+            }
+            if cut.origin.as_deref() == Some("flowing:abandon") {
+                if abandonment_receipt.is_some() {
+                    return Ok(R::SourceMismatch);
+                }
+                let crate::vcs::flowing_abandonment::FlowingAbandonmentLineageOutcome::Verified(
+                    lineage,
+                ) = self.verify_flowing_abandonment_lineage(&id)?
+                else {
+                    return Ok(R::SourceMismatch);
+                };
+                let receipt = lineage.receipt();
+                let Some(old) = self.branches.get_cut(&receipt.before_cut_id)? else {
+                    return Ok(R::SourceMismatch);
+                };
+                if receipt.source_branch_id != revision.source_branch_id
+                    || receipt.source_incarnation_id != revision.source_incarnation_id
+                    || receipt.branch_point_cut_id.as_deref() != expected_trunk_cut_id
+                    || receipt.branch_point_manifest_hash != trunk.head_manifest_hash
+                    || receipt.after_cut_id != id
+                    || receipt.after_manifest_hash != cut.manifest_hash
+                    || receipt.units.is_empty()
+                    || old.branch_id != revision.source_branch_id
+                    || old.manifest_hash != receipt.before_manifest_hash
+                    || self.load_manifest(Some(&cut.manifest_hash))?
+                        != self.load_manifest(trunk.head_manifest_hash.as_deref())?
+                {
+                    return Ok(R::SourceMismatch);
+                }
+                abandonment_receipt = Some(receipt.clone());
+                cursor = cut.parent_cut_id;
+                continue;
+            }
+            if !cut
+                .origin
+                .as_deref()
+                .is_some_and(|origin| origin.starts_with("write:"))
             {
                 return Ok(R::SourceMismatch);
             }
@@ -951,6 +988,13 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 return Ok(R::UnitAlreadyAdmitted {
                     unit_id: unit.unit_id.clone(),
                 });
+            }
+            if self
+                .branches
+                .abandoned_unit_operation(&unit.unit_id)?
+                .is_some()
+            {
+                return Ok(R::IncompletePrefix);
             }
             let Some(declared) = self.branches.contribution_declaration(&unit.unit_id)? else {
                 return Ok(R::IncompletePrefix);
@@ -1152,16 +1196,30 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         if no_op != (expected_trunk_cut_id == Some(candidate_cut_id)) {
             return Ok(R::CandidateMismatch);
         }
-        let witness = serde_json::to_vec(&(
-            "native-closed-prefix-v1",
-            revision,
-            expected_trunk_cut_id,
-            &atoms,
-            &basis_evidence,
-            &outcomes,
-            candidate_cut_id,
-            &selected_cut.manifest_hash,
-        ))?;
+        let witness = if let Some(abandonment) = &abandonment_receipt {
+            serde_json::to_vec(&(
+                "native-closed-prefix-after-abandonment-v1",
+                revision,
+                expected_trunk_cut_id,
+                abandonment,
+                &atoms,
+                &basis_evidence,
+                &outcomes,
+                candidate_cut_id,
+                &selected_cut.manifest_hash,
+            ))?
+        } else {
+            serde_json::to_vec(&(
+                "native-closed-prefix-v1",
+                revision,
+                expected_trunk_cut_id,
+                &atoms,
+                &basis_evidence,
+                &outcomes,
+                candidate_cut_id,
+                &selected_cut.manifest_hash,
+            ))?
+        };
         let source_atoms_digest = format!("sha256:{}", crate::chunking::content_hash_hex(&witness));
         let candidate_witness = FlowingCandidateWitness {
             contribution_id: revision.contribution_id.clone(),
@@ -2284,7 +2342,7 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
         expr: &SelExpr,
     ) -> StoreResult<FlowingSelectionOutcome>
     where
-        B: crate::branches::flowing_rewrite::FlowingRewrites,
+        B: crate::branches::flowing_rewrite::FlowingRewrites + FlowingAbandonments,
     {
         if requires_unproved_semantics(expr) {
             return Ok(FlowingSelectionOutcome::UnsupportedSelection);
@@ -2330,6 +2388,40 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                         .any(|atom| atom.cut_id == pin.cut_id)
                 {
                     return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: pin.cut_id });
+                }
+                break;
+            }
+            // A committed whole-twig disposition is a new empty source
+            // frontier. Its old atoms stay in the receipt, not in a later
+            // declaration's selection universe.
+            if cut.origin.as_deref() == Some("flowing:abandon") {
+                let crate::vcs::flowing_abandonment::FlowingAbandonmentLineageOutcome::Verified(
+                    abandonment_lineage,
+                ) = self.verify_flowing_abandonment_lineage(&cut.cut_id)?
+                else {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: cut.cut_id });
+                };
+                let receipt = abandonment_lineage.receipt();
+                let Some(fence) = self.branches.flowing_source(&pin.twig_branch_id)? else {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: cut.cut_id });
+                };
+                let Some(old) = self.branches.get_cut(&receipt.before_cut_id)? else {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: cut.cut_id });
+                };
+                if pin.cut_id == cut.cut_id
+                    || lineage.is_empty()
+                    || receipt.source_branch_id != pin.twig_branch_id
+                    || receipt.source_incarnation_id != fence.incarnation_id
+                    || receipt.branch_point_cut_id != branch.branch_point_cut_id
+                    || receipt.branch_point_manifest_hash != branch.branch_point_manifest_hash
+                    || receipt.after_cut_id != cut.cut_id
+                    || receipt.after_manifest_hash != cut.manifest_hash
+                    || old.branch_id != pin.twig_branch_id
+                    || old.manifest_hash != receipt.before_manifest_hash
+                    || self.load_manifest(Some(&cut.manifest_hash))?
+                        != self.load_manifest(branch.branch_point_manifest_hash.as_deref())?
+                {
+                    return Ok(FlowingSelectionOutcome::UnsupportedLineage { cut_id: cut.cut_id });
                 }
                 break;
             }
@@ -2848,6 +2940,183 @@ mod tests {
             actor: "coordinator",
             recorded_at,
         }
+    }
+
+    #[test]
+    fn direct_twig_candidate_after_abandonment_uses_only_new_unit_atoms() {
+        use crate::branches::flowing_abandonment::FlowingAbandonmentOutcome;
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome;
+
+        let (mut vcs, mut reviews) = reviewed_two_unit_twig();
+        upload_two_units(&vcs, &mut reviews, &["unit-a", "unit-b"]);
+        let WholeTwigAbandonmentOutcome::Prepared(plan) =
+            vcs.prepare_whole_twig_abandonment("twig").unwrap()
+        else {
+            panic!("old source units are complete");
+        };
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-abandon".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    expected_eligibility_epoch: 0,
+                    expected_owner_epoch: 0,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some("twig-b".into()),
+                        after_cut_id: "abandoned".into(),
+                    },
+                    recorded_at: "t7".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "coordinator",
+                "t8",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingAbandonmentOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "finish-abandon".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    expected_eligibility_epoch: 1,
+                    expected_owner_epoch: 0,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::FinishRevision {
+                        begin_op_id: "begin-abandon".into()
+                    },
+                    recorded_at: "t9".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            reviews
+                .prepare_native_candidate(
+                    &mut vcs,
+                    native_candidate_request("candidate-old-after-abandon", "t9"),
+                )
+                .unwrap(),
+            NativeCandidateOutcome::SourceMismatch,
+        );
+        vcs.write("twig", "c.txt", Some("C"), "twig-c", "t10")
+            .unwrap();
+        pin(&mut vcs, "twig-c", "pin-c");
+        declare_native(&mut vcs, "unit-c", "pin-c", Some("abandoned"), &[], None);
+        let FlowingSelectionOutcome::Selected(selected) = vcs
+            .select_private_changes("pin-c", &selection::parse("change(twig-c)").unwrap())
+            .unwrap()
+        else {
+            panic!("post-abandonment selection");
+        };
+        assert_eq!(selected.changes().len(), 1);
+        assert_eq!(selected.changes()[0].cut_id, "twig-c");
+        vcs.bind_private_selection("unit-c", &selected, "t11")
+            .unwrap();
+        reviews
+            .create_native_contribution(
+                "review-after",
+                "s:author",
+                "new unit",
+                MAINLINE_BRANCH_ID,
+                &[],
+            )
+            .unwrap();
+        reviews
+            .upload_native_revision(
+                &vcs.branches,
+                NativeUpload {
+                    contribution_id: "review-after",
+                    upload_id: "upload-after",
+                    actor: "s:author",
+                    source_branch_id: "twig",
+                    source_cut_id: "twig-c",
+                    unit_ids: &["unit-c"],
+                },
+            )
+            .unwrap();
+        let outcome = reviews
+            .prepare_native_candidate(
+                &mut vcs,
+                NativeCandidateRequest {
+                    contribution_id: "review-after",
+                    sequence: 1,
+                    expected_trunk_cut_id: None,
+                    candidate_cut_id: "candidate-after",
+                    actor: "coordinator",
+                    recorded_at: "t12",
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, NativeCandidateOutcome::Prepared(_)),
+            "{outcome:?}"
+        );
+
+        let WholeTwigAbandonmentOutcome::Prepared(second) =
+            vcs.prepare_whole_twig_abandonment("twig").unwrap()
+        else {
+            panic!("later unit remains abandonable");
+        };
+        assert_eq!(
+            second
+                .units()
+                .iter()
+                .map(|unit| unit.unit_id())
+                .collect::<Vec<_>>(),
+            ["unit-c"]
+        );
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-abandon-again".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "inc-1".into(),
+                    expected_eligibility_epoch: second.source_eligibility_epoch(),
+                    expected_owner_epoch: 0,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some("twig-c".into()),
+                        after_cut_id: "abandoned-again".into(),
+                    },
+                    recorded_at: "t13".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &second,
+                "abandon-again",
+                "begin-abandon-again",
+                "abandoned-again",
+                "coordinator",
+                "t14",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingAbandonmentOutcome::Committed(_)
+        ));
+        let crate::vcs::flowing_abandonment::FlowingAbandonmentLineageOutcome::Verified(lineage) =
+            vcs.verify_flowing_abandonment_lineage("abandoned-again")
+                .unwrap()
+        else {
+            panic!("both historical dispositions verify");
+        };
+        assert_eq!(lineage.source_atoms().len(), 1);
+        assert_eq!(lineage.source_atoms()[0].cut_id, "twig-c");
     }
 
     #[test]

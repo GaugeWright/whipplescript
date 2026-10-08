@@ -6,7 +6,7 @@
 //! A separate finish-revision transition can recover after a crash here.
 
 #[cfg(feature = "native")]
-mod native;
+pub(crate) mod native;
 
 use std::collections::{BTreeMap, BTreeSet};
 

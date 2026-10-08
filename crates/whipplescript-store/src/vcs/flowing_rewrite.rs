@@ -521,7 +521,8 @@ mod tests {
     };
     use crate::branches::flowing_sources::{
         BindContributionBasis, BindContributionBasisOutcome, DeclareContribution,
-        DeclareContributionOutcome, PinPrivateCut, PinPrivateCutOutcome,
+        DeclareContributionOutcome, PinPrivateCut, PinPrivateCutOutcome, ReleasePrivateCut,
+        ReleasePrivateCutOutcome,
     };
     use crate::branches::{BranchStore, MAINLINE_BRANCH_ID};
     use crate::content::ContentStore;
@@ -694,6 +695,1075 @@ mod tests {
                 cut_id: "rebased".into()
             }
         );
+    }
+
+    fn begin_abandonment(
+        vcs: &mut WorkspaceVcs<BranchStore, ContentStore>,
+        plan: &crate::vcs::flowing_abandonment::WholeTwigAbandonment,
+    ) {
+        assert!(matches!(
+            vcs.branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "begin-abandon".into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: plan.source_incarnation_id().into(),
+                    expected_eligibility_epoch: plan.source_eligibility_epoch(),
+                    expected_owner_epoch: plan.source_owner_epoch(),
+                    actor: "s:author".into(),
+                    action: FlowingFenceAction::BeginRevision {
+                        before_cut_id: Some(plan.before_cut_id().into()),
+                        after_cut_id: "abandoned".into(),
+                    },
+                    recorded_at: "t5".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn whole_twig_abandonment_ref_entry_requires_active_unreserved_exact_revision() {
+        use crate::branches::flowing_abandonment::{
+            check_current as check_abandonment_current, AbandonUnitState,
+            FlowingAbandonmentReceipt, FlowingAbandonmentRefusal as R,
+        };
+        use crate::branches::BranchStatus;
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        let source = vcs.branches.get_branch("twig").unwrap().unwrap();
+        begin_abandonment(&mut vcs, &plan);
+        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+        let units: Vec<_> = vcs
+            .branches
+            .source_contributions("twig")
+            .unwrap()
+            .into_iter()
+            .map(|declaration| AbandonUnitState {
+                basis: vcs
+                    .branches
+                    .contribution_basis(&declaration.unit_id)
+                    .unwrap(),
+                pin: vcs.branches.private_cut_pin(&declaration.pin_id).unwrap(),
+                handed_off: false,
+                admitted: false,
+                parked: false,
+                abandoned: false,
+                declaration,
+            })
+            .collect();
+        let receipt = FlowingAbandonmentReceipt {
+            op_id: "abandon-op".into(),
+            begin_revision_op_id: "begin-abandon".into(),
+            source_branch_id: plan.source_branch_id().into(),
+            source_incarnation_id: plan.source_incarnation_id().into(),
+            source_eligibility_epoch_before_revision: plan.source_eligibility_epoch(),
+            source_owner_epoch: plan.source_owner_epoch(),
+            before_cut_id: plan.before_cut_id().into(),
+            before_manifest_hash: plan.before_manifest_hash().into(),
+            branch_point_cut_id: plan.branch_point_cut_id().map(str::to_owned),
+            branch_point_manifest_hash: plan.branch_point_manifest_hash().map(str::to_owned),
+            after_cut_id: "abandoned".into(),
+            after_manifest_hash: "replacement-manifest".into(),
+            units: plan.units().to_vec(),
+            actor: "s:author".into(),
+            recorded_at: "t6".into(),
+        };
+        let check = |source, fence, reserved| {
+            check_abandonment_current(&receipt, source, fence, reserved, &units)
+        };
+        assert!(check(Some(source.clone()), Some(fence.clone()), false).is_ok());
+        let mut invalid = receipt.clone();
+        invalid.op_id.clear();
+        assert_eq!(
+            check_abandonment_current(
+                &invalid,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &units,
+            ),
+            Err(R::Invalid)
+        );
+        assert_eq!(
+            check(None, Some(fence.clone()), false),
+            Err(R::SourceMissing)
+        );
+        let mut inactive = source.clone();
+        inactive.status = BranchStatus::Discarded;
+        assert_eq!(
+            check(Some(inactive), Some(fence.clone()), false),
+            Err(R::SourceNotActive)
+        );
+        assert_eq!(
+            check(Some(source.clone()), Some(fence.clone()), true),
+            Err(R::HeadReserved)
+        );
+        let mut moved = source.clone();
+        moved.head_cut_id = Some("another-cut".into());
+        assert_eq!(
+            check(Some(moved), Some(fence.clone()), false),
+            Err(R::SourceMoved)
+        );
+        assert_eq!(
+            check(Some(source.clone()), None, false),
+            Err(R::RevisionMissing)
+        );
+        let mut missing_revision = fence.clone();
+        missing_revision.revision = None;
+        assert_eq!(
+            check(Some(source.clone()), Some(missing_revision), false),
+            Err(R::RevisionMissing)
+        );
+        let mut wrong_revision = fence.clone();
+        wrong_revision.owner_epoch += 1;
+        assert_eq!(
+            check(Some(source.clone()), Some(wrong_revision), false),
+            Err(R::RevisionMismatch)
+        );
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &units[..1],
+            ),
+            Err(R::UnitRosterChanged)
+        );
+        let mut unknown_unit = units.clone();
+        unknown_unit[0].declaration.unit_id = "unknown-unit".into();
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &unknown_unit,
+            ),
+            Err(R::UnitRosterChanged)
+        );
+        let mut terminal_unit = units.clone();
+        terminal_unit[0].admitted = true;
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &terminal_unit,
+            ),
+            Err(R::UnitNoLongerOwed {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut duplicate_unit = units.clone();
+        duplicate_unit[1] = duplicate_unit[0].clone();
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &duplicate_unit,
+            ),
+            Err(R::UnitRosterChanged)
+        );
+        let mut missing_basis = units.clone();
+        missing_basis[0].basis = None;
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &missing_basis,
+            ),
+            Err(R::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut missing_pin = units.clone();
+        missing_pin[0].pin = None;
+        assert_eq!(
+            check_abandonment_current(
+                &receipt,
+                Some(source.clone()),
+                Some(fence.clone()),
+                false,
+                &missing_pin,
+            ),
+            Err(R::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+        let mut wrong_basis = units.clone();
+        wrong_basis[0].basis.as_mut().unwrap().basis_digest = "wrong".into();
+        assert_eq!(
+            check_abandonment_current(&receipt, Some(source), Some(fence), false, &wrong_basis,),
+            Err(R::UnitBasisChanged {
+                unit_id: "unit-a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn whole_twig_abandonment_moves_head_and_disposes_every_unit_atomically() {
+        use crate::branches::flowing_abandonment::{
+            FlowingAbandonmentOutcome as A, FlowingAbandonments,
+        };
+        use crate::branches::flowing_close_roster::{
+            FlowingCloseRosterReader, FlowingCloseUnitState,
+        };
+        use crate::vcs::flowing_abandonment::FlowingAbandonmentLineageOutcome as L;
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        let point = vcs
+            .load_manifest(plan.branch_point_manifest_hash())
+            .unwrap();
+        begin_abandonment(&mut vcs, &plan);
+        let A::Committed(receipt) = vcs
+            .commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("committed");
+        };
+        assert_eq!(receipt.units.len(), 2);
+        let close_roster = vcs.branches.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(close_roster.units.len(), 2);
+        assert!(close_roster.units.iter().all(|unit| matches!(
+            &unit.state,
+            FlowingCloseUnitState::Abandoned { op_id } if op_id == "abandon-op"
+        )));
+        let L::Verified(lineage) = vcs.verify_flowing_abandonment_lineage("abandoned").unwrap()
+        else {
+            panic!("retained history independently verifies the disposition");
+        };
+        assert_eq!(lineage.receipt(), &receipt);
+        assert_eq!(lineage.source_atoms().len(), 2);
+        let host = vcs
+            .read_abandonment_evidence("abandon-op")
+            .unwrap()
+            .expect("verified host disposition");
+        assert_eq!(host.units.len(), 2);
+        assert_eq!(host.after_cut_id, "abandoned");
+        let wire = serde_json::to_vec(&host).unwrap();
+        assert_eq!(
+            crate::vcs::flowing_abandonment::FlowingHostAbandonmentEvidenceV1::decode(&wire)
+                .unwrap(),
+            host
+        );
+        let wire_text = String::from_utf8(wire).unwrap();
+        for private in ["a.txt", "b.txt", "rebase fixture", "s:author"] {
+            assert!(!wire_text.contains(private), "host wire exposed {private}");
+        }
+        assert!(vcs
+            .read_abandonment_evidence("unknown-op")
+            .unwrap()
+            .is_none());
+        let error = vcs.read_abandonment_evidence("").unwrap_err();
+        assert!(format!("{error:?}").contains("operation identity is empty"));
+        let mut changed: serde_json::Value = serde_json::from_str(&wire_text).unwrap();
+        let decode = |value: &serde_json::Value| {
+            crate::vcs::flowing_abandonment::FlowingHostAbandonmentEvidenceV1::decode(
+                &serde_json::to_vec(value).unwrap(),
+            )
+            .unwrap_err()
+        };
+        changed["units"][1]["unit_id"] = "unit-a".into();
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("invalid or duplicated"));
+        changed["units"][1]["unit_id"] = "unit-b".into();
+        changed["receipt_digest"] = "sha256:wrong".into();
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("digest is invalid"));
+        changed["receipt_digest"] = host.receipt_digest.clone().into();
+        changed["schema"] = "whipplescript.flowing_abandonment_evidence.v2".into();
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("wrong evidence schema"));
+        changed["schema"] = host.schema.clone().into();
+        changed["before_cut_id"] = host.after_cut_id.clone().into();
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("required abandonment coordinate is invalid"));
+        changed["before_cut_id"] = host.before_cut_id.clone().into();
+        changed["branch_point_cut_id"] = "".into();
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("branch point coordinate is empty"));
+        changed["branch_point_cut_id"] = host.branch_point_cut_id.clone().unwrap().into();
+        changed["units"] = serde_json::json!([]);
+        let error = decode(&changed);
+        assert!(format!("{error:?}").contains("abandonment evidence has no units"));
+        changed["units"] = serde_json::to_value(&host.units).unwrap();
+        changed["unexpected"] = true.into();
+        assert!(
+            crate::vcs::flowing_abandonment::FlowingHostAbandonmentEvidenceV1::decode(
+                &serde_json::to_vec(&changed).unwrap()
+            )
+            .is_err(),
+            "unknown wire fields require a new schema"
+        );
+        assert_eq!(
+            vcs.branches
+                .abandoned_unit_operation("unit-a")
+                .unwrap()
+                .as_deref(),
+            Some("abandon-op")
+        );
+        assert_eq!(
+            vcs.branches
+                .abandoned_unit_operation("unit-b")
+                .unwrap()
+                .as_deref(),
+            Some("abandon-op")
+        );
+        let head = vcs.branches.get_branch("twig").unwrap().unwrap();
+        assert_eq!(head.head_cut_id.as_deref(), Some("abandoned"));
+        assert_eq!(
+            vcs.load_manifest(head.head_manifest_hash.as_deref())
+                .unwrap(),
+            point
+        );
+        assert_eq!(
+            vcs.branches
+                .flowing_abandonment_for_cut("abandoned")
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || panic!("exact retry must not repeat the final check"),
+            )
+            .unwrap(),
+            A::Existing(receipt.clone())
+        );
+        assert_eq!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "changed-time",
+                &mut || panic!("mismatched retry must refuse before final check"),
+            )
+            .unwrap(),
+            A::Refused(
+                crate::branches::flowing_abandonment::FlowingAbandonmentRefusal::IdentityMismatch
+            )
+        );
+        assert_eq!(
+            vcs.branches
+                .release_private_cut(ReleasePrivateCut {
+                    pin_id: "pin-unit-a",
+                    released_by: "s:author",
+                    reason: "unit abandoned under exact disposition",
+                    released_at: "t7",
+                })
+                .unwrap(),
+            ReleasePrivateCutOutcome::Released
+        );
+        assert_eq!(
+            vcs.branches
+                .flowing_abandonment_receipt("abandon-op")
+                .unwrap(),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn whole_twig_abandonment_is_a_verified_final_close_disposition() {
+        use crate::branches::flowing_abandonment::{
+            digest, FlowingAbandonmentReceipt, FlowingAbandonments,
+        };
+        use crate::branches::flowing_close_host::{
+            read_close_evidence, FlowingHostCloseDispositionV1, FlowingHostCloseEvidenceV1,
+            FLOWING_CLOSE_EVIDENCE_V2,
+        };
+        use crate::branches::flowing_close_roster::{
+            FlowingCloseRosterReader, FlowingCloseUnitState,
+        };
+        use crate::branches::flowing_final_close::{
+            FinalCloseFlowingSource, FlowingFinalClose, FlowingFinalCloseOutcome,
+            FlowingFinalCloseRefusal,
+        };
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        vcs.commit_prepared_whole_twig_abandonment(
+            &plan,
+            "abandon-op",
+            "begin-abandon",
+            "abandoned",
+            "s:author",
+            "t6",
+            &mut || Ok(()),
+        )
+        .unwrap();
+        for unit_id in ["unit-a", "unit-b"] {
+            assert_eq!(
+                vcs.branches
+                    .release_private_cut(ReleasePrivateCut {
+                        pin_id: &format!("pin-{unit_id}"),
+                        released_by: "s:author",
+                        reason: "unit abandoned under exact disposition",
+                        released_at: "t7",
+                    })
+                    .unwrap(),
+                ReleasePrivateCutOutcome::Released
+            );
+        }
+        let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+        let finished = vcs
+            .branches
+            .transition_flowing_source(&FlowingFenceTransition {
+                op_id: "finish-abandon".into(),
+                source_branch_id: "twig".into(),
+                incarnation_id: fence.incarnation_id,
+                expected_eligibility_epoch: fence.eligibility_epoch,
+                expected_owner_epoch: fence.owner_epoch,
+                actor: "s:author".into(),
+                action: FlowingFenceAction::FinishRevision {
+                    begin_op_id: "begin-abandon".into(),
+                },
+                recorded_at: "t8".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(finished, FlowingFenceOutcome::Applied(_)),
+            "{finished:?}"
+        );
+        for (op_id, action) in [
+            ("request-close", FlowingFenceAction::RequestClose),
+            ("disable", FlowingFenceAction::DisableAdmission),
+        ] {
+            let fence = vcs.branches.flowing_source("twig").unwrap().unwrap();
+            let transition = vcs
+                .branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: op_id.into(),
+                    source_branch_id: "twig".into(),
+                    incarnation_id: fence.incarnation_id,
+                    expected_eligibility_epoch: fence.eligibility_epoch,
+                    expected_owner_epoch: fence.owner_epoch,
+                    actor: "s:author".into(),
+                    action,
+                    recorded_at: "t8".into(),
+                })
+                .unwrap();
+            assert!(
+                matches!(transition, FlowingFenceOutcome::Applied(_)),
+                "{transition:?}"
+            );
+        }
+        let roster = vcs.branches.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(roster.units.len(), 2);
+        assert!(roster.units.iter().all(|unit| matches!(
+            &unit.state,
+            FlowingCloseUnitState::Abandoned { op_id } if op_id == "abandon-op"
+        )));
+        let request = FinalCloseFlowingSource {
+            op_id: "final-close".into(),
+            source_branch_id: "twig".into(),
+            source_incarnation_id: roster.source_fence.incarnation_id.clone(),
+            expected_eligibility_epoch: roster.source_fence.eligibility_epoch,
+            expected_owner_epoch: roster.source_fence.owner_epoch,
+            expected_roster_digest: roster.digest().unwrap(),
+            actor: "s:author".into(),
+            recorded_at: "t9".into(),
+        };
+        let original = vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap()
+            .unwrap();
+        let mut wrong_incarnation = original.clone();
+        wrong_incarnation.source_incarnation_id = "other-incarnation".into();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_abandonments SET witness_json = ?1, witness_digest = ?2 \
+                 WHERE op_id = 'abandon-op'",
+                rusqlite::params![
+                    serde_json::to_string(&wrong_incarnation).unwrap(),
+                    digest(&wrong_incarnation)
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.branches.final_close_flowing_source(&request).unwrap(),
+            FlowingFinalCloseOutcome::Refused(FlowingFinalCloseRefusal::UnitReceiptMismatch {
+                unit_id: "unit-a".into(),
+            })
+        );
+        let mut extra_value = serde_json::to_value(&original).unwrap();
+        let mut extra_unit = extra_value["units"][0].clone();
+        extra_unit["unit_id"] = "unit-z".into();
+        extra_value["units"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra_unit);
+        let extra: FlowingAbandonmentReceipt = serde_json::from_value(extra_value).unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_abandonments SET witness_json = ?1, witness_digest = ?2 \
+                 WHERE op_id = 'abandon-op'",
+                rusqlite::params![serde_json::to_string(&extra).unwrap(), digest(&extra)],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "INSERT INTO flowing_abandoned_units (unit_id, op_id) \
+                 VALUES ('unit-z', 'abandon-op')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.branches.final_close_flowing_source(&request).unwrap(),
+            FlowingFinalCloseOutcome::Refused(FlowingFinalCloseRefusal::UnitReceiptMismatch {
+                unit_id: "unit-z".into(),
+            })
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                "DELETE FROM flowing_abandoned_units WHERE unit_id = 'unit-z'",
+                [],
+            )
+            .unwrap();
+        vcs.branches
+            .test_connection()
+            .execute(
+                "UPDATE flowing_abandonments SET witness_json = ?1, witness_digest = ?2 \
+                 WHERE op_id = 'abandon-op'",
+                rusqlite::params![serde_json::to_string(&original).unwrap(), digest(&original)],
+            )
+            .unwrap();
+        let outcome = vcs.branches.final_close_flowing_source(&request).unwrap();
+        let FlowingFinalCloseOutcome::Closed(receipt) = outcome else {
+            panic!("exact abandonment dispositions close the source: {outcome:?}");
+        };
+        assert_eq!(receipt.unit_evidence.abandonments.len(), 1);
+        assert_eq!(receipt.unit_evidence.abandonments[0].units.len(), 2);
+        let host = read_close_evidence(&vcs.branches, "twig").unwrap().unwrap();
+        assert_eq!(host.schema, FLOWING_CLOSE_EVIDENCE_V2);
+        assert_eq!(
+            FlowingHostCloseEvidenceV1::decode(&serde_json::to_vec(&host).unwrap()).unwrap(),
+            host
+        );
+        assert!(host.units.iter().all(|unit| matches!(
+            &unit.disposition,
+            FlowingHostCloseDispositionV1::Abandoned { operation_id, .. }
+                if operation_id == "abandon-op"
+        )));
+        assert_eq!(
+            vcs.branches.final_close_flowing_source(&request).unwrap(),
+            FlowingFinalCloseOutcome::Existing(receipt)
+        );
+    }
+
+    #[test]
+    fn whole_twig_abandonment_lineage_refuses_a_rehashed_false_atom() {
+        use crate::branches::flowing_abandonment::{digest, FlowingAbandonmentReceipt};
+        use crate::vcs::flowing_abandonment::{
+            FlowingAbandonmentLineageOutcome as L, WholeTwigAbandonmentOutcome as P,
+        };
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        vcs.commit_prepared_whole_twig_abandonment(
+            &plan,
+            "abandon-op",
+            "begin-abandon",
+            "abandoned",
+            "s:author",
+            "t6",
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let db = vcs.branches.test_connection();
+        let raw: String = db
+            .query_row(
+                "SELECT witness_json FROM flowing_abandonments WHERE op_id = 'abandon-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["units"][0]["atoms"][0]["after"] = "sha256:false".into();
+        let changed: FlowingAbandonmentReceipt = serde_json::from_value(value).unwrap();
+        db.execute(
+            "UPDATE flowing_abandonments SET witness_json = ?1, witness_digest = ?2 \
+             WHERE op_id = 'abandon-op'",
+            rusqlite::params![serde_json::to_string(&changed).unwrap(), digest(&changed)],
+        )
+        .unwrap();
+        assert!(matches!(
+            vcs.verify_flowing_abandonment_lineage("abandoned").unwrap(),
+            L::IncompleteUnits
+        ));
+        let error = vcs.read_abandonment_evidence("abandon-op").unwrap_err();
+        assert!(format!("{error:?}").contains("retained source lineage is unverified"));
+    }
+
+    #[test]
+    fn whole_twig_abandonment_native_receipt_refuses_changed_digest_cut_and_unit_index() {
+        use crate::branches::flowing_abandonment::{
+            digest, FlowingAbandonmentOutcome as A, FlowingAbandonments,
+        };
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        let A::Committed(receipt) = vcs
+            .commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("committed");
+        };
+        let db = vcs.branches.test_connection();
+        db.execute(
+            "UPDATE flowing_abandonments SET witness_digest = 'wrong' WHERE op_id = 'abandon-op'",
+            [],
+        )
+        .unwrap();
+        let error = vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("receipt differs from its row or digest"));
+        db.execute(
+            "UPDATE flowing_abandonments SET witness_digest = ?1 WHERE op_id = 'abandon-op'",
+            [digest(&receipt)],
+        )
+        .unwrap();
+
+        db.execute(
+            "UPDATE cuts SET origin = 'write:forged' WHERE cut_id = 'abandoned'",
+            [],
+        )
+        .unwrap();
+        let error = vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("receipt lost its exact cut"));
+        db.execute(
+            "UPDATE cuts SET origin = 'flowing:abandon' WHERE cut_id = 'abandoned'",
+            [],
+        )
+        .unwrap();
+
+        db.execute(
+            "DELETE FROM flowing_abandoned_units WHERE unit_id = 'unit-b'",
+            [],
+        )
+        .unwrap();
+        let error = vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("receipt differs from unit dispositions"));
+    }
+
+    #[test]
+    fn whole_twig_abandonment_native_refuses_operation_collision_and_reserved_head() {
+        use crate::branches::flowing_abandonment::{
+            FlowingAbandonmentOutcome as A, FlowingAbandonmentRefusal as R,
+        };
+        use crate::branches::write_commit::INSERT_OP;
+        use crate::branches::HeadReservationOutcome;
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        assert_eq!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "cut-b",
+                "s:author",
+                "t6",
+                &mut || panic!("reused cut must refuse before final check"),
+            )
+            .unwrap(),
+            A::Refused(R::CutAlreadyRecorded)
+        );
+        vcs.branches
+            .test_connection()
+            .execute(
+                INSERT_OP,
+                rusqlite::params!["abandon-op", "unrelated", "[]", None::<&str>, "t5"],
+            )
+            .unwrap();
+        assert_eq!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || panic!("operation collision must refuse before final check"),
+            )
+            .unwrap(),
+            A::Refused(R::OperationAlreadyRecorded)
+        );
+        assert_eq!(
+            vcs.branches
+                .reserve_head("twig", "other-writer", "t5")
+                .unwrap(),
+            HeadReservationOutcome::Reserved
+        );
+        assert_eq!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "different-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || panic!("reserved head must refuse before final check"),
+            )
+            .unwrap(),
+            A::Refused(R::HeadReserved)
+        );
+    }
+
+    #[test]
+    fn whole_twig_abandonment_native_refuses_foreign_prior_unit_receipt() {
+        use crate::branches::flowing_abandonment::{
+            digest, FlowingAbandonmentOutcome as A, FlowingAbandonments,
+        };
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        let A::Committed(mut prior) = vcs
+            .commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("committed");
+        };
+        prior.source_branch_id = "another-source".into();
+        let db = vcs.branches.test_connection();
+        db.execute(
+            "UPDATE flowing_abandonments SET witness_json = ?1, witness_digest = ?2 \
+             WHERE op_id = 'abandon-op'",
+            rusqlite::params![serde_json::to_string(&prior).unwrap(), digest(&prior)],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE cuts SET branch_id = 'another-source' WHERE cut_id = 'abandoned'",
+            [],
+        )
+        .unwrap();
+        let error = vcs
+            .commit_prepared_whole_twig_abandonment(
+                &plan,
+                "different-op",
+                "begin-abandon",
+                "different-cut",
+                "s:author",
+                "t7",
+                &mut || panic!("foreign receipt must refuse before final check"),
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("abandoned unit differs from its source receipt"));
+        assert!(vcs
+            .branches
+            .flowing_abandonment_receipt("different-op")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn whole_twig_abandonment_rolls_back_when_final_authority_refuses() {
+        use crate::branches::flowing_abandonment::FlowingAbandonments;
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        let refused = vcs.commit_prepared_whole_twig_abandonment(
+            &plan,
+            "abandon-op",
+            "begin-abandon",
+            "abandoned",
+            "s:author",
+            "t6",
+            &mut || {
+                Err(crate::StoreError::Conflict(
+                    "current Home basis changed".into(),
+                ))
+            },
+        );
+        assert!(refused.is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch("twig")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut-b")
+        );
+        assert!(vcs.branches.get_cut("abandoned").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap()
+            .is_none());
+        assert!(vcs
+            .branches
+            .abandoned_unit_operation("unit-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn whole_twig_abandonment_late_unit_insert_failure_keeps_every_unit_owed() {
+        use crate::branches::flowing_abandonment::{
+            FlowingAbandonmentOutcome, FlowingAbandonments,
+        };
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut vcs = two_units();
+        let P::Prepared(plan) = vcs.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut vcs, &plan);
+        vcs.branches.test_connection().execute_batch(
+            "CREATE TRIGGER fail_second_abandoned_unit BEFORE INSERT ON flowing_abandoned_units \
+             WHEN NEW.unit_id = 'unit-b' BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        ).unwrap();
+        assert!(vcs
+            .commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .is_err());
+        assert_eq!(
+            vcs.branches
+                .get_branch("twig")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut-b")
+        );
+        assert!(vcs.branches.get_cut("abandoned").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .flowing_abandonment_receipt("abandon-op")
+            .unwrap()
+            .is_none());
+        assert!(vcs
+            .branches
+            .abandoned_unit_operation("unit-a")
+            .unwrap()
+            .is_none());
+        assert!(vcs
+            .branches
+            .abandoned_unit_operation("unit-b")
+            .unwrap()
+            .is_none());
+        vcs.branches
+            .test_connection()
+            .execute_batch("DROP TRIGGER fail_second_abandoned_unit")
+            .unwrap();
+        assert!(matches!(
+            vcs.commit_prepared_whole_twig_abandonment(
+                &plan,
+                "abandon-op",
+                "begin-abandon",
+                "abandoned",
+                "s:author",
+                "t6",
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            FlowingAbandonmentOutcome::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn whole_twig_abandonment_refuses_stale_head_new_unit_and_prior_admission() {
+        use crate::branches::flowing_abandonment::{
+            FlowingAbandonmentOutcome as O, FlowingAbandonmentRefusal as R, FlowingAbandonments,
+        };
+        use crate::vcs::flowing_abandonment::WholeTwigAbandonmentOutcome as P;
+
+        let mut moved = two_units();
+        let P::Prepared(plan) = moved.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut moved, &plan);
+        moved
+            .branches
+            .test_connection()
+            .execute(
+                "UPDATE branches SET head_cut_id = 'other' WHERE branch_id = 'twig'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            moved
+                .commit_prepared_whole_twig_abandonment(
+                    &plan,
+                    "abandon-op",
+                    "begin-abandon",
+                    "abandoned",
+                    "s:author",
+                    "t6",
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            O::Refused(R::SourceMoved)
+        );
+        assert!(moved
+            .branches
+            .abandoned_unit_operation("unit-a")
+            .unwrap()
+            .is_none());
+
+        let mut added = two_units();
+        let P::Prepared(plan) = added.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut added, &plan);
+        assert_eq!(
+            added
+                .branches
+                .declare_contribution(DeclareContribution {
+                    unit_id: "unit-later",
+                    pin_id: "pin-unit-a",
+                    principal: "s:author",
+                    intent: "new declaration on retained cut",
+                    read_basis_digest: "read",
+                    dependency_basis_digest: "deps",
+                    scope_digest: "later",
+                    declared_at: "t6",
+                })
+                .unwrap(),
+            DeclareContributionOutcome::Declared
+        );
+        assert_eq!(
+            added
+                .commit_prepared_whole_twig_abandonment(
+                    &plan,
+                    "abandon-op",
+                    "begin-abandon",
+                    "abandoned",
+                    "s:author",
+                    "t7",
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            O::Refused(R::UnitRosterChanged)
+        );
+        assert!(added
+            .branches
+            .abandoned_unit_operation("unit-a")
+            .unwrap()
+            .is_none());
+
+        let mut admitted = two_units();
+        let P::Prepared(plan) = admitted.prepare_whole_twig_abandonment("twig").unwrap() else {
+            panic!("prepared");
+        };
+        begin_abandonment(&mut admitted, &plan);
+        admitted
+            .branches
+            .test_connection()
+            .execute_batch(
+                "INSERT INTO flowing_admissions (op_id, receipt_json) VALUES ('cas-first', '{}'); \
+             INSERT INTO flowing_admitted_units (unit_id, op_id) VALUES ('unit-a', 'cas-first');",
+            )
+            .unwrap();
+        assert_eq!(
+            admitted
+                .commit_prepared_whole_twig_abandonment(
+                    &plan,
+                    "abandon-op",
+                    "begin-abandon",
+                    "abandoned",
+                    "s:author",
+                    "t6",
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            O::Refused(R::UnitNoLongerOwed {
+                unit_id: "unit-a".into()
+            })
+        );
+        assert!(admitted
+            .branches
+            .abandoned_unit_operation("unit-a")
+            .unwrap()
+            .is_none());
     }
 
     fn begin_rewrite(

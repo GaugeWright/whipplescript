@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::flowing_abandonment;
 use super::flowing_admission::FlowingUnitOutcome;
 use super::flowing_close_roster::FlowingCloseUnitState;
 use super::flowing_fence::FlowingSourceKind;
@@ -19,6 +20,7 @@ use super::MAINLINE_BRANCH_ID;
 use crate::{StoreError, StoreResult};
 
 pub const FLOWING_CLOSE_EVIDENCE_V1: &str = "whipplescript.flowing_close_evidence.v1";
+pub const FLOWING_CLOSE_EVIDENCE_V2: &str = "whipplescript.flowing_close_evidence.v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -27,6 +29,10 @@ pub enum FlowingHostCloseDispositionV1 {
         operation_id: String,
         outcome: FlowingUnitOutcome,
         unit_witness_digest: String,
+    },
+    Abandoned {
+        operation_id: String,
+        receipt_digest: String,
     },
     Parked {
         operation_id: String,
@@ -137,6 +143,12 @@ impl FlowingHostCloseEvidenceV1 {
             .iter()
             .map(|handoff| (handoff.unit_id.as_str(), handoff))
             .collect();
+        let abandonments: BTreeMap<_, _> = receipt
+            .unit_evidence
+            .abandonments
+            .iter()
+            .map(|abandonment| (abandonment.op_id.as_str(), abandonment))
+            .collect();
         let mut units = Vec::with_capacity(receipt.roster.units.len());
         for unit in &receipt.roster.units {
             let disposition = match &unit.state {
@@ -148,6 +160,15 @@ impl FlowingHostCloseEvidenceV1 {
                         operation_id: op_id.clone(),
                         outcome: selected.outcome,
                         unit_witness_digest: unit_digest(selected)?,
+                    }
+                }
+                FlowingCloseUnitState::Abandoned { op_id } => {
+                    let abandonment = abandonments
+                        .get(op_id.as_str())
+                        .expect("validated abandoned unit");
+                    FlowingHostCloseDispositionV1::Abandoned {
+                        operation_id: op_id.clone(),
+                        receipt_digest: flowing_abandonment::digest(abandonment),
                     }
                 }
                 FlowingCloseUnitState::Parked { op_id, holder_id } => {
@@ -192,7 +213,17 @@ impl FlowingHostCloseEvidenceV1 {
             })
             .collect();
         let evidence = Self {
-            schema: FLOWING_CLOSE_EVIDENCE_V1.into(),
+            schema: if receipt
+                .roster
+                .units
+                .iter()
+                .any(|unit| matches!(unit.state, FlowingCloseUnitState::Abandoned { .. }))
+            {
+                FLOWING_CLOSE_EVIDENCE_V2
+            } else {
+                FLOWING_CLOSE_EVIDENCE_V1
+            }
+            .into(),
             operation_id: receipt.request.op_id.clone(),
             source_branch_id: receipt.request.source_branch_id.clone(),
             source_incarnation_id: receipt.request.source_incarnation_id.clone(),
@@ -225,8 +256,16 @@ impl FlowingHostCloseEvidenceV1 {
     }
 
     pub fn validate(&self) -> StoreResult<()> {
-        if self.schema != FLOWING_CLOSE_EVIDENCE_V1
-            || self.operation_id.trim().is_empty()
+        let has_abandonment = self.units.iter().any(|unit| {
+            matches!(
+                unit.disposition,
+                FlowingHostCloseDispositionV1::Abandoned { .. }
+            )
+        });
+        if !matches!(
+            (self.schema.as_str(), has_abandonment),
+            (FLOWING_CLOSE_EVIDENCE_V1, false) | (FLOWING_CLOSE_EVIDENCE_V2, true)
+        ) || self.operation_id.trim().is_empty()
             || self.source_branch_id.trim().is_empty()
             || self.source_incarnation_id.trim().is_empty()
             || self.source_parent_branch_id != MAINLINE_BRANCH_ID
@@ -268,6 +307,12 @@ impl FlowingHostCloseEvidenceV1 {
                     ..
                 } if operation_id.trim().is_empty() || !valid_digest(unit_witness_digest) => {
                     return Err(invalid("admitted close unit has invalid evidence"));
+                }
+                FlowingHostCloseDispositionV1::Abandoned {
+                    operation_id,
+                    receipt_digest,
+                } if operation_id.trim().is_empty() || !valid_digest(receipt_digest) => {
+                    return Err(invalid("abandoned close unit has invalid evidence"));
                 }
                 FlowingHostCloseDispositionV1::Parked {
                     operation_id,
@@ -354,6 +399,24 @@ mod tests {
         let mut value = evidence.clone();
         value.schema = "whipplescript.flowing_close_evidence.v2".into();
         assert!(value.validate().is_err());
+        value.units.push(FlowingHostClosedUnitV1 {
+            unit_id: "unit".into(),
+            original_source_branch_id: "twig".into(),
+            disposition: FlowingHostCloseDispositionV1::Abandoned {
+                operation_id: "abandon".into(),
+                receipt_digest: format!("sha256:{}", "2".repeat(32)),
+            },
+        });
+        assert!(value.validate().is_ok());
+        value.schema = FLOWING_CLOSE_EVIDENCE_V1.into();
+        assert!(value.validate().is_err());
+        value.schema = FLOWING_CLOSE_EVIDENCE_V2.into();
+        value.units[0].disposition = FlowingHostCloseDispositionV1::Abandoned {
+            operation_id: "abandon".into(),
+            receipt_digest: "bad-digest".into(),
+        };
+        assert!(format!("{:?}", value.validate().unwrap_err())
+            .contains("abandoned close unit has invalid evidence"));
         value = evidence.clone();
         value.operation_id.clear();
         assert!(value.validate().is_err());

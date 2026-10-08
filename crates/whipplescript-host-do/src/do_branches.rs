@@ -15,6 +15,7 @@
 //! defensively for stores that predate it.
 
 mod carried_cuts;
+mod flowing_abandonment;
 mod flowing_admission;
 mod flowing_close_roster;
 mod flowing_fence;
@@ -258,6 +259,9 @@ impl<S: DoSql> DoBranches<S> {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_admission::SCHEMA {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_abandonment::SCHEMA {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_parking::SCHEMA {

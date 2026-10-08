@@ -18,7 +18,9 @@ impl VerifiedNativeCandidate {
 
 use super::native_candidate_recording::witness_for;
 
-impl<B: Branches + FlowingSources + FlowingAdmissions, C: ContentBlobs> WorkspaceVcs<B, C> {
+impl<B: Branches + FlowingSources + FlowingAdmissions + FlowingAbandonments, C: ContentBlobs>
+    WorkspaceVcs<B, C>
+{
     /// Verify an existing candidate without storing a cut or issuing a
     /// witness. The embedding supplies the original immutable revision from
     /// its independent review authority, not a reconstructed or caller-chosen

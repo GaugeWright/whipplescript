@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use whipplescript_core::norm_evidence::EvidenceVersion;
 use whipplescript_core::norm_selection::EvidenceSelection;
+use whipplescript_store::branches::flowing_abandonment::FlowingAbandonments;
 use whipplescript_store::branches::flowing_admission::FlowingAdmissions;
 use whipplescript_store::branches::flowing_admission::FlowingCandidateWitness;
 use whipplescript_store::branches::flowing_fence::FlowingFence;
@@ -344,7 +345,7 @@ pub fn plan_native_with_authority<L: AdmissionLedger, S: RuntimeStore>(
 /// The same domain process over any owning VCS implementation. Hosted
 /// readers do not substitute serialized manifests or replayed subjects.
 pub fn plan<
-    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
+    B: Branches + FlowingAdmissions + FlowingAbandonments + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -366,7 +367,7 @@ pub fn plan<
 }
 
 pub fn plan_with_authority<
-    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
+    B: Branches + FlowingAdmissions + FlowingAbandonments + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -394,7 +395,7 @@ pub fn plan_with_authority<
 /// Compose independently installed Home and native review readers. The request
 /// continues to select only retained witness and attempt coordinates.
 pub fn plan_with_capture<
-    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
+    B: Branches + FlowingAdmissions + FlowingAbandonments + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,
@@ -410,7 +411,7 @@ pub fn plan_with_capture<
 }
 
 fn derive<
-    B: Branches + FlowingAdmissions + FlowingFence + FlowingSources,
+    B: Branches + FlowingAdmissions + FlowingAbandonments + FlowingFence + FlowingSources,
     C: ContentBlobs,
     L: AdmissionLedger,
     S: RuntimeStore,

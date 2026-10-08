@@ -1230,8 +1230,10 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
                      LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
                      LEFT JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
                      LEFT JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+                     LEFT JOIN flowing_abandoned_units AS abandoned ON abandoned.unit_id = unit.unit_id \
                      WHERE unit.pin_id = ?1 AND handoff.unit_id IS NULL \
-                       AND admitted.unit_id IS NULL AND parked.unit_id IS NULL LIMIT 1",
+                       AND admitted.unit_id IS NULL AND parked.unit_id IS NULL \
+                       AND abandoned.unit_id IS NULL LIMIT 1",
                     &[text(request.pin_id)],
                 )
                 .map_err(sql_err)?;

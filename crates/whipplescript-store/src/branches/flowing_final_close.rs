@@ -9,6 +9,7 @@ pub(crate) mod native;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::flowing_abandonment::FlowingAbandonmentReceipt;
 use super::flowing_admission::FlowingAdmissionReceipt;
 use super::flowing_close_roster::{FlowingCloseRoster, FlowingCloseUnitState};
 use super::flowing_fence::FlowingFenceAction;
@@ -51,6 +52,8 @@ pub struct FinalCloseFlowingSource {
 #[serde(deny_unknown_fields)]
 pub struct FlowingCloseEvidence {
     pub admissions: Vec<FlowingAdmissionReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abandonments: Vec<FlowingAbandonmentReceipt>,
     pub parked_units: Vec<FlowingParkReceipt>,
     pub handoffs: Vec<HandoffReceipt>,
 }
@@ -65,7 +68,12 @@ pub struct FlowingFinalCloseReceipt {
 
 impl FlowingFinalCloseReceipt {
     pub fn digest(&self) -> StoreResult<String> {
-        let bytes = serde_json::to_vec(&("flowing-final-close-v1", self))?;
+        let version = if self.unit_evidence.abandonments.is_empty() {
+            "flowing-final-close-v1"
+        } else {
+            "flowing-final-close-v2"
+        };
+        let bytes = serde_json::to_vec(&(version, self))?;
         Ok(format!(
             "sha256:{}",
             crate::chunking::content_hash_hex(&bytes)
@@ -270,6 +278,12 @@ pub fn receipt_matches_snapshot(receipt: &FlowingFinalCloseReceipt) -> bool {
         .iter()
         .map(|value| (value.request.unit_id.as_str(), value))
         .collect();
+    let abandonments: BTreeMap<_, _> = receipt
+        .unit_evidence
+        .abandonments
+        .iter()
+        .map(|value| (value.op_id.as_str(), value))
+        .collect();
     let handoffs: BTreeMap<_, _> = receipt
         .unit_evidence
         .handoffs
@@ -294,10 +308,29 @@ pub fn receipt_matches_snapshot(receipt: &FlowingFinalCloseReceipt) -> bool {
         .iter()
         .map(|value| value.request.units.len())
         .sum();
+    let abandoned_units: BTreeSet<_> = receipt
+        .unit_evidence
+        .abandonments
+        .iter()
+        .flat_map(|value| {
+            value
+                .units
+                .iter()
+                .map(|unit| (value.op_id.as_str(), unit.unit_id()))
+        })
+        .collect();
+    let abandonment_selection_count: usize = receipt
+        .unit_evidence
+        .abandonments
+        .iter()
+        .map(|value| value.units.len())
+        .sum();
     if admissions.len() != receipt.unit_evidence.admissions.len()
+        || abandonments.len() != receipt.unit_evidence.abandonments.len()
         || parked.len() != receipt.unit_evidence.parked_units.len()
         || handoffs.len() != receipt.unit_evidence.handoffs.len()
         || admitted_units.len() != admission_selection_count
+        || abandoned_units.len() != abandonment_selection_count
         || receipt.unit_evidence.admissions.iter().any(|admission| {
             admission.request.source_branch_id != receipt.roster.source_branch_id
                 || admission.request.source_incarnation_id
@@ -308,6 +341,8 @@ pub fn receipt_matches_snapshot(receipt: &FlowingFinalCloseReceipt) -> bool {
     }
     let mut used_admissions = BTreeSet::new();
     let mut roster_admitted_units = BTreeSet::new();
+    let mut used_abandonments = BTreeSet::new();
+    let mut roster_abandoned_units = BTreeSet::new();
     let mut used_parked = BTreeSet::new();
     let mut used_handoffs = BTreeSet::new();
     for unit in &receipt.roster.units {
@@ -320,6 +355,17 @@ pub fn receipt_matches_snapshot(receipt: &FlowingFinalCloseReceipt) -> bool {
                 roster_admitted_units.insert((op_id.as_str(), unit.unit_id.as_str()));
                 !admission.request.units.is_empty()
                     && admitted_units.contains(&(op_id.as_str(), unit.unit_id.as_str()))
+            }
+            FlowingCloseUnitState::Abandoned { op_id } => {
+                let Some(abandonment) = abandonments.get(op_id.as_str()) else {
+                    return false;
+                };
+                used_abandonments.insert(op_id.as_str());
+                roster_abandoned_units.insert((op_id.as_str(), unit.unit_id.as_str()));
+                abandonment.source_branch_id == receipt.roster.source_branch_id
+                    && abandonment.source_incarnation_id
+                        == receipt.roster.source_fence.incarnation_id
+                    && abandoned_units.contains(&(op_id.as_str(), unit.unit_id.as_str()))
             }
             FlowingCloseUnitState::Parked { op_id, holder_id } => {
                 let Some(park) = parked.get(unit.unit_id.as_str()) else {
@@ -346,7 +392,9 @@ pub fn receipt_matches_snapshot(receipt: &FlowingFinalCloseReceipt) -> bool {
         }
     }
     roster_admitted_units == admitted_units
+        && roster_abandoned_units == abandoned_units
         && used_admissions.len() == admissions.len()
+        && used_abandonments.len() == abandonments.len()
         && used_parked.len() == parked.len()
         && used_handoffs.len() == handoffs.len()
 }
@@ -417,6 +465,33 @@ mod tests {
             recorded_at: "t3".into(),
         };
         (roster, request)
+    }
+
+    #[test]
+    fn legacy_close_receipt_keeps_its_wire_shape_and_digest() {
+        let (roster, request) = ready();
+        let receipt = FlowingFinalCloseReceipt {
+            request,
+            roster,
+            unit_evidence: FlowingCloseEvidence {
+                admissions: Vec::new(),
+                abandonments: Vec::new(),
+                parked_units: Vec::new(),
+                handoffs: Vec::new(),
+            },
+        };
+        let serialized = serde_json::to_value(&receipt).unwrap();
+        assert!(serialized["unit_evidence"].get("abandonments").is_none());
+        let decoded: FlowingFinalCloseReceipt = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded, receipt);
+        let legacy_bytes = serde_json::to_vec(&("flowing-final-close-v1", &receipt)).unwrap();
+        assert_eq!(
+            receipt.digest().unwrap(),
+            format!(
+                "sha256:{}",
+                crate::chunking::content_hash_hex(&legacy_bytes)
+            )
+        );
     }
 
     #[test]
