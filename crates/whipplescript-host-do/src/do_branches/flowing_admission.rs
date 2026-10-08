@@ -1194,6 +1194,9 @@ mod tests {
     use whipplescript_store::branches::flowing_admission::{
         FlowingGateCheck, FlowingGateVerdict, FlowingSelectedUnit,
     };
+    use whipplescript_store::branches::flowing_close_roster::{
+        FlowingCloseAttemptState, FlowingCloseRosterReader,
+    };
     use whipplescript_store::branches::flowing_coverage::{
         FlowingCoverageBasis, FlowingCoverageClaim, FlowingCoverageUniverse,
         FlowingOwnerValidation, FlowingRequiredScope, FlowingScopeCoverage,
@@ -2588,6 +2591,44 @@ mod tests {
     }
 
     #[test]
+    fn hosted_close_roster_keeps_pending_and_admitted_attempts() {
+        let (sql, mut store) = fixture();
+        let attempt = request("unit-a", "fixture");
+        assert!(store
+            .flowing_close_roster("twig")
+            .unwrap()
+            .unwrap()
+            .live_attempts
+            .is_empty());
+        pin_attempt(&mut store, &attempt);
+        let pending = store.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(pending.live_attempts.len(), 1);
+        assert_eq!(
+            pending.live_attempts[0].state,
+            FlowingCloseAttemptState::Pending
+        );
+        assert_eq!(pending.live_attempts[0].unit_ids, ["unit-a"]);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        let admitted = store.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(
+            admitted.live_attempts[0].state,
+            FlowingCloseAttemptState::Admitted
+        );
+        sql.execute(
+            "UPDATE flowing_attempt_pins SET witness_digest = 'missing' WHERE op_id = 'fixture'",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.flowing_close_roster("twig"),
+            Err(StoreError::Conflict(message)) if message.contains("lost its candidate witness")
+        ));
+    }
+
+    #[test]
     fn trunk_cas_first_returns_exact_admission_to_hosted_parking() {
         let (sql, mut store) = fixture();
         let attempt = request("unit-a", "admission-a");
@@ -2708,6 +2749,51 @@ mod tests {
         attempt.certificate_handle = certificate.handle().unwrap();
         insert_gate_certificate(sql, &certificate);
         attempt
+    }
+
+    #[test]
+    fn hosted_close_roster_distinguishes_cancelled_failed_and_unrun_attempts() {
+        for (verdict, expected) in [
+            (FlowingGateVerdict::Failed, FlowingCloseAttemptState::Failed),
+            (FlowingGateVerdict::Unrun, FlowingCloseAttemptState::Unrun),
+        ] {
+            let (sql, mut store) = fixture();
+            let attempt = terminal_request(&sql, "terminal", verdict);
+            pin_attempt(&mut store, &attempt);
+            assert!(matches!(
+                store.finish_flowing_attempt(&attempt).unwrap(),
+                FlowingAttemptFinishOutcome::Finished(_)
+            ));
+            assert_eq!(
+                store
+                    .flowing_close_roster("twig")
+                    .unwrap()
+                    .unwrap()
+                    .live_attempts[0]
+                    .state,
+                expected
+            );
+        }
+        let (_sql, mut store) = fixture();
+        let attempt = request("unit-a", "fixture");
+        pin_attempt(&mut store, &attempt);
+        assert!(matches!(
+            store
+                .cancel_flowing_attempt(&cancel("fixture", "cancel-a"))
+                .unwrap(),
+            FlowingCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            store
+                .flowing_close_roster("twig")
+                .unwrap()
+                .unwrap()
+                .live_attempts[0]
+                .state,
+            FlowingCloseAttemptState::Cancelled {
+                cancel_op_id: "cancel-a".into()
+            }
+        );
     }
 
     #[test]

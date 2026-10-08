@@ -35,6 +35,8 @@ use whipplescript_store::files::FileStore;
 /// SHA-256/128 hash twins and the four `content_blobs` declarations.
 #[cfg(test)]
 mod content_parity;
+#[cfg(test)]
+mod cut_carriage_tests;
 pub mod do_branches;
 #[cfg(any(target_arch = "wasm32", test))]
 mod do_fork;

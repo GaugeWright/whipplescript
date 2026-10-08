@@ -1,9 +1,10 @@
 use super::flowing_sources::exact_atomic;
 use super::{flowing_fence, DoBranches};
 use crate::do_store::{as_opt_text, as_text, sql_err, text, DoSql};
+use whipplescript_store::branches::flowing_admission::FlowingAttemptPin;
 use whipplescript_store::branches::flowing_close_roster::{
-    classify_unit, FlowingCloseMember, FlowingClosePrivatePin, FlowingCloseRoster,
-    FlowingCloseRosterReader, FlowingCloseUnit,
+    classify_attempt, classify_unit, FlowingCloseMember, FlowingClosePrivatePin,
+    FlowingCloseRoster, FlowingCloseRosterReader, FlowingCloseUnit,
 };
 use whipplescript_store::branches::BranchStatus;
 use whipplescript_store::{StoreError, StoreResult};
@@ -123,6 +124,47 @@ impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
                     manifest_hash: as_text(&row[3]),
                 })
                 .collect();
+            let mut live_attempts = Vec::new();
+            for row in self
+                .sql
+                .query(
+                    "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
+                            pin.retained_at, witness.witness_json, admitted.receipt_json, \
+                            cancelled.cancel_op_id, cancelled.request_json, finished.receipt_json \
+                     FROM flowing_attempt_pins AS pin \
+                     LEFT JOIN flowing_candidate_witnesses AS witness \
+                       ON witness.digest = pin.witness_digest \
+                     LEFT JOIN flowing_admissions AS admitted ON admitted.op_id = pin.op_id \
+                     LEFT JOIN flowing_admission_cancellations AS cancelled \
+                       ON cancelled.admission_op_id = pin.op_id \
+                     LEFT JOIN flowing_attempt_finishes AS finished ON finished.op_id = pin.op_id \
+                     WHERE pin.released_at IS NULL ORDER BY pin.op_id",
+                    &[],
+                )
+                .map_err(sql_err)?
+            {
+                let attempt = classify_attempt(
+                    FlowingAttemptPin {
+                        op_id: as_text(&row[0]),
+                        witness_digest: as_text(&row[1]),
+                        source_cut_id: as_text(&row[2]),
+                        candidate_cut_id: as_text(&row[3]),
+                        retained_at: as_text(&row[4]),
+                        released_at: None,
+                    },
+                    as_opt_text(&row[5]),
+                    as_opt_text(&row[6]),
+                    as_opt_text(&row[7]).zip(as_opt_text(&row[8])),
+                    as_opt_text(&row[9]),
+                )?;
+                if attempt.source_branch_id == source_branch_id
+                    || members
+                        .iter()
+                        .any(|member| member.branch_id == attempt.source_branch_id)
+                {
+                    live_attempts.push(attempt);
+                }
+            }
             Ok(Some(FlowingCloseRoster {
                 source_branch_id: source.branch_id,
                 source_fence: fence,
@@ -132,6 +174,7 @@ impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
                 members,
                 units,
                 live_private_pins,
+                live_attempts,
             }))
         })
     }

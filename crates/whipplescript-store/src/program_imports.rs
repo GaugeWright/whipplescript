@@ -57,9 +57,10 @@ pub struct ProgramImportWitness {
     /// identities or live update edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_bindings: Option<ProgramProviderBindingCapture>,
-    /// `None` leaves the compiler's resource fields unknown on older witnesses.
-    /// `Some` classifies their spellings at this exact checked admission; it
-    /// does not resolve external resource identities or establish live edges.
+    /// `None` leaves compiler-owned resource fields unknown. The scope says
+    /// whether agent selectors were examined too; an older V1 witness cannot
+    /// establish that. Spellings are not resolved external identities or
+    /// live edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_fields: Option<ProgramResourceFieldCapture>,
 }
@@ -78,6 +79,12 @@ pub enum ProgramResourceField {
     SourceEndpoint,
     SourceAuthSecret,
     SourceVerifiedCredential,
+    AgentProfile,
+    AgentSkills,
+    AgentCapabilities,
+    AgentRequires,
+    AgentTools,
+    AgentReturns,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,6 +99,12 @@ pub enum ProgramResourceFieldMeaning {
     HttpFetchEndpoint,
     InboundRoute,
     CredentialSelector,
+    ProviderProfileSelector,
+    SkillSelector,
+    CapabilitySelector,
+    ProviderFeatureSelector,
+    WorkflowToolSelector,
+    ResultSchemaSelector,
 }
 
 impl ProgramResourceField {
@@ -110,6 +123,12 @@ impl ProgramResourceField {
             Self::SourceAuthSecret | Self::SourceVerifiedCredential => {
                 ProgramResourceFieldMeaning::CredentialSelector
             }
+            Self::AgentProfile => ProgramResourceFieldMeaning::ProviderProfileSelector,
+            Self::AgentSkills => ProgramResourceFieldMeaning::SkillSelector,
+            Self::AgentCapabilities => ProgramResourceFieldMeaning::CapabilitySelector,
+            Self::AgentRequires => ProgramResourceFieldMeaning::ProviderFeatureSelector,
+            Self::AgentTools => ProgramResourceFieldMeaning::WorkflowToolSelector,
+            Self::AgentReturns => ProgramResourceFieldMeaning::ResultSchemaSelector,
         }
     }
 
@@ -125,12 +144,23 @@ impl ProgramResourceField {
             | Self::SourceEndpoint
             | Self::SourceAuthSecret
             | Self::SourceVerifiedCredential => "source",
+            Self::AgentProfile
+            | Self::AgentSkills
+            | Self::AgentCapabilities
+            | Self::AgentRequires
+            | Self::AgentTools
+            | Self::AgentReturns => "agent",
         }
     }
 
     fn max_values(self) -> Option<usize> {
         match self {
-            Self::FileStoreReadGlobs | Self::FileStoreWriteGlobs => None,
+            Self::FileStoreReadGlobs
+            | Self::FileStoreWriteGlobs
+            | Self::AgentSkills
+            | Self::AgentCapabilities
+            | Self::AgentRequires
+            | Self::AgentTools => None,
             _ => Some(1),
         }
     }
@@ -140,6 +170,8 @@ impl ProgramResourceField {
 #[serde(rename_all = "snake_case")]
 pub enum ProgramResourceFieldScope {
     DeclaredFieldsV1,
+    /// V1 resource fields plus the six reference-capable agent selectors.
+    DeclaredFieldsAndAgentSelectorsV2,
 }
 
 /// An empty `values` preserves an omitted optional clause or an empty glob
@@ -712,6 +744,8 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
             || resources.examined.iter().enumerate().any(|(index, field)| {
                 field.occurrence != index
                     || field.owner.is_empty()
+                    || (resources.scope == ProgramResourceFieldScope::DeclaredFieldsV1
+                        && field.field.owner_kind() == "agent")
                     || field.meaning != field.field.meaning()
                     || field.values.iter().any(String::is_empty)
                     || field
@@ -743,6 +777,14 @@ pub fn encode(witness: &ProgramImportWitness) -> StoreResult<(String, String)> {
                     ProgramResourceField::SourceEndpoint,
                     ProgramResourceField::SourceAuthSecret,
                     ProgramResourceField::SourceVerifiedCredential,
+                ],
+                "agent" => &[
+                    ProgramResourceField::AgentProfile,
+                    ProgramResourceField::AgentSkills,
+                    ProgramResourceField::AgentCapabilities,
+                    ProgramResourceField::AgentRequires,
+                    ProgramResourceField::AgentTools,
+                    ProgramResourceField::AgentReturns,
                 ],
                 _ => unreachable!(),
             };
@@ -1031,6 +1073,55 @@ mod tests {
         assert!(matches!(
             encode(&checked),
             Err(StoreError::Conflict(message)) if message.contains("digest differs")
+        ));
+    }
+
+    #[test]
+    fn agent_selector_scope_requires_all_six_fields_and_refuses_legacy_mislabeling() {
+        use ProgramResourceField as Field;
+
+        let fields = [
+            (Field::AgentProfile, vec!["repo-reader".into()]),
+            (Field::AgentSkills, vec!["reviewer".into()]),
+            (Field::AgentCapabilities, vec!["repo.read".into()]),
+            (Field::AgentRequires, vec!["session.resume".into()]),
+            (Field::AgentTools, vec!["Review".into()]),
+            (Field::AgentReturns, vec!["ReviewResult".into()]),
+        ];
+        let examined = fields
+            .into_iter()
+            .enumerate()
+            .map(|(occurrence, (field, values))| ProgramResourceFieldUse {
+                occurrence,
+                owner: "reviewer".into(),
+                field,
+                meaning: field.meaning(),
+                values,
+            })
+            .collect::<Vec<_>>();
+        let mut checked = witness(LOCK);
+        checked.resource_fields = Some(ProgramResourceFieldCapture {
+            scope: ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2,
+            digest: crate::items::sha256_hex(&serde_json::to_string(&examined).unwrap()),
+            examined,
+        });
+        assert!(encode(&checked).is_ok());
+
+        let mut omitted = checked.clone();
+        let capture = omitted.resource_fields.as_mut().unwrap();
+        capture.examined.pop();
+        capture.digest =
+            crate::items::sha256_hex(&serde_json::to_string(&capture.examined).unwrap());
+        assert!(matches!(
+            encode(&omitted),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
+        ));
+
+        checked.resource_fields.as_mut().unwrap().scope =
+            ProgramResourceFieldScope::DeclaredFieldsV1;
+        assert!(matches!(
+            encode(&checked),
+            Err(StoreError::Conflict(message)) if message.contains("incomplete or misclassified")
         ));
     }
 

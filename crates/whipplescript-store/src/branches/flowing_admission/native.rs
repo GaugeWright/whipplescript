@@ -1313,6 +1313,9 @@ impl FlowingAdmissions for BranchStore {
 mod tests {
     use super::*;
     use crate::branches::flowing_admission::{test_issuer, FlowingGateCheck, FlowingGateVerdict};
+    use crate::branches::flowing_close_roster::{
+        FlowingCloseAttemptState, FlowingCloseRosterReader,
+    };
     use crate::branches::flowing_fence::{
         FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
         FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
@@ -2140,6 +2143,40 @@ mod tests {
     }
 
     #[test]
+    fn close_roster_keeps_pending_and_admitted_attempts_under_one_source() {
+        let mut store = fixture();
+        let attempt = request("unit-a", "fixture");
+        assert!(store
+            .flowing_close_roster("twig")
+            .unwrap()
+            .unwrap()
+            .live_attempts
+            .is_empty());
+        pin_attempt(&mut store, &attempt);
+        let pending = store.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(pending.live_attempts.len(), 1);
+        assert_eq!(
+            pending.live_attempts[0].state,
+            FlowingCloseAttemptState::Pending
+        );
+        assert_eq!(pending.live_attempts[0].unit_ids, ["unit-a"]);
+        assert!(matches!(
+            store.admit_flowing_prefix(&attempt).unwrap(),
+            FlowingAdmissionOutcome::Admitted(_)
+        ));
+        let admitted = store.flowing_close_roster("twig").unwrap().unwrap();
+        assert_eq!(
+            admitted.live_attempts[0].state,
+            FlowingCloseAttemptState::Admitted
+        );
+        store.connection.execute("UPDATE flowing_attempt_pins SET witness_digest = 'missing' WHERE op_id = 'fixture'", []).unwrap();
+        assert!(matches!(
+            store.flowing_close_roster("twig"),
+            Err(StoreError::Conflict(message)) if message.contains("lost its candidate witness")
+        ));
+    }
+
+    #[test]
     fn trunk_cas_first_returns_exact_admission_to_native_parking() {
         let mut store = fixture();
         let attempt = request("unit-a", "admission-a");
@@ -2262,6 +2299,127 @@ mod tests {
         attempt.certificate_handle = certificate.handle().unwrap();
         insert_gate_certificate(store, &certificate);
         attempt
+    }
+
+    #[test]
+    fn close_roster_distinguishes_cancelled_failed_and_unrun_attempts() {
+        for (verdict, expected) in [
+            (FlowingGateVerdict::Failed, FlowingCloseAttemptState::Failed),
+            (FlowingGateVerdict::Unrun, FlowingCloseAttemptState::Unrun),
+        ] {
+            let mut store = fixture();
+            let attempt = terminal_request(&store, "terminal", verdict);
+            pin_attempt(&mut store, &attempt);
+            assert!(matches!(
+                store.finish_flowing_attempt(&attempt).unwrap(),
+                FlowingAttemptFinishOutcome::Finished(_)
+            ));
+            assert_eq!(
+                store
+                    .flowing_close_roster("twig")
+                    .unwrap()
+                    .unwrap()
+                    .live_attempts[0]
+                    .state,
+                expected
+            );
+        }
+        let mut store = fixture();
+        let attempt = request("unit-a", "fixture");
+        pin_attempt(&mut store, &attempt);
+        assert!(matches!(
+            store
+                .cancel_flowing_attempt(&cancel("fixture", "cancel-a"))
+                .unwrap(),
+            FlowingCancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            store
+                .flowing_close_roster("twig")
+                .unwrap()
+                .unwrap()
+                .live_attempts[0]
+                .state,
+            FlowingCloseAttemptState::Cancelled {
+                cancel_op_id: "cancel-a".into()
+            }
+        );
+        let witness = store
+            .candidate_witness(&attempt.candidate_witness_digest)
+            .unwrap()
+            .unwrap();
+        let pin = store.flowing_attempt_pin("fixture").unwrap().unwrap();
+        assert!(matches!(
+            crate::branches::flowing_close_roster::classify_attempt(
+                pin,
+                Some(serde_json::to_string(&witness).unwrap()),
+                Some(serde_json::to_string(&FlowingAdmissionReceipt { request: attempt }).unwrap()),
+                Some(("cancel-a".into(), serde_json::to_string(&cancel("fixture", "cancel-a")).unwrap())),
+                None,
+            ),
+            Err(StoreError::Conflict(message)) if message.contains("conflicting terminal results")
+        ));
+    }
+
+    #[test]
+    fn close_attempt_classifier_refuses_changed_witness_and_terminal_rows() {
+        use crate::branches::flowing_close_roster::classify_attempt;
+
+        let mut store = fixture();
+        let attempt = request("unit-a", "fixture");
+        pin_attempt(&mut store, &attempt);
+        let pin = store.flowing_attempt_pin("fixture").unwrap().unwrap();
+        let witness = store
+            .candidate_witness(&pin.witness_digest)
+            .unwrap()
+            .unwrap();
+        let witness_json = serde_json::to_string(&witness).unwrap();
+
+        let mut changed_pin = pin.clone();
+        changed_pin.source_cut_id = "other-cut".into();
+        assert!(matches!(
+            classify_attempt(changed_pin, Some(witness_json.clone()), None, None, None),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its witness")
+        ));
+
+        let mut changed_request = attempt.clone();
+        changed_request.op_id = "other-op".into();
+        let changed_admission = serde_json::to_string(&FlowingAdmissionReceipt {
+            request: changed_request.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            classify_attempt(pin.clone(), Some(witness_json.clone()), Some(changed_admission), None, None),
+            Err(StoreError::Conflict(message)) if message.contains("admission differs")
+        ));
+
+        let cancellation = serde_json::to_string(&cancel("fixture", "cancel-a")).unwrap();
+        assert!(matches!(
+            classify_attempt(pin.clone(), Some(witness_json.clone()), None, Some(("changed-key".into(), cancellation)), None),
+            Err(StoreError::Conflict(message)) if message.contains("cancellation differs")
+        ));
+
+        for (finish, expected) in [
+            (
+                FlowingAttemptFinishReceipt {
+                    request: changed_request,
+                    verdict: FlowingGateVerdict::Failed,
+                },
+                "finish differs",
+            ),
+            (
+                FlowingAttemptFinishReceipt {
+                    request: attempt,
+                    verdict: FlowingGateVerdict::Passed,
+                },
+                "passed gate",
+            ),
+        ] {
+            assert!(matches!(
+                classify_attempt(pin.clone(), Some(witness_json.clone()), None, None, Some(serde_json::to_string(&finish).unwrap())),
+                Err(StoreError::Conflict(message)) if message.contains(expected)
+            ));
+        }
     }
 
     #[test]

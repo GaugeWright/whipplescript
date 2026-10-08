@@ -764,6 +764,66 @@ rule notify
         assert!(!current_basis(&stored, &changed, &basis));
     }
 
+    #[cfg(feature = "native")]
+    #[test]
+    fn checked_native_admission_revalidates_agent_skill_selectors() {
+        use whipplescript_store::program_imports::{
+            ProgramResourceField, ProgramResourceFieldScope,
+        };
+
+        let source = include_str!("../../../examples/revision-ticket-v1.whip");
+        let ir = program(source);
+        let source_digest = sha256_hex(source.as_bytes());
+        let basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: B,
+            packages: &[],
+        };
+        let mut kernel = crate::RuntimeKernel::new(
+            whipplescript_store::SqliteStore::open_in_memory().expect("store"),
+        );
+        let admitted = kernel
+            .create_program_version_for_compiled_program_with_imports(
+                crate::CompiledProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &crate::stable_hash_hex(source),
+                    compiler_version: "test",
+                },
+                &ir,
+                None,
+                &basis,
+                None,
+            )
+            .expect("checked admission");
+        let stored = kernel
+            .store()
+            .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+            .unwrap()
+            .unwrap();
+        let fields = stored.resource_fields.as_ref().unwrap();
+        assert_eq!(
+            fields.scope,
+            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2
+        );
+        assert!(fields.examined.iter().any(|field| {
+            field.owner == "worker"
+                && field.field == ProgramResourceField::AgentSkills
+                && field.values == ["whipplescript-author"]
+        }));
+        assert!(current_basis(&stored, &ir, &basis));
+        let mut changed = ir;
+        changed
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == "worker")
+            .unwrap()
+            .skills
+            .clear();
+        assert!(!current_basis(&stored, &changed, &basis));
+    }
+
     #[test]
     fn exact_imports_and_same_lock_source_drift() {
         let ir = program("use std.memory\nuse local.x\nuse local.y\nworkflow Imports\n");

@@ -15,6 +15,7 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod carried_cuts;
 pub mod flowing_admission;
 pub mod flowing_close_roster;
 pub mod flowing_coverage;
@@ -1084,6 +1085,9 @@ impl BranchStore {
             "SELECT ours FROM conflicts",
             "SELECT theirs FROM conflicts",
             "SELECT resolution FROM conflicts",
+            // A recorded carriage keeps its header and every step's manifest.
+            "SELECT record_id FROM carried_cuts",
+            "SELECT manifest_hash FROM carried_cut_steps",
         ] {
             collect(&self.connection, sql, &mut roots)?;
         }
@@ -1214,7 +1218,9 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// Version 12 records immutable member-opening receipts, so retries cannot
 /// mistake a changed owner or head for a different creation request.
 /// Version 13 gives all newly opened flowing sources immutable retry receipts.
-const SATELLITE_SCHEMA_VERSION: i64 = 13;
+/// Version 14 records cut carriages (DR-0139, FB-6); an older collector would
+/// reclaim the headers and manifests a recorded carriage holds.
+const SATELLITE_SCHEMA_VERSION: i64 = 14;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1226,6 +1232,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(resolution_batch::CREATE)?;
     connection.execute_batch(resolution_origin::CREATE)?;
     for statement in flowing_sources::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in carried_cuts::SCHEMA {
         connection.execute(statement, [])?;
     }
     for statement in flowing_fence::SCHEMA {

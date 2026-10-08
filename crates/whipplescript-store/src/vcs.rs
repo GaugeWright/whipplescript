@@ -20,6 +20,7 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
+pub mod cut_carriage;
 pub mod flowing_abandonment;
 #[cfg(feature = "native")]
 pub mod flowing_gate;

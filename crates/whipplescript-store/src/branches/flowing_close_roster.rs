@@ -7,9 +7,13 @@
 #[cfg(feature = "native")]
 pub(crate) mod native;
 
+use super::flowing_admission::{
+    FlowingAdmissionReceipt, FlowingAttemptFinishReceipt, FlowingAttemptPin, FlowingCancelRequest,
+    FlowingCandidateWitness, FlowingGateVerdict,
+};
 use super::flowing_fence::FlowingFenceState;
 use super::BranchStatus;
-use crate::StoreResult;
+use crate::{StoreError, StoreResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowingCloseMember {
@@ -44,6 +48,24 @@ pub struct FlowingClosePrivatePin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowingCloseAttemptState {
+    Pending,
+    Admitted,
+    Cancelled { cancel_op_id: String },
+    Failed,
+    Unrun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowingCloseAttempt {
+    pub pin: FlowingAttemptPin,
+    pub source_branch_id: String,
+    pub source_incarnation_id: String,
+    pub unit_ids: Vec<String>,
+    pub state: FlowingCloseAttemptState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowingCloseRoster {
     pub source_branch_id: String,
     pub source_fence: FlowingFenceState,
@@ -53,6 +75,7 @@ pub struct FlowingCloseRoster {
     pub members: Vec<FlowingCloseMember>,
     pub units: Vec<FlowingCloseUnit>,
     pub live_private_pins: Vec<FlowingClosePrivatePin>,
+    pub live_attempts: Vec<FlowingCloseAttempt>,
 }
 
 /// Reads one internally consistent ref snapshot. `None` means this branch has
@@ -62,6 +85,96 @@ pub trait FlowingCloseRosterReader {
         &mut self,
         source_branch_id: &str,
     ) -> StoreResult<Option<FlowingCloseRoster>>;
+}
+
+/// Classify a live attempt pin from rows read in the same ref snapshot. A
+/// missing witness or ambiguous terminal state cannot disappear from a close
+/// roster just because its source cannot be identified.
+#[doc(hidden)]
+pub fn classify_attempt(
+    pin: FlowingAttemptPin,
+    witness_json: Option<String>,
+    admission_json: Option<String>,
+    cancellation_row: Option<(String, String)>,
+    finish_json: Option<String>,
+) -> StoreResult<FlowingCloseAttempt> {
+    let witness_json = witness_json.ok_or_else(|| {
+        StoreError::Conflict("live flowing attempt lost its candidate witness".into())
+    })?;
+    let witness: FlowingCandidateWitness = serde_json::from_str(&witness_json)?;
+    if pin.op_id.trim().is_empty()
+        || pin.retained_at.trim().is_empty()
+        || witness.source_branch_id.trim().is_empty()
+        || witness.source_incarnation_id.trim().is_empty()
+        || witness.digest()? != pin.witness_digest
+        || witness.source_cut_id != pin.source_cut_id
+        || witness.candidate_cut_id != pin.candidate_cut_id
+    {
+        return Err(StoreError::Conflict(
+            "live flowing attempt differs from its witness".into(),
+        ));
+    }
+    let terminal_count = admission_json.is_some() as u8
+        + cancellation_row.is_some() as u8
+        + finish_json.is_some() as u8;
+    if terminal_count > 1 {
+        return Err(StoreError::Conflict(
+            "live flowing attempt has conflicting terminal results".into(),
+        ));
+    }
+    let state = if let Some(json) = admission_json {
+        let receipt: FlowingAdmissionReceipt = serde_json::from_str(&json)?;
+        if receipt.request.op_id != pin.op_id
+            || receipt.request.candidate_witness_digest != pin.witness_digest
+            || !witness.matches_request(&receipt.request)
+        {
+            return Err(StoreError::Conflict(
+                "live flowing admission differs from its attempt".into(),
+            ));
+        }
+        FlowingCloseAttemptState::Admitted
+    } else if let Some((cancel_op_id, json)) = cancellation_row {
+        let request: FlowingCancelRequest = serde_json::from_str(&json)?;
+        if request.admission_op_id != pin.op_id
+            || request.source_branch_id != witness.source_branch_id
+            || request.source_incarnation_id != witness.source_incarnation_id
+            || request.cancel_op_id != cancel_op_id
+            || cancel_op_id.trim().is_empty()
+        {
+            return Err(StoreError::Conflict(
+                "live flowing cancellation differs from its attempt".into(),
+            ));
+        }
+        FlowingCloseAttemptState::Cancelled { cancel_op_id }
+    } else if let Some(json) = finish_json {
+        let receipt: FlowingAttemptFinishReceipt = serde_json::from_str(&json)?;
+        if receipt.request.op_id != pin.op_id
+            || receipt.request.candidate_witness_digest != pin.witness_digest
+            || !witness.matches_request(&receipt.request)
+        {
+            return Err(StoreError::Conflict(
+                "live flowing finish differs from its attempt".into(),
+            ));
+        }
+        match receipt.verdict {
+            FlowingGateVerdict::Failed => FlowingCloseAttemptState::Failed,
+            FlowingGateVerdict::Unrun => FlowingCloseAttemptState::Unrun,
+            FlowingGateVerdict::Passed => {
+                return Err(StoreError::Conflict(
+                    "live flowing finish reports a passed gate without admission".into(),
+                ))
+            }
+        }
+    } else {
+        FlowingCloseAttemptState::Pending
+    };
+    Ok(FlowingCloseAttempt {
+        pin,
+        source_branch_id: witness.source_branch_id,
+        source_incarnation_id: witness.source_incarnation_id,
+        unit_ids: witness.units.into_iter().map(|unit| unit.unit_id).collect(),
+        state,
+    })
 }
 
 /// Classify a declared unit without silently discarding a conflicting

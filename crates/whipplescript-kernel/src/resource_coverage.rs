@@ -1,10 +1,11 @@
 //! Compiler-owned resource-field inventory for checked admission (RC-1).
 //!
 //! These are exact source spellings with field-specific meanings. A path,
-//! endpoint, destination or credential name is not an external revision pin or
-//! a live update edge without its host binding and admitting operation.
+//! endpoint, destination, credential or agent selector is not an external
+//! revision pin or live update edge without its host binding and admitting
+//! operation.
 
-use whipplescript_parser::{IrChannel, IrFileStore, IrProgram, IrSource};
+use whipplescript_parser::{IrAgent, IrChannel, IrFileStore, IrProgram, IrSource};
 use whipplescript_store::program_imports::{
     ProgramResourceField, ProgramResourceFieldCapture, ProgramResourceFieldScope,
     ProgramResourceFieldUse,
@@ -45,7 +46,7 @@ pub fn capture(program: &IrProgram) -> Result<ProgramResourceFieldCapture, Strin
         counters: _,
         shared_coordination_usage: _,
         schemas: _,
-        agents: _,
+        agents,
         coerces: _,
         assertions: _,
         rules: _,
@@ -145,9 +146,46 @@ pub fn capture(program: &IrProgram) -> Result<ProgramResourceFieldCapture, Strin
             push(name, field, value.iter().cloned().collect());
         }
     }
+    for agent in agents {
+        let IrAgent {
+            name,
+            span: _,
+            harness: _,
+            provider: _,
+            profile,
+            capacity: _,
+            skills,
+            capabilities,
+            requires,
+            tools,
+            compaction: _,
+            thread: _,
+            settings: _,
+            returns,
+            harness_class: _,
+        } = agent;
+        push(
+            name,
+            ProgramResourceField::AgentProfile,
+            profile.iter().cloned().collect(),
+        );
+        push(name, ProgramResourceField::AgentSkills, skills.clone());
+        push(
+            name,
+            ProgramResourceField::AgentCapabilities,
+            capabilities.clone(),
+        );
+        push(name, ProgramResourceField::AgentRequires, requires.clone());
+        push(name, ProgramResourceField::AgentTools, tools.clone());
+        push(
+            name,
+            ProgramResourceField::AgentReturns,
+            returns.iter().cloned().collect(),
+        );
+    }
     let json = serde_json::to_vec(&examined).map_err(|error| error.to_string())?;
     Ok(ProgramResourceFieldCapture {
-        scope: ProgramResourceFieldScope::DeclaredFieldsV1,
+        scope: ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2,
         examined,
         digest: sha256_hex(&json),
     })
@@ -211,6 +249,69 @@ mod tests {
         }));
         assert!(file_source.examined.iter().any(|use_site| {
             use_site.field == ProgramResourceField::SourceWatch && use_site.values.is_empty()
+        }));
+    }
+
+    #[test]
+    fn agent_selector_fields_are_inventoried_without_claiming_live_edges() {
+        let compiled = whipplescript_parser::compile_program(include_str!(
+            "../../../examples/subworkflow-tool-consumer.whip"
+        ));
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let mut program = compiled.ir.unwrap();
+        let worker = program
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == "worker")
+            .unwrap();
+        worker.skills = vec!["code-reviewer".into()];
+        worker.capabilities = vec!["repo.read".into()];
+        worker.requires = vec!["session.resume".into()];
+        worker.returns = Some("ReviewResult".into());
+        let capture = capture(&program).unwrap();
+        assert_eq!(
+            capture.scope,
+            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2
+        );
+        let worker_fields = capture
+            .examined
+            .iter()
+            .filter(|field| field.owner == "worker")
+            .collect::<Vec<_>>();
+        assert_eq!(worker_fields.len(), 6);
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentTools
+                && field.meaning == ProgramResourceFieldMeaning::WorkflowToolSelector
+                && field.values == ["EchoText"]
+        }));
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentSkills
+                && field.meaning == ProgramResourceFieldMeaning::SkillSelector
+                && field.values == ["code-reviewer"]
+        }));
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentRequires
+                && field.meaning == ProgramResourceFieldMeaning::ProviderFeatureSelector
+                && field.values == ["session.resume"]
+        }));
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentReturns
+                && field.meaning == ProgramResourceFieldMeaning::ResultSchemaSelector
+                && field.values == ["ReviewResult"]
+        }));
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentProfile
+                && field.meaning == ProgramResourceFieldMeaning::ProviderProfileSelector
+                && field.values == ["repo-writer"]
+        }));
+        assert!(worker_fields.iter().any(|field| {
+            field.field == ProgramResourceField::AgentCapabilities
+                && field.meaning == ProgramResourceFieldMeaning::CapabilitySelector
+                && field.values == ["repo.read"]
         }));
     }
 }

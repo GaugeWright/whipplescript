@@ -1,9 +1,10 @@
 use rusqlite::{params, TransactionBehavior};
 
 use super::{
-    classify_unit, FlowingCloseMember, FlowingClosePrivatePin, FlowingCloseRoster,
-    FlowingCloseRosterReader, FlowingCloseUnit,
+    classify_attempt, classify_unit, FlowingCloseMember, FlowingClosePrivatePin,
+    FlowingCloseRoster, FlowingCloseRosterReader, FlowingCloseUnit,
 };
+use crate::branches::flowing_admission::FlowingAttemptPin;
 use crate::branches::flowing_fence;
 use crate::branches::{BranchStatus, BranchStore};
 use crate::{StoreError, StoreResult};
@@ -136,6 +137,50 @@ impl FlowingCloseRosterReader for BranchStore {
         }
         drop(statement);
 
+        let mut live_attempts = Vec::new();
+        let mut statement = tx.prepare(
+            "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
+                    pin.retained_at, witness.witness_json, admitted.receipt_json, \
+                    cancelled.cancel_op_id, cancelled.request_json, finished.receipt_json \
+             FROM flowing_attempt_pins AS pin \
+             LEFT JOIN flowing_candidate_witnesses AS witness \
+               ON witness.digest = pin.witness_digest \
+             LEFT JOIN flowing_admissions AS admitted ON admitted.op_id = pin.op_id \
+             LEFT JOIN flowing_admission_cancellations AS cancelled \
+               ON cancelled.admission_op_id = pin.op_id \
+             LEFT JOIN flowing_attempt_finishes AS finished ON finished.op_id = pin.op_id \
+             WHERE pin.released_at IS NULL ORDER BY pin.op_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                FlowingAttemptPin {
+                    op_id: row.get(0)?,
+                    witness_digest: row.get(1)?,
+                    source_cut_id: row.get(2)?,
+                    candidate_cut_id: row.get(3)?,
+                    retained_at: row.get(4)?,
+                    released_at: None,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?
+                    .zip(row.get::<_, Option<String>>(8)?),
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        for row in rows {
+            let (pin, witness, admission, cancellation, finish) = row?;
+            let attempt = classify_attempt(pin, witness, admission, cancellation, finish)?;
+            if attempt.source_branch_id == source_branch_id
+                || members
+                    .iter()
+                    .any(|member| member.branch_id == attempt.source_branch_id)
+            {
+                live_attempts.push(attempt);
+            }
+        }
+        drop(statement);
+
         let roster = FlowingCloseRoster {
             source_branch_id: source.branch_id,
             source_fence: fence,
@@ -145,6 +190,7 @@ impl FlowingCloseRosterReader for BranchStore {
             members,
             units,
             live_private_pins,
+            live_attempts,
         };
         tx.commit()?;
         Ok(Some(roster))

@@ -2008,6 +2008,54 @@ rule finish
     }
 
     #[test]
+    fn hosted_worker_persists_checked_agent_skill_selectors() {
+        use crate::do_store::{as_text, SqlValue};
+        use whipplescript_store::program_imports::{
+            ProgramResourceField, ProgramResourceFieldScope,
+        };
+
+        let sql = store().sql;
+        let instance = DurableInstance::create(
+            sql.clone(),
+            include_str!("../../../examples/revision-ticket-v1.whip"),
+            r#"{"ticket":{"title":"Review","body":"Check the change"}}"#,
+            "local/RevisionTicket",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some("d".repeat(64)),
+                ..test_ports()
+            },
+            &[],
+            &[],
+        )
+        .expect("hosted agent source admits");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let version_id = &kernel.store().list_instances().unwrap()[0].version_id;
+        let rows = sql
+            .query(
+                "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+                &[SqlValue::Text(version_id.clone())],
+            )
+            .unwrap();
+        let witness = kernel
+            .store()
+            .program_import_witness(version_id, &as_text(&rows[0][0]))
+            .unwrap()
+            .unwrap();
+        let fields = witness
+            .resource_fields
+            .expect("agent selectors inventoried");
+        assert_eq!(
+            fields.scope,
+            ProgramResourceFieldScope::DeclaredFieldsAndAgentSelectorsV2
+        );
+        assert!(fields.examined.iter().any(|field| {
+            field.owner == "worker"
+                && field.field == ProgramResourceField::AgentSkills
+                && field.values == ["whipplescript-author"]
+        }));
+    }
+
+    #[test]
     fn hosted_worker_persists_ordinary_package_calls_in_checked_admission() {
         use crate::do_store::{as_text, SqlValue};
 
