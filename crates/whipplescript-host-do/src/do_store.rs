@@ -33,6 +33,9 @@
 //! actual Durable Object. The Rust side is complete and green (native tests +
 //! clippy + `wasm32-unknown-unknown`).
 
+#[cfg(test)]
+#[path = "do_store_checkpoint_positions_tests.rs"]
+mod checkpoint_positions_tests;
 mod dispatch;
 mod host_actions;
 mod readiness;
@@ -774,6 +777,128 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// owner. Native parity: `SqliteStore::claim_instance_ownership`.
     pub fn claim_instance_ownership(&self, instance_id: &str) -> StoreResult<i64> {
         do_claim_instance_ownership(&self.sql, instance_id)
+    }
+
+    fn capture_checkpoint_inner(
+        &self,
+        capture: CheckpointCapture<'_>,
+        positions: Option<CheckpointPositions<'_>>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
+        let positions_payload = if let Some(positions) = positions {
+            let payload = checkpoint_positions::payload(capture, positions)?;
+            let rows = self.sql.query("SELECT event_id, sequence, event_type, payload_json, source, occurred_at, idempotency_key FROM events WHERE instance_id = ?1 AND event_type IN ('plane.positions', 'context.checkpoint') ORDER BY sequence", &[text(capture.instance_id)]).map_err(sql_err)?;
+            let events = rows
+                .iter()
+                .map(|row| {
+                    (
+                        EventView {
+                            event_id: as_text(&row[0]),
+                            sequence: as_i64(&row[1]),
+                            event_type: as_text(&row[2]),
+                            payload_json: as_text(&row[3]),
+                            source: as_text(&row[4]),
+                            occurred_at: as_text(&row[5]),
+                        },
+                        as_opt_text(&row[6]),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(retained) = checkpoint_positions::retained(capture, positions, &events)? {
+                let blob = self.get_content(&retained.checkpoint.manifest_hash)?;
+                if blob
+                    .as_deref()
+                    .is_none_or(|body| stable_hash_hex(body) != retained.checkpoint.manifest_hash)
+                {
+                    return Err(StoreError::Conflict(
+                        "retained checkpoint manifest is unavailable".into(),
+                    ));
+                }
+                return Ok(retained);
+            }
+            Some(payload)
+        } else {
+            None
+        };
+        // INV-2 no-in-flight straddle: a checkpoint is a consistent cut only at
+        // a quiescent point; refuse if any effect is mid-run.
+        let running_rows = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                &[text(capture.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let running = running_rows.first().map(|row| as_i64(&row[0])).unwrap_or(0);
+        if running > 0 {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint requires a quiescent instance; {running} effect(s) still running"
+            )));
+        }
+        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
+        // restore-marker fold applied), so a checkpoint after a restore reflects
+        // the reconciled file plane, never an abandoned-branch write. The
+        // checkpoint event appended below is not a file write, so folding over
+        // the current head equals folding <= the checkpoint's own sequence.
+        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id)?;
+        let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
+        // INV-4 coherence: store the manifest content-addressed BEFORE the cut
+        // references its hash (same DO SQLite), so no committed cut names a
+        // manifest hash absent from the blob store.
+        let manifest_hash = stable_hash_hex(&manifest_json);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[
+                    text(&manifest_hash),
+                    text(&manifest_json),
+                    int(manifest_json.len() as i64),
+                ],
+            )
+            .map_err(sql_err)?;
+        if let (Some(positions), Some(payload)) = (positions, positions_payload.as_ref()) {
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: capture.instance_id,
+                    event_type: "plane.positions",
+                    payload_json: payload,
+                    source: positions.source,
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(positions.idempotency_key),
+                },
+            )?;
+        }
+        let payload = serde_json::json!({
+            "cut_id": capture.cut_id,
+            "transcript_ref": capture.transcript_ref,
+            "manifest_hash": manifest_hash,
+            "manifest": manifest,
+            "file_count": manifest.len(),
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: capture.instance_id,
+                event_type: "context.checkpoint",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: capture.idempotency_key,
+            },
+        )?;
+        Ok(CapturedCheckpointWithPositions {
+            checkpoint: CapturedCheckpoint {
+                cut_id: capture.cut_id.to_owned(),
+                event_id: event.event_id,
+                sequence: event.sequence,
+                manifest_hash,
+                file_count: manifest.len(),
+            },
+            positions_payload_json: positions_payload.unwrap_or_default(),
+        })
     }
 
     /// DR-0068 §3: read an instance's log against a pin, verifying as it goes.
@@ -7552,68 +7677,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint> {
-        // INV-2 no-in-flight straddle: a checkpoint is a consistent cut only at
-        // a quiescent point; refuse if any effect is mid-run.
-        let running_rows = self
-            .sql
-            .query(
-                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
-                &[text(capture.instance_id)],
-            )
-            .map_err(sql_err)?;
-        let running = running_rows.first().map(|row| as_i64(&row[0])).unwrap_or(0);
-        if running > 0 {
-            return Err(StoreError::Conflict(format!(
-                "checkpoint requires a quiescent instance; {running} effect(s) still running"
-            )));
-        }
-        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
-        // restore-marker fold applied), so a checkpoint after a restore reflects
-        // the reconciled file plane, never an abandoned-branch write. The
-        // checkpoint event appended below is not a file write, so folding over
-        // the current head equals folding <= the checkpoint's own sequence.
-        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id)?;
-        let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
-        // INV-4 coherence: store the manifest content-addressed BEFORE the cut
-        // references its hash (same DO SQLite), so no committed cut names a
-        // manifest hash absent from the blob store.
-        let manifest_hash = stable_hash_hex(&manifest_json);
-        self.sql
-            .execute(
-                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
-                &[
-                    text(&manifest_hash),
-                    text(&manifest_json),
-                    int(manifest_json.len() as i64),
-                ],
-            )
-            .map_err(sql_err)?;
-        let payload = serde_json::json!({
-            "cut_id": capture.cut_id,
-            "transcript_ref": capture.transcript_ref,
-            "manifest_hash": manifest_hash,
-            "manifest": manifest,
-            "file_count": manifest.len(),
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: capture.instance_id,
-                event_type: "context.checkpoint",
-                payload_json: &payload,
-                source: "restorable-context",
-                causation_id: None,
-                correlation_id: None,
-                idempotency_key: capture.idempotency_key,
-            },
-        )?;
-        Ok(CapturedCheckpoint {
-            cut_id: capture.cut_id.to_owned(),
-            event_id: event.event_id,
-            sequence: event.sequence,
-            manifest_hash,
-            file_count: manifest.len(),
+        self.capture_checkpoint_inner(capture, None)
+            .map(|held| held.checkpoint)
+    }
+
+    fn capture_checkpoint_with_positions(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+        positions: CheckpointPositions<'_>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
+        recovery::atomic_result(&self.sql, false, &mut || {
+            self.capture_checkpoint_inner(capture, Some(positions))
         })
     }
 

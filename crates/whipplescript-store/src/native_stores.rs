@@ -622,6 +622,15 @@ impl RuntimeStore for NativeStores {
         self.runtime.capture_checkpoint(capture)
     }
 
+    fn capture_checkpoint_with_positions(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+        positions: crate::CheckpointPositions<'_>,
+    ) -> StoreResult<crate::CapturedCheckpointWithPositions> {
+        self.runtime
+            .capture_checkpoint_with_positions(capture, positions)
+    }
+
     fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
         self.runtime.plan_restore(instance_id, cut_id)
     }

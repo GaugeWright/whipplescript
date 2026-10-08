@@ -38539,8 +38539,8 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
     let key = idempotency_key(&[instance_id, &cut_id, "checkpoint"]);
     // Two-plane consistent cut (vw note §9.3): the workspace plane's
     // monotone stores snapshot by HIGH-WATER POSITION, recorded in the
-    // same quiescent pass as the substance cut. A store that cannot be read
-    // refuses the cut rather than being recorded as empty (WS-378).
+    // same quiescent pass as the substance cut. An unreadable plane refuses
+    // before the pair's atomic publication; it is never recorded as empty.
     let plane_positions =
         match capture_plane_positions(&coordination_store_path(), &items_store_path()) {
             Ok(positions) => positions,
@@ -38549,47 +38549,49 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    let positions_payload = json!({
-        "cut_id": cut_id,
-        "positions": plane_positions,
-        // The position pair: the external store's positions travel INSIDE
-        // the same event as the workspace cut id — one coherent coordinate,
-        // or absent when no external scope was supplied.
-        "external": external_positions,
-    })
-    .to_string();
-    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
-        instance_id,
-        event_type: "plane.positions",
-        payload_json: &positions_payload,
-        source: "cli",
-        causation_id: None,
-        correlation_id: None,
-        idempotency_key: Some(&idempotency_key(&[instance_id, &cut_id, "plane-positions"])),
-    }) {
-        eprintln!("could not record plane positions: {}", store_error(error));
-        return ExitCode::FAILURE;
-    }
-    match kernel.store_mut().capture_checkpoint(CheckpointCapture {
-        instance_id,
-        cut_id: &cut_id,
-        transcript_ref: None,
-        idempotency_key: Some(&key),
-    }) {
-        Ok(checkpoint) if options.json => emit_json(json!({
-            "instance_id": instance_id,
-            "cut_id": checkpoint.cut_id,
-            "plane_positions": plane_positions,
-            "sequence": checkpoint.sequence,
-            "manifest_hash": checkpoint.manifest_hash,
-            "file_count": checkpoint.file_count,
-        })),
-        Ok(checkpoint) => {
-            println!(
-                "checkpoint `{}` captured at event #{} ({} file(s))",
-                checkpoint.cut_id, checkpoint.sequence, checkpoint.file_count
-            );
-            ExitCode::SUCCESS
+    let observed_positions = plane_positions.to_string();
+    let external_json =
+        serde_json::to_string(&external_positions).expect("JSON value serialization");
+    let positions_key = idempotency_key(&[instance_id, &cut_id, "plane-positions"]);
+    match kernel.store_mut().capture_checkpoint_with_positions(
+        CheckpointCapture {
+            instance_id,
+            cut_id: &cut_id,
+            transcript_ref: None,
+            idempotency_key: Some(&key),
+        },
+        whipplescript_store::CheckpointPositions {
+            positions_json: &observed_positions,
+            external_json: Some(&external_json),
+            source: "cli",
+            idempotency_key: &positions_key,
+        },
+    ) {
+        Ok(held) => {
+            let checkpoint = held.checkpoint;
+            if options.json {
+                let original: serde_json::Value =
+                    match serde_json::from_str(&held.positions_payload_json) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return report_store_error(
+                                "retained checkpoint positions malformed",
+                                whipplescript_store::StoreError::Conflict(error.to_string()),
+                            )
+                        }
+                    };
+                emit_json(json!({
+                    "instance_id": instance_id, "cut_id": checkpoint.cut_id,
+                    "plane_positions": original["positions"], "sequence": checkpoint.sequence,
+                    "manifest_hash": checkpoint.manifest_hash, "file_count": checkpoint.file_count,
+                }))
+            } else {
+                println!(
+                    "checkpoint `{}` captured at event #{} ({} file(s))",
+                    checkpoint.cut_id, checkpoint.sequence, checkpoint.file_count
+                );
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => report_store_error("failed to capture checkpoint", error),
     }
@@ -38739,11 +38741,13 @@ fn handles_command(options: &CliOptions) -> ExitCode {
     // The latest position-pair cut: workspace cut id + monotone plane
     // positions (+ the external authority's own positions when the pair was
     // captured through `whip checkpoint --external-positions`).
-    let position_pair = events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == "plane.positions")
-        .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok());
+    let position_pair =
+        match whipplescript_store::checkpoint_positions::latest_completed_pair(&events) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return report_store_error("checkpoint position pairs unavailable", error)
+            }
+        };
     let effects = match store.list_effects(instance_id) {
         Ok(effects) => effects
             .iter()

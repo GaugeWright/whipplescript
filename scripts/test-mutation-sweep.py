@@ -125,6 +125,90 @@ class TypedRefusalTests(unittest.TestCase):
                          'return Ok(Outcome::AlreadyArchived)')
 
 
+class BehavioralValidityTests(unittest.TestCase):
+    def test_diagnostic_only_is_unknown_without_writing_or_running(self):
+        source = ['fn refusal() -> Result<(), String> {', '    Err("owned refusal".into())', '}']
+        [site] = sweep.find_sites(source)
+        self.assertIsNone(sweep.apply_mutation(source, site))
+        self.assertTrue(sweep.diagnostic_only_mutation(source, site))
+        for outcome in (sweep.PASSED, sweep.CAUGHT):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "target.rs"
+                backup = Path(directory) / "backup.rs"
+                original = "\n".join(source)
+                target.write_text(original)
+                backup.write_text(original)
+                output = io.StringIO()
+                with mock.patch.object(sweep, "run_suite", return_value=outcome) as trial, contextlib.redirect_stdout(output):
+                    write = mock.Mock()
+                    survivors, unknown, deferred = sweep.sweep(str(target), "owning", [site], str(backup), write=write)
+                trial.assert_not_called()
+                write.assert_not_called()
+                self.assertEqual((survivors, unknown, deferred), ([], [site], []))
+                self.assertIn("diagnostic-only; refusal not neutralized", output.getvalue())
+                self.assertEqual(target.read_text(), original)
+
+    def test_diagnostic_unknown_fails_required_main_and_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            original = 'fn refusal() -> Result<(), String> {\n    Err("owned refusal".into())\n}\n'
+            target.write_text(original)
+            with mock.patch("sys.argv", ["mutation_sweep.py", "--target", str(target), "--filter", "owning", "--skip-self-test"]), mock.patch.object(sweep, "run_suite") as trial, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(), 1)
+            trial.assert_not_called()
+            self.assertEqual(target.read_text(), original)
+            self.assertFalse(Path(str(target) + ".sweepbak").exists())
+
+
+    def test_known_unsupported_shapes_are_not_false_coverage(self):
+        sources = [
+            ['let (Some(Int(actual)), Some(Int(recorded))) = row else {', '    return Err(Error::Conflict("sizes not integers".into()));', '};'],
+            ['let Some(Int(claimed)) = row.first() else {', '    return Err(Error::Conflict("object size not integer".into()));', '};'],
+            ['let Some(external) = self.external.as_ref() else {', '    return Err(Error::Conflict("object authority needed".into()));', '};'],
+            ['let actual = observe()?.ok_or_else(|| {', '    StoreError::Conflict("physical payload unavailable".into())', '})?;'],
+            ['match status {', '    Live { .. } => Err(Error::Conflict("inconsistent availability".into())),', '    Unknown => Ok(Unknown),', '}'],
+            ['fn reference_size() -> Result<Option<u64>, Error> {', '    Err(Error::new(Unsupported, "no exact observation"))', '}'],
+            ['fn reference_descriptor() -> Result<Status, Error> {', '    Err(Error::Conflict("no exact descriptor".into()))', '}'],
+            ['let Some(actual) = actual else {', '    return Err(failure("packed payload unavailable"));', '};'],
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                [site] = sweep.find_sites(source)
+                self.assertIsNone(sweep.apply_mutation(source, site))
+                self.assertTrue(sweep.diagnostic_only_mutation(source, site))
+
+    def test_unknown_only_cleanup_does_not_rewrite_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            original = b'fn refusal() -> Result<(), String> {\n    Err("owned refusal".into())\n}\n'
+            target.write_bytes(original)
+            real_write = Path.write_bytes
+            writes = []
+            def tracked(path, content):
+                writes.append(path)
+                return real_write(path, content)
+            with mock.patch("sys.argv", ["mutation_sweep.py", "--target", str(target), "--filter", "owning", "--skip-self-test"]), mock.patch.object(Path, "write_bytes", tracked), mock.patch.object(sweep, "run_suite") as trial, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(), 1)
+            self.assertNotIn(target, writes)
+            trial.assert_not_called()
+            self.assertEqual(target.read_bytes(), original)
+
+    def test_real_guard_is_behavioral_and_not_diagnostic(self):
+        source = ['if actual != claimed {', '    return Err(Error::Conflict("physical mismatch".into()));', '}']
+        [site] = sweep.find_sites(source)
+        self.assertEqual(sweep.apply_mutation(source, site)[0], 'if false {')
+
+    def test_all_nineteen_plants_have_behavioral_mutations(self):
+        source = sweep.PLANT.splitlines()
+        sites = sweep.find_sites(source)
+        self.assertEqual(len(sites), 19)
+        for site in sites:
+            with self.subTest(site=site):
+                mutated = sweep.apply_mutation(source, site)
+                self.assertIsNotNone(mutated)
+                self.assertNotIn("MUTATED-BY-SWEEP", "\n".join(mutated))
+
+
 class CalibrationTests(unittest.TestCase):
     def test_all_plant_edits_combine_without_line_offset_interference(self):
         source = ["// original source boundary"] + sweep.PLANT.split("\n")
@@ -464,7 +548,7 @@ class ColdProofSelectionTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "POSIX signals must reach the Python handler")
 class InterruptedSweepTests(unittest.TestCase):
-    ORIGINAL = b'// existing editor bytes\r\nfn refusal() -> Result<(), String> {\r\n    Err("actual refusal".into())\r\n}\r\n'
+    ORIGINAL = b'// existing editor bytes\r\nfn refusal() -> Result<(), String> {\r\n    // MUTATION-SUCCESS-EXPR: Ok(())\r\n    return Err("actual refusal".into());\r\n}\r\n'
 
     def interrupt_trial(self, signum, *, self_test=True, concurrent_edit=False):
         with tempfile.TemporaryDirectory() as directory:

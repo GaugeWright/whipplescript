@@ -19,6 +19,11 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Checkpoints publish workspace/external positions and the successful cut atomically
+  on native and DO stores. Busy or failed captures leave no orphan carrier; exact
+  redelivery returns the original positions, and changed command content refuses.
+  `whip handles` no longer presents historical orphan carriers as completed cuts.
+
 - Apply the settled authority-only admission compile to native signal, resident ingress and local message delivery, including retained legacy instances; preserve replay/schema/source checks, check-only liveness and the script runtime backstop (DR-0233, WS-326).
 
 - Publish the immutable host-action V7 contract for DR-0207 anchors and

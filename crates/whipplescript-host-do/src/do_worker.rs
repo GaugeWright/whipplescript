@@ -966,13 +966,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // Two-plane consistent cut, DO parity: the workspace plane's
         // monotone high-water positions land in the same pass as the
         // substance cut (all three surfaces share the one DO SQLite).
-        {
+        let positions = {
             use whipplescript_store::coordination::Coordination;
             use whipplescript_store::items::WorkItems;
-            // An unreadable position refuses the cut: recording it as empty
-            // or zero would claim coherence at positions nobody observed
-            // (WS-378). Every DO table exists from schema init, so an
-            // untouched domain still answers its empty high-water mark.
             let ledgers = kernel
                 .store()
                 .ledger_positions()
@@ -981,45 +977,30 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 .store()
                 .event_position()
                 .map_err(|error| format!("tracker event position: {error:?}"))?;
-            let payload = serde_json::json!({
-                "cut_id": cut_id,
-                "positions": {
-                    "coordination_ledgers": ledgers
-                        .iter()
-                        .map(|(owner, ledger, seq)| serde_json::json!({
-                            "owner": owner, "ledger": ledger, "seq": seq,
-                        }))
-                        .collect::<Vec<_>>(),
-                    "tracker_event_seq": tracker_seq,
-                },
-            })
-            .to_string();
-            kernel
-                .store()
-                .append_event(whipplescript_store::NewEvent {
-                    instance_id: &instance_id,
-                    event_type: "plane.positions",
-                    payload_json: &payload,
-                    source: "do",
-                    causation_id: None,
-                    correlation_id: None,
-                    idempotency_key: Some(&idempotency_key(&[
-                        &instance_id,
-                        cut_id,
-                        "plane-positions",
-                    ])),
-                })
-                .map_err(|error| format!("plane positions: {error:?}"))?;
-        }
+            serde_json::json!({
+                "coordination_ledgers": ledgers.iter().map(|(owner, ledger, seq)| serde_json::json!({"owner":owner,"ledger":ledger,"seq":seq})).collect::<Vec<_>>(),
+                "tracker_event_seq": tracker_seq,
+            }).to_string()
+        };
+        let positions_key = idempotency_key(&[&instance_id, cut_id, "plane-positions"]);
         let captured = kernel
             .store_mut()
-            .capture_checkpoint(CheckpointCapture {
-                instance_id: &instance_id,
-                cut_id,
-                transcript_ref: None,
-                idempotency_key: Some(&key),
-            })
-            .map_err(|error| format!("{error:?}"))?;
+            .capture_checkpoint_with_positions(
+                CheckpointCapture {
+                    instance_id: &instance_id,
+                    cut_id,
+                    transcript_ref: None,
+                    idempotency_key: Some(&key),
+                },
+                whipplescript_store::CheckpointPositions {
+                    positions_json: &positions,
+                    external_json: None,
+                    source: "do",
+                    idempotency_key: &positions_key,
+                },
+            )
+            .map_err(|error| format!("{error:?}"))?
+            .checkpoint;
         Ok(DoCheckpointReport {
             cut_id: captured.cut_id,
             sequence: captured.sequence,
@@ -1302,6 +1283,105 @@ rule go when started => {
             .find(|effect| effect.status == "running")
             .unwrap();
         (sql, instance, source.to_owned(), effect.effect_id)
+    }
+
+    #[test]
+    fn operator_checkpoint_running_refusal_has_no_orphan_position_pair() {
+        let (_sql, mut instance, _source, _effect) = stranded_host_turn_fixture();
+        let before = instance
+            .kernel
+            .as_ref()
+            .expect("kernel")
+            .store()
+            .list_events(&instance.instance_id)
+            .expect("before events");
+        let error = instance
+            .checkpoint("busy-paired-cut")
+            .err()
+            .expect("busy instance");
+        assert!(error.contains("quiescent"));
+        assert_eq!(
+            instance
+                .kernel
+                .as_ref()
+                .expect("kernel")
+                .store()
+                .list_events(&instance.instance_id)
+                .expect("after events"),
+            before,
+            "actual operator refusal must not publish plane.positions"
+        );
+    }
+
+    #[test]
+    fn operator_checkpoint_redelivery_retains_real_workspace_positions() {
+        use whipplescript_store::coordination::Coordination;
+        let sql = store().sql;
+        let source = r#"workflow CheckpointPairs
+output result Done
+class Done { ok int }
+rule go when started => { complete result { ok 1 } }
+"#;
+        let mut instance = DurableInstance::create(
+            sql,
+            source,
+            "{}",
+            "local/CheckpointPairs",
+            test_ports(),
+            &[],
+            &[],
+        )
+        .expect("normal program admission");
+        let first = instance.checkpoint("operator-paired-cut").expect("capture");
+        let before = instance
+            .kernel
+            .as_ref()
+            .expect("kernel")
+            .store()
+            .list_events(&instance.instance_id)
+            .expect("events");
+        instance
+            .kernel
+            .as_mut()
+            .expect("kernel")
+            .store_mut()
+            .append_for_owner("shared", "audit", "p1", "{}", "fixture", 3600)
+            .expect("actual workspace ledger advance");
+        assert!(!instance
+            .kernel
+            .as_ref()
+            .expect("kernel")
+            .store()
+            .ledger_positions()
+            .expect("positions")
+            .is_empty());
+        let repeated = instance
+            .checkpoint("operator-paired-cut")
+            .expect("retained capture");
+        assert_eq!(
+            (
+                repeated.cut_id,
+                repeated.sequence,
+                repeated.manifest_hash,
+                repeated.file_count
+            ),
+            (
+                first.cut_id,
+                first.sequence,
+                first.manifest_hash,
+                first.file_count
+            )
+        );
+        assert_eq!(
+            instance
+                .kernel
+                .as_ref()
+                .expect("kernel")
+                .store()
+                .list_events(&instance.instance_id)
+                .expect("no position append"),
+            before
+        );
     }
 
     fn request_fixture_cancellation(
@@ -1835,65 +1915,82 @@ rule finish
     /// than recording an empty domain nobody observed (WS-378).
     #[test]
     fn checkpoint_refuses_unreadable_plane_positions() {
-        let source = "workflow PlaneCut\noutput result Done\nclass Done { ok int }\nrule go when started => { complete result { ok 1 } }\n";
-        let sql = store().sql;
-        let mut instance = DurableInstance::create(
-            sql.clone(),
-            source,
-            "{}",
-            "local/PlaneCut",
-            test_ports(),
-            &[],
-            &[],
-        )
-        .expect("create");
-        assert!(matches!(
-            instance.step(None, TEST_NOW_MS),
-            DurableStepOutcome::Terminal
-        ));
-        let instance_id = instance.instance_id.clone();
-        let positions = |instance: &DurableInstance<_>| {
-            instance
-                .kernel
-                .as_ref()
-                .expect("kernel")
-                .store()
-                .list_events(&instance_id)
-                .expect("events")
-                .into_iter()
-                .filter(|event| event.event_type == "plane.positions")
-                .map(|event| {
-                    serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                        .expect("plane positions are JSON")
-                })
-                .collect::<Vec<_>>()
-        };
+        for (table, diagnostic) in [
+            ("coord_ledger_seq", "coordination ledger positions"),
+            ("tracker_events", "tracker event position"),
+        ] {
+            let source = "workflow PlaneCut\noutput result Done\nclass Done { ok int }\nrule go when started => { complete result { ok 1 } }\n";
+            let sql = store().sql;
+            let mut instance = DurableInstance::create(
+                sql.clone(),
+                source,
+                "{}",
+                "local/PlaneCut",
+                test_ports(),
+                &[],
+                &[],
+            )
+            .expect("create");
+            assert!(matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ));
+            let instance_id = instance.instance_id.clone();
+            let positions = |instance: &DurableInstance<_>| {
+                instance
+                    .kernel
+                    .as_ref()
+                    .expect("kernel")
+                    .store()
+                    .list_events(&instance_id)
+                    .expect("events")
+                    .into_iter()
+                    .filter(|event| event.event_type == "plane.positions")
+                    .map(|event| {
+                        serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                            .expect("plane positions are JSON")
+                    })
+                    .collect::<Vec<_>>()
+            };
 
-        instance.checkpoint("cut-1").expect("quiescent cut");
-        let recorded = positions(&instance);
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0]["cut_id"], "cut-1");
-        assert_eq!(
-            recorded[0]["positions"]["coordination_ledgers"],
-            serde_json::json!([])
-        );
-        assert_eq!(recorded[0]["positions"]["tracker_event_seq"], 0);
+            instance.checkpoint("cut-1").expect("quiescent cut");
+            let recorded = positions(&instance);
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0]["cut_id"], "cut-1");
+            assert_eq!(
+                recorded[0]["positions"]["coordination_ledgers"],
+                serde_json::json!([])
+            );
+            assert_eq!(recorded[0]["positions"]["tracker_event_seq"], 0);
 
-        sql.execute("DROP TABLE coord_ledger_seq", &[])
-            .expect("drop ledger positions");
-        let refused = instance
-            .checkpoint("cut-2")
-            .err()
-            .expect("an unreadable position refuses the cut");
-        assert!(
-            refused.contains("coordination ledger positions"),
-            "{refused}"
-        );
-        assert_eq!(
-            positions(&instance).len(),
-            1,
-            "a refused cut records nothing"
-        );
+            let retained_state = |instance: &DurableInstance<_>| {
+                let runtime = instance.kernel.as_ref().expect("kernel").store();
+                (
+                    runtime.list_events(&instance_id).expect("all events"),
+                    runtime.chain_head(&instance_id).expect("chain head"),
+                    format!(
+                        "{:?}",
+                        sql.query("SELECT id, body FROM content_blobs ORDER BY id", &[])
+                            .expect("manifest payloads")
+                    ),
+                )
+            };
+            sql.execute(&format!("DROP TABLE {table}"), &[])
+                .expect("drop actual position table");
+            let before = retained_state(&instance);
+            let refused = instance
+                .checkpoint("cut-2")
+                .err()
+                .expect("unreadable position refuses");
+            assert!(refused.contains(diagnostic), "{refused}");
+            assert_eq!(retained_state(&instance), before,
+            "read refusal preserves all runtime events, chain and manifest/checkpoint state ({table})");
+            assert_eq!(
+                positions(&instance).len(),
+                1,
+                "a refused cut records nothing"
+            );
+        }
     }
 
     #[test]

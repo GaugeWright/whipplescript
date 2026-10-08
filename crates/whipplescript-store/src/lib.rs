@@ -3,6 +3,9 @@
 pub mod attempt_admission;
 pub mod branches;
 pub mod bundle;
+pub mod checkpoint_positions;
+#[cfg(all(test, feature = "native"))]
+mod checkpoint_positions_tests;
 pub mod chunking;
 pub mod coerce_settlement;
 pub mod content;
@@ -517,6 +520,23 @@ pub struct CapturedCheckpoint {
     pub sequence: i64,
     pub manifest_hash: String,
     pub file_count: usize,
+}
+
+/// Observed workspace positions published atomically with a checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointPositions<'a> {
+    pub positions_json: &'a str,
+    /// `Some("null")` preserves an explicit native external-position field.
+    pub external_json: Option<&'a str>,
+    pub source: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+/// The retained cut and its authoritative original position carrier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedCheckpointWithPositions {
+    pub checkpoint: CapturedCheckpoint,
+    pub positions_payload_json: String,
 }
 
 /// Restorable-context RC-4c: the outcome of PLANNING a restore. `plan_restore`
@@ -8640,17 +8660,68 @@ impl SqliteStore {
         &mut self,
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint> {
+        self.retained_publication().run(|| {
+            self.capture_checkpoint_retained(capture, None)
+                .map(|held| held.checkpoint)
+        })
+    }
+
+    pub fn capture_checkpoint_with_positions(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+        positions: CheckpointPositions<'_>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
         self.retained_publication()
-            .run(|| self.capture_checkpoint_retained(capture))
+            .run(|| self.capture_checkpoint_retained(capture, Some(positions)))
     }
 
     fn capture_checkpoint_retained(
         &mut self,
         capture: CheckpointCapture<'_>,
-    ) -> StoreResult<CapturedCheckpoint> {
+        positions: Option<CheckpointPositions<'_>>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let positions_payload = if let Some(positions) = positions {
+            let payload = checkpoint_positions::payload(capture, positions)?;
+            let mut statement = tx.prepare(
+                "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), source, occurred_at, idempotency_key FROM events WHERE instance_id = ?1 AND event_type IN ('plane.positions', 'context.checkpoint') ORDER BY sequence",
+            )?;
+            let events = statement
+                .query_map([capture.instance_id], |row| {
+                    Ok((
+                        EventView {
+                            event_id: row.get(0)?,
+                            sequence: row.get(1)?,
+                            event_type: row.get(2)?,
+                            payload_json: row.get(3)?,
+                            source: row.get(4)?,
+                            occurred_at: row.get(5)?,
+                        },
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            if let Some(retained) = checkpoint_positions::retained(capture, positions, &events)? {
+                let blob: Option<String> = tx.query_row(
+                    "SELECT whip_payload_open('runtime.content', id, body) FROM content_blobs WHERE id = ?1",
+                    [&retained.checkpoint.manifest_hash], |row| row.get(0),
+                ).optional()?;
+                if blob
+                    .as_deref()
+                    .is_none_or(|body| stable_hash_hex(body) != retained.checkpoint.manifest_hash)
+                {
+                    return Err(StoreError::Conflict(
+                        "retained checkpoint manifest is unavailable".into(),
+                    ));
+                }
+                return Ok(retained);
+            }
+            Some(payload)
+        } else {
+            None
+        };
         let running: i64 = tx.query_row(
             "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
             [capture.instance_id],
@@ -8671,6 +8742,20 @@ impl SqliteStore {
             "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, whip_payload_seal('runtime.content', ?1, ?2), ?3)",
             params![manifest_hash, manifest_json, manifest_json.len() as i64],
         )?;
+        if let (Some(positions), Some(payload)) = (positions, positions_payload.as_ref()) {
+            append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: capture.instance_id,
+                    event_type: "plane.positions",
+                    payload_json: payload,
+                    source: positions.source,
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(positions.idempotency_key),
+                },
+            )?;
+        }
         let payload = json!({
             "cut_id": capture.cut_id,
             "transcript_ref": capture.transcript_ref,
@@ -8692,12 +8777,15 @@ impl SqliteStore {
             },
         )?;
         tx.commit()?;
-        Ok(CapturedCheckpoint {
-            cut_id: capture.cut_id.to_owned(),
-            event_id: event.event_id,
-            sequence: event.sequence,
-            manifest_hash,
-            file_count: manifest.len(),
+        Ok(CapturedCheckpointWithPositions {
+            checkpoint: CapturedCheckpoint {
+                cut_id: capture.cut_id.to_owned(),
+                event_id: event.event_id,
+                sequence: event.sequence,
+                manifest_hash,
+                file_count: manifest.len(),
+            },
+            positions_payload_json: positions_payload.unwrap_or_default(),
         })
     }
 
@@ -9197,6 +9285,17 @@ pub trait RuntimeStore {
         &mut self,
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint>;
+    /// Atomically publish positions before the checkpoint cut. Unsupported
+    /// hosts refuse; a fallback to two independent appends is not equivalent.
+    fn capture_checkpoint_with_positions(
+        &mut self,
+        _capture: CheckpointCapture<'_>,
+        _positions: CheckpointPositions<'_>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
+        Err(StoreError::Conflict(
+            "atomic checkpoint position publication is unsupported".into(),
+        ))
+    }
     /// Restorable-context RC-4c: plan a restore to `cut_id` (read-only, coherence
     /// check up front; `Refused` on unknown cut / dangling manifest). See the
     /// inherent method for the full contract.
@@ -10003,6 +10102,14 @@ impl RuntimeStore for SqliteStore {
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint> {
         SqliteStore::capture_checkpoint(self, capture)
+    }
+
+    fn capture_checkpoint_with_positions(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+        positions: CheckpointPositions<'_>,
+    ) -> StoreResult<CapturedCheckpointWithPositions> {
+        SqliteStore::capture_checkpoint_with_positions(self, capture, positions)
     }
 
     fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {

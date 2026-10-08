@@ -50,6 +50,12 @@ the positions of an instance. The positions are the event position, the
 identifiers of the effects, and the binding to the workspace. Use this command
 when an external tool needs the coordinates.
 
+Workspace and external positions commit with their successful checkpoint. A
+refused capture leaves no position bookmark. Repeating the same named cut returns
+its original positions even after the workspace advances; a changed transcript
+or explicit external-position command refuses. `handles` reports only carriers
+with a successful matching cut, leaving historical orphan records unchanged.
+
 ## The `restore` command: how to rewind the context
 
 ```sh

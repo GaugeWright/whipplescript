@@ -2153,6 +2153,27 @@ rule pick
     // Unreadable stores: refused, and no position pair is recorded for them.
     let unreadable = side.join("unreadable.sqlite");
     fs::write(&unreadable, b"not a sqlite database").expect("write unreadable store");
+    let retained_state = || {
+        let runtime = SqliteStore::open(&store_path).expect("existing runtime");
+        let events = runtime.list_events(&instance_id).expect("complete events");
+        let head = runtime.chain_head(&instance_id).expect("chain head");
+        let db = rusqlite::Connection::open_with_flags(
+            &store_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read-only manifest snapshot");
+        let mut statement = db
+            .prepare("SELECT id, hex(body) FROM content_blobs ORDER BY id")
+            .expect("manifest payloads");
+        let bodies = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query payloads")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("payload rows");
+        (events, head, bodies)
+    };
     for (variable, cut_id) in [
         (
             "WHIPPLESCRIPT_COORDINATION_STORE",
@@ -2160,6 +2181,7 @@ rule pick
         ),
         ("WHIPPLESCRIPT_ITEMS_STORE", "unreadable-items"),
     ] {
+        let before = retained_state();
         let output = whip(bin, &store_path)
             .args([
                 "--store",
@@ -2182,6 +2204,8 @@ rule pick
             stderr.contains("could not capture plane positions"),
             "the refusal names the plane positions ({variable}): {stderr}"
         );
+        assert_eq!(retained_state(), before,
+            "read refusal preserves all runtime events, chain and manifest/checkpoint state ({variable})");
         let handles = run_json_isolated(
             bin,
             &store_path,

@@ -853,7 +853,7 @@ def neutralise_early_return(lines: list[str], index: int) -> list[str] | None:
     A dead wrapper around the return asks the same stronger question without
     rewriting either guard. Stop at its balanced statement terminator; quoted
     delimiters and semicolons are data, not Rust structure. Unsupported raw
-    literals/block comments fall back to the existing mutations.
+    literals/block comments remain unmeasured if no behavioral mutation exists.
     """
     if not re.match(r"^\s*return\s+", lines[index]):
         return None
@@ -947,24 +947,36 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     if replaced is not None:
         mutated[index] = replaced
         return mutated
-    # Before the message rewrite: falsifying the guard asks the stronger
-    # question, and it is the only one available to a refusal with no message.
+    # A message rewrite does not neutralize refusal. Falsifying the guard asks the actual
+    # coverage question; changing an error message cannot answer it.
     guarded = neutralise_guard(mutated, index)
     if guarded is not None:
         return guarded
     early_return = neutralise_early_return(mutated, index)
     if early_return is not None:
         return early_return
+
+    return None
+
+
+def diagnostic_only_mutation(lines: list[str], site: Site) -> bool:
+    """A discovered refusal with only a text perturbation is not neutralized.
+
+    This classifies unsupported measurement; it never writes or runs that trial.
+    Diagnostic helpers remain useful for identifying the reason, not coverage.
+    """
+    index = site.line - 1
+    mutated = list(lines)
     for offset in range(0, 6):
         if index + offset >= len(mutated):
             break
         replaced = mutate_message(mutated[index + offset])
         if replaced is not None:
             mutated[index + offset] = replaced
-            return mutated
+            return True
         wrapped = mutate_wrapped_message(mutated, index + offset)
         if wrapped is not None:
-            return wrapped
+            return True
     # Nothing at or below the site. Look UP for a diverging arm's message: see
     # `PRINT_MACRO`.
     for offset in range(1, 4):
@@ -978,8 +990,8 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
         replaced = mutate_message(mutated[above])
         if replaced is not None:
             mutated[above] = replaced
-            return mutated
-    return None
+            return True
+    return False
 
 
 # libtest names each test it failed once in its `failures:` report, whatever
@@ -1125,6 +1137,10 @@ class MutationTarget:
     def write_bytes(self, content: bytes):
         if self.target.read_bytes() != self.written:
             raise RuntimeError(f"{self.target} changed outside the sweep; preserved it and {self.backup}")
+        # An unsupported trial (and its cleanup) must not touch target bytes.
+        # Still compare above: an intervening edit is never silently accepted.
+        if content == self.written:
+            return
         # Defer a signal until the successful write is recorded as ours.
         self.writing = True
         try:
@@ -1176,7 +1192,8 @@ def sweep(
             break
         mutated = apply_mutation(source, site)
         if mutated is None:
-            print(f"  {number:4d}/{len(sites)}  SKIP (no mutation)  {site.label}", flush=True)
+            reason = "diagnostic-only; refusal not neutralized" if diagnostic_only_mutation(source, site) else "no behavioral mutation"
+            print(f"  {number:4d}/{len(sites)}  UNKNOWN (not measured: {reason})  {target}:{site.line}  {site.label}", flush=True)
             unmeasured.append(site)
             continue
         (write or Path(target).write_text)("\n".join(mutated))
@@ -1226,14 +1243,15 @@ fn mutation_sweep_self_test_refusal(diagnostics: &mut Vec<String>, reached: bool
     }
 }
 
-// A diverging arm whose message sits ABOVE the return it belongs to. Before the
-// upward search this reported SKIP: no literal at or below the site.
+// A diverging arm whose declared typed success replaces the actual refusal.
+// The diagnostic above the return is not the behavioral counterfactual.
 #[allow(dead_code)]
 fn mutation_sweep_self_test_diverging_arm(reached: Result<(), String>) -> Result<(), u8> {
     match reached {
         Ok(()) => Ok(()),
         Err(detail) => {
             eprintln!("mutation sweep self test diverging arm: {detail}");
+            // MUTATION-SUCCESS-EXPR: Ok(())
             return Err(2);
         }
     }
@@ -1281,16 +1299,15 @@ fn mutation_sweep_self_test_guarded_refusal(
 // plant reports it working.
 #[allow(dead_code)]
 fn mutation_sweep_self_test_ok_or_refusal(value: Option<u8>, detail: &str) -> Result<u8, MutationSweepSelfTestError> {
-    value.ok_or_else(|| MutationSweepSelfTestError::Missing(format!("mutation sweep self test ok_or refusal at {}", detail)))
+    if value.is_none() {
+        return value.ok_or_else(|| MutationSweepSelfTestError::Missing(format!("mutation sweep self test ok_or refusal at {}", detail)));
+    }
+    Ok(value.unwrap_or(0))
 }
 
-// A refusal whose CODE is minted above its message. `mutation_sweep_self_test_code!`
-// stands in for `diagnostic_code!`: one literal arm, so a rewritten argument
-// matches no rule and the crate stops building — which is what made four real
-// parser sites report "not measured" rather than answering the question. The
-// plant only bites while the code sits ABOVE the message inside the search
-// window, because that is the ordering that makes the code the first literal
-// found.
+// A refusal whose code is minted above its message. The code macro retains its
+// original diagnostic shape; neutralizing the enclosing guard, rather than
+// rewriting a literal, is the behavioral counterfactual.
 macro_rules! mutation_sweep_self_test_code {
     ("mutation-sweep.self-test") => {
         "mutation-sweep.self-test"
@@ -1308,18 +1325,18 @@ fn mutation_sweep_self_test_coded_refusal(
     reached: Option<&str>,
     detail: &str,
 ) -> Result<(), MutationSweepSelfTestDiagnostic> {
-    // An `if let`, not an `if`, and that is the whole plant. `neutralise_guard`
-    // excludes `let` bindings — falsifying one leaves the binding unused and the
-    // arm below unreachable — so this refusal falls through to the message
-    // rewrite, which is where the code literal was being hit. Behind a plain
-    // `if` the guard mutation fires first and the bug is never reached.
+    // Code-bearing discovery stays present; its enclosing guard supplies the
+    // actual counterfactual instead of perturbing diagnostic text.
     if let Some(_reached) = reached {
         return Ok(());
     }
-    Err(MutationSweepSelfTestDiagnostic {
+    if reached.is_none() {
+        return Err(MutationSweepSelfTestDiagnostic {
         code: mutation_sweep_self_test_code!("mutation-sweep.self-test"),
         message: format!("mutation sweep self test coded refusal at {}", detail),
-    })
+        });
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1327,13 +1344,16 @@ fn mutation_sweep_self_test_wrapped_ok_or_refusal(
     value: Option<u8>,
     detail: &str,
 ) -> Result<u8, MutationSweepSelfTestError> {
-    value.ok_or_else(|| {
+    if value.is_none() {
+        return value.ok_or_else(|| {
         MutationSweepSelfTestError::Missing(format!(
             "mutation sweep self test wrapped ok_or refusal, whose message is itself \
              continued across lines, at {}",
             detail
         ))
-    })
+        });
+    }
+    Ok(value.unwrap_or(0))
 }
 
 // A refusal whose contract is not `Result`: the VARIANT NAME is what says it
@@ -1710,7 +1730,7 @@ def main() -> int:
     if unmeasured:
         print(
             f"\n{len(unmeasured)} of {len(sites)} refusals were not measured — no "
-            f"mutation applied, or the mutation did not compile. These are "
+            f"behavioral mutation applied (including diagnostic-only shapes), or the mutation did not compile. These are "
             f"unknown, not covered."
         )
         for site in unmeasured:
