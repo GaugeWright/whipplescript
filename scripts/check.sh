@@ -84,6 +84,18 @@ fi
 # put it in their action's environment and will not run without it, while the
 # cached sections do not read the key and are undisturbed by it.
 GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
+# A section is built through the rules cell's scripts/buck2-section.sh: it is
+# `buck2 build` on the gate, and on a workstation joined to the fleet's cache it
+# asks the cache for the gate's own verdict before answering the section here
+# (GaugeWright DR-0252). Plain `buck2 build` where the rules cell predates it.
+buck2_section() {
+  if [ -x ../GaugeWright/scripts/buck2-section.sh ]; then
+    ../GaugeWright/scripts/buck2-section.sh "$@"
+  else
+    buck2 build "$@"
+  fi
+}
+
 section() {
   if [ -n "$via_buck2" ]; then
     # The word travels with the run, for the opposite reason to the nonce. The
@@ -98,7 +110,7 @@ section() {
     # by inspection. It is part of the action's KEY, not merely its
     # environment, because a skip is not a verdict: a run that skipped the
     # supply-chain policy check must never be served to one that required it.
-    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" \
+    log="$(buck2_section "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" \
       -c "green_bar.prerequisites=$prerequisites" --show-full-simple-output)"
     cat "$log"
   else
