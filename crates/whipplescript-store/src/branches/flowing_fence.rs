@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use crate::branches::{BranchRow, CreateBranch, CutRow};
 use crate::{StoreError, StoreResult};
 
-pub const SCHEMA: [&str; 4] = [
+pub const SCHEMA: [&str; 5] = [
     "CREATE TABLE IF NOT EXISTS flowing_source_fences (
         source_branch_id TEXT PRIMARY KEY,
         state_json TEXT NOT NULL
@@ -36,6 +36,12 @@ pub const SCHEMA: [&str; 4] = [
         source_branch_id TEXT PRIMARY KEY,
         request_json TEXT NOT NULL,
         state_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS flowing_source_close_requests (
+        source_branch_id TEXT PRIMARY KEY,
+        op_id TEXT NOT NULL UNIQUE,
+        incarnation_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
     )",
 ];
 
@@ -298,6 +304,9 @@ pub enum FlowingFenceAction {
     InvalidateEligibility {
         reason: String,
     },
+    /// Fences new membership and imports while an earlier trunk CAS may
+    /// still win. DisableAdmission is a separate ref transition.
+    RequestClose,
     DisableAdmission,
 }
 
@@ -333,6 +342,8 @@ pub enum FlowingFenceRefusal {
     RevisionMissing,
     RevisionMismatch,
     AdmissionDisabled,
+    CloseAlreadyPending,
+    NotDirectSource,
     IdentityMismatch,
     EpochExhausted,
     Invalid { field: &'static str },
@@ -364,6 +375,10 @@ pub trait FlowingFence {
         &self,
         branch_id: &str,
     ) -> StoreResult<Option<FlowingMemberOpeningReceipt>>;
+    fn flowing_close_request(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingFenceReceipt>>;
     fn transition_flowing_source(
         &mut self,
         request: &FlowingFenceTransition,
@@ -553,6 +568,12 @@ pub fn decide(
                 return Err(FlowingFenceRefusal::Invalid { field: "reason" });
             }
             after.eligibility_epoch = next_epoch(state.eligibility_epoch)?;
+        }
+        FlowingFenceAction::RequestClose => {
+            // The topology marker is committed by the store alongside this
+            // transition receipt. For a twig, the store also checks that its
+            // parent is trunk. Do not change the eligibility epoch: a trunk
+            // CAS ordered before DisableAdmission may still win.
         }
         FlowingFenceAction::DisableAdmission => {
             if state.revision.is_some() {
@@ -751,6 +772,27 @@ mod tests {
                 None
             ),
             Err(FlowingFenceRefusal::Invalid { field: "reason" })
+        );
+    }
+
+    #[test]
+    fn close_request_is_a_branch_topology_fence_before_admission_disable() {
+        let current = state();
+        assert_eq!(
+            decide(&current, &request(FlowingFenceAction::RequestClose), None),
+            Ok(current.clone())
+        );
+        let mut twig = current.clone();
+        twig.kind = FlowingSourceKind::Twig;
+        assert_eq!(
+            decide(&twig, &request(FlowingFenceAction::RequestClose), None),
+            Ok(twig)
+        );
+        let mut stale = request(FlowingFenceAction::RequestClose);
+        stale.expected_eligibility_epoch = 1;
+        assert_eq!(
+            decide(&current, &stale, None),
+            Err(FlowingFenceRefusal::StaleEligibilityEpoch { current: 0 })
         );
     }
 }

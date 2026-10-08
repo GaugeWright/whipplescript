@@ -630,6 +630,9 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
             if target.status != BranchStatus::Active {
                 return Ok(HandoffContributionOutcome::TargetNotActive);
             }
+            if super::flowing_fence::close_pending(&self.sql, witness.target_branch_id())? {
+                return Ok(HandoffContributionOutcome::TargetFenceRefused);
+            }
             if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
                 return Ok(HandoffContributionOutcome::TargetNotParent);
             }
@@ -928,6 +931,9 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
             };
             if target.status != BranchStatus::Active {
                 return Ok(R::TargetNotActive);
+            }
+            if super::flowing_fence::close_pending(&self.sql, witness.target_branch_id())? {
+                return Ok(R::TargetFenceRefused);
             }
             if let Some(holder) = self.head_reservation(witness.target_branch_id())? {
                 return Ok(R::TargetReserved { holder });
@@ -1406,8 +1412,8 @@ mod tests {
         assert!(branches.flowing_derived_cut("derive-1").is_err());
     }
 
-    #[test]
-    fn hosted_mixed_batch_handoff_keeps_head_and_unit_receipts_atomic() {
+    #[allow(clippy::unwrap_used)] // Test setup and assertions retain the former #[test] contract.
+    fn exercise_hosted_mixed_batch_handoff(closing: bool) {
         use std::rc::Rc;
 
         use crate::do_branches::DoContentBlobs;
@@ -1572,6 +1578,48 @@ mod tests {
         }
         sql.execute("DROP TRIGGER fail_second_batch_unit", &[])
             .unwrap();
+        if closing {
+            use whipplescript_store::branches::flowing_fence::{
+                FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
+            };
+            let state = branches.flowing_source("branch").unwrap().unwrap();
+            assert!(matches!(
+                branches
+                    .transition_flowing_source(&FlowingFenceTransition {
+                        op_id: "request-close".into(),
+                        source_branch_id: "branch".into(),
+                        incarnation_id: "branch-batch-inc".into(),
+                        expected_eligibility_epoch: state.eligibility_epoch,
+                        expected_owner_epoch: state.owner_epoch,
+                        actor: "coordinator".into(),
+                        action: FlowingFenceAction::RequestClose,
+                        recorded_at: "t7".into(),
+                    })
+                    .unwrap(),
+                FlowingFenceOutcome::Applied(_)
+            ));
+            assert_eq!(
+                vcs.handoff_private_batch_derivation(
+                    "derive-1",
+                    &derived.witness_digest,
+                    "mediator",
+                    "t7",
+                )
+                .unwrap(),
+                HandoffBatchContributionOutcome::TargetFenceRefused
+            );
+            assert!(branches
+                .handoff_batch_receipt("derive-1")
+                .unwrap()
+                .is_none());
+            assert!(branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .is_none());
+            return;
+        }
         let HandoffBatchContributionOutcome::Transferred(receipt) = vcs
             .handoff_private_batch_derivation("derive-1", &derived.witness_digest, "mediator", "t7")
             .unwrap()
@@ -2012,6 +2060,16 @@ mod tests {
         .unwrap();
         let error = branches.handoff_batch_receipt("derive-1").unwrap_err();
         assert!(format!("{error:?}").contains("batch handoff receipt roster is incomplete"));
+    }
+
+    #[test]
+    fn hosted_mixed_batch_handoff_keeps_head_and_unit_receipts_atomic() {
+        exercise_hosted_mixed_batch_handoff(false);
+    }
+
+    #[test]
+    fn hosted_pending_close_fences_prepared_batch_import() {
+        exercise_hosted_mixed_batch_handoff(true);
     }
 
     #[test]
@@ -2591,14 +2649,16 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn hosted_handoff_refuses_a_disabled_flowing_target_without_moving_its_ref() {
+    #[allow(clippy::unwrap_used)] // Test setup and assertions retain the former #[test] contract.
+    fn hosted_handoff_refuses_a_fenced_flowing_target(
+        action: whipplescript_store::branches::flowing_fence::FlowingFenceAction,
+    ) {
         use std::rc::Rc;
 
         use crate::do_branches::DoContentBlobs;
         use whipplescript_store::branches::flowing_fence::{
-            FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
-            FlowingSourceKind, OpenFlowingSource,
+            FlowingFence, FlowingFenceOutcome, FlowingFenceTransition, FlowingSourceKind,
+            OpenFlowingSource,
         };
         use whipplescript_store::selection::parse;
         use whipplescript_store::vcs::{
@@ -2685,7 +2745,7 @@ mod tests {
                     expected_eligibility_epoch: state.eligibility_epoch,
                     expected_owner_epoch: state.owner_epoch,
                     actor: "coordinator".into(),
-                    action: FlowingFenceAction::DisableAdmission,
+                    action,
                     recorded_at: "t5".into(),
                 })
                 .unwrap(),
@@ -2703,6 +2763,20 @@ mod tests {
             .unwrap()
             .head_cut_id
             .is_none());
+    }
+
+    #[test]
+    fn hosted_handoff_refuses_a_disabled_flowing_target_without_moving_its_ref() {
+        hosted_handoff_refuses_a_fenced_flowing_target(
+            whipplescript_store::branches::flowing_fence::FlowingFenceAction::DisableAdmission,
+        );
+    }
+
+    #[test]
+    fn hosted_handoff_refuses_a_closing_flowing_target_without_moving_its_ref() {
+        hosted_handoff_refuses_a_fenced_flowing_target(
+            whipplescript_store::branches::flowing_fence::FlowingFenceAction::RequestClose,
+        );
     }
 
     #[test]

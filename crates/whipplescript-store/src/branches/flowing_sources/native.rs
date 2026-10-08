@@ -716,6 +716,9 @@ impl FlowingSources for BranchStore {
         if target.status != BranchStatus::Active {
             return Ok(HandoffContributionOutcome::TargetNotActive);
         }
+        if crate::branches::flowing_fence::native::close_pending(&tx, witness.target_branch_id())? {
+            return Ok(HandoffContributionOutcome::TargetFenceRefused);
+        }
         if source.parent_branch_id.as_deref() != Some(witness.target_branch_id()) {
             return Ok(HandoffContributionOutcome::TargetNotParent);
         }
@@ -1016,6 +1019,9 @@ impl FlowingSources for BranchStore {
         };
         if target.status != BranchStatus::Active {
             return Ok(R::TargetNotActive);
+        }
+        if crate::branches::flowing_fence::native::close_pending(&tx, witness.target_branch_id())? {
+            return Ok(R::TargetFenceRefused);
         }
         let reservation: Option<String> = tx
             .query_row(

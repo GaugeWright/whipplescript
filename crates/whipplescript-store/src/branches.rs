@@ -17,14 +17,17 @@
 
 pub mod carried_cuts;
 pub mod flowing_admission;
+pub mod flowing_close_host;
 pub mod flowing_close_roster;
 pub mod flowing_coverage;
 pub mod flowing_declaration_host;
 pub mod flowing_fence;
 pub mod flowing_fence_host;
+pub mod flowing_final_close;
 pub mod flowing_holders;
 pub mod flowing_host;
 pub mod flowing_lineage;
+pub mod flowing_member_parking;
 pub mod flowing_open_host;
 pub mod flowing_parking;
 pub mod flowing_parking_host;
@@ -67,6 +70,10 @@ pub enum BranchStatus {
     Active,
     Discarded,
     Adopted,
+    /// An exact member head is retained by a named continuing holder.
+    Parked,
+    /// A flowing branch with a terminal ref-owned close receipt.
+    Closed,
 }
 
 impl BranchStatus {
@@ -75,6 +82,8 @@ impl BranchStatus {
             BranchStatus::Active => "active",
             BranchStatus::Discarded => "discarded",
             BranchStatus::Adopted => "adopted",
+            BranchStatus::Parked => "parked",
+            BranchStatus::Closed => "closed",
         }
     }
 
@@ -83,6 +92,8 @@ impl BranchStatus {
             "active" => Some(BranchStatus::Active),
             "discarded" => Some(BranchStatus::Discarded),
             "adopted" => Some(BranchStatus::Adopted),
+            "parked" => Some(BranchStatus::Parked),
+            "closed" => Some(BranchStatus::Closed),
             _ => None,
         }
     }
@@ -1220,7 +1231,12 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// Version 13 gives all newly opened flowing sources immutable retry receipts.
 /// Version 14 records cut carriages (DR-0139, FB-6); an older collector would
 /// reclaim the headers and manifests a recorded carriage holds.
-const SATELLITE_SCHEMA_VERSION: i64 = 14;
+/// Version 15 adds a pending-close marker; an older writer could otherwise
+/// admit a member or import after closure was requested.
+/// Version 16 adds parked-member receipts and terminal member status; an
+/// older writer could otherwise resume a member whose continuing holder owns it.
+/// Version 17 adds an atomic terminal close receipt and non-writable status.
+const SATELLITE_SCHEMA_VERSION: i64 = 17;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1247,6 +1263,12 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute(statement, [])?;
     }
     for statement in flowing_parking::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_member_parking::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_final_close::SCHEMA {
         connection.execute(statement, [])?;
     }
     connection.execute_batch(
@@ -1458,6 +1480,11 @@ impl Branches for BranchStore {
         let ancestry = Self::flowing_ancestry(&tx, request.parent_branch_id)?;
         if ancestry.iter().any(|state| !state.admission_enabled) {
             return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+        }
+        for state in &ancestry {
+            if flowing_fence::native::close_pending(&tx, &state.source_branch_id)? {
+                return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+            }
         }
         if ancestry.first().is_some_and(|state| {
             state.source_branch_id != request.parent_branch_id
@@ -1928,6 +1955,10 @@ impl Branches for BranchStore {
                       JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
                       UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
                       JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+                      UNION SELECT retained_head_cut_id FROM flowing_parked_members \
+                      WHERE retained_head_cut_id IS NOT NULL \
+                      UNION SELECT retained_head_cut_id FROM flowing_final_closes \
+                      WHERE retained_head_cut_id IS NOT NULL \
                       UNION SELECT source_cut_id FROM flowing_attempt_pins \
                       WHERE released_at IS NULL \
                       UNION SELECT candidate_cut_id FROM flowing_attempt_pins \

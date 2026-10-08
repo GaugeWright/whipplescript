@@ -4,6 +4,8 @@
 //! every named receipt, resolve member and private work, and recapture under
 //! the same ref exclusion that changes the source's state.
 
+use serde::{Deserialize, Serialize};
+
 #[cfg(feature = "native")]
 pub(crate) mod native;
 
@@ -11,19 +13,21 @@ use super::flowing_admission::{
     FlowingAdmissionReceipt, FlowingAttemptFinishReceipt, FlowingAttemptPin, FlowingCancelRequest,
     FlowingCandidateWitness, FlowingGateVerdict,
 };
-use super::flowing_fence::FlowingFenceState;
+use super::flowing_fence::{FlowingFenceReceipt, FlowingFenceState};
+use super::flowing_member_parking::FlowingMemberParkReceipt;
 use super::BranchStatus;
 use crate::{StoreError, StoreResult};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingCloseMember {
     pub branch_id: String,
     pub status: BranchStatus,
     pub head_cut_id: Option<String>,
     pub source_fence: Option<FlowingFenceState>,
+    pub parked: Option<FlowingMemberParkReceipt>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FlowingCloseUnitState {
     OwedBySource,
     OwedByMember { branch_id: String },
@@ -32,14 +36,17 @@ pub enum FlowingCloseUnitState {
     Admitted { op_id: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingCloseUnit {
     pub unit_id: String,
     pub original_source_branch_id: String,
+    /// Locate the exact transfer receipt before accepting a transferred
+    /// obligation as resolved during final close.
+    pub handoff_op_id: Option<String>,
     pub state: FlowingCloseUnitState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingClosePrivatePin {
     pub pin_id: String,
     pub twig_branch_id: String,
@@ -47,7 +54,7 @@ pub struct FlowingClosePrivatePin {
     pub manifest_hash: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FlowingCloseAttemptState {
     Pending,
     Admitted,
@@ -56,7 +63,7 @@ pub enum FlowingCloseAttemptState {
     Unrun,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingCloseAttempt {
     pub pin: FlowingAttemptPin,
     pub source_branch_id: String,
@@ -65,17 +72,31 @@ pub struct FlowingCloseAttempt {
     pub state: FlowingCloseAttemptState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingCloseRoster {
     pub source_branch_id: String,
     pub source_fence: FlowingFenceState,
     pub source_status: BranchStatus,
+    pub source_parent_branch_id: Option<String>,
+    pub source_branch_point_cut_id: Option<String>,
     pub source_head_cut_id: Option<String>,
     pub source_head_manifest_hash: Option<String>,
+    /// Exact topology-fence receipt. Final close must require and verify it.
+    pub close_request: Option<FlowingFenceReceipt>,
     pub members: Vec<FlowingCloseMember>,
     pub units: Vec<FlowingCloseUnit>,
     pub live_private_pins: Vec<FlowingClosePrivatePin>,
     pub live_attempts: Vec<FlowingCloseAttempt>,
+}
+
+impl FlowingCloseRoster {
+    pub fn digest(&self) -> StoreResult<String> {
+        let bytes = serde_json::to_vec(&("flowing-close-roster-v1", self))?;
+        Ok(format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(&bytes)
+        ))
+    }
 }
 
 /// Reads one internally consistent ref snapshot. `None` means this branch has
@@ -87,6 +108,22 @@ pub trait FlowingCloseRosterReader {
     ) -> StoreResult<Option<FlowingCloseRoster>>;
 }
 
+/// A partial joined receipt must not vanish into `None` during close review.
+#[doc(hidden)]
+pub fn complete_pair(
+    kind: &'static str,
+    op_id: Option<String>,
+    value: Option<String>,
+) -> StoreResult<Option<(String, String)>> {
+    match (op_id, value) {
+        (Some(op_id), Some(value)) => Ok(Some((op_id, value))),
+        (None, None) => Ok(None),
+        _ => Err(StoreError::Conflict(format!(
+            "flowing close {kind} has an incomplete receipt identity"
+        ))),
+    }
+}
+
 /// Classify a live attempt pin from rows read in the same ref snapshot. A
 /// missing witness or ambiguous terminal state cannot disappear from a close
 /// roster just because its source cannot be identified.
@@ -95,9 +132,11 @@ pub fn classify_attempt(
     pin: FlowingAttemptPin,
     witness_json: Option<String>,
     admission_json: Option<String>,
-    cancellation_row: Option<(String, String)>,
+    cancellation_op_id: Option<String>,
+    cancellation_json: Option<String>,
     finish_json: Option<String>,
 ) -> StoreResult<FlowingCloseAttempt> {
+    let cancellation_row = complete_pair("cancellation", cancellation_op_id, cancellation_json)?;
     let witness_json = witness_json.ok_or_else(|| {
         StoreError::Conflict("live flowing attempt lost its candidate witness".into())
     })?;
@@ -183,14 +222,14 @@ pub fn classify_attempt(
 pub fn classify_unit(
     source_branch_id: &str,
     original_source_branch_id: String,
-    handoff_target: Option<String>,
+    handoff: Option<(String, String)>,
     admitted_op: Option<String>,
     parked: Option<(String, String)>,
 ) -> StoreResult<FlowingCloseUnitState> {
     if original_source_branch_id.trim().is_empty()
-        || handoff_target
+        || handoff
             .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
+            .is_some_and(|(op_id, target)| op_id.trim().is_empty() || target.trim().is_empty())
         || admitted_op
             .as_ref()
             .is_some_and(|value| value.trim().is_empty())
@@ -213,7 +252,7 @@ pub fn classify_unit(
     if let Some((op_id, holder_id)) = parked {
         return Ok(FlowingCloseUnitState::Parked { op_id, holder_id });
     }
-    if let Some(target_branch_id) = handoff_target {
+    if let Some((_, target_branch_id)) = handoff {
         return Ok(if target_branch_id == source_branch_id {
             FlowingCloseUnitState::OwedBySource
         } else {
@@ -242,7 +281,14 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_unit("branch", "member".into(), Some("branch".into()), None, None).unwrap(),
+            classify_unit(
+                "branch",
+                "member".into(),
+                Some(("handoff-1".into(), "branch".into())),
+                None,
+                None
+            )
+            .unwrap(),
             FlowingCloseUnitState::OwedBySource
         );
         assert_eq!(
@@ -268,5 +314,52 @@ mod tests {
         )
         .is_err());
         assert!(classify_unit("branch", "member".into(), None, Some(" ".into()), None).is_err());
+        assert!(classify_unit(
+            "branch",
+            "member".into(),
+            Some((" ".into(), "branch".into())),
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn partial_joined_receipts_do_not_disappear_from_close_review() {
+        for (kind, op_id, value) in [
+            ("handoff", Some("op".into()), None),
+            ("handoff", None, Some("branch".into())),
+            ("parking", Some("op".into()), None),
+            ("parking", None, Some("holder".into())),
+            ("cancellation", Some("op".into()), None),
+            ("cancellation", None, Some("request".into())),
+        ] {
+            let error = complete_pair(kind, op_id, value).unwrap_err();
+            assert!(
+                format!("{error:?}").contains(&format!(
+                    "flowing close {kind} has an incomplete receipt identity"
+                )),
+                "{error:?}"
+            );
+        }
+        assert_eq!(complete_pair("handoff", None, None).unwrap(), None);
+
+        let pin = FlowingAttemptPin {
+            op_id: "attempt".into(),
+            witness_digest: "digest".into(),
+            source_cut_id: "source".into(),
+            candidate_cut_id: "candidate".into(),
+            retained_at: "now".into(),
+            released_at: None,
+        };
+        for (op_id, request) in [(Some("cancel".into()), None), (None, Some("{}".into()))] {
+            let error =
+                classify_attempt(pin.clone(), None, None, op_id, request, None).unwrap_err();
+            assert!(
+                format!("{error:?}")
+                    .contains("flowing close cancellation has an incomplete receipt identity"),
+                "{error:?}"
+            );
+        }
     }
 }

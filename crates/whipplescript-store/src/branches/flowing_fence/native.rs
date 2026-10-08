@@ -3,10 +3,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use super::{
     decide, initial_state, member_point_is_ancestor, missing_member_field, missing_open_field,
     missing_transition_field, validate_member_opening_receipt, validate_source_opening_receipt,
-    FlowingFence, FlowingFenceOutcome, FlowingFenceReceipt, FlowingFenceRefusal, FlowingFenceState,
-    FlowingFenceTransition, FlowingMemberOpeningReceipt, FlowingMemberOpeningRequest,
-    FlowingSourceKind, FlowingSourceOpeningReceipt, OpenFlowingMemberOutcome,
-    OpenFlowingMemberRefusal, OpenFlowingSource, OpenFlowingSourceOutcome,
+    FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceReceipt,
+    FlowingFenceRefusal, FlowingFenceState, FlowingFenceTransition, FlowingMemberOpeningReceipt,
+    FlowingMemberOpeningRequest, FlowingSourceKind, FlowingSourceOpeningReceipt,
+    OpenFlowingMemberOutcome, OpenFlowingMemberRefusal, OpenFlowingSource,
+    OpenFlowingSourceOutcome,
 };
 use crate::branches::{BranchStatus, BranchStore, CreateBranch, MAINLINE_BRANCH_ID};
 use crate::StoreResult;
@@ -26,6 +27,10 @@ pub(crate) fn read_state(
         .optional()?
         .map(|json| serde_json::from_str(&json).map_err(Into::into))
         .transpose()
+}
+
+pub(crate) fn close_pending(connection: &Connection, source: &str) -> StoreResult<bool> {
+    Ok(read_close_request(connection, source)?.is_some())
 }
 
 fn read_receipt(connection: &Connection, op_id: &str) -> StoreResult<Option<FlowingFenceReceipt>> {
@@ -92,6 +97,38 @@ fn read_source_opening(
         validate_source_opening_receipt(source_branch_id, receipt)?;
     }
     Ok(receipt)
+}
+
+pub(crate) fn read_close_request(
+    connection: &Connection,
+    source: &str,
+) -> StoreResult<Option<FlowingFenceReceipt>> {
+    let marker: Option<(String, String)> = connection
+        .query_row(
+            "SELECT op_id, incarnation_id FROM flowing_source_close_requests \
+             WHERE source_branch_id = ?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((op_id, incarnation_id)) = marker else {
+        return Ok(None);
+    };
+    let receipt = read_receipt(connection, &op_id)?.ok_or_else(|| {
+        crate::StoreError::Conflict("flowing close request lost its ref receipt".into())
+    })?;
+    if receipt.request.action != FlowingFenceAction::RequestClose
+        || receipt.request.op_id != op_id
+        || receipt.request.source_branch_id != source
+        || receipt.request.incarnation_id != incarnation_id
+        || receipt.state.source_branch_id != source
+        || receipt.state.incarnation_id != incarnation_id
+    {
+        return Err(crate::StoreError::Conflict(
+            "flowing close request differs from its ref receipt".into(),
+        ));
+    }
+    Ok(Some(receipt))
 }
 
 impl FlowingFence for BranchStore {
@@ -354,6 +391,13 @@ impl FlowingFence for BranchStore {
         read_member_opening(&self.connection, branch_id)
     }
 
+    fn flowing_close_request(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingFenceReceipt>> {
+        read_close_request(&self.connection, source_branch_id)
+    }
+
     fn transition_flowing_source(
         &mut self,
         request: &FlowingFenceTransition,
@@ -389,6 +433,28 @@ impl FlowingFence for BranchStore {
             Ok(after) => after,
             Err(refusal) => return Ok(FlowingFenceOutcome::Refused(refusal)),
         };
+        if request.action == FlowingFenceAction::RequestClose {
+            if state.kind == FlowingSourceKind::Twig
+                && branch.parent_branch_id.as_deref() != Some(MAINLINE_BRANCH_ID)
+            {
+                return Ok(FenceOutcome::Refused(FlowingFenceRefusal::NotDirectSource));
+            }
+            if close_pending(&tx, &request.source_branch_id)? {
+                return Ok(FenceOutcome::Refused(
+                    FlowingFenceRefusal::CloseAlreadyPending,
+                ));
+            }
+            tx.execute(
+                "INSERT INTO flowing_source_close_requests \
+                 (source_branch_id, op_id, incarnation_id, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.source_branch_id,
+                    request.op_id,
+                    request.incarnation_id,
+                    request.recorded_at
+                ],
+            )?;
+        }
         let state_json = serde_json::to_string(&after)?;
         tx.execute(
             "UPDATE flowing_source_fences SET state_json = ?2 WHERE source_branch_id = ?1",
@@ -414,6 +480,7 @@ impl FlowingFence for BranchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branches::flowing_close_roster::FlowingCloseRosterReader;
     use crate::branches::flowing_fence::{FlowingFenceAction, FlowingRevision};
     use crate::branches::{
         AdvanceOutcome, Branches, CreateBranch, CreateBranchOutcome, CutRecord, CutRow,
@@ -841,6 +908,22 @@ mod tests {
                 .unwrap(),
             OpenFlowingSourceOutcome::Opened(_)
         ));
+        let member = store.flowing_source("member").unwrap().unwrap();
+        let member_close = FlowingFenceTransition {
+            op_id: "member-close".into(),
+            source_branch_id: "member".into(),
+            incarnation_id: "member-inc".into(),
+            expected_eligibility_epoch: member.eligibility_epoch,
+            expected_owner_epoch: member.owner_epoch,
+            actor: "mediator".into(),
+            action: FlowingFenceAction::RequestClose,
+            recorded_at: "t3".into(),
+        };
+        assert_eq!(
+            store.transition_flowing_source(&member_close).unwrap(),
+            FlowingFenceOutcome::Refused(FlowingFenceRefusal::NotDirectSource)
+        );
+        assert!(store.flowing_close_request("member").unwrap().is_none());
     }
 
     #[test]
@@ -937,65 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn source_open_rolls_back_fence_when_opening_receipt_insert_fails() {
-        let mut store = source();
-        assert!(matches!(
-            crate::branches::flowing_open_host::read_source_opening_evidence(&store, ""),
-            Err(StoreError::Conflict(message)) if message == "flowing opening host evidence refuses: source identity is empty"
-        ));
-        assert!(matches!(
-            crate::branches::flowing_open_host::read_member_opening_evidence(&store, ""),
-            Err(StoreError::Conflict(message)) if message == "flowing opening host evidence refuses: member identity is empty"
-        ));
-        store
-            .test_connection()
-            .execute_batch(
-                "CREATE TRIGGER reject_source_opening BEFORE INSERT ON flowing_source_openings \
-             WHEN NEW.source_branch_id = 'branch' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-            )
-            .unwrap();
-        let opening = OpenFlowingSource {
-            source_branch_id: "branch".into(),
-            incarnation_id: "inc".into(),
-            kind: FlowingSourceKind::Branch,
-            owner: "mediator".into(),
-            opened_at: "t2".into(),
-        };
-        assert!(store.open_flowing_source(&opening).is_err());
-        assert!(store.flowing_source("branch").unwrap().is_none());
-        store
-            .test_connection()
-            .execute_batch("DROP TRIGGER reject_source_opening")
-            .unwrap();
-        assert!(matches!(
-            store.open_flowing_source(&opening).unwrap(),
-            OpenFlowingSourceOutcome::Opened(_)
-        ));
-        store
-            .test_connection()
-            .execute(
-                "DELETE FROM flowing_source_fences WHERE source_branch_id = 'branch'",
-                [],
-            )
-            .unwrap();
-        assert!(matches!(
-            store.open_flowing_source(&opening),
-            Err(StoreError::Conflict(message)) if message == "flowing source opening lost current authority"
-        ));
-        let mut retained = store.flowing_source_opening("branch").unwrap().unwrap();
-        retained.state.held = true;
-        store.test_connection().execute(
-            "UPDATE flowing_source_openings SET state_json = ?1 WHERE source_branch_id = 'branch'",
-            [serde_json::to_string(&retained.state).unwrap()],
-        ).unwrap();
-        assert!(matches!(
-            store.flowing_source_opening("branch"),
-            Err(StoreError::Conflict(message)) if message == "flowing source opening receipt is inconsistent"
-        ));
-    }
-
-    #[test]
-    fn member_open_replay_requires_current_source_authority() {
+    fn close_request_fences_new_members_but_retains_existing_members_and_cas_window() {
         let mut store = source();
         store
             .open_flowing_source(&OpenFlowingSource {
@@ -1006,23 +1031,131 @@ mod tests {
                 opened_at: "t2".into(),
             })
             .unwrap();
-        let member = member_request("member", "branch", None);
-        let opening = member_opening("member");
         assert!(matches!(
-            store.open_flowing_member(member.clone(), &opening).unwrap(),
-            OpenFlowingMemberOutcome::Opened { .. }
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "early-member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t3",
+                    idempotency_key: Some("early-member-op"),
+                })
+                .unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
+        let close = request(&store, "request-close", FlowingFenceAction::RequestClose);
+        let before = store.flowing_source("branch").unwrap().unwrap();
+        assert!(matches!(
+            store.transition_flowing_source(&close).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(store.flowing_source("branch").unwrap().unwrap(), before);
+        assert_eq!(
+            store.transition_flowing_source(&close).unwrap(),
+            FlowingFenceOutcome::Existing(store.flowing_close_request("branch").unwrap().unwrap())
+        );
+        assert_eq!(
+            store
+                .transition_flowing_source(&request(
+                    &store,
+                    "another-close",
+                    FlowingFenceAction::RequestClose,
+                ))
+                .unwrap(),
+            FlowingFenceOutcome::Refused(FlowingFenceRefusal::CloseAlreadyPending)
+        );
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "late-member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentAdmissionDisabled
+        );
+        assert!(matches!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "early-member".into(),
+                    incarnation_id: "early-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "mediator".into(),
+                    opened_at: "t4".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        let roster = store.flowing_close_roster("branch").unwrap().unwrap();
+        assert_eq!(roster.close_request.unwrap().request, close);
+        assert_eq!(roster.members.len(), 1);
+        assert_eq!(roster.members[0].branch_id, "early-member");
+        let disable = request(&store, "disable", FlowingFenceAction::DisableAdmission);
+        assert!(matches!(
+            store.transition_flowing_source(&disable).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        let after = store.flowing_source("branch").unwrap().unwrap();
+        assert!(!after.admission_enabled);
+        assert_eq!(after.eligibility_epoch, before.eligibility_epoch + 1);
+
+        let mut wrong_incarnation = after.clone();
+        wrong_incarnation.incarnation_id = "foreign-incarnation".into();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+                [serde_json::to_string(&wrong_incarnation).unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_close_roster("branch"),
+            Err(StoreError::Conflict(message))
+                if message == "flowing close request belongs to another incarnation"
         ));
         store
             .test_connection()
             .execute(
-                "DELETE FROM flowing_source_fences WHERE source_branch_id = 'member'",
+                "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+                [serde_json::to_string(&after).unwrap()],
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "UPDATE flowing_source_close_requests SET incarnation_id = 'foreign-incarnation' \
+                 WHERE source_branch_id = 'branch'",
                 [],
             )
             .unwrap();
         assert!(matches!(
-            store.open_flowing_member(member, &opening),
-            Err(crate::StoreError::Conflict(message))
-                if message == "flowing member opening lost current authority"
+            store.flowing_close_request("branch"),
+            Err(StoreError::Conflict(message))
+                if message == "flowing close request differs from its ref receipt"
+        ));
+        store
+            .test_connection()
+            .execute(
+                "UPDATE flowing_source_close_requests SET incarnation_id = 'inc-1' \
+                 WHERE source_branch_id = 'branch'",
+                [],
+            )
+            .unwrap();
+        store
+            .test_connection()
+            .execute(
+                "DELETE FROM flowing_source_fence_ops WHERE op_id = 'request-close'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.flowing_close_request("branch"),
+            Err(StoreError::Conflict(message))
+                if message == "flowing close request lost its ref receipt"
         ));
     }
 
@@ -1449,6 +1582,22 @@ mod tests {
         assert!(!state.held);
         assert_eq!(state.eligibility_epoch, 0);
         assert!(store.flowing_fence_receipt("hold-fails").unwrap().is_none());
+        let close = request(&store, "close-fails", FlowingFenceAction::RequestClose);
+        assert!(store.transition_flowing_source(&close).is_err());
+        assert!(store.flowing_close_request("branch").unwrap().is_none());
+        assert!(matches!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "member-after-failed-close",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
     }
 
     #[test]

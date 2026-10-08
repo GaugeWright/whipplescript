@@ -3,7 +3,7 @@ use super::{flowing_fence, DoBranches};
 use crate::do_store::{as_opt_text, as_text, sql_err, text, DoSql};
 use whipplescript_store::branches::flowing_admission::FlowingAttemptPin;
 use whipplescript_store::branches::flowing_close_roster::{
-    classify_attempt, classify_unit, FlowingCloseMember, FlowingClosePrivatePin,
+    classify_attempt, classify_unit, complete_pair, FlowingCloseMember, FlowingClosePrivatePin,
     FlowingCloseRoster, FlowingCloseRosterReader, FlowingCloseUnit,
 };
 use whipplescript_store::branches::BranchStatus;
@@ -14,64 +14,74 @@ fn status(value: &str) -> StoreResult<BranchStatus> {
         .ok_or_else(|| StoreError::Conflict(format!("unknown flowing branch status `{value}`")))
 }
 
-impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
-    fn flowing_close_roster(
-        &mut self,
+impl<S: DoSql> DoBranches<S> {
+    pub(super) fn read_close_roster(
+        &self,
         source_branch_id: &str,
     ) -> StoreResult<Option<FlowingCloseRoster>> {
         if source_branch_id.trim().is_empty() {
             return Err(StoreError::Conflict("flowing close source is empty".into()));
         }
-        exact_atomic(&self.sql, "flowing close roster", || {
-            let Some(fence) = flowing_fence::read_state(&self.sql, source_branch_id)? else {
-                return Ok(None);
-            };
-            let source = self.row_by_id(source_branch_id)?.ok_or_else(|| {
-                StoreError::Conflict("flowing close source branch is missing".into())
-            })?;
-            if fence.source_branch_id != source.branch_id {
-                return Err(StoreError::Conflict(
-                    "flowing close source fence differs from branch".into(),
-                ));
-            }
+        let Some(fence) = flowing_fence::read_state(&self.sql, source_branch_id)? else {
+            return Ok(None);
+        };
+        let source = self
+            .row_by_id(source_branch_id)?
+            .ok_or_else(|| StoreError::Conflict("flowing close source branch is missing".into()))?;
+        if fence.source_branch_id != source.branch_id {
+            return Err(StoreError::Conflict(
+                "flowing close source fence differs from branch".into(),
+            ));
+        }
+        let close_request = flowing_fence::read_close_request(&self.sql, source_branch_id)?;
+        if close_request
+            .as_ref()
+            .is_some_and(|receipt| receipt.request.incarnation_id != fence.incarnation_id)
+        {
+            return Err(StoreError::Conflict(
+                "flowing close request belongs to another incarnation".into(),
+            ));
+        }
 
-            let members = self
-                .sql
-                .query(
-                    "SELECT b.branch_id, b.status, b.head_cut_id, f.state_json \
+        let members = self
+            .sql
+            .query(
+                "SELECT b.branch_id, b.status, b.head_cut_id, f.state_json \
                      FROM branches AS b LEFT JOIN flowing_source_fences AS f \
                      ON f.source_branch_id = b.branch_id \
                      WHERE b.parent_branch_id = ?1 ORDER BY b.branch_id",
-                    &[text(source_branch_id)],
-                )
-                .map_err(sql_err)?
-                .into_iter()
-                .map(|row| {
-                    let branch_id = as_text(&row[0]);
-                    let source_fence = as_opt_text(&row[3])
-                        .map(|json| serde_json::from_str(&json))
-                        .transpose()?;
-                    if source_fence
-                        .as_ref()
-                        .is_some_and(|fence: &whipplescript_store::branches::flowing_fence::FlowingFenceState| fence.source_branch_id != branch_id)
-                    {
-                        return Err(StoreError::Conflict(
-                            "flowing member fence differs from branch".into(),
-                        ));
-                    }
-                    Ok(FlowingCloseMember {
-                        branch_id,
-                        status: status(&as_text(&row[1]))?,
-                        head_cut_id: as_opt_text(&row[2]),
-                        source_fence,
-                    })
+                &[text(source_branch_id)],
+            )
+            .map_err(sql_err)?
+            .into_iter()
+            .map(|row| {
+                let branch_id = as_text(&row[0]);
+                let source_fence = as_opt_text(&row[3])
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+                if source_fence.as_ref().is_some_and(
+                    |fence: &whipplescript_store::branches::flowing_fence::FlowingFenceState| {
+                        fence.source_branch_id != branch_id
+                    },
+                ) {
+                    return Err(StoreError::Conflict(
+                        "flowing member fence differs from branch".into(),
+                    ));
+                }
+                Ok(FlowingCloseMember {
+                    parked: super::flowing_member_parking::read_by_member(self, &branch_id)?,
+                    branch_id,
+                    status: status(&as_text(&row[1]))?,
+                    head_cut_id: as_opt_text(&row[2]),
+                    source_fence,
                 })
-                .collect::<StoreResult<Vec<_>>>()?;
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
 
-            let units = self
+        let units = self
                 .sql
                 .query(
-                    "SELECT unit.unit_id, unit.source_branch_id, handoff.target_branch_id, \
+                    "SELECT unit.unit_id, unit.source_branch_id, handoff.op_id, handoff.target_branch_id, \
                             admitted.op_id, parked.op_id, parked.holder_id \
                      FROM flowing_contributions AS unit \
                      LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
@@ -88,47 +98,53 @@ impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
                 .into_iter()
                 .map(|row| {
                     let original_source_branch_id = as_text(&row[1]);
-                    // Both columns are NOT NULL in one joined parked row.
-                    let parked = as_opt_text(&row[4]).zip(as_opt_text(&row[5]));
+                    let parked = complete_pair(
+                        "parking", as_opt_text(&row[5]), as_opt_text(&row[6]),
+                    )?;
+                    let handoff = complete_pair(
+                        "handoff", as_opt_text(&row[2]), as_opt_text(&row[3]),
+                    )?;
+                    let handoff_op_id = handoff.as_ref().map(|(op_id, _)| op_id.clone());
                     Ok(FlowingCloseUnit {
                         unit_id: as_text(&row[0]),
                         state: classify_unit(
                             source_branch_id,
                             original_source_branch_id.clone(),
-                            as_opt_text(&row[2]),
-                            as_opt_text(&row[3]),
+                            handoff,
+                            as_opt_text(&row[4]),
                             parked,
                         )?,
                         original_source_branch_id,
+                        handoff_op_id,
                     })
                 })
                 .collect::<StoreResult<Vec<_>>>()?;
 
-            let live_private_pins = self
-                .sql
-                .query(
-                    "SELECT pin_id, twig_branch_id, cut_id, manifest_hash \
+        let live_private_pins = self
+            .sql
+            .query(
+                "SELECT pin_id, twig_branch_id, cut_id, manifest_hash \
                      FROM flowing_private_pins \
                      WHERE released_at IS NULL AND \
                        (twig_branch_id = ?1 OR twig_branch_id IN \
                          (SELECT branch_id FROM branches WHERE parent_branch_id = ?1)) \
                      ORDER BY pin_id",
-                    &[text(source_branch_id)],
-                )
-                .map_err(sql_err)?
-                .into_iter()
-                .map(|row| FlowingClosePrivatePin {
-                    pin_id: as_text(&row[0]),
-                    twig_branch_id: as_text(&row[1]),
-                    cut_id: as_text(&row[2]),
-                    manifest_hash: as_text(&row[3]),
-                })
-                .collect();
-            let mut live_attempts = Vec::new();
-            for row in self
-                .sql
-                .query(
-                    "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
+                &[text(source_branch_id)],
+            )
+            .map_err(sql_err)?
+            .into_iter()
+            .map(|row| FlowingClosePrivatePin {
+                pin_id: as_text(&row[0]),
+                twig_branch_id: as_text(&row[1]),
+                cut_id: as_text(&row[2]),
+                manifest_hash: as_text(&row[3]),
+            })
+            .collect();
+        let mut live_attempts = Vec::new();
+        for row in self
+            .sql
+            .query(
+                "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
                             pin.retained_at, witness.witness_json, admitted.receipt_json, \
                             cancelled.cancel_op_id, cancelled.request_json, finished.receipt_json \
                      FROM flowing_attempt_pins AS pin \
@@ -139,43 +155,57 @@ impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
                        ON cancelled.admission_op_id = pin.op_id \
                      LEFT JOIN flowing_attempt_finishes AS finished ON finished.op_id = pin.op_id \
                      WHERE pin.released_at IS NULL ORDER BY pin.op_id",
-                    &[],
-                )
-                .map_err(sql_err)?
+                &[],
+            )
+            .map_err(sql_err)?
+        {
+            let attempt = classify_attempt(
+                FlowingAttemptPin {
+                    op_id: as_text(&row[0]),
+                    witness_digest: as_text(&row[1]),
+                    source_cut_id: as_text(&row[2]),
+                    candidate_cut_id: as_text(&row[3]),
+                    retained_at: as_text(&row[4]),
+                    released_at: None,
+                },
+                as_opt_text(&row[5]),
+                as_opt_text(&row[6]),
+                as_opt_text(&row[7]),
+                as_opt_text(&row[8]),
+                as_opt_text(&row[9]),
+            )?;
+            if attempt.source_branch_id == source_branch_id
+                || members
+                    .iter()
+                    .any(|member| member.branch_id == attempt.source_branch_id)
             {
-                let attempt = classify_attempt(
-                    FlowingAttemptPin {
-                        op_id: as_text(&row[0]),
-                        witness_digest: as_text(&row[1]),
-                        source_cut_id: as_text(&row[2]),
-                        candidate_cut_id: as_text(&row[3]),
-                        retained_at: as_text(&row[4]),
-                        released_at: None,
-                    },
-                    as_opt_text(&row[5]),
-                    as_opt_text(&row[6]),
-                    as_opt_text(&row[7]).zip(as_opt_text(&row[8])),
-                    as_opt_text(&row[9]),
-                )?;
-                if attempt.source_branch_id == source_branch_id
-                    || members
-                        .iter()
-                        .any(|member| member.branch_id == attempt.source_branch_id)
-                {
-                    live_attempts.push(attempt);
-                }
+                live_attempts.push(attempt);
             }
-            Ok(Some(FlowingCloseRoster {
-                source_branch_id: source.branch_id,
-                source_fence: fence,
-                source_status: source.status,
-                source_head_cut_id: source.head_cut_id,
-                source_head_manifest_hash: source.head_manifest_hash,
-                members,
-                units,
-                live_private_pins,
-                live_attempts,
-            }))
+        }
+        Ok(Some(FlowingCloseRoster {
+            source_branch_id: source.branch_id,
+            source_fence: fence,
+            source_status: source.status,
+            source_parent_branch_id: source.parent_branch_id,
+            source_branch_point_cut_id: source.branch_point_cut_id,
+            source_head_cut_id: source.head_cut_id,
+            source_head_manifest_hash: source.head_manifest_hash,
+            close_request,
+            members,
+            units,
+            live_private_pins,
+            live_attempts,
+        }))
+    }
+}
+
+impl<S: DoSql> FlowingCloseRosterReader for DoBranches<S> {
+    fn flowing_close_roster(
+        &mut self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingCloseRoster>> {
+        exact_atomic(&self.sql, "flowing close roster", || {
+            self.read_close_roster(source_branch_id)
         })
     }
 }
@@ -369,6 +399,37 @@ mod tests {
         assert!(matches!(
             store.flowing_close_roster("branch"),
             Err(StoreError::Conflict(message)) if message.contains("source fence differs")
+        ));
+        sql.execute(
+            "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+            &[text(&serde_json::to_string(&source_fence).unwrap())],
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "request-close".into(),
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    expected_eligibility_epoch: source_fence.eligibility_epoch,
+                    expected_owner_epoch: source_fence.owner_epoch,
+                    actor: "owner".into(),
+                    action: FlowingFenceAction::RequestClose,
+                    recorded_at: "t9".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        let mut foreign_incarnation = source_fence.clone();
+        foreign_incarnation.incarnation_id = "foreign-incarnation".into();
+        sql.execute(
+            "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+            &[text(&serde_json::to_string(&foreign_incarnation).unwrap())],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.flowing_close_roster("branch"),
+            Err(StoreError::Conflict(message)) if message.contains("close request belongs to another incarnation")
         ));
         sql.execute(
             "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",

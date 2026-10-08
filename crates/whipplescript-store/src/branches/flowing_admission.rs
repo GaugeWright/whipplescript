@@ -87,7 +87,7 @@ pub const SCHEMA: [&str; 12] = [
 /// every selected unit; this row preserves the exact review basis and output
 /// across a gate worker crash. A terminal attempt may release only this row
 /// after the ref authority confirms its outcome and the source holder.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowingAttemptPin {
     pub op_id: String,
     pub witness_digest: String,

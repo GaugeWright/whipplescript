@@ -4,10 +4,11 @@ use crate::do_store::{as_text, opt_text, sql_err, text, DoSql};
 use whipplescript_store::branches::flowing_fence::{
     decide, initial_state, member_point_is_ancestor, missing_member_field, missing_open_field,
     missing_transition_field, validate_member_opening_receipt, validate_source_opening_receipt,
-    FlowingFence, FlowingFenceOutcome, FlowingFenceReceipt, FlowingFenceRefusal, FlowingFenceState,
-    FlowingFenceTransition, FlowingMemberOpeningReceipt, FlowingMemberOpeningRequest,
-    FlowingSourceKind, FlowingSourceOpeningReceipt, OpenFlowingMemberOutcome,
-    OpenFlowingMemberRefusal, OpenFlowingSource, OpenFlowingSourceOutcome,
+    FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceReceipt,
+    FlowingFenceRefusal, FlowingFenceState, FlowingFenceTransition, FlowingMemberOpeningReceipt,
+    FlowingMemberOpeningRequest, FlowingSourceKind, FlowingSourceOpeningReceipt,
+    OpenFlowingMemberOutcome, OpenFlowingMemberRefusal, OpenFlowingSource,
+    OpenFlowingSourceOutcome,
 };
 use whipplescript_store::branches::{BranchStatus, Branches, CreateBranch, MAINLINE_BRANCH_ID};
 use whipplescript_store::StoreResult;
@@ -26,6 +27,10 @@ pub(super) fn read_state<S: DoSql>(
     .first()
     .map(|row| serde_json::from_str(&as_text(&row[0])).map_err(Into::into))
     .transpose()
+}
+
+pub(super) fn close_pending<S: DoSql>(sql: &S, source: &str) -> StoreResult<bool> {
+    Ok(read_close_request(sql, source)?.is_some())
 }
 
 fn read_receipt<S: DoSql>(sql: &S, op_id: &str) -> StoreResult<Option<FlowingFenceReceipt>> {
@@ -89,6 +94,41 @@ fn read_source_opening<S: DoSql>(
         validate_source_opening_receipt(source_branch_id, receipt)?;
     }
     Ok(receipt)
+}
+
+pub(super) fn read_close_request<S: DoSql>(
+    sql: &S,
+    source: &str,
+) -> StoreResult<Option<FlowingFenceReceipt>> {
+    let rows = sql
+        .query(
+            "SELECT op_id, incarnation_id FROM flowing_source_close_requests \
+             WHERE source_branch_id = ?1",
+            &[text(source)],
+        )
+        .map_err(sql_err)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let op_id = as_text(&row[0]);
+    let incarnation_id = as_text(&row[1]);
+    let receipt = read_receipt(sql, &op_id)?.ok_or_else(|| {
+        whipplescript_store::StoreError::Conflict(
+            "flowing close request lost its ref receipt".into(),
+        )
+    })?;
+    if receipt.request.action != FlowingFenceAction::RequestClose
+        || receipt.request.op_id != op_id
+        || receipt.request.source_branch_id != source
+        || receipt.request.incarnation_id != incarnation_id
+        || receipt.state.source_branch_id != source
+        || receipt.state.incarnation_id != incarnation_id
+    {
+        return Err(whipplescript_store::StoreError::Conflict(
+            "flowing close request differs from its ref receipt".into(),
+        ));
+    }
+    Ok(Some(receipt))
 }
 
 impl<S: DoSql> FlowingFence for DoBranches<S> {
@@ -365,6 +405,13 @@ impl<S: DoSql> FlowingFence for DoBranches<S> {
         read_member_opening(&self.sql, branch_id)
     }
 
+    fn flowing_close_request(
+        &self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingFenceReceipt>> {
+        read_close_request(&self.sql, source_branch_id)
+    }
+
     fn transition_flowing_source(
         &mut self,
         request: &FlowingFenceTransition,
@@ -398,6 +445,28 @@ impl<S: DoSql> FlowingFence for DoBranches<S> {
                 Ok(after) => after,
                 Err(refusal) => return Ok(FlowingFenceOutcome::Refused(refusal)),
             };
+            if request.action == FlowingFenceAction::RequestClose {
+                if state.kind == FlowingSourceKind::Twig
+                    && branch.parent_branch_id.as_deref() != Some(MAINLINE_BRANCH_ID)
+                {
+                    return Ok(FenceOutcome::Refused(FlowingFenceRefusal::NotDirectSource));
+                }
+                if close_pending(&self.sql, &request.source_branch_id)? {
+                    return Ok(FenceOutcome::Refused(
+                        FlowingFenceRefusal::CloseAlreadyPending,
+                    ));
+                }
+                self.sql.execute(
+                    "INSERT INTO flowing_source_close_requests \
+                     (source_branch_id, op_id, incarnation_id, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        text(&request.source_branch_id),
+                        text(&request.op_id),
+                        text(&request.incarnation_id),
+                        text(&request.recorded_at),
+                    ],
+                ).map_err(sql_err)?;
+            }
             let state_json = serde_json::to_string(&after)?;
             self.sql
                 .execute(
@@ -434,6 +503,7 @@ mod tests {
     use super::*;
     use crate::do_store::test_support::RusqliteDoSql;
     use std::rc::Rc;
+    use whipplescript_store::branches::flowing_close_roster::FlowingCloseRosterReader;
     use whipplescript_store::branches::flowing_fence::FlowingFenceAction;
     use whipplescript_store::branches::flowing_open_host::{
         read_member_opening_evidence, read_source_opening_evidence,
@@ -1115,6 +1185,22 @@ mod tests {
                 .unwrap(),
             OpenFlowingSourceOutcome::Opened(_)
         ));
+        let member = store.flowing_source("twig").unwrap().unwrap();
+        let member_close = FlowingFenceTransition {
+            op_id: "member-close".into(),
+            source_branch_id: "twig".into(),
+            incarnation_id: "twig-inc".into(),
+            expected_eligibility_epoch: member.eligibility_epoch,
+            expected_owner_epoch: member.owner_epoch,
+            actor: "coordinator-a".into(),
+            action: FlowingFenceAction::RequestClose,
+            recorded_at: "t2".into(),
+        };
+        assert_eq!(
+            store.transition_flowing_source(&member_close).unwrap(),
+            FlowingFenceOutcome::Refused(FlowingFenceRefusal::NotDirectSource)
+        );
+        assert!(store.flowing_close_request("twig").unwrap().is_none());
         assert_eq!(
             store
                 .create_branch(CreateBranch {
@@ -1323,6 +1409,143 @@ mod tests {
             hosted[3],
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::HeadMismatch { current: None })
         );
+    }
+
+    #[test]
+    fn hosted_close_request_keeps_existing_member_and_fences_late_members() {
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut store = DoBranches::new(Rc::clone(&sql)).unwrap();
+        store.ensure_mainline("t0").unwrap();
+        store
+            .create_branch(CreateBranch {
+                branch_id: "branch",
+                name: Some("feature"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t1",
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "mediator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        store
+            .create_branch(CreateBranch {
+                branch_id: "early-member",
+                name: None,
+                parent_branch_id: "branch",
+                at_cut: None,
+                created_at: "t3",
+                idempotency_key: Some("early-member-op"),
+            })
+            .unwrap();
+        let before = store.flowing_source("branch").unwrap().unwrap();
+        let close = FlowingFenceTransition {
+            op_id: "close".into(),
+            source_branch_id: "branch".into(),
+            incarnation_id: "inc-1".into(),
+            expected_eligibility_epoch: before.eligibility_epoch,
+            expected_owner_epoch: before.owner_epoch,
+            actor: "mediator".into(),
+            action: FlowingFenceAction::RequestClose,
+            recorded_at: "t4".into(),
+        };
+        assert!(matches!(
+            store.transition_flowing_source(&close).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            store.transition_flowing_source(&close).unwrap(),
+            FlowingFenceOutcome::Existing(store.flowing_close_request("branch").unwrap().unwrap())
+        );
+        let mut competing = close.clone();
+        competing.op_id = "another-close".into();
+        assert_eq!(
+            store.transition_flowing_source(&competing).unwrap(),
+            FlowingFenceOutcome::Refused(FlowingFenceRefusal::CloseAlreadyPending)
+        );
+        assert_eq!(store.flowing_source("branch").unwrap().unwrap(), before);
+        assert_eq!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "late-member",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t5",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::ParentAdmissionDisabled
+        );
+        assert!(matches!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "early-member".into(),
+                    incarnation_id: "early-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "mediator".into(),
+                    opened_at: "t5".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
+        let roster = store.flowing_close_roster("branch").unwrap().unwrap();
+        assert_eq!(roster.close_request.unwrap().request, close);
+        assert_eq!(roster.members.len(), 1);
+        assert_eq!(roster.members[0].branch_id, "early-member");
+
+        let original_fence = store.flowing_source("branch").unwrap().unwrap();
+        let mut wrong_incarnation = original_fence.clone();
+        wrong_incarnation.incarnation_id = "foreign-incarnation".into();
+        sql.execute(
+            "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+            &[text(&serde_json::to_string(&wrong_incarnation).unwrap())],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.flowing_close_roster("branch"),
+            Err(whipplescript_store::StoreError::Conflict(message))
+                if message == "flowing close request belongs to another incarnation"
+        ));
+        sql.execute(
+            "UPDATE flowing_source_fences SET state_json = ?1 WHERE source_branch_id = 'branch'",
+            &[text(&serde_json::to_string(&original_fence).unwrap())],
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE flowing_source_close_requests SET incarnation_id = 'foreign-incarnation' \
+             WHERE source_branch_id = 'branch'",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.flowing_close_request("branch"),
+            Err(whipplescript_store::StoreError::Conflict(message))
+                if message == "flowing close request differs from its ref receipt"
+        ));
+        sql.execute(
+            "UPDATE flowing_source_close_requests SET incarnation_id = 'inc-1' \
+             WHERE source_branch_id = 'branch'",
+            &[],
+        )
+        .unwrap();
+        sql.execute(
+            "DELETE FROM flowing_source_fence_ops WHERE op_id = 'close'",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.flowing_close_request("branch"),
+            Err(whipplescript_store::StoreError::Conflict(message))
+                if message == "flowing close request lost its ref receipt"
+        ));
     }
 
     #[test]
@@ -1668,6 +1891,24 @@ mod tests {
         assert!(!state.held);
         assert_eq!(state.eligibility_epoch, 0);
         assert!(store.flowing_fence_receipt("hold-fails").unwrap().is_none());
+        let mut close = hold;
+        close.op_id = "close-fails".into();
+        close.action = FlowingFenceAction::RequestClose;
+        assert!(store.transition_flowing_source(&close).is_err());
+        assert!(store.flowing_close_request("branch").unwrap().is_none());
+        assert!(matches!(
+            store
+                .create_branch(CreateBranch {
+                    branch_id: "member-after-failed-close",
+                    name: None,
+                    parent_branch_id: "branch",
+                    at_cut: None,
+                    created_at: "t4",
+                    idempotency_key: None,
+                })
+                .unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
     }
 
     #[test]

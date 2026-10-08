@@ -2354,7 +2354,8 @@ mod tests {
                 pin,
                 Some(serde_json::to_string(&witness).unwrap()),
                 Some(serde_json::to_string(&FlowingAdmissionReceipt { request: attempt }).unwrap()),
-                Some(("cancel-a".into(), serde_json::to_string(&cancel("fixture", "cancel-a")).unwrap())),
+                Some("cancel-a".into()),
+                Some(serde_json::to_string(&cancel("fixture", "cancel-a")).unwrap()),
                 None,
             ),
             Err(StoreError::Conflict(message)) if message.contains("conflicting terminal results")
@@ -2378,7 +2379,7 @@ mod tests {
         let mut changed_pin = pin.clone();
         changed_pin.source_cut_id = "other-cut".into();
         assert!(matches!(
-            classify_attempt(changed_pin, Some(witness_json.clone()), None, None, None),
+            classify_attempt(changed_pin, Some(witness_json.clone()), None, None, None, None),
             Err(StoreError::Conflict(message)) if message.contains("differs from its witness")
         ));
 
@@ -2389,13 +2390,13 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            classify_attempt(pin.clone(), Some(witness_json.clone()), Some(changed_admission), None, None),
+            classify_attempt(pin.clone(), Some(witness_json.clone()), Some(changed_admission), None, None, None),
             Err(StoreError::Conflict(message)) if message.contains("admission differs")
         ));
 
         let cancellation = serde_json::to_string(&cancel("fixture", "cancel-a")).unwrap();
         assert!(matches!(
-            classify_attempt(pin.clone(), Some(witness_json.clone()), None, Some(("changed-key".into(), cancellation)), None),
+            classify_attempt(pin.clone(), Some(witness_json.clone()), None, Some("changed-key".into()), Some(cancellation), None),
             Err(StoreError::Conflict(message)) if message.contains("cancellation differs")
         ));
 
@@ -2416,7 +2417,7 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                classify_attempt(pin.clone(), Some(witness_json.clone()), None, None, Some(serde_json::to_string(&finish).unwrap())),
+                classify_attempt(pin.clone(), Some(witness_json.clone()), None, None, None, Some(serde_json::to_string(&finish).unwrap())),
                 Err(StoreError::Conflict(message)) if message.contains(expected)
             ));
         }

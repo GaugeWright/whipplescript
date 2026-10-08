@@ -1,11 +1,11 @@
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 use super::{
-    classify_attempt, classify_unit, FlowingCloseMember, FlowingClosePrivatePin,
+    classify_attempt, classify_unit, complete_pair, FlowingCloseMember, FlowingClosePrivatePin,
     FlowingCloseRoster, FlowingCloseRosterReader, FlowingCloseUnit,
 };
 use crate::branches::flowing_admission::FlowingAttemptPin;
-use crate::branches::flowing_fence;
+use crate::branches::{flowing_fence, flowing_member_parking};
 use crate::branches::{BranchStatus, BranchStore};
 use crate::{StoreError, StoreResult};
 
@@ -14,68 +14,74 @@ fn status(value: &str) -> StoreResult<BranchStatus> {
         .ok_or_else(|| StoreError::Conflict(format!("unknown flowing branch status `{value}`")))
 }
 
-impl FlowingCloseRosterReader for BranchStore {
-    fn flowing_close_roster(
-        &mut self,
-        source_branch_id: &str,
-    ) -> StoreResult<Option<FlowingCloseRoster>> {
-        if source_branch_id.trim().is_empty() {
-            return Err(StoreError::Conflict("flowing close source is empty".into()));
-        }
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let Some(fence) = flowing_fence::native::read_state(&tx, source_branch_id)? else {
-            return Ok(None);
-        };
-        let source = BranchStore::row_by_id(&tx, source_branch_id)?
-            .ok_or_else(|| StoreError::Conflict("flowing close source branch is missing".into()))?;
-        if fence.source_branch_id != source.branch_id {
-            return Err(StoreError::Conflict(
-                "flowing close source fence differs from branch".into(),
-            ));
-        }
+pub(crate) fn read_roster(
+    tx: &Connection,
+    source_branch_id: &str,
+) -> StoreResult<Option<FlowingCloseRoster>> {
+    if source_branch_id.trim().is_empty() {
+        return Err(StoreError::Conflict("flowing close source is empty".into()));
+    }
+    let Some(fence) = flowing_fence::native::read_state(tx, source_branch_id)? else {
+        return Ok(None);
+    };
+    let source = BranchStore::row_by_id(tx, source_branch_id)?
+        .ok_or_else(|| StoreError::Conflict("flowing close source branch is missing".into()))?;
+    if fence.source_branch_id != source.branch_id {
+        return Err(StoreError::Conflict(
+            "flowing close source fence differs from branch".into(),
+        ));
+    }
+    let close_request = flowing_fence::native::read_close_request(tx, source_branch_id)?;
+    if close_request
+        .as_ref()
+        .is_some_and(|receipt| receipt.request.incarnation_id != fence.incarnation_id)
+    {
+        return Err(StoreError::Conflict(
+            "flowing close request belongs to another incarnation".into(),
+        ));
+    }
 
-        let mut members = Vec::new();
-        let mut statement = tx.prepare(
-            "SELECT b.branch_id, b.status, b.head_cut_id, f.state_json \
+    let mut members = Vec::new();
+    let mut statement = tx.prepare(
+        "SELECT b.branch_id, b.status, b.head_cut_id, f.state_json \
              FROM branches AS b LEFT JOIN flowing_source_fences AS f \
              ON f.source_branch_id = b.branch_id \
              WHERE b.parent_branch_id = ?1 ORDER BY b.branch_id",
-        )?;
-        let rows = statement.query_map([source_branch_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (branch_id, branch_status, head_cut_id, state_json) = row?;
-            let source_fence = state_json
-                .map(|json| serde_json::from_str::<flowing_fence::FlowingFenceState>(&json))
-                .transpose()?;
-            if source_fence
-                .as_ref()
-                .is_some_and(|fence| fence.source_branch_id != branch_id)
-            {
-                return Err(StoreError::Conflict(
-                    "flowing member fence differs from branch".into(),
-                ));
-            }
-            members.push(FlowingCloseMember {
-                branch_id,
-                status: status(&branch_status)?,
-                head_cut_id,
-                source_fence,
-            });
+    )?;
+    let rows = statement.query_map([source_branch_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (branch_id, branch_status, head_cut_id, state_json) = row?;
+        let source_fence = state_json
+            .map(|json| serde_json::from_str::<flowing_fence::FlowingFenceState>(&json))
+            .transpose()?;
+        if source_fence
+            .as_ref()
+            .is_some_and(|fence| fence.source_branch_id != branch_id)
+        {
+            return Err(StoreError::Conflict(
+                "flowing member fence differs from branch".into(),
+            ));
         }
-        drop(statement);
+        members.push(FlowingCloseMember {
+            parked: flowing_member_parking::native::read_by_member(tx, &branch_id)?,
+            branch_id,
+            status: status(&branch_status)?,
+            head_cut_id,
+            source_fence,
+        });
+    }
+    drop(statement);
 
-        let mut units = Vec::new();
-        let mut statement = tx.prepare(
-            "SELECT unit.unit_id, unit.source_branch_id, handoff.target_branch_id, \
+    let mut units = Vec::new();
+    let mut statement = tx.prepare(
+        "SELECT unit.unit_id, unit.source_branch_id, handoff.op_id, handoff.target_branch_id, \
                     admitted.op_id, parked.op_id, parked.holder_id \
              FROM flowing_contributions AS unit \
              LEFT JOIN flowing_handoffs AS handoff ON handoff.unit_id = unit.unit_id \
@@ -86,60 +92,71 @@ impl FlowingCloseRosterReader for BranchStore {
                    (SELECT branch_id FROM branches WHERE parent_branch_id = ?1) \
                 OR handoff.target_branch_id = ?1 \
              ORDER BY unit.unit_id",
-        )?;
-        let rows = statement.query_map([source_branch_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
-        for row in rows {
-            let (unit_id, original_source_branch_id, handoff, admitted, parked_op, holder) = row?;
-            // Both columns are NOT NULL in one joined parked row.
-            let parked = parked_op.zip(holder);
-            units.push(FlowingCloseUnit {
-                unit_id,
-                state: classify_unit(
-                    source_branch_id,
-                    original_source_branch_id.clone(),
-                    handoff,
-                    admitted,
-                    parked,
-                )?,
-                original_source_branch_id,
-            });
-        }
-        drop(statement);
+    )?;
+    let rows = statement.query_map([source_branch_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            unit_id,
+            original_source_branch_id,
+            handoff_op,
+            handoff_target,
+            admitted,
+            parked_op,
+            holder,
+        ) = row?;
+        let parked = complete_pair("parking", parked_op, holder)?;
+        let handoff = complete_pair("handoff", handoff_op, handoff_target)?;
+        let handoff_op_id = handoff.as_ref().map(|(op_id, _)| op_id.clone());
+        units.push(FlowingCloseUnit {
+            unit_id,
+            state: classify_unit(
+                source_branch_id,
+                original_source_branch_id.clone(),
+                handoff,
+                admitted,
+                parked,
+            )?,
+            original_source_branch_id,
+            handoff_op_id,
+        });
+    }
+    drop(statement);
 
-        let mut live_private_pins = Vec::new();
-        let mut statement = tx.prepare(
-            "SELECT pin_id, twig_branch_id, cut_id, manifest_hash \
+    let mut live_private_pins = Vec::new();
+    let mut statement = tx.prepare(
+        "SELECT pin_id, twig_branch_id, cut_id, manifest_hash \
              FROM flowing_private_pins \
              WHERE released_at IS NULL AND \
                (twig_branch_id = ?1 OR twig_branch_id IN \
                  (SELECT branch_id FROM branches WHERE parent_branch_id = ?1)) \
              ORDER BY pin_id",
-        )?;
-        let rows = statement.query_map(params![source_branch_id], |row| {
-            Ok(FlowingClosePrivatePin {
-                pin_id: row.get(0)?,
-                twig_branch_id: row.get(1)?,
-                cut_id: row.get(2)?,
-                manifest_hash: row.get(3)?,
-            })
-        })?;
-        for row in rows {
-            live_private_pins.push(row?);
-        }
-        drop(statement);
+    )?;
+    let rows = statement.query_map(params![source_branch_id], |row| {
+        Ok(FlowingClosePrivatePin {
+            pin_id: row.get(0)?,
+            twig_branch_id: row.get(1)?,
+            cut_id: row.get(2)?,
+            manifest_hash: row.get(3)?,
+        })
+    })?;
+    for row in rows {
+        live_private_pins.push(row?);
+    }
+    drop(statement);
 
-        let mut live_attempts = Vec::new();
-        let mut statement = tx.prepare(
-            "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
+    let mut live_attempts = Vec::new();
+    let mut statement = tx.prepare(
+        "SELECT pin.op_id, pin.witness_digest, pin.source_cut_id, pin.candidate_cut_id, \
                     pin.retained_at, witness.witness_json, admitted.receipt_json, \
                     cancelled.cancel_op_id, cancelled.request_json, finished.receipt_json \
              FROM flowing_attempt_pins AS pin \
@@ -150,50 +167,72 @@ impl FlowingCloseRosterReader for BranchStore {
                ON cancelled.admission_op_id = pin.op_id \
              LEFT JOIN flowing_attempt_finishes AS finished ON finished.op_id = pin.op_id \
              WHERE pin.released_at IS NULL ORDER BY pin.op_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            FlowingAttemptPin {
+                op_id: row.get(0)?,
+                witness_digest: row.get(1)?,
+                source_cut_id: row.get(2)?,
+                candidate_cut_id: row.get(3)?,
+                retained_at: row.get(4)?,
+                released_at: None,
+            },
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+        ))
+    })?;
+    for row in rows {
+        let (pin, witness, admission, cancellation_op_id, cancellation_json, finish) = row?;
+        let attempt = classify_attempt(
+            pin,
+            witness,
+            admission,
+            cancellation_op_id,
+            cancellation_json,
+            finish,
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                FlowingAttemptPin {
-                    op_id: row.get(0)?,
-                    witness_digest: row.get(1)?,
-                    source_cut_id: row.get(2)?,
-                    candidate_cut_id: row.get(3)?,
-                    retained_at: row.get(4)?,
-                    released_at: None,
-                },
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?
-                    .zip(row.get::<_, Option<String>>(8)?),
-                row.get::<_, Option<String>>(9)?,
-            ))
-        })?;
-        for row in rows {
-            let (pin, witness, admission, cancellation, finish) = row?;
-            let attempt = classify_attempt(pin, witness, admission, cancellation, finish)?;
-            if attempt.source_branch_id == source_branch_id
-                || members
-                    .iter()
-                    .any(|member| member.branch_id == attempt.source_branch_id)
-            {
-                live_attempts.push(attempt);
-            }
+        if attempt.source_branch_id == source_branch_id
+            || members
+                .iter()
+                .any(|member| member.branch_id == attempt.source_branch_id)
+        {
+            live_attempts.push(attempt);
         }
-        drop(statement);
+    }
+    drop(statement);
 
-        let roster = FlowingCloseRoster {
-            source_branch_id: source.branch_id,
-            source_fence: fence,
-            source_status: source.status,
-            source_head_cut_id: source.head_cut_id,
-            source_head_manifest_hash: source.head_manifest_hash,
-            members,
-            units,
-            live_private_pins,
-            live_attempts,
-        };
+    let roster = FlowingCloseRoster {
+        source_branch_id: source.branch_id,
+        source_fence: fence,
+        source_status: source.status,
+        source_parent_branch_id: source.parent_branch_id,
+        source_branch_point_cut_id: source.branch_point_cut_id,
+        source_head_cut_id: source.head_cut_id,
+        source_head_manifest_hash: source.head_manifest_hash,
+        close_request,
+        members,
+        units,
+        live_private_pins,
+        live_attempts,
+    };
+    Ok(Some(roster))
+}
+
+impl FlowingCloseRosterReader for BranchStore {
+    fn flowing_close_roster(
+        &mut self,
+        source_branch_id: &str,
+    ) -> StoreResult<Option<FlowingCloseRoster>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let roster = read_roster(&tx, source_branch_id)?;
         tx.commit()?;
-        Ok(Some(roster))
+        Ok(roster)
     }
 }
 

@@ -48,7 +48,7 @@ fn invalid(reason: &str) -> StoreError {
     StoreError::Conflict(format!("flowing host evidence refuses: {reason}"))
 }
 
-fn unit_digest(unit: &FlowingSelectedUnit) -> StoreResult<String> {
+pub(crate) fn unit_digest(unit: &FlowingSelectedUnit) -> StoreResult<String> {
     let bytes = serde_json::to_vec(&("flowing-host-unit-outcome-v1", unit))?;
     Ok(format!(
         "sha256:{}",

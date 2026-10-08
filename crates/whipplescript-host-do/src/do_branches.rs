@@ -18,6 +18,8 @@ mod carried_cuts;
 mod flowing_admission;
 mod flowing_close_roster;
 mod flowing_fence;
+mod flowing_final_close;
+mod flowing_member_parking;
 mod flowing_parking;
 mod flowing_rewrite;
 mod flowing_sources;
@@ -259,6 +261,12 @@ impl<S: DoSql> DoBranches<S> {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         for statement in whipplescript_store::branches::flowing_parking::SCHEMA {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_member_parking::SCHEMA {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_final_close::SCHEMA {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         // Provenance columns arrived with Phase 2 (exactly as native):
@@ -508,6 +516,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
         let ancestry = self.flowing_ancestry(request.parent_branch_id)?;
         if ancestry.iter().any(|state| !state.admission_enabled) {
             return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+        }
+        for state in &ancestry {
+            if flowing_fence::close_pending(&self.sql, &state.source_branch_id)? {
+                return Ok(CreateBranchOutcome::ParentAdmissionDisabled);
+            }
         }
         if ancestry.first().is_some_and(|state| {
             state.source_branch_id != request.parent_branch_id
@@ -1016,6 +1029,10 @@ impl<S: DoSql> Branches for DoBranches<S> {
                  JOIN flowing_admitted_units AS admitted ON admitted.unit_id = unit.unit_id \
                  UNION SELECT unit.source_cut_id FROM flowing_contributions AS unit \
                  JOIN flowing_parked_units AS parked ON parked.unit_id = unit.unit_id \
+                 UNION SELECT retained_head_cut_id FROM flowing_parked_members \
+                 WHERE retained_head_cut_id IS NOT NULL \
+                 UNION SELECT retained_head_cut_id FROM flowing_final_closes \
+                 WHERE retained_head_cut_id IS NOT NULL \
                  UNION SELECT source_cut_id FROM flowing_attempt_pins \
                  WHERE released_at IS NULL \
                  UNION SELECT candidate_cut_id FROM flowing_attempt_pins \

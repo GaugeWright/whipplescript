@@ -4937,6 +4937,48 @@ mod tests {
             .handoff_receipt("handoff-a")
             .unwrap()
             .is_none());
+
+        let mut closing = bound_unit_with_flowing_target(true);
+        let witness = prepare_target(&mut closing, "target-a");
+        let before = closing.branches.flowing_source("branch").unwrap().unwrap();
+        assert!(matches!(
+            closing
+                .branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "request-close".into(),
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    expected_eligibility_epoch: before.eligibility_epoch,
+                    expected_owner_epoch: before.owner_epoch,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::RequestClose,
+                    recorded_at: "t5".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            closing.branches.flowing_source("branch").unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            closing
+                .handoff_private_selection("handoff-a", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::TargetFenceRefused
+        );
+        assert!(closing
+            .branches
+            .handoff_receipt("handoff-a")
+            .unwrap()
+            .is_none());
+        assert!(closing
+            .branches
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
         assert!(closed
             .branches
             .get_branch("branch")
@@ -5893,8 +5935,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn native_mixed_batch_handoff_moves_head_and_both_units_or_neither() {
+    #[allow(clippy::unwrap_used)] // Test setup and assertions retain the former #[test] contract.
+    fn exercise_native_mixed_batch_handoff(closing: bool) {
         use crate::branches::flowing_sources::{
             HandoffBatchContributionOutcome as H, RecordFlowingDerivedCutOutcome as D,
         };
@@ -6028,6 +6070,47 @@ mod tests {
             .test_connection()
             .execute_batch("DROP TRIGGER fail_second_batch_unit")
             .unwrap();
+        if closing {
+            let state = vcs.branches.flowing_source("branch").unwrap().unwrap();
+            assert!(matches!(
+                vcs.branches
+                    .transition_flowing_source(&FlowingFenceTransition {
+                        op_id: "request-close".into(),
+                        source_branch_id: "branch".into(),
+                        incarnation_id: "branch-batch-inc".into(),
+                        expected_eligibility_epoch: state.eligibility_epoch,
+                        expected_owner_epoch: state.owner_epoch,
+                        actor: "coordinator".into(),
+                        action: FlowingFenceAction::RequestClose,
+                        recorded_at: "t10".into(),
+                    })
+                    .unwrap(),
+                FlowingFenceOutcome::Applied(_)
+            ));
+            assert_eq!(
+                vcs.handoff_private_batch_derivation(
+                    "derive-1",
+                    &derived.witness_digest,
+                    "mediator",
+                    "t10",
+                )
+                .unwrap(),
+                H::TargetFenceRefused
+            );
+            assert!(vcs
+                .branches
+                .handoff_batch_receipt("derive-1")
+                .unwrap()
+                .is_none());
+            assert!(vcs
+                .branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .is_none());
+            return;
+        }
         let H::Transferred(receipt) = vcs
             .handoff_private_batch_derivation(
                 "derive-1",
@@ -6550,6 +6633,16 @@ mod tests {
             .unwrap();
         let error = vcs.branches.handoff_batch_receipt("derive-1").unwrap_err();
         assert!(format!("{error:?}").contains("batch handoff receipt roster is incomplete"));
+    }
+
+    #[test]
+    fn native_mixed_batch_handoff_moves_head_and_both_units_or_neither() {
+        exercise_native_mixed_batch_handoff(false);
+    }
+
+    #[test]
+    fn native_pending_close_fences_prepared_batch_import() {
+        exercise_native_mixed_batch_handoff(true);
     }
 
     #[test]
