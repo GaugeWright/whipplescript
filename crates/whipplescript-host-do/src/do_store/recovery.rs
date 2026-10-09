@@ -42,8 +42,8 @@ pub(super) fn require_proved_absence<Sql: DoSql>(
         .map_err(sql_err)?;
     let events = rows
         .iter()
-        .map(|row| event_view_from_row(row))
-        .collect::<Vec<_>>();
+        .map(|row| EVENT_VIEW.decode(row))
+        .collect::<StoreResult<Vec<_>>>()?;
     effect_recovery::require_proved_absence(&effect_recovery::fold_attempts(
         instance_id,
         effect_id,

@@ -39,6 +39,8 @@ mod checkpoint_positions_tests;
 mod dispatch;
 mod governance_import;
 mod host_actions;
+mod projection;
+use projection::*;
 mod readiness;
 pub(crate) mod recovery;
 mod tracker_closure;
@@ -1257,15 +1259,16 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             let existing = self
                 .sql
                 .query(
-                    "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
-                     causation_event_id, status, idempotency_key, created_at, updated_at, \
-                     resolved_by_event_id FROM effect_cancellation_requests \
-                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    &format!(
+                        "SELECT {} FROM effect_cancellation_requests \
+                         WHERE instance_id = ?1 AND idempotency_key = ?2",
+                        EFFECT_CANCELLATION_REQUEST_VIEW.columns()
+                    ),
                     &[text(request.instance_id), text(idempotency_key)],
                 )
                 .map_err(sql_err)?;
             if let Some(row) = existing.first() {
-                return Ok(effect_cancellation_request_from_row(row));
+                return EFFECT_CANCELLATION_REQUEST_VIEW.decode(row);
             }
         }
         if self.effect_has_open_cancellation_request(request.instance_id, request.effect_id)? {
@@ -1380,16 +1383,18 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let recorded = self
             .sql
             .query(
-                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
-                 causation_event_id, status, idempotency_key, created_at, updated_at, \
-                 resolved_by_event_id FROM effect_cancellation_requests WHERE request_id = ?1",
+                &format!(
+                    "SELECT {} FROM effect_cancellation_requests WHERE request_id = ?1",
+                    EFFECT_CANCELLATION_REQUEST_VIEW.columns()
+                ),
                 &[text(&request_id)],
             )
             .map_err(sql_err)?;
         StoreError::written_row(
             recorded
                 .first()
-                .map(|r| effect_cancellation_request_from_row(r)),
+                .map(|r| EFFECT_CANCELLATION_REQUEST_VIEW.decode(r))
+                .transpose()?,
             "effect cancellation request",
         )
     }
@@ -1971,7 +1976,7 @@ pub(crate) fn as_opt_text(value: &SqlValue) -> Option<String> {
     }
 }
 
-fn as_opt_i64(value: &SqlValue) -> Option<i64> {
+pub(crate) fn as_opt_i64(value: &SqlValue) -> Option<i64> {
     match value {
         SqlValue::Int(n) => Some(*n),
         _ => None,
@@ -1995,109 +2000,14 @@ pub(crate) fn stable_hash_hex(value: &str) -> String {
     whipplescript_store::stable_hash_hex(value)
 }
 
-/// Maps an 8-column skill row (`skill_id..required_capabilities`) to a `SkillView`.
-fn skill_view_from_row(row: &[SqlValue]) -> SkillView {
-    SkillView {
-        skill_id: as_text(&row[0]),
-        name: as_text(&row[1]),
-        version: as_text(&row[2]),
-        source: as_text(&row[3]),
-        source_path: as_text(&row[4]),
-        content_hash: as_text(&row[5]),
-        description: as_text(&row[6]),
-        required_capabilities_json: as_text(&row[7]),
-    }
+/// The instance-revision projection, used by the by-id / by-idempotency
+/// revision lookups and the per-instance listing; callers append a WHERE clause.
+fn revision_select_sql(predicate: &str) -> String {
+    format!(
+        "SELECT {} FROM instance_revisions {predicate}",
+        WORKFLOW_REVISION_VIEW.columns()
+    )
 }
-
-/// Maps a 10-column instance row to an `InstanceView`.
-fn instance_view_from_row(row: &[SqlValue]) -> InstanceView {
-    InstanceView {
-        instance_id: as_text(&row[0]),
-        program_id: as_text(&row[1]),
-        version_id: as_text(&row[2]),
-        revision_epoch: as_i64(&row[3]),
-        workflow_principal: as_text(&row[4]),
-        effective_authority_json: as_text(&row[5]),
-        status: as_text(&row[6]),
-        input_json: as_text(&row[7]),
-        created_at: as_text(&row[8]),
-        updated_at: as_text(&row[9]),
-    }
-}
-
-/// Maps a 6-column event row to an `EventView`.
-fn event_view_from_row(row: &[SqlValue]) -> EventView {
-    EventView {
-        event_id: as_text(&row[0]),
-        sequence: as_i64(&row[1]),
-        event_type: as_text(&row[2]),
-        payload_json: as_text(&row[3]),
-        source: as_text(&row[4]),
-        occurred_at: as_text(&row[5]),
-    }
-}
-
-/// Maps a 10-column fact row to a `FactView` (nullable: `program_version_id`,
-/// `source_span_json`, `validity_json`).
-fn fact_view_from_row(row: &[SqlValue]) -> FactView {
-    FactView {
-        fact_id: as_text(&row[0]),
-        program_version_id: as_opt_text(&row[1]),
-        revision_epoch: as_i64(&row[2]),
-        name: as_text(&row[3]),
-        key: as_text(&row[4]),
-        value_json: as_text(&row[5]),
-        provenance_class: as_text(&row[6]),
-        source_span_json: as_opt_text(&row[7]),
-        source_event_id: as_opt_text(&row[8]).unwrap_or_default(),
-        validity_json: as_opt_text(&row[9]),
-    }
-}
-
-/// Maps a 14-column effect row to an `EffectView` (last column is the
-/// `EXISTS(...)` cancel-requested flag, 0/1).
-fn effect_view_from_row(row: &[SqlValue]) -> EffectView {
-    EffectView {
-        effect_id: as_text(&row[0]),
-        kind: as_text(&row[1]),
-        target: as_opt_text(&row[2]),
-        input_json: as_text(&row[3]),
-        status: as_text(&row[4]),
-        created_by_rule: as_text(&row[5]),
-        program_version_id: as_opt_text(&row[6]),
-        revision_epoch: as_i64(&row[7]),
-        profile: as_opt_text(&row[8]),
-        required_capabilities_json: as_text(&row[9]),
-        policy_block_reason: as_opt_text(&row[10]),
-        policy_block_category: as_opt_text(&row[11]),
-        declared_profiles_json: as_text(&row[12]),
-        cancel_requested: as_i64(&row[13]) != 0,
-    }
-}
-
-/// Maps a 10-column run row to a `RunView` (column 8 is the `EXISTS(...)`
-/// cancel-requested flag; column 9 is the terminal summary).
-fn run_view_from_row(row: &[SqlValue]) -> RunView {
-    RunView {
-        run_id: as_text(&row[0]),
-        effect_id: as_text(&row[1]),
-        provider: as_text(&row[2]),
-        worker_id: as_text(&row[3]),
-        status: as_text(&row[4]),
-        started_at: as_text(&row[5]),
-        completed_at: as_opt_text(&row[6]),
-        metadata_json: as_text(&row[7]),
-        cancel_requested: as_i64(&row[8]) != 0,
-        summary: as_opt_text(&row[9]),
-    }
-}
-
-/// The 13-column instance-revision projection, used by the by-id / by-idempotency
-/// revision lookups.
-const REVISION_SELECT: &str = "SELECT revision_id, instance_id, epoch, from_version_id, \
-     to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, \
-     rule_carries_json, status, idempotency_key, created_at, activated_at \
-     FROM instance_revisions ";
 
 /// A revision by its id, mirroring `revision_by_id_on`.
 fn do_revision_by_id<Sql: DoSql>(
@@ -2106,11 +2016,13 @@ fn do_revision_by_id<Sql: DoSql>(
 ) -> StoreResult<Option<WorkflowRevisionView>> {
     let rows = sql
         .query(
-            &format!("{REVISION_SELECT}WHERE revision_id = ?1"),
+            &revision_select_sql("WHERE revision_id = ?1"),
             &[text(revision_id)],
         )
         .map_err(sql_err)?;
-    Ok(rows.first().map(|r| workflow_revision_from_row(r)))
+    rows.first()
+        .map(|r| WORKFLOW_REVISION_VIEW.decode(r))
+        .transpose()
 }
 
 /// A revision by its instance + idempotency key, mirroring
@@ -2122,11 +2034,13 @@ fn do_revision_by_idempotency<Sql: DoSql>(
 ) -> StoreResult<Option<WorkflowRevisionView>> {
     let rows = sql
         .query(
-            &format!("{REVISION_SELECT}WHERE instance_id = ?1 AND idempotency_key = ?2"),
+            &revision_select_sql("WHERE instance_id = ?1 AND idempotency_key = ?2"),
             &[text(instance_id), text(idempotency_key)],
         )
         .map_err(sql_err)?;
-    Ok(rows.first().map(|r| workflow_revision_from_row(r)))
+    rows.first()
+        .map(|r| WORKFLOW_REVISION_VIEW.decode(r))
+        .transpose()
 }
 
 /// Effect ids a revision policy would act on: running effects (`running=true`) or
@@ -2153,183 +2067,11 @@ fn do_revision_policy_effects<Sql: DoSql>(
     Ok(rows.iter().map(|r| as_text(&r[0])).collect())
 }
 
-/// Maps a 12-column instance-revision row to a `WorkflowRevisionView`.
-fn workflow_revision_from_row(row: &[SqlValue]) -> WorkflowRevisionView {
-    WorkflowRevisionView {
-        revision_id: as_text(&row[0]),
-        instance_id: as_text(&row[1]),
-        epoch: as_i64(&row[2]),
-        from_version_id: as_text(&row[3]),
-        to_version_id: as_text(&row[4]),
-        activated_by_event_id: as_text(&row[5]),
-        activation_policy_json: as_text(&row[6]),
-        cancellation_policy: as_text(&row[7]),
-        rule_carries_json: as_text(&row[8]),
-        status: as_text(&row[9]),
-        idempotency_key: as_opt_text(&row[10]),
-        created_at: as_text(&row[11]),
-        activated_at: as_text(&row[12]),
-    }
-}
-
-/// Maps a 12-column cancellation-request row to an `EffectCancellationRequestView`.
-fn effect_cancellation_request_from_row(row: &[SqlValue]) -> EffectCancellationRequestView {
-    EffectCancellationRequestView {
-        request_id: as_text(&row[0]),
-        instance_id: as_text(&row[1]),
-        effect_id: as_text(&row[2]),
-        revision_id: as_opt_text(&row[3]),
-        reason: as_opt_text(&row[4]),
-        requested_by: as_text(&row[5]),
-        causation_event_id: as_opt_text(&row[6]),
-        status: as_text(&row[7]),
-        idempotency_key: as_opt_text(&row[8]),
-        created_at: as_text(&row[9]),
-        updated_at: as_text(&row[10]),
-        resolved_by_event_id: as_opt_text(&row[11]),
-    }
-}
-
-/// Maps a 19-column workflow-invocation row (with parent/child active-version
-/// joins) to a `WorkflowInvocationView`.
-fn workflow_invocation_from_row(row: &[SqlValue]) -> WorkflowInvocationView {
-    WorkflowInvocationView {
-        invocation_id: as_text(&row[0]),
-        parent_instance_id: as_text(&row[1]),
-        parent_effect_id: as_text(&row[2]),
-        parent_program_version_id: as_opt_text(&row[3]),
-        parent_revision_epoch: as_i64(&row[4]),
-        parent_active_program_version_id: as_opt_text(&row[5]),
-        parent_active_revision_epoch: as_opt_i64(&row[6]),
-        child_instance_id: as_text(&row[7]),
-        child_program_version_id: as_opt_text(&row[8]),
-        child_revision_epoch: as_opt_i64(&row[9]),
-        child_active_program_version_id: as_opt_text(&row[10]),
-        child_active_revision_epoch: as_opt_i64(&row[11]),
-        target_workflow: as_text(&row[12]),
-        input_json: as_text(&row[13]),
-        status: as_text(&row[14]),
-        terminal_event_id: as_opt_text(&row[15]),
-        source_span_json: as_opt_text(&row[16]),
-        created_at: as_text(&row[17]),
-        updated_at: as_text(&row[18]),
-    }
-}
-
-/// Maps a 7-column program-version row (joined with `programs.name`) to a
-/// `ProgramVersionView`.
-fn program_version_from_row(row: &[SqlValue]) -> ProgramVersionView {
-    ProgramVersionView {
-        program_id: as_text(&row[0]),
-        program_name: as_text(&row[1]),
-        version_id: as_text(&row[2]),
-        source_hash: as_text(&row[3]),
-        ir_hash: as_text(&row[4]),
-        compiler_version: as_text(&row[5]),
-        analysis_summary_json: as_text(&row[6]),
-    }
-}
-
-/// Maps a 7-column artifact row to an `ArtifactView` (nullable: `content_hash`,
-/// `mime_type`).
-fn artifact_from_row(row: &[SqlValue]) -> ArtifactView {
-    ArtifactView {
-        artifact_id: as_text(&row[0]),
-        run_id: as_text(&row[1]),
-        kind: as_text(&row[2]),
-        path: as_text(&row[3]),
-        content_hash: as_opt_text(&row[4]),
-        mime_type: as_opt_text(&row[5]),
-        created_at: as_text(&row[6]),
-    }
-}
-
-/// Maps an 11-column workspace row to a `WorkspaceView`.
-fn workspace_from_row(row: &[SqlValue]) -> WorkspaceView {
-    WorkspaceView {
-        workspace_id: as_text(&row[0]),
-        instance_id: as_opt_text(&row[1]),
-        effect_id: as_opt_text(&row[2]),
-        run_id: as_opt_text(&row[3]),
-        provider: as_opt_text(&row[4]),
-        policy: as_text(&row[5]),
-        uri: as_text(&row[6]),
-        status: as_text(&row[7]),
-        metadata_json: as_text(&row[8]),
-        created_at: as_text(&row[9]),
-        updated_at: as_text(&row[10]),
-    }
-}
-
-/// Maps a 20-column diagnostics row to a `DiagnosticView`.
-fn diagnostic_from_row(row: &[SqlValue]) -> DiagnosticView {
-    DiagnosticView {
-        diagnostic_id: as_text(&row[0]),
-        instance_id: as_opt_text(&row[1]),
-        program_id: as_opt_text(&row[2]),
-        program_version_id: as_opt_text(&row[3]),
-        severity: as_text(&row[4]),
-        code: as_opt_text(&row[5]),
-        message: as_text(&row[6]),
-        source_span_json: as_opt_text(&row[7]),
-        subject_type: as_opt_text(&row[8]),
-        subject_id: as_opt_text(&row[9]),
-        event_id: as_opt_text(&row[10]),
-        effect_id: as_opt_text(&row[11]),
-        run_id: as_opt_text(&row[12]),
-        assertion_id: as_opt_text(&row[13]),
-        evidence_ids_json: as_text(&row[14]),
-        artifact_ids_json: as_text(&row[15]),
-        causation_id: as_opt_text(&row[16]),
-        correlation_id: as_opt_text(&row[17]),
-        idempotency_key: as_opt_text(&row[18]),
-        created_at: as_text(&row[19]),
-    }
-}
-
-/// Maps a 10-column evidence row to an `EvidenceView`.
-fn evidence_from_row(row: &[SqlValue]) -> EvidenceView {
-    EvidenceView {
-        evidence_id: as_text(&row[0]),
-        instance_id: as_text(&row[1]),
-        kind: as_text(&row[2]),
-        subject_type: as_text(&row[3]),
-        subject_id: as_text(&row[4]),
-        causation_id: as_opt_text(&row[5]),
-        correlation_id: as_opt_text(&row[6]),
-        summary: as_opt_text(&row[7]),
-        metadata_json: as_text(&row[8]),
-        created_at: as_text(&row[9]),
-    }
-}
-
-/// Maps a 4-column time-effect row (`effect_id, kind, status, timeout_seconds`)
-/// to a `DueTimeEffect`.
-fn due_time_effect_from_row(row: &[SqlValue]) -> DueTimeEffect {
-    DueTimeEffect {
-        effect_id: as_text(&row[0]),
-        kind: as_text(&row[1]),
-        status: as_text(&row[2]),
-        timeout_seconds: as_i64(&row[3]),
-    }
-}
-
-/// Maps a 5-column evidence-link row to an `EvidenceLinkView`.
-fn evidence_link_from_row(row: &[SqlValue]) -> EvidenceLinkView {
-    EvidenceLinkView {
-        evidence_id: as_text(&row[0]),
-        target_type: as_text(&row[1]),
-        target_id: as_text(&row[2]),
-        relation: as_text(&row[3]),
-        created_at: as_text(&row[4]),
-    }
-}
-
-/// The shared 11-column workspace projection; callers append a WHERE/ORDER clause.
+/// The shared workspace projection; callers append a WHERE/ORDER clause.
 fn workspace_select_sql(predicate: &str) -> String {
     format!(
-        "SELECT workspace_id, instance_id, effect_id, run_id, provider, policy, uri, status, \
-         metadata_json, created_at, updated_at FROM workspaces {predicate}"
+        "SELECT {} FROM workspaces {predicate}",
+        WORKSPACE_VIEW.columns()
     )
 }
 
@@ -4773,21 +4515,10 @@ fn do_capacity_block<Sql: DoSql>(
     }
 }
 
-/// The shared 19-column workflow-invocation projection (parent/child active
-/// versions joined, status folded to the parent effect's terminal). Callers
-/// append their own `WHERE ... ORDER BY ...` clause. Mirrors the native SQL.
-const WORKFLOW_INVOCATION_SELECT: &str = "SELECT invocation_id, parent_instance_id, \
-     parent_effect_id, parent_program_version_id, parent_revision_epoch, \
-     parent_instance.version_id, parent_instance.revision_epoch, child_instance_id, \
-     child_program_version_id, child_revision_epoch, child_instance.version_id, \
-     child_instance.revision_epoch, workflow_invocations.target_workflow, \
-     workflow_invocations.input_json, \
-     CASE WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled') \
-     THEN parent_effect.status ELSE workflow_invocations.status END, \
-     workflow_invocations.terminal_event_id, workflow_invocations.source_span_json, \
-     workflow_invocations.created_at, \
-     COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at) \
-     FROM workflow_invocations \
+/// The joins `WORKFLOW_INVOCATION_VIEW` reads through (parent/child active
+/// versions, status folded to the parent effect's terminal). Mirrors the
+/// native SQL.
+const WORKFLOW_INVOCATION_FROM: &str = "FROM workflow_invocations \
      LEFT JOIN instances AS parent_instance \
      ON parent_instance.instance_id = workflow_invocations.parent_instance_id \
      LEFT JOIN instances AS child_instance \
@@ -4795,6 +4526,15 @@ const WORKFLOW_INVOCATION_SELECT: &str = "SELECT invocation_id, parent_instance_
      LEFT JOIN effects AS parent_effect \
      ON parent_effect.instance_id = workflow_invocations.parent_instance_id \
      AND parent_effect.effect_id = workflow_invocations.parent_effect_id ";
+
+/// The shared workflow-invocation projection; callers append their own
+/// `WHERE ... ORDER BY ...` clause.
+fn workflow_invocation_select_sql(predicate: &str) -> String {
+    format!(
+        "SELECT {} {WORKFLOW_INVOCATION_FROM}{predicate}",
+        WORKFLOW_INVOCATION_VIEW.columns()
+    )
+}
 
 impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// RC-2 Delta A (DO mirror): bounded projection replay. Reconstructs the
@@ -5991,16 +5731,18 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT program_versions.program_id, programs.name, \
-                 program_versions.version_id, program_versions.source_hash, \
-                 program_versions.ir_hash, program_versions.compiler_version, \
-                 program_versions.analysis_summary FROM program_versions \
-                 JOIN programs ON programs.program_id = program_versions.program_id \
-                 WHERE program_versions.version_id = ?1",
+                &format!(
+                    "SELECT {} FROM program_versions \
+                     JOIN programs ON programs.program_id = program_versions.program_id \
+                     WHERE program_versions.version_id = ?1",
+                    PROGRAM_VERSION_VIEW.columns()
+                ),
                 &[text(version_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| program_version_from_row(r)))
+        rows.first()
+            .map(|r| PROGRAM_VERSION_VIEW.decode(r))
+            .transpose()
     }
 
     fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord> {
@@ -6019,14 +5761,13 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT revision_id, instance_id, epoch, from_version_id, to_version_id, \
-                 activated_by_event_id, activation_policy_json, cancellation_policy, \
-                 rule_carries_json, status, idempotency_key, created_at, activated_at \
-                 FROM instance_revisions WHERE instance_id = ?1 ORDER BY epoch",
+                &revision_select_sql("WHERE instance_id = ?1 ORDER BY epoch"),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| workflow_revision_from_row(r)).collect())
+        rows.iter()
+            .map(|r| WORKFLOW_REVISION_VIEW.decode(r))
+            .collect()
     }
 
     fn revision_cancellation_impact(
@@ -6508,17 +6249,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT request_id, instance_id, effect_id, revision_id, reason, requested_by, \
-                 causation_event_id, status, idempotency_key, created_at, updated_at, \
-                 resolved_by_event_id FROM effect_cancellation_requests \
-                 WHERE instance_id = ?1 ORDER BY created_at, request_id",
+                &format!(
+                    "SELECT {} FROM effect_cancellation_requests \
+                     WHERE instance_id = ?1 ORDER BY created_at, request_id",
+                    EFFECT_CANCELLATION_REQUEST_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows
-            .iter()
-            .map(|r| effect_cancellation_request_from_row(r))
-            .collect())
+        rows.iter()
+            .map(|r| EFFECT_CANCELLATION_REQUEST_VIEW.decode(r))
+            .collect()
     }
 
     fn record_workflow_invocation(&self, invocation: NewWorkflowInvocation<'_>) -> StoreResult<()> {
@@ -6583,49 +6324,52 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         parent_instance_id: &str,
         parent_effect_id: &str,
     ) -> StoreResult<Option<WorkflowInvocationView>> {
-        let sql = format!(
-            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.parent_instance_id = ?1 \
+        let sql = workflow_invocation_select_sql(
+            "WHERE workflow_invocations.parent_instance_id = ?1 \
              AND workflow_invocations.parent_effect_id = ?2 \
-             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1"
+             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1",
         );
         let rows = self
             .sql
             .query(&sql, &[text(parent_instance_id), text(parent_effect_id)])
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| workflow_invocation_from_row(r)))
+        rows.first()
+            .map(|r| WORKFLOW_INVOCATION_VIEW.decode(r))
+            .transpose()
     }
 
     fn list_child_workflow_invocations(
         &self,
         parent_instance_id: &str,
     ) -> StoreResult<Vec<WorkflowInvocationView>> {
-        let sql = format!(
-            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.parent_instance_id = ?1 \
-             ORDER BY workflow_invocations.created_at, invocation_id"
+        let sql = workflow_invocation_select_sql(
+            "WHERE workflow_invocations.parent_instance_id = ?1 \
+             ORDER BY workflow_invocations.created_at, invocation_id",
         );
         let rows = self
             .sql
             .query(&sql, &[text(parent_instance_id)])
             .map_err(sql_err)?;
-        Ok(rows
-            .iter()
-            .map(|r| workflow_invocation_from_row(r))
-            .collect())
+        rows.iter()
+            .map(|r| WORKFLOW_INVOCATION_VIEW.decode(r))
+            .collect()
     }
 
     fn get_parent_workflow_invocation(
         &self,
         child_instance_id: &str,
     ) -> StoreResult<Option<WorkflowInvocationView>> {
-        let sql = format!(
-            "{WORKFLOW_INVOCATION_SELECT}WHERE workflow_invocations.child_instance_id = ?1 \
-             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1"
+        let sql = workflow_invocation_select_sql(
+            "WHERE workflow_invocations.child_instance_id = ?1 \
+             ORDER BY workflow_invocations.created_at DESC, invocation_id DESC LIMIT 1",
         );
         let rows = self
             .sql
             .query(&sql, &[text(child_instance_id)])
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| workflow_invocation_from_row(r)))
+        rows.first()
+            .map(|r| WORKFLOW_INVOCATION_VIEW.decode(r))
+            .transpose()
     }
 
     fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
@@ -7921,12 +7665,11 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT skill_id, name, version, source, source_path, content_hash, \
-                 description, required_capabilities FROM skills ORDER BY name",
+                &format!("SELECT {} FROM skills ORDER BY name", SKILL_VIEW.columns()),
                 &[],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| skill_view_from_row(r)).collect())
+        rows.iter().map(|r| SKILL_VIEW.decode(r)).collect()
     }
 
     fn list_skill_attachments(
@@ -7937,25 +7680,30 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT attachment.attachment_id, attachment.scope_type, attachment.scope_id, \
-                 skill.skill_id, skill.name, skill.version, skill.source, skill.source_path, \
-                 skill.content_hash, skill.description, skill.required_capabilities \
-                 FROM skill_attachments AS attachment \
+                &format!(
+                    "SELECT attachment.attachment_id, attachment.scope_type, attachment.scope_id, \
+                 {} FROM skill_attachments AS attachment \
                  JOIN skills AS skill ON skill.skill_id = attachment.skill_id \
                  WHERE attachment.scope_type = ?1 AND attachment.scope_id = ?2 \
                  ORDER BY skill.name",
+                    ATTACHED_SKILL_VIEW.columns()
+                ),
                 &[text(scope_type), text(scope_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows
-            .iter()
-            .map(|r| SkillAttachmentView {
-                attachment_id: as_text(&r[0]),
-                scope_type: as_text(&r[1]),
-                scope_id: as_text(&r[2]),
-                skill: skill_view_from_row(&r[3..11]),
+        rows.iter()
+            .map(|r| {
+                // The three attachment cells lead the row; the projection
+                // checks the whole width before either half is read.
+                let skill = ATTACHED_SKILL_VIEW.decode_framed(r, 3, 0)?;
+                Ok(SkillAttachmentView {
+                    attachment_id: as_text(&r[0]),
+                    scope_type: as_text(&r[1]),
+                    scope_id: as_text(&r[2]),
+                    skill,
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
@@ -8153,12 +7901,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT artifact_id, run_id, kind, path, content_hash, mime_type, created_at \
-                 FROM artifacts WHERE run_id = ?1 ORDER BY created_at, artifact_id",
+                &format!(
+                    "SELECT {} FROM artifacts WHERE run_id = ?1 ORDER BY created_at, artifact_id",
+                    ARTIFACT_VIEW.columns()
+                ),
                 &[text(run_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| artifact_from_row(r)).collect())
+        rows.iter().map(|r| ARTIFACT_VIEW.decode(r)).collect()
     }
 
     fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
@@ -8201,7 +7951,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(workspace_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| workspace_from_row(r)))
+        rows.first().map(|r| WORKSPACE_VIEW.decode(r)).transpose()
     }
 
     fn list_workspaces_for_instance(&self, instance_id: &str) -> StoreResult<Vec<WorkspaceView>> {
@@ -8212,7 +7962,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| workspace_from_row(r)).collect())
+        rows.iter().map(|r| WORKSPACE_VIEW.decode(r)).collect()
     }
 
     fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
@@ -8220,18 +7970,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn list_diagnostics(&self, instance_id: Option<&str>) -> StoreResult<Vec<DiagnosticView>> {
-        let mut sql = "SELECT diagnostic_id, instance_id, program_id, program_version_id, \
-             severity, code, message, source_span_json, subject_type, subject_id, event_id, \
-             effect_id, run_id, assertion_id, evidence_ids_json, artifact_ids_json, causation_id, \
-             correlation_id, idempotency_key, created_at FROM diagnostics"
-            .to_owned();
+        let mut sql = format!("SELECT {} FROM diagnostics", DIAGNOSTIC_VIEW.columns());
         if instance_id.is_some() {
             sql.push_str(" WHERE instance_id = ?1");
         }
         sql.push_str(" ORDER BY created_at, diagnostic_id");
         let params: Vec<SqlValue> = instance_id.map(|i| vec![text(i)]).unwrap_or_default();
         let rows = self.sql.query(&sql, &params).map_err(sql_err)?;
-        Ok(rows.iter().map(|r| diagnostic_from_row(r)).collect())
+        rows.iter().map(|r| DIAGNOSTIC_VIEW.decode(r)).collect()
     }
 
     fn list_diagnostics_from_events(&self, instance_id: &str) -> StoreResult<Vec<DiagnosticView>> {
@@ -8334,15 +8080,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             let rows = self
                 .sql
                 .query(
-                    "SELECT skill_id, name, version, source, source_path, content_hash, \
-                     description, required_capabilities FROM skills WHERE name = ?1",
+                    &format!(
+                        "SELECT {} FROM skills WHERE name = ?1",
+                        SKILL_VIEW.columns()
+                    ),
                     &[text(name)],
                 )
                 .map_err(sql_err)?;
             let row = rows
                 .first()
                 .ok_or_else(|| sql_err(format!("no skill named `{name}`")))?;
-            skills.push(skill_view_from_row(row));
+            skills.push(SKILL_VIEW.decode(row)?);
         }
         skills.sort_by(|left, right| left.name.cmp(&right.name));
         let metadata = serde_json::json!({
@@ -8381,13 +8129,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT evidence_id, instance_id, kind, subject_type, subject_id, causation_id, \
-                 correlation_id, summary, metadata_json, created_at FROM evidence \
-                 WHERE instance_id = ?1 ORDER BY created_at, evidence_id",
+                &format!(
+                    "SELECT {} FROM evidence WHERE instance_id = ?1 ORDER BY created_at, evidence_id",
+                    EVIDENCE_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| evidence_from_row(r)).collect())
+        rows.iter().map(|r| EVIDENCE_VIEW.decode(r)).collect()
     }
 
     fn list_evidence_for_subject(
@@ -8398,64 +8147,72 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT evidence_id, instance_id, kind, subject_type, subject_id, causation_id, \
-                 correlation_id, summary, metadata_json, created_at FROM evidence \
-                 WHERE subject_type = ?1 AND subject_id = ?2 ORDER BY created_at, evidence_id",
+                &format!(
+                    "SELECT {} FROM evidence \
+                     WHERE subject_type = ?1 AND subject_id = ?2 ORDER BY created_at, evidence_id",
+                    EVIDENCE_VIEW.columns()
+                ),
                 &[text(subject_type), text(subject_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| evidence_from_row(r)).collect())
+        rows.iter().map(|r| EVIDENCE_VIEW.decode(r)).collect()
     }
 
     fn list_evidence_links(&self, instance_id: &str) -> StoreResult<Vec<EvidenceLinkView>> {
         let rows = self
             .sql
             .query(
-                "SELECT evidence_id, target_type, target_id, relation, created_at \
-                 FROM evidence_links WHERE instance_id = ?1 \
-                 ORDER BY created_at, evidence_id, target_type, target_id, relation",
+                &format!(
+                    "SELECT {} FROM evidence_links WHERE instance_id = ?1 \
+                     ORDER BY created_at, evidence_id, target_type, target_id, relation",
+                    EVIDENCE_LINK_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| evidence_link_from_row(r)).collect())
+        rows.iter().map(|r| EVIDENCE_LINK_VIEW.decode(r)).collect()
     }
 
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>> {
         let rows = self
             .sql
             .query(
-                "SELECT instance_id, program_id, version_id, revision_epoch, \
-                 workflow_principal, effective_authority, status, input_json, created_at, \
-                 updated_at FROM instances ORDER BY created_at, instance_id",
+                &format!(
+                    "SELECT {} FROM instances ORDER BY created_at, instance_id",
+                    INSTANCE_VIEW.columns()
+                ),
                 &[],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| instance_view_from_row(r)).collect())
+        rows.iter().map(|r| INSTANCE_VIEW.decode(r)).collect()
     }
 
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
         let rows = self
             .sql
             .query(
-                "SELECT instance_id, program_id, version_id, revision_epoch, \
-                 workflow_principal, effective_authority, status, input_json, created_at, \
-                 updated_at FROM instances WHERE instance_id = ?1",
+                &format!(
+                    "SELECT {} FROM instances WHERE instance_id = ?1",
+                    INSTANCE_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| instance_view_from_row(r)))
+        rows.first().map(|r| INSTANCE_VIEW.decode(r)).transpose()
     }
 
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         let rows = self
             .sql
             .query(
-                "SELECT event_id, sequence, event_type, payload_json, source, occurred_at \
-                 FROM events WHERE instance_id = ?1 ORDER BY sequence",
+                &format!(
+                    "SELECT {} FROM events WHERE instance_id = ?1 ORDER BY sequence",
+                    EVENT_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| event_view_from_row(r)).collect())
+        rows.iter().map(|r| EVENT_VIEW.decode(r)).collect()
     }
 
     fn event_by_idempotency_key(
@@ -8481,41 +8238,37 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json, source_event_id, validity_json FROM facts \
-                 WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY name, key",
+                &format!(
+                    "SELECT {} FROM facts \
+                     WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY name, key",
+                    FACT_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| fact_view_from_row(r)).collect())
+        rows.iter().map(|r| FACT_VIEW.decode(r)).collect()
     }
 
     fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let rows = self
             .sql
             .query(
-                "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json, source_event_id, validity_json FROM facts \
-                 WHERE instance_id = ?1 ORDER BY name, key",
+                &format!(
+                    "SELECT {} FROM facts WHERE instance_id = ?1 ORDER BY name, key",
+                    FACT_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| fact_view_from_row(r)).collect())
+        rows.iter().map(|r| FACT_VIEW.decode(r)).collect()
     }
 
     fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>> {
         let rows = self
             .sql
             .query(
-                "SELECT effects.effect_id, effects.kind, effects.target, effects.input_json, \
-                 effects.status, effects.created_by_rule, effects.program_version_id, \
-                 effects.revision_epoch, effects.profile, effects.required_capabilities, \
-                 effects.policy_block_reason, effects.policy_block_category, \
-                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
-                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
-                 WHERE request.instance_id = effects.instance_id \
-                 AND request.effect_id = effects.effect_id AND request.status = 'requested'), \
-                 effects.created_by_event_id \
+                &format!(
+                    "SELECT {}, effects.created_by_event_id \
                  FROM effects \
                  LEFT JOIN instances ON instances.instance_id = effects.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -8523,19 +8276,27 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  LEFT JOIN program_versions AS effect_versions \
                  ON effect_versions.version_id = effects.program_version_id \
                  WHERE effects.instance_id = ?1 ORDER BY effects.created_at, effects.effect_id",
+                    EFFECT_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
         // RC-4b on the effects plane (parity with native list_effects).
         let live = do_live_event_ids(&self.sql, instance_id)?;
-        Ok(rows
-            .iter()
-            .filter(|row| match (&live, &row.get(14).map(as_opt_text)) {
-                (Some(live), Some(Some(event_id))) => live.contains(event_id),
+        // The view is followed by exactly one provenance cell; the width is
+        // checked before either is read.
+        let mut effects = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let effect = EFFECT_VIEW.decode_framed(row, 0, 1)?;
+            let visible = match (&live, as_opt_text(&row[EFFECT_VIEW.width()])) {
+                (Some(live), Some(event_id)) => live.contains(&event_id),
                 _ => true,
-            })
-            .map(|r| effect_view_from_row(r))
-            .collect())
+            };
+            if visible {
+                effects.push(effect);
+            }
+        }
+        Ok(effects)
     }
 
     fn list_effect_instances(&self) -> StoreResult<Vec<String>> {
@@ -8553,16 +8314,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT run_id, effect_id, provider, worker_id, status, started_at, \
-                 completed_at, metadata_json, \
-                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
-                 WHERE request.instance_id = runs.instance_id \
-                 AND request.effect_id = runs.effect_id AND request.status = 'requested'), summary \
-                 FROM runs WHERE runs.instance_id = ?1 ORDER BY started_at, run_id",
+                &format!(
+                    "SELECT {} FROM runs WHERE runs.instance_id = ?1 ORDER BY started_at, run_id",
+                    RUN_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| run_view_from_row(r)).collect())
+        rows.iter().map(|r| RUN_VIEW.decode(r)).collect()
     }
 
     /// Parity with the native `running_run_for_effect`: `list_runs` narrowed
@@ -8576,17 +8335,15 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT run_id, effect_id, provider, worker_id, status, started_at, \
-                 completed_at, metadata_json, \
-                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
-                 WHERE request.instance_id = runs.instance_id \
-                 AND request.effect_id = runs.effect_id AND request.status = 'requested'), summary \
-                 FROM runs WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 \
-                 AND runs.status = 'running' ORDER BY started_at, run_id LIMIT 1",
+                &format!(
+                    "SELECT {} FROM runs WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 \
+                     AND runs.status = 'running' ORDER BY started_at, run_id LIMIT 1",
+                    RUN_VIEW.columns()
+                ),
                 &[text(instance_id), text(effect_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|r| run_view_from_row(r)))
+        rows.first().map(|r| RUN_VIEW.decode(r)).transpose()
     }
 
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
@@ -8627,14 +8384,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let mut recent_events = self
             .sql
             .query(
-                "SELECT event_id, sequence, event_type, payload_json, source, occurred_at \
-                 FROM events WHERE instance_id = ?1 ORDER BY sequence DESC LIMIT 5",
+                &format!(
+                    "SELECT {} FROM events WHERE instance_id = ?1 ORDER BY sequence DESC LIMIT 5",
+                    EVENT_VIEW.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?
             .iter()
-            .map(|r| event_view_from_row(r))
-            .collect::<Vec<_>>();
+            .map(|r| EVENT_VIEW.decode(r))
+            .collect::<StoreResult<Vec<_>>>()?;
         recent_events.reverse();
         let revisions = self.list_instance_revisions(instance_id)?;
         let parent_invocation = self.get_parent_workflow_invocation(instance_id)?;
@@ -8775,8 +8534,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 &format!(
-                    "SELECT candidate.effect_id, candidate.kind, candidate.status, \
-                 COALESCE(candidate.timeout_seconds, 0) FROM effects AS candidate \
+                    "SELECT {columns} FROM effects AS candidate \
                  WHERE candidate.instance_id = ?1 \
                  AND candidate.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
                  AND ( \
@@ -8795,12 +8553,13 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                      WHERE dependency.instance_id = candidate.instance_id \
                        AND dependency.downstream_effect_id = candidate.effect_id AND NOT {DEPENDENCY_SATISFIED} \
                    ) \
-                 ) ORDER BY candidate.created_at, candidate.effect_id"
+                 ) ORDER BY candidate.created_at, candidate.effect_id",
+                    columns = DUE_TIME_EFFECT.columns()
                 ),
                 &[text(instance_id), text(now)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| due_time_effect_from_row(r)).collect())
+        rows.iter().map(|r| DUE_TIME_EFFECT.decode(r)).collect()
     }
 
     fn due_interval_occurrences(
@@ -8859,14 +8618,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT effect_id, kind, status, timeout_seconds FROM effects \
-                 WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
-                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
-                 ORDER BY created_at, effect_id",
+                &format!(
+                    "SELECT {} FROM effects \
+                     WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
+                     AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                     ORDER BY created_at, effect_id",
+                    DUE_TIME_EFFECT.columns()
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| due_time_effect_from_row(r)).collect())
+        rows.iter().map(|r| DUE_TIME_EFFECT.decode(r)).collect()
     }
 
     fn expire_effect(
