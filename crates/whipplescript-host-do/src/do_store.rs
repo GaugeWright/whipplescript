@@ -37,6 +37,7 @@
 #[path = "do_store_checkpoint_positions_tests.rs"]
 mod checkpoint_positions_tests;
 mod dispatch;
+mod governance_import;
 mod host_actions;
 mod readiness;
 pub(crate) mod recovery;
@@ -5385,6 +5386,21 @@ impl<Sql: DoSql> whipplescript_store::norm_commands::NormCommandStore for DoSqli
         verifier: &dyn whipplescript_store::norm::NormVerifier,
     ) -> StoreResult<usize> {
         self.import_norm_events(events, verifier)
+    }
+    fn import_governance(
+        &mut self,
+        request: &whipplescript_store::norm_governance_import::GovernanceImportRequest,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm_governance_import::GovernanceImportResult> {
+        self.import_governance(request, verifier)
+    }
+    fn governance_reference(
+        &self,
+        scope: &str,
+        number: &str,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<Option<String>> {
+        self.governance_reference(scope, number, verifier)
     }
 }
 

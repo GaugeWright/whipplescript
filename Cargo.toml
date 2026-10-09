@@ -6,6 +6,7 @@ members = [
     "crates/whipplescript-custody",
     "crates/whipplescript-custodian",
     "crates/whipplescript-host-do",
+    "crates/whipplescript-hjson",
     "crates/whipplescript-kernel",
     "crates/whipplescript-parser",
     "crates/whipplescript-provider-claude",

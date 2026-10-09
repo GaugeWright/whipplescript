@@ -48,6 +48,7 @@ pub mod norm_constraints;
 pub mod norm_correspondence;
 pub mod norm_deployment;
 pub mod norm_enforcement;
+pub mod norm_governance_import;
 pub mod norm_history;
 pub mod norm_inventory;
 pub mod norm_manifests;

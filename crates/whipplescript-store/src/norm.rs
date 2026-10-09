@@ -2363,6 +2363,61 @@ pub fn replay_norm(
     Ok(view)
 }
 
+/// Opaque incremental preparation under the same verifier and interpreter as
+/// ordinary admission. It owns its verified projection; callers cannot inject
+/// projected state. Publication still has to compare the captured host basis.
+pub struct NormPreparation<'a> {
+    view: NormView,
+    verifier: &'a dyn NormVerifier,
+    events: BTreeMap<String, TrackerEvent>,
+}
+impl<'a> NormPreparation<'a> {
+    pub fn new(
+        history: &[TrackerEvent],
+        checkpoint: &NormCheckpoint,
+        verifier: &'a dyn NormVerifier,
+    ) -> StoreResult<Self> {
+        Ok(Self {
+            view: replay_norm(history, checkpoint, verifier)?,
+            verifier,
+            events: history
+                .iter()
+                .filter(|e| e.kind.starts_with("norm."))
+                .map(|e| (e.event_id.clone(), e.clone()))
+                .collect(),
+        })
+    }
+    pub fn view(&self) -> &NormView {
+        &self.view
+    }
+    /// Check current admission premises, exact signature/nonce and complete
+    /// causal parents before applying the ordinary interpreter once.
+    pub fn admit(&mut self, event: &TrackerEvent) -> StoreResult<()> {
+        if let Some(prior) = self.events.get(&event.event_id) {
+            return if prior == event {
+                Ok(())
+            } else {
+                Err(refused(
+                    "norm event identity has conflicting transport bytes",
+                ))
+            };
+        }
+        if event
+            .parents
+            .iter()
+            .any(|parent| !self.events.contains_key(parent))
+        {
+            return Err(refused("norm preparation has missing causal parents"));
+        }
+        self.view.check_admission_premises(event, self.verifier)?;
+        let mut next = self.view.clone();
+        next.apply(event, self.verifier)?;
+        self.view = next;
+        self.events.insert(event.event_id.clone(), event.clone());
+        Ok(())
+    }
+}
+
 /// A validated candidate and expected pin, prepared under the host transaction.
 /// Replaying all existing events also ensures that a partial/corrupt import can
 /// never become usable authority merely because the next request is well formed.

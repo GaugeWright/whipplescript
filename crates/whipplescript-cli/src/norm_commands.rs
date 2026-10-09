@@ -24,6 +24,8 @@ use whipplescript_store::norm_commands::{
 
 #[path = "norm_commands/buck2.rs"]
 pub(crate) mod buck2;
+#[path = "norm_commands/governance.rs"]
+mod governance;
 #[path = "norm_commands/impact.rs"]
 mod impact;
 
@@ -51,6 +53,8 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   sign --as <binding> --statement <file>\n\
   cosign --as <binding> --event <file>\n\
   dispatch --request <file> | import --events <file>\n\
+  prepare-governance --source <file> --scope <qualified-source> --revision <git-revision> --import-id <id> --as <binding> [--adopt <numbers-file>]\n\
+  import-governance --request <file> | resolve-governance <scope> <DR-number>\n\
   provision (uses only the checkpoint in trusted host configuration)\n\
   Authoring accepts --nonce and --at; exact retries reuse signed events via dispatch.\n\
   Host configuration: WHIPPLESCRIPT_NORM_TRUST and WHIPPLESCRIPT_CUSTODIAN_SOCKET.\n\
@@ -122,6 +126,21 @@ impl<'a> Arguments<'a> {
             "compare-resources" | "impact" => (2, &["--before-frontier", "--after-frontier"]),
             "dispatch" => (0, &["--request"]),
             "import" => (0, &["--events"]),
+            "prepare-governance" => (
+                0,
+                &[
+                    "--source",
+                    "--scope",
+                    "--revision",
+                    "--import-id",
+                    "--as",
+                    "--adopt",
+                    "--nonce",
+                    "--at",
+                ],
+            ),
+            "import-governance" => (0, &["--request"]),
+            "resolve-governance" => (2, &[]),
             "sign" => (0, &["--as", "--statement"]),
             "cosign" => (0, &["--as", "--event"]),
             "bootstrap" => (0, &["--as", "--creator", "--charter", "--nonce", "--at"]),
@@ -404,6 +423,9 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             .map_err(debug_error)?;
         return Ok(serde_json::json!({"checkpoint": checkpoint}));
     }
+    if args.verb == "prepare-governance" {
+        return governance::prepare(&args, &store, &verifier, key(args.required("--as")?)?);
+    }
     let artifacts = |cut: &str| -> whipplescript_store::StoreResult<
         whipplescript_store::norm_artifact::CapturedArtifact,
     > {
@@ -673,6 +695,18 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                 serde_json::from_str(&args.file("--proposal")?)
                     .map_err(|error| error.to_string())?,
             ),
+        },
+        "import-governance" => NormCommand::GovernanceImport {
+            request: Box::new(
+                whipplescript_store::norm_governance_import::decode_request(
+                    &args.file("--request")?,
+                )
+                .map_err(debug_error)?,
+            ),
+        },
+        "resolve-governance" => NormCommand::GovernanceReference {
+            scope: args.positional[0].into(),
+            number: args.positional[1].into(),
         },
         "import" => NormCommand::Import {
             events: serde_json::from_str(&args.file("--events")?)

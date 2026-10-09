@@ -4711,6 +4711,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "whipplescript-hjson"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "whipplescript-host-do"
 version = "0.10.0"
 dependencies = [
@@ -4829,6 +4837,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "whipplescript-core",
+ "whipplescript-hjson",
 ]
 
 [[package]]

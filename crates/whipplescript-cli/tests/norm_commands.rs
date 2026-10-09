@@ -2131,3 +2131,6 @@ mod impact;
 
 #[path = "norm_commands/review.rs"]
 mod review;
+
+#[path = "norm_commands/governance_batch.rs"]
+mod governance_batch;

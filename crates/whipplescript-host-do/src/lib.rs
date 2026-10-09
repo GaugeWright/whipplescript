@@ -69,6 +69,8 @@ pub mod hosted_actions;
 #[cfg(test)]
 mod import_admission_inventory_tests;
 pub mod norm_commands;
+#[cfg(test)]
+mod norm_governance_import_tests;
 pub mod norm_runtime;
 #[cfg(test)]
 mod rule_commit_recovery_tests;

@@ -45,6 +45,8 @@ pub mod discovery;
 #[cfg(feature = "native")]
 mod filing;
 #[cfg(feature = "native")]
+mod governance_import;
+#[cfg(feature = "native")]
 mod protection;
 #[cfg(feature = "native")]
 pub use protection::TrackerEventMetadata;

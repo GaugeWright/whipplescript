@@ -42,6 +42,13 @@ pub enum NormCommand {
     Import {
         events: Vec<TrackerEvent>,
     },
+    GovernanceImport {
+        request: Box<crate::norm_governance_import::GovernanceImportRequest>,
+    },
+    GovernanceReference {
+        scope: String,
+        number: String,
+    },
     Snapshot {},
     Inventory {},
     SnapshotAt {
@@ -186,6 +193,12 @@ pub enum NormCommandResult {
     Imported {
         inserted: usize,
     },
+    GovernanceImported {
+        import: crate::norm_governance_import::GovernanceImportResult,
+    },
+    GovernanceReference {
+        record: Option<String>,
+    },
     Snapshot {
         snapshot: Box<NormSnapshot>,
     },
@@ -300,6 +313,25 @@ pub trait NormCommandStore {
         events: &[TrackerEvent],
         verifier: &dyn NormVerifier,
     ) -> StoreResult<usize>;
+    fn import_governance(
+        &mut self,
+        _request: &crate::norm_governance_import::GovernanceImportRequest,
+        _verifier: &dyn NormVerifier,
+    ) -> StoreResult<crate::norm_governance_import::GovernanceImportResult> {
+        Err(StoreError::Conflict(
+            "this host does not support atomic governance import".into(),
+        ))
+    }
+    fn governance_reference(
+        &self,
+        _scope: &str,
+        _number: &str,
+        _verifier: &dyn NormVerifier,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::Conflict(
+            "this host does not support coherent governance reference reads".into(),
+        ))
+    }
 }
 
 /// A host's lease on the refs a charter gates: the mainline, and every line
@@ -631,6 +663,16 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             NormCommand::Import { events } => NormCommandResult::Imported {
                 inserted: self.store.import_norm(&events, self.verifier)?,
             },
+            NormCommand::GovernanceImport { request } => NormCommandResult::GovernanceImported {
+                import: self.store.import_governance(&request, self.verifier)?,
+            },
+            NormCommand::GovernanceReference { scope, number } => {
+                NormCommandResult::GovernanceReference {
+                    record: self
+                        .store
+                        .governance_reference(&scope, &number, self.verifier)?,
+                }
+            }
             NormCommand::Inventory {} => NormCommandResult::Inventory {
                 inventory: self
                     .store
@@ -882,5 +924,20 @@ impl NormCommandStore for crate::items::WorkItemStore {
         verifier: &dyn NormVerifier,
     ) -> StoreResult<usize> {
         self.import_norm_events(events, verifier)
+    }
+    fn import_governance(
+        &mut self,
+        request: &crate::norm_governance_import::GovernanceImportRequest,
+        verifier: &dyn NormVerifier,
+    ) -> StoreResult<crate::norm_governance_import::GovernanceImportResult> {
+        self.import_governance(request, verifier)
+    }
+    fn governance_reference(
+        &self,
+        scope: &str,
+        number: &str,
+        verifier: &dyn NormVerifier,
+    ) -> StoreResult<Option<String>> {
+        self.governance_reference(scope, number, verifier)
     }
 }

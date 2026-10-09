@@ -137,7 +137,7 @@ pub fn collect_blobs_delta(
 /// that its own hash would then reject at the far end.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn encode_base64(bytes: &[u8]) -> String {
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as usize;
@@ -159,7 +159,7 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_base64(encoded: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_base64(encoded: &str) -> Result<Vec<u8>, String> {
     fn value(byte: u8) -> Result<u32, String> {
         match byte {
             b'A'..=b'Z' => Ok((byte - b'A') as u32),
