@@ -4409,6 +4409,38 @@ pub fn parse_effect_statements(
             });
             consumed_delta = brace_delta(&statement);
             index = next_index;
+        } else if trimmed.starts_with("seal ") {
+            // The compiler accepts newline-separated construct slots. Collect
+            // through the required binding rather than silently omitting a
+            // checked seal whose `with`/`as` appears on another line.
+            let mut statement = trimmed.to_owned();
+            let mut next_index = index;
+            while (parse_seal_statement(&statement).is_none()
+                || binding_after_as(&statement).is_none())
+                && next_index + 1 < lines.len()
+            {
+                next_index += 1;
+                statement.push(' ');
+                statement.push_str(lines[next_index].trim());
+            }
+            if let Some((value, credential)) = parse_seal_statement(&statement) {
+                let target = "custody.wrap".to_owned();
+                effects.push(ParsedEffect {
+                    timeout_seconds: parse_timeout_clause_seconds(&statement),
+                    kind: "capability.call".to_owned(),
+                    target: Some(target.clone()),
+                    name: Some("seal".to_owned()),
+                    binding: binding_after_as(&statement),
+                    args: vec![value, credential],
+                    prompt: None,
+                    prompt_content_type: None,
+                    prompt_template: None,
+                    required_capabilities: vec![target],
+                    after: current_after,
+                });
+            }
+            consumed_delta = brace_delta(&statement);
+            index = next_index;
         } else if let Some((envelope, payload_type, credential)) = parse_open_statement(trimmed) {
             // `open <sealed> into <Type> with <credential> as <binding>`
             // (std.custody, DR-0074 §3): a `custody.unwrap` capability call
@@ -5680,6 +5712,30 @@ pub fn parsed_effect_input_json(
             "bindings": context_bindings_json(context),
             "rule": rule.name,
         }),
+        "capability.call" if effect.name.as_deref() == Some("seal") => {
+            // This is the ordinary, out-of-region producer (WS820). DR0284's
+            // derived region input is WS345: never resolve an opened alias into
+            // this durable value, even if the particular expression is public.
+            if context.bindings.iter().any(|(_, fact)| {
+                fact.provenance_class == crate::opened_plaintext::OPENED_PROVENANCE
+            }) {
+                errors.push(
+                    "in-region seal requires envelope-identity derivation (DR0284)".to_owned(),
+                );
+                Value::Null
+            } else {
+                json!({
+                    "target": effect.target,
+                    "source_form": "seal",
+                    "credential": effect.args.get(1).cloned().unwrap_or_default(),
+                    "value": parse_seal_value_scoped(
+                        effect.args.first().map(String::as_str).unwrap_or_default(),
+                        context, live_facts, live_effects, live_ir,
+                    ),
+                    "rule": rule.name,
+                })
+            }
+        }
         // The open's input is the envelope and the narrowing, and nothing
         // else. Deliberately no `bindings` dump: an open nested inside another
         // region would otherwise carry that region's plaintext into this
@@ -6218,6 +6274,41 @@ pub fn prompt_provider_after_using(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve the authored seal value with the expression evaluator before the
+/// legacy field helper's quoted-literal shortcut. Bare bindings retain their
+/// ordinary context lookup; other expressions use the same parser and evaluator
+/// as checked runtime expressions (including raw string literal semantics).
+fn parse_seal_value_scoped(
+    value: &str,
+    context: &RuleContext,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> Value {
+    if let Ok(expr) = whipplescript_parser::parse_expression(value.trim()) {
+        if !matches!(expr, Expr::Literal(ExprLiteral::Ident(_))) {
+            return eval_expr_value(
+                &expr,
+                &EvalScope::rule(context, live_facts, live_effects, live_ir),
+            )
+            .into_json();
+        }
+    }
+    parse_field_value_scoped(value, context, live_facts, live_effects, live_ir)
+}
+
+/// The std.custody ordinary `seal <value> with <credential> as <binding>`.
+fn parse_seal_statement(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("seal ")?.trim_start();
+    let (value, rest) = rest.rsplit_once(" with ")?;
+    let credential = rest.split_whitespace().next()?;
+    let value = value.trim();
+    if value.is_empty() || credential.is_empty() {
+        return None;
+    }
+    Some((value.to_owned(), credential.to_owned()))
 }
 
 /// `open <sealed> into <Type> with <credential> [as <binding>]` as
@@ -10038,3 +10129,6 @@ rule r
             .is_some_and(|reference| reference.starts_with("inline:")));
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+mod authored_seal_tests;

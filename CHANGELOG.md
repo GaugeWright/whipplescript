@@ -19,6 +19,11 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- Authored `seal ... with ... as ...` actions now wrap the resolved value and
+  resume their continuation, including when the construct slots span lines.
+  In an opened region, sealing requires envelope identity derivation;
+  constant and declassified values there remain conservatively refused.
+
 - Checkpoints publish workspace/external positions and the successful cut atomically
   on native and DO stores. Busy or failed captures leave no orphan carrier; exact
   redelivery returns the original positions, and changed command content refuses.
