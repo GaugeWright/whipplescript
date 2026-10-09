@@ -120,6 +120,22 @@ several. The manual steps, for reference:
 4. **Deploy**: name the target — see the next section. `npm run deploy` is not
    a deploy; it prints the map and exits non-zero.
 
+## Public Session command correlation
+
+The accepted public `send_message` request retains its existing `request_id`
+and apply-once command identity. Its durable User projection now includes
+`client_request_id` from that admitted request and `chat_id` from the owning
+Session. Applied steering and follow-up User projections use the corresponding
+accepted command id and the same durable Session id. Older projections without
+these optional fields remain readable and unbound.
+
+These fields describe the existing per-visitor Session capability boundary;
+they do not grant native Home/requester authority or widen signed admission,
+provider credential, disclosure, or tool permissions. Local workerd coverage
+checks the actual initial turn and steering/follow-up durable projections with
+synthetic provider responses. It does not establish an outer cloud-edge
+publication, deployed version, or complete GaugeDesk browser journey.
+
 ## Which worker serves what
 
 `src/index.ts` is deployed under several names, so this directory has **no

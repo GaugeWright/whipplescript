@@ -608,6 +608,15 @@ describe("real WorkflowInstance hibernation", () => {
     expect((await durableStringValues(stub)).join("\n")).not.toContain(
       "canary-provider-secret-must-not-persist",
     );
+    const state = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(state.status).toBe(200);
+    const projection = await state.json() as { session_id: string; transcript: unknown[] };
+    expect(projection.session_id).toBe(sessionId);
+    expect(projection.transcript).toContainEqual({
+      type: "user", text: "hello", client_request_id: "turn-1", chat_id: sessionId,
+    });
     expect(providerFetch).toHaveBeenCalledOnce();
     vi.unstubAllGlobals();
     socket.close(1000, "done");
@@ -730,10 +739,10 @@ describe("real WorkflowInstance hibernation", () => {
       expect(await state.json()).toMatchObject({
         queue: [],
         transcript: [
-          { type: "user", text: "start" },
-          { type: "user", text: "change direction" },
+          { type: "user", text: "start", client_request_id: "turn-live", chat_id: "session-interactive-commands" },
+          { type: "user", text: "change direction", client_request_id: "steer-1", chat_id: "session-interactive-commands" },
           { type: "assistant", text: "redirected" },
-          { type: "user", text: "one more thing" },
+          { type: "user", text: "one more thing", client_request_id: "follow-1", chat_id: "session-interactive-commands" },
           { type: "assistant", text: "followed up" },
         ],
       });

@@ -2233,7 +2233,7 @@ export class WorkflowInstance implements DurableObject {
     // before the Worker projected its public event/transcript update.
     await this.publishAppliedTurnCommands();
     const transcript =
-      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string; client_request_id?: string; chat_id?: string }[]>(
         "public-transcript",
       )) ?? [];
     const prefix = `${session.instance_ref}/`;
@@ -3414,7 +3414,7 @@ export class WorkflowInstance implements DurableObject {
     const text = selectAssistantText(authoritativeText, streamed);
     if (!text) return;
     const transcript =
-      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string; client_request_id?: string; chat_id?: string }[]>(
         "public-transcript",
       )) ?? [];
     transcript.push({ type: "assistant", text });
@@ -3455,12 +3455,13 @@ export class WorkflowInstance implements DurableObject {
         );
       }
       const transcript =
-        (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+        (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string; client_request_id?: string; chat_id?: string }[]>(
           "public-transcript",
         )) ?? [];
       const projectionKey = `public-transcript-user:${row.command_id}`;
       if (!(await this.ctx.storage.get<boolean>(projectionKey))) {
-        transcript.push({ type: "user", text: row.text });
+        transcript.push({ type: "user", text: row.text,
+          ...(session ? { client_request_id: row.command_id, chat_id: session.session_id } : {}) });
         await this.ctx.storage.put({
           "public-transcript": transcript,
           [projectionKey]: true,
@@ -3602,12 +3603,13 @@ export class WorkflowInstance implements DurableObject {
     if (reservation instanceof Response) return reservation;
     traceBoundary("reservation_complete");
     const transcript =
-      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string; client_request_id?: string; chat_id?: string }[]>(
         "public-transcript",
       )) ?? [];
     const userProjectionKey = `public-transcript-user:${requestId}`;
     if (!(await this.ctx.storage.get<boolean>(userProjectionKey))) {
-      transcript.push({ type: "user", text });
+      transcript.push({ type: "user", text,
+        client_request_id: requestId, chat_id: session.session_id });
       await this.ctx.storage.put({
         "public-transcript": transcript,
         [userProjectionKey]: true,
