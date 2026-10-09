@@ -324,9 +324,7 @@ echo "== production dependency advisories =="
 #
 # The repository-health question — does this tree carry an advisory, whoever
 # introduced it — is answered by the `advisories` job in
-# `.github/workflows/security-baseline.yml`, on `main` and on the daily cron,
-# beside the gitleaks scan that already splits the same two questions the same
-# way.
+# `.github/workflows/security-baseline.yml`, on `main` and on the daily cron.
 section advisories
 
 echo "== supply-chain policy =="

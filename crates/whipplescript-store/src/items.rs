@@ -233,6 +233,24 @@ pub struct Assertion {
     pub updated_at: String,
 }
 
+/// One retained body revision identity, including agreeing concurrent edits.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct BodyRevision {
+    pub event_id: String,
+    pub edited_at: String,
+}
+
+/// Read-only causal context for the complete body revision frontier (DR-0295).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct IssueDescriptionContext {
+    pub body_revisions: Vec<BodyRevision>,
+    pub body_provenance_ambiguous: bool,
+    pub later_comments: usize,
+    pub later_evidence: usize,
+    pub unordered_comments: usize,
+    pub unordered_evidence: usize,
+}
+
 /// One field whose value is disputed: its `bef`-maximal setters in the event
 /// DAG disagree (ADR-0002 phase B1 slice ii; `tracker-merge.maude` `conflict`).
 /// `values` are the distinct maximal-setter values, sorted for stable output.
@@ -1696,6 +1714,56 @@ impl WorkItemStore {
         };
         let events = load_issue_events(&self.connection, &content_id)?;
         Ok(Some(analyze_issue_dag(&events)))
+    }
+
+    /// Observe body provenance and discussion in this handle's read snapshot.
+    /// No schema, projection or historical event is written.
+    pub fn description_context(
+        &self,
+        item_id: &str,
+    ) -> StoreResult<Option<IssueDescriptionContext>> {
+        let Some(content_id) = content_id_of(&self.connection, item_id)? else {
+            return Ok(None);
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, parents_json, kind, \
+             whip_tracker_event_open(event_id, kind, payload_json), created_at, \
+             datetime(created_at) IS NOT NULL FROM tracker_events \
+             WHERE issue_id = ?1",
+        )?;
+        let rows = statement
+            .query_map([&content_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut events = Vec::with_capacity(rows.len());
+        for (id, parents, kind, payload, edited_at, valid_time) in rows {
+            let event_id = id
+                .filter(|id| !id.is_empty())
+                .ok_or_else(description_history_fault)?;
+            let parents: Vec<String> =
+                serde_json::from_str(&parents).map_err(|_| description_history_fault())?;
+            let payload: Value =
+                serde_json::from_str(&payload).map_err(|_| description_history_fault())?;
+            if !valid_time || kind.is_empty() || !payload.is_object() {
+                return Err(description_history_fault());
+            }
+            events.push(DescriptionEvent {
+                event_id,
+                parents,
+                kind,
+                payload,
+                edited_at,
+            });
+        }
+        derive_description_context(&events, &content_id).map(Some)
     }
 
     /// Rebuilds the disposable projections (`tracker_issues`,
@@ -3248,6 +3316,202 @@ fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<Issue
             payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
         })
         .collect())
+}
+
+#[cfg(feature = "native")]
+struct DescriptionEvent {
+    event_id: String,
+    parents: Vec<String>,
+    kind: String,
+    payload: Value,
+    edited_at: String,
+}
+
+#[cfg(feature = "native")]
+fn description_history_fault() -> StoreError {
+    StoreError::Fault {
+        subject: "issue description context".to_owned(),
+        detail: "recorded description provenance is invalid or incomplete".to_owned(),
+    }
+}
+
+#[cfg(feature = "native")]
+// Called only for the validated non-self parent/child edges below: both
+// indices are in bounds and distinct. Split borrows permit allocation-free
+// word propagation in either edge direction without cloning a frontier row.
+fn inherit_description_frontier(rows: &mut [Vec<u64>], destination: usize, source: usize) {
+    let (destination_row, source_row) = if destination < source {
+        let (earlier, later) = rows.split_at_mut(source);
+        (&mut earlier[destination], &later[0])
+    } else {
+        let (earlier, later) = rows.split_at_mut(destination);
+        (&mut later[0], &earlier[source])
+    };
+    for (destination_word, source_word) in destination_row.iter_mut().zip(source_row.iter()) {
+        *destination_word |= *source_word;
+    }
+}
+
+/// Indexed propagation, not repeated per-discussion ancestry searches.
+/// The singleton frontier costs O(events + edges); coverage for a frontier of
+/// F concurrent revisions uses bitset propagation proportional to
+/// (events + edges) * ceil(F / 64), with frontier-dependent memory.
+/// Stable presentation additionally sorts the F retained identities.
+#[cfg(feature = "native")]
+fn derive_description_context(
+    events: &[DescriptionEvent],
+    content_id: &str,
+) -> StoreResult<IssueDescriptionContext> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut index = HashMap::with_capacity(events.len());
+    let mut roots = Vec::new();
+    let mut body = vec![false; events.len()];
+    for (i, event) in events.iter().enumerate() {
+        if index.insert(event.event_id.as_str(), i).is_some() {
+            return Err(description_history_fault());
+        }
+        match event.kind.as_str() {
+            "issue.created" => {
+                if event.event_id != content_id
+                    || !event.parents.is_empty()
+                    || event.payload.get("body").and_then(Value::as_str).is_none()
+                {
+                    return Err(description_history_fault());
+                }
+                roots.push(i);
+                body[i] = true;
+            }
+            "issue.field_set" => {
+                let field = event
+                    .payload
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(description_history_fault)?;
+                if event.payload.get("value").and_then(Value::as_str).is_none() {
+                    return Err(description_history_fault());
+                }
+                body[i] = field == "body";
+            }
+            "comment.added" if event.payload.get("body").and_then(Value::as_str).is_none() => {
+                return Err(description_history_fault());
+            }
+            "evidence.added" => {
+                for field in ["kind", "reference", "note", "added_by"] {
+                    if !event
+                        .payload
+                        .get(field)
+                        .is_some_and(|v| v.is_null() || v.is_string())
+                    {
+                        return Err(description_history_fault());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if roots.len() != 1 {
+        return Err(description_history_fault());
+    }
+    let mut parents = vec![Vec::new(); events.len()];
+    let mut children = vec![Vec::new(); events.len()];
+    let mut indegree = vec![0usize; events.len()];
+    for (i, event) in events.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for parent in &event.parents {
+            let &p = index
+                .get(parent.as_str())
+                .ok_or_else(description_history_fault)?;
+            if p == i || !seen.insert(p) {
+                return Err(description_history_fault());
+            }
+            parents[i].push(p);
+            children[p].push(i);
+        }
+        if i != roots[0] && parents[i].is_empty() {
+            return Err(description_history_fault());
+        }
+        indegree[i] = parents[i].len();
+    }
+    let mut ready: VecDeque<_> = (0..events.len()).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(events.len());
+    while let Some(i) = ready.pop_front() {
+        order.push(i);
+        for &child in &children[i] {
+            indegree[child] -= 1;
+            if indegree[child] == 0 {
+                ready.push_back(child);
+            }
+        }
+    }
+    if order.len() != events.len() {
+        return Err(description_history_fault());
+    }
+    let mut covered_body = vec![false; events.len()];
+    for &i in order.iter().rev() {
+        covered_body[i] = children[i].iter().any(|&c| body[c] || covered_body[c]);
+    }
+    let frontier: Vec<_> = (0..events.len())
+        .filter(|&i| body[i] && !covered_body[i])
+        .collect();
+    let mut frontier_slot = vec![None; events.len()];
+    for (slot, &i) in frontier.iter().enumerate() {
+        frontier_slot[i] = Some(slot);
+    }
+    let words = frontier.len().div_ceil(64);
+    let mut after = vec![vec![0u64; words]; events.len()];
+    for &i in &order {
+        for &p in &parents[i] {
+            inherit_description_frontier(&mut after, i, p);
+            if let Some(slot) = frontier_slot[p] {
+                after[i][slot / 64] |= 1u64 << (slot % 64);
+            }
+        }
+    }
+    let mut before = vec![vec![0u64; words]; events.len()];
+    for &i in order.iter().rev() {
+        for &c in &children[i] {
+            inherit_description_frontier(&mut before, i, c);
+            if let Some(slot) = frontier_slot[c] {
+                before[i][slot / 64] |= 1u64 << (slot % 64);
+            }
+        }
+    }
+    let mut result = IssueDescriptionContext {
+        body_revisions: frontier
+            .iter()
+            .map(|&i| BodyRevision {
+                event_id: events[i].event_id.clone(),
+                edited_at: events[i].edited_at.clone(),
+            })
+            .collect(),
+        body_provenance_ambiguous: frontier.len() > 1,
+        later_comments: 0,
+        later_evidence: 0,
+        unordered_comments: 0,
+        unordered_evidence: 0,
+    };
+    // Sorting exposes every provenance member stably; it selects no winner.
+    result
+        .body_revisions
+        .sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    for (i, event) in events.iter().enumerate() {
+        let (later, unordered) = match event.kind.as_str() {
+            "comment.added" => (&mut result.later_comments, &mut result.unordered_comments),
+            "evidence.added" => (&mut result.later_evidence, &mut result.unordered_evidence),
+            _ => continue,
+        };
+        let after_count: usize = after[i].iter().map(|word| word.count_ones() as usize).sum();
+        let before_count: usize = before[i]
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        if after_count == frontier.len() {
+            *later += 1;
+        } else if before_count != frontier.len() {
+            *unordered += 1;
+        }
+    }
+    Ok(result)
 }
 
 /// The event that adds labels to a filed issue; its payload is `{"labels": [..]}`.

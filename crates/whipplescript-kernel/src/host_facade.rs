@@ -375,6 +375,13 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         &self.policy
     }
 
+    /// Read the verified policy when carrying a source thread into this
+    /// instance. Importers may compare recorded read identities with it;
+    /// possession of the envelope does not admit a host operation by itself.
+    pub fn verified_envelope(&self) -> &VerifiedEnvelope {
+        &self.envelope
+    }
+
     pub fn kernel(&self) -> &RuntimeKernel<S> {
         &self.kernel
     }

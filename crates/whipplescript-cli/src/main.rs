@@ -35079,8 +35079,19 @@ fn issue(options: &CliOptions) -> ExitCode {
                         Ok(view) => view,
                         Err(error) => return report_store_error("failed to read conflicts", error),
                     };
+                    let description_context = match store.description_context(id) {
+                        Ok(Some(context)) => context,
+                        Ok(None) => {
+                            eprintln!("issue `{id}` has no recorded description provenance");
+                            return ExitCode::FAILURE;
+                        }
+                        Err(error) => {
+                            return report_store_error("failed to read description context", error);
+                        }
+                    };
                     if options.json {
                         let mut value = work_item_to_json(&item);
+                        value["description_context"] = json!(description_context);
                         if whipplescript_store::items::initiatives::issue_kind(&item.metadata).ok()
                             == Some("initiative")
                         {
@@ -35175,6 +35186,34 @@ fn issue(options: &CliOptions) -> ExitCode {
                         if !item.body.is_empty() {
                             println!("body: {}", item.body);
                         }
+                        if description_context.body_provenance_ambiguous {
+                            println!(
+                                "body revision provenance: concurrent (all revisions retained)"
+                            );
+                        }
+                        for revision in &description_context.body_revisions {
+                            println!(
+                                "body edited: {} (event {})",
+                                revision.edited_at, revision.event_id
+                            );
+                        }
+                        if description_context.later_comments != 0
+                            || description_context.later_evidence != 0
+                        {
+                            println!(
+                                "LATER DISCUSSION: {} comment(s), {} evidence item(s) after every body revision; review before relying on the description",
+                                description_context.later_comments, description_context.later_evidence
+                            );
+                        }
+                        if description_context.unordered_comments != 0
+                            || description_context.unordered_evidence != 0
+                        {
+                            println!(
+                                "UNORDERED DISCUSSION: {} comment(s), {} evidence item(s) relative to the body revision frontier",
+                                description_context.unordered_comments, description_context.unordered_evidence
+                            );
+                        }
+                        println!("revise: whip issue set <id> title|body <value> --expect-state-token <observed-token> (issue edit is an alias)");
                         if !item.labels.is_empty() {
                             println!("labels: {}", item.labels.join(", "));
                         }

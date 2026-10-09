@@ -19,6 +19,10 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+- `whip issue show` reports body revision times and later or unordered comments
+  and evidence, with the existing guarded edit path; it does not infer truth
+  from discussion or rewrite append-only history.
+
 ## [0.11.0] — 2026-10-07
 
 A minor release because tracker query setup behavior, embedding-host admission

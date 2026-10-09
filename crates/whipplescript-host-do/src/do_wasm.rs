@@ -18,7 +18,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, SqlValue};
+use crate::do_store::SqlValue;
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::{MessagesApiClient, ModelWire};
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
@@ -41,6 +41,81 @@ use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
 use crate::host_discard::{
     validate_discard_eligibility, verify_discard_event, DISCARDED_FORK_REASON,
 };
+
+use crate::do_fork::CarriedRead;
+
+/// The source DO attests every read in the live thread, including a previous
+/// cross-object seed. The latter is carried in the target's fork event because
+/// the original command object may already have been retired.
+fn carried_reads<S: RuntimeStore>(
+    facade: &GovernedHostFacade<S>,
+    instance_ref: &str,
+    agent: Option<&str>,
+    up_to: i64,
+    envelope: &whipplescript_kernel::ifc::VerifiedEnvelope,
+    seen: &mut std::collections::BTreeSet<(String, i64)>,
+    reads: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), JsValue> {
+    if !seen.insert((instance_ref.to_owned(), up_to)) {
+        return Ok(());
+    }
+    let lineage = facade
+        .kernel()
+        .agent_thread_lineage(instance_ref, agent, Some(up_to))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let effects = facade
+        .kernel()
+        .store()
+        .list_effects(instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    for effect_id in lineage.turn_effect_ids {
+        let turn = effects
+            .iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .and_then(|effect| serde_json::from_str::<StartTurnCommand>(&effect.input_json).ok())
+            .ok_or_else(|| JsValue::from_str("carried turn has no recorded read command"))?;
+        for read in turn.resources.iter().chain(turn.input.images.iter()) {
+            crate::do_fork::record_turn_read(envelope, reads, &read.handle)
+                .map_err(JsValue::from_str)?;
+        }
+    }
+    if let Some(seed) = lineage.seed.filter(|seed| seed.carried_messages) {
+        if facade
+            .kernel()
+            .store()
+            .get_instance(&seed.source_instance_id)
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+            .is_some()
+        {
+            carried_reads(
+                facade,
+                &seed.source_instance_id,
+                None,
+                seed.source_sequence,
+                envelope,
+                seen,
+                reads,
+            )?;
+        } else {
+            let fork = facade
+                .kernel()
+                .store()
+                .list_events(instance_ref)
+                .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+                .into_iter()
+                .find(|event| event.event_type == "host.instance.forked")
+                .ok_or_else(|| JsValue::from_str("cross-object seed has no fork evidence"))?;
+            let payload: serde_json::Value = serde_json::from_str(&fork.payload_json)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            let inherited: Vec<CarriedRead> = serde_json::from_value(payload["reads"].clone())
+                .map_err(|_| JsValue::from_str("cross-object fork has no read evidence"))?;
+            for read in inherited {
+                crate::do_fork::record_inherited_read(reads, read).map_err(JsValue::from_str)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Internal host cleanup seam; never exposed as a caller-supplied proof route.
 #[wasm_bindgen]
@@ -1176,12 +1251,56 @@ pub fn host_export_thread(
         .kernel()
         .snapshot_agent_thread(&source.instance_ref, &resolved.agent, Some(source_sequence))
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let verified = hosted_root(
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .verify(signed_envelope)
+    .map_err(|error| JsValue::from_str(&error))?;
+    let mut reads = std::collections::BTreeMap::new();
+    carried_reads(
+        &facade,
+        &source.instance_ref,
+        Some(&resolved.agent),
+        source_sequence,
+        &verified.envelope,
+        &mut std::collections::BTreeSet::new(),
+        &mut reads,
+    )?;
+    let prefix = facade
+        .kernel()
+        .store()
+        .chain_prefix(&source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let recorded_head = facade
+        .kernel()
+        .store()
+        .chain_head(&source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let chain_digest = crate::do_fork::verified_source_chain_digest(
+        &source.instance_ref,
+        &prefix,
+        &recorded_head,
+        source_sequence,
+    )
+    .map_err(JsValue::from_str)?;
+    let reads = reads
+        .into_iter()
+        .map(|(handle, resolved)| CarriedRead { handle, resolved })
+        .collect::<Vec<_>>();
+    let thread = whipplescript_kernel::harness_loop::chat_messages_to_json(&messages);
+    let thread_digest = whipplescript_store::items::sha256_hex(&thread.to_string());
     Ok(serde_json::json!({
         "protocol": HOST_PROTOCOL,
         "source": source,
         "package_version_ref": package.version_ref(),
         "policy": facade.policy_ref(),
-        "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
+        "messages": thread,
+        "thread_digest": thread_digest,
+        "source_chain_digest": chain_digest,
+        "source_authority": verified.envelope.attestation().and_then(|attestation| attestation.authority.as_deref()),
+        "reads": reads,
     })
     .to_string())
 }
@@ -1406,6 +1525,174 @@ pub fn host_import_fork(
                 .ok()
                 .filter(|sequence| *sequence > 0)
                 .ok_or_else(|| JsValue::from_str("fork receipt event position must be positive"))?,
+        },
+        cut: None,
+    };
+    result
+        .validate_for(&command)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Import a Home-pinned checkpoint from a different private command object.
+/// The Home authenticated the source export when it retained it; this door
+/// verifies its exact digest, same-authority policy progression and all
+/// recorded reads before writing the target's first event.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_adopt_thread(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+    export_json: &str,
+    source_pin: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+    project_context: Option<String>,
+    compiler_artifact_digest: &str,
+    retained_policy_json: Option<String>,
+) -> Result<String, JsValue> {
+    let verified = hosted_root(
+        expected_signer,
+        public_key_hex,
+        retained_policy_json.as_deref(),
+    )?
+    .verify(signed_envelope)
+    .map_err(|error| JsValue::from_str(&error))?;
+    let mut facade = GovernedHostFacade::from_verified_store(
+        crate::do_store::DoSqliteStore::new(JsDoSql { bridge }),
+        verified.policy.epoch,
+        verified.envelope,
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))?
+    .with_embedded_std_manifests(crate::do_packages::EMBEDDED_STD_MANIFESTS)
+    .with_compiler_artifact_digest(compiler_artifact_digest);
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
+    let command: ForkInstanceCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    command
+        .validate()
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let export: serde_json::Value =
+        serde_json::from_str(export_json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let admitted = crate::do_fork::validate_adoption(
+        &command,
+        facade.policy_ref(),
+        package.version_ref(),
+        facade
+            .verified_envelope()
+            .attestation()
+            .and_then(|attestation| attestation.authority.as_deref()),
+        facade.verified_envelope(),
+        &export,
+        source_pin,
+    )
+    .map_err(JsValue::from_str)?;
+    let source = admitted.source;
+    let source_policy = admitted.source_policy;
+    let chain = admitted.chain_digest;
+    let thread_json = admitted.thread;
+    let digest = admitted.thread_digest;
+    let reads = admitted.reads;
+    let messages = whipplescript_kernel::harness_loop::chat_messages_from_json(&thread_json);
+    let target = facade
+        .open_instance(&command.target_open_command(), &package)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    crate::do_fork::require_distinct_target(&source.instance_ref, &target.instance_ref)
+        .map_err(JsValue::from_str)?;
+    let seed_payload = serde_json::json!({
+        "agent": package.resolve_package(package.version_ref())
+            .map_err(|error| JsValue::from_str(&error))?.agent,
+        "messages": thread_json,
+        "source_instance_id": source.instance_ref,
+        "source_sequence": source.sequence,
+    });
+    let seed_key = whipplescript_kernel::idempotency_key(&[
+        &target.instance_ref,
+        &command.request_id,
+        "host-instance-thread-seed",
+    ]);
+    let events = facade
+        .kernel()
+        .store()
+        .list_events(&target.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let recorded_seed = events
+        .iter()
+        .find(|event| event.event_type == "agent.thread.seeded");
+    if let Some(seed) = recorded_seed {
+        crate::do_fork::verify_replay_payload(&seed.payload_json, &seed_payload, "seed")
+            .map_err(JsValue::from_str)?;
+    } else {
+        facade
+            .kernel_mut()
+            .seed_agent_thread(AgentThreadSeed {
+                instance_id: &target.instance_ref,
+                agent: seed_payload["agent"].as_str().unwrap_or_default(),
+                messages: &messages,
+                source_instance_id: &command.source.instance_ref,
+                source_sequence: i64::try_from(source.sequence)
+                    .map_err(|_| JsValue::from_str("source sequence exceeds runtime range"))?,
+                idempotency_key: &seed_key,
+            })
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    }
+    let fork_payload = serde_json::json!({
+        "request_id": command.request_id,
+        "source": command.source,
+        "target_request_id": command.target_request_id,
+        "package_version_ref": command.package_version_ref,
+        "policy": command.policy,
+        "target_instance_ref": target.instance_ref,
+        "source_pin": source_pin,
+        "source_chain_digest": chain,
+        "thread_digest": digest,
+        "source_policy": source_policy,
+        "reads": reads,
+    });
+    let recorded_fork = events
+        .iter()
+        .find(|event| event.event_type == "host.instance.forked");
+    let forked_at = if let Some(event) = recorded_fork {
+        crate::do_fork::verify_replay_payload(&event.payload_json, &fork_payload, "fork")
+            .map_err(JsValue::from_str)?;
+        u64::try_from(event.sequence).map_err(|_| JsValue::from_str("fork sequence is invalid"))?
+    } else {
+        let event = facade
+            .kernel()
+            .store()
+            .append_event(NewEvent {
+                instance_id: &target.instance_ref,
+                event_type: "host.instance.forked",
+                payload_json: &fork_payload.to_string(),
+                source: "host-do",
+                causation_id: None,
+                correlation_id: Some(&command.request_id),
+                idempotency_key: Some(&whipplescript_kernel::idempotency_key(&[
+                    &target.instance_ref,
+                    &command.request_id,
+                    "host-instance-forked",
+                ])),
+            })
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        u64::try_from(event.sequence).map_err(|_| JsValue::from_str("fork sequence is invalid"))?
+    };
+    let result = ForkedInstance {
+        protocol: HOST_PROTOCOL.to_owned(),
+        request_id: command.request_id.clone(),
+        source: command.source.clone(),
+        target: target.clone(),
+        forked_at: EventPosition {
+            instance_ref: target.instance_ref,
+            sequence: forked_at,
         },
         cut: None,
     };

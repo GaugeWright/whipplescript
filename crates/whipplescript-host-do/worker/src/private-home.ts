@@ -62,7 +62,7 @@ function packageBindingError(
 ): string | undefined {
   if (body.byteLength === 0) return undefined;
   if (
-    !["/host/instances/open", "/host/turns", "/host/forks/import"].includes(
+    !["/host/instances/open", "/host/turns", "/host/forks/import", "/host/forks/adopt"].includes(
       route.innerPath,
     )
   ) {

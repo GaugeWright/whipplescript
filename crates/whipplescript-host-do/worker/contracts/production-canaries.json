@@ -210,6 +210,24 @@
       ]
     },
     {
+      "id": "private-chat-adoption",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-private-home",
+      "contracts": [
+        "runtime.host.fork.adopt"
+      ],
+      "requiredInfrastructure": [
+        "Dedicated synthetic private Home and tenant with a signer admitted by the deployed private Worker",
+        "Two disposable command objects under one synthetic chat and a policy epoch change",
+        "Synthetic Home grants for source export and target adoption with exact source pin and read identities"
+      ],
+      "cleanup": "Discard both synthetic command objects and erase the synthetic chat checkpoint after proving the adopted turn contains the source transcript and rejects a changed pin or forbidden read.",
+      "surfaces": [
+        "whip-runtime"
+      ]
+    },
+    {
       "id": "private-command-retirement",
       "state": "ready-awaiting-identity",
       "runner": "scripts/production-wiring-canary.mjs#private-command-retirement",

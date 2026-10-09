@@ -300,6 +300,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.fork.adopt",
+      "method": "POST",
+      "path": "/host/forks/adopt",
+      "samplePath": "/host/forks/adopt",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.action.admit",
       "method": "POST",
       "path": "/host/actions/admit",

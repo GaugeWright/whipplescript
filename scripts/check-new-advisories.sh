@@ -9,8 +9,8 @@
 # unrelated pull requests down with it; `339fa43c` records the same shape
 # earlier.
 #
-# This is the ruling `security-baseline.yml` already makes for gitleaks, in its
-# own words:
+# This is the ruling `security-baseline.yml` made for gitleaks while it carried
+# the secret scan, in its own words:
 #
 #   Does this CHANGE introduce a secret?  -- per pull request, blocking,
 #                                            and the author can act on it.

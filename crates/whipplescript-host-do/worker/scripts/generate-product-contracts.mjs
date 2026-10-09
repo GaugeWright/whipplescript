@@ -46,6 +46,7 @@ const hostOperations = [
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],
+  ["runtime.host.fork.adopt", "POST", "/host/forks/adopt", "http-json", "mutation", "critical"],
   // Governed host actions (HA-5): admission under the deployment's pinned
   // action authority, ordinary execution of the admitted program, and a
   // separately authorized result read.

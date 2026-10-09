@@ -1238,6 +1238,71 @@ describe("real WorkflowInstance hibernation", () => {
       await exportedResponse.clone().text(),
     ).toBe(200);
     const exported = await exportedResponse.json<Record<string, unknown>>();
+    expect(exported.source_chain_digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(exported.thread_digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(exported.source_authority).toBe("gaugedesk");
+    expect(Array.isArray(exported.reads)).toBe(true);
+    const sourcePin = await sha256(JSON.stringify(exported));
+    const adoption = {
+      protocol: HOST_PROTOCOL,
+      request_id: "adopt-placement-journey",
+      source: afterPosition,
+      target_request_id: "open-adopted-placement-journey",
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+    };
+    const adoptionBody = JSON.stringify({
+      command: adoption,
+      export: exported,
+      source_pin: sourcePin,
+      package: packageDocs,
+    });
+    const adoptedResponse = await placementFetch("/host/forks/adopt", {
+      method: "POST", body: adoptionBody,
+    });
+    expect(adoptedResponse.status, await adoptedResponse.clone().text()).toBe(201);
+    const adopted = await adoptedResponse.json<{ target: { instance_ref: string } }>();
+    expect(adopted.target.instance_ref).not.toBe(opened.instance_ref);
+    const adoptionReplay = await placementFetch("/host/forks/adopt", {
+      method: "POST", body: adoptionBody,
+    });
+    expect(adoptionReplay.status, await adoptionReplay.clone().text()).toBe(201);
+    expect(await adoptionReplay.json()).toEqual(adopted);
+    const alteredExport = structuredClone(exported);
+    (alteredExport as { messages: unknown[] }).messages = [];
+    const altered = await placementFetch("/host/forks/adopt", {
+      method: "POST",
+      body: JSON.stringify({
+        command: { ...adoption, request_id: "adopt-altered", target_request_id: "open-adopt-altered" },
+        export: alteredExport, source_pin: sourcePin, package: packageDocs,
+      }),
+    });
+    expect(altered.status).toBe(409);
+    for (const [name, mutate] of [
+      ["authority", (value: Record<string, unknown>) => { value.source_authority = "other"; }],
+      ["read", (value: Record<string, unknown>) => { value.reads = [{ handle: "forbidden", resolved: "forbidden" }]; }],
+      ["digest", (value: Record<string, unknown>) => { value.thread_digest = "0".repeat(64); }],
+    ] as const) {
+      const changed = structuredClone(exported);
+      mutate(changed);
+      const refused = await placementFetch("/host/forks/adopt", {
+        method: "POST",
+        body: JSON.stringify({
+          command: { ...adoption, request_id: `adopt-${name}`, target_request_id: `open-adopt-${name}` },
+          export: changed, source_pin: await sha256(JSON.stringify(changed)), package: packageDocs,
+        }),
+      });
+      expect(refused.status, await refused.clone().text()).toBe(409);
+    }
+    const wrongPackage = await placementFetch("/host/forks/adopt", {
+      method: "POST",
+      body: JSON.stringify({
+        command: { ...adoption, request_id: "adopt-package-mismatch",
+          target_request_id: "open-adopt-package-mismatch", package_version_ref: "wrong-package" },
+        export: exported, source_pin: sourcePin, package: packageDocs,
+      }),
+    });
+    expect(wrongPackage.status, await wrongPackage.clone().text()).toBe(409);
     const rootDiscard = await placementFetch(`${instancePath}/discard`, {
       method: "POST",
       body: JSON.stringify({
@@ -1875,7 +1940,7 @@ async function placementFetch(
     //
     // It counts what the FILTER yields, not the declared surface: outer
     // `/v1/...` and DO-internal `/__private/...` routes are outside it.
-    expect(operations.length).toBe(43);
+    expect(operations.length).toBe(44);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {

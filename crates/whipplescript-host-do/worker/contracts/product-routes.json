@@ -985,6 +985,42 @@
       }
     },
     {
+      "id": "runtime.host.fork.adopt",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/forks/adopt",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.fork.adopt/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.fork.adopt/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.action.admit",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",

@@ -299,6 +299,21 @@ const hostFunctions = bindings as unknown as {
     compilerArtifactDigest: string,
     retainedPolicyJson?: string,
   ) => string;
+  host_adopt_thread: (
+    bridge: unknown,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    exportJson: string,
+    sourcePin: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+    projectContext: string | undefined,
+    compilerArtifactDigest: string,
+    retainedPolicyJson?: string,
+  ) => string;
 };
 
 function publicCommandId(sessionId: string, requestId: string): string {
@@ -1951,6 +1966,9 @@ export class WorkflowInstance implements DurableObject {
     }
     if (url.pathname === "/host/forks/import") {
       return this.importHostFork(parsed);
+    }
+    if (url.pathname === "/host/forks/adopt") {
+      return this.adoptHostThread(parsed);
     }
     if (url.pathname === "/host/actions/admit") {
       return this.admitHostAction(parsed);
@@ -5811,6 +5829,44 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  private async adoptHostThread(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    if (!parsed.export || typeof parsed.export !== "object" || Array.isArray(parsed.export)
+      || typeof parsed.source_pin !== "string" || !/^[0-9a-f]{64}$/.test(parsed.source_pin)) {
+      return Response.json({ error: "adoption requires a pinned source checkpoint" }, { status: 400 });
+    }
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot(policy);
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const forked = JSON.parse(hostFunctions.host_adopt_thread(
+        makeBridge(this.ctx.storage),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify(request.command),
+        JSON.stringify(parsed.export),
+        parsed.source_pin,
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+        request.package.project_context,
+        wasmArtifactDigest,
+        root.retainedPolicyJson,
+      ));
+      await this.ctx.storage.put(
+        `host-package:${String(forked.target?.instance_ref ?? "")}`,
+        request.package,
+      );
+      return Response.json(forked, { status: 201 });
+    } catch (error) {
+      return Response.json({ error: `adoption rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
   /**
    * Governed host actions through the Worker transport (HA-5). The command is
    * admitted under the placement's verified policy and a proof the
@@ -6641,6 +6697,7 @@ export default {
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
+        url.pathname === "/host/forks/adopt" ||
         url.pathname === "/host/actions/admit" ||
         url.pathname === "/host/actions/execute" ||
         url.pathname === "/host/actions/result" ||

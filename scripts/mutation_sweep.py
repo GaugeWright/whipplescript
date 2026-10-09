@@ -1018,6 +1018,22 @@ CAUGHT_BY: list[str] = []
 
 def run_suite_once(filter_expr: str) -> tuple[str, list[str]]:
     """One run of the suite against whatever is on disk, and who it blamed."""
+    if filter_expr == "@host-do-wasm":
+        worker = Path("crates/whipplescript-host-do/worker")
+        build = subprocess.run(["npm", "run", "build:wasm"], cwd=worker,
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            return BUILD_FAILED, []
+        tested = subprocess.run(["npx", "vitest", "run", "--config",
+                                 "vitest.authenticated.config.ts", "-t",
+                                 "composes the authenticated placement route through the hosted protocol"],
+                                cwd=worker, capture_output=True, text=True)
+        if tested.returncode == 0:
+            return PASSED, []
+        output = tested.stdout + tested.stderr
+        if "Tests  1 failed" not in output or "composes the authenticated placement route through the hosted protocol" not in output:
+            return BUILD_FAILED, []
+        return CAUGHT, ["authenticated hosted Worker integration"]
     # The suite runs the way `cargo test` runs it: one process per test binary,
     # its tests on threads. That is also how the bar runs it on a host without
     # nextest, so a test that cannot survive it is fixed in the test (see
