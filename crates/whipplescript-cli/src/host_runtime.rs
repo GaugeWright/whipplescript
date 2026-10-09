@@ -58,9 +58,10 @@ use whipplescript_store::{
 };
 
 use crate::host_protocol::{
-    EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent, OpenInstanceCommand,
-    OpenedInstance, PinnedPosition, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
-    RuntimeEvidencePointer, StartTurnCommand, TurnReceipt, TurnStatus, HOST_PROTOCOL,
+    AdoptionCut, EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent,
+    OpenInstanceCommand, OpenedInstance, PinnedPosition, PolicyEpochRef, ProtocolError,
+    ProviderBindingRef, ResourceRef, RuntimeEvidencePointer, StartTurnCommand, TurnReceipt,
+    TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
 pub use whipplescript_kernel::host_package::{
@@ -1854,6 +1855,10 @@ impl TurnExecution {
 pub struct RecordedInstance {
     pub instance_ref: String,
     pub package_version_ref: String,
+    /// The policy epoch the instance was recorded under. A host adopting it
+    /// into a newer epoch opens the source runtime under this one, so the
+    /// runtime can read the source's own verified envelope (DR-0293).
+    pub policy: PolicyEpochRef,
 }
 
 /// How [`GovernedHostRuntime::newest_recorded_instance`] orders adoption
@@ -2465,6 +2470,7 @@ impl GovernedHostRuntime {
         Ok(Some(RecordedInstance {
             instance_ref: instance.instance_id,
             package_version_ref: metadata.package_version_ref,
+            policy: metadata.policy,
         }))
     }
 
@@ -2940,16 +2946,15 @@ impl GovernedHostRuntime {
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
 
-        let (_, source_metadata) =
-            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
+        let seed = Self::fork_source(source_runtime, command)?;
         let source_package = packages
-            .resolve_package(&source_metadata.package_version_ref)
+            .resolve_package(&seed.metadata.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
-        validate_package(&source_package, &source_metadata.package_version_ref)?;
+        validate_package(&source_package, &seed.metadata.package_version_ref)?;
         source_runtime.check_package_ifc(&source_package)?;
         source_runtime.validate_instance_binding(
             &command.source.instance_ref,
-            &source_metadata.package_version_ref,
+            &seed.metadata.package_version_ref,
             &command.policy,
             packages,
         )?;
@@ -2960,6 +2965,7 @@ impl GovernedHostRuntime {
             packages,
             &target_package,
             &source_package.agent,
+            &seed,
         )
     }
 
@@ -2967,12 +2973,21 @@ impl GovernedHostRuntime {
     /// source's authored package to be reproducible** — the adoption seam for
     /// an embedding host whose package authoring has evolved past what a
     /// replayed open can reproduce (spec/agent-harness.md "Program identity
-    /// across toolchains"). The source is identified, protocol- and
-    /// policy-checked, and required quiescent exactly as an ordinary fork;
-    /// only source-content reproduction is waived. That is sound because an
-    /// adopted source is never executed again: its thread is seeded into the
-    /// target, and the target's package resolves and validates in full under
-    /// the current authoring.
+    /// across toolchains"). The source is identified and its position checked
+    /// exactly as an ordinary fork; source-content reproduction is waived.
+    /// That is sound because an adopted source is never executed again: its
+    /// thread is seeded into the target, and the target's package resolves and
+    /// validates in full under the current authoring.
+    ///
+    /// Policy and quiescence differ from a fork's in two bounded ways
+    /// (DR-0293). The source may have been recorded under an earlier epoch of
+    /// this runtime's authority: `source_runtime` is then opened under the
+    /// source's own recorded epoch, so its envelope is verified, and every
+    /// resource the carried thread read must still be governed here and
+    /// resolve to the same identity, or the adoption refuses rather than
+    /// relabel it. And a source with an effect still running is cut at the
+    /// newest position before that effect began; the effect is never settled,
+    /// and [`ForkedInstance::cut`] says the turn after the cut is unresolved.
     pub fn adopt_instance_from<P: PackageResolver + ?Sized>(
         &mut self,
         source_runtime: &GovernedHostRuntime,
@@ -2981,7 +2996,6 @@ impl GovernedHostRuntime {
     ) -> Result<ForkedInstance, HostRuntimeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
-        source_runtime.require_policy(&command.policy)?;
 
         let target_package = packages
             .resolve_package(&command.package_version_ref)
@@ -2989,26 +3003,19 @@ impl GovernedHostRuntime {
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
 
-        let (source_instance, source_metadata) =
-            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
-        let _ = source_metadata; // identity + policy checked; content deliberately not re-derived
-                                 // The recorded program name stands in for the unresolvable source
-                                 // package's agent: it names whose thread is being carried.
-        let source_version = source_runtime
-            .kernel
-            .store()
-            .get_program_version(&source_instance.version_id)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| {
-                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
-            })?;
+        // The recorded program name stands in for the unresolvable source
+        // package's agent: it names whose thread is being carried.
+        let (seed, source_agent) = self.adoption_source(source_runtime, command, || {
+            HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
+        })?;
 
         self.fork_to_target(
             source_runtime,
             command,
             packages,
             &target_package,
-            &source_version.program_name,
+            &source_agent,
+            &seed,
         )
     }
 
@@ -3055,39 +3062,32 @@ impl GovernedHostRuntime {
     ) -> Result<ForkedInstance, HostRuntimeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
-        source_runtime.require_policy(&command.policy)?;
+        if !adopt {
+            source_runtime.require_policy(&command.policy)?;
+        }
         let target_package = packages
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
-        let (source_instance, source_metadata) =
-            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
-        let source_agent = if adopt {
-            let source_version = source_runtime
-                .kernel
-                .store()
-                .get_program_version(&source_instance.version_id)
-                .map_err(HostRuntimeError::Store)?;
-            let Some(source_version) = source_version else {
-                return Err(HostRuntimeError::Incomplete(
-                    "Home adoption source version is missing".into(),
-                ));
-            };
-            source_version.program_name
+        let (seed, source_agent) = if adopt {
+            self.adoption_source(source_runtime, command, || {
+                HostRuntimeError::Incomplete("Home adoption source version is missing".into())
+            })?
         } else {
+            let seed = Self::fork_source(source_runtime, command)?;
             let source_package = packages
-                .resolve_package(&source_metadata.package_version_ref)
+                .resolve_package(&seed.metadata.package_version_ref)
                 .map_err(HostRuntimeError::Resolver)?;
-            validate_package(&source_package, &source_metadata.package_version_ref)?;
+            validate_package(&source_package, &seed.metadata.package_version_ref)?;
             source_runtime.check_package_ifc(&source_package)?;
             source_runtime.validate_instance_binding(
                 &command.source.instance_ref,
-                &source_metadata.package_version_ref,
+                &seed.metadata.package_version_ref,
                 &command.policy,
                 packages,
             )?;
-            source_package.agent
+            (seed, source_package.agent)
         };
         self.home_fork_to_target(
             source_runtime,
@@ -3095,7 +3095,7 @@ impl GovernedHostRuntime {
             packages,
             &target_package,
             &source_agent,
-            &source_instance.version_id,
+            &seed,
             journal,
             if adopt { "adopt" } else { "fork" },
         )
@@ -3109,25 +3109,26 @@ impl GovernedHostRuntime {
         packages: &P,
         target_package: &ResolvedPackage,
         source_agent: &str,
-        source_observed_version_id: &str,
+        seed_source: &SeedSource,
         journal: &mut J,
         kind: &str,
     ) -> Result<ForkedInstance, HostRuntimeError> {
-        Self::check_source_fork_ready(source_runtime, command)?;
+        let source_observed_version_id = seed_source.instance.version_id.as_str();
+        let source_sequence = seed_source.position.sequence;
         let source_store_incarnation =
             require_home_store_incarnation(source_runtime.kernel.store())?;
         let target_store_incarnation = require_home_store_incarnation(self.kernel.store())?;
         let source_chain = source_runtime
             .kernel
             .store()
-            .chain_head_at(&command.source.instance_ref, command.source.sequence as i64)
+            .chain_head_at(&command.source.instance_ref, source_sequence as i64)
             .map_err(HostRuntimeError::Store)?;
         let messages = source_runtime
             .kernel
             .snapshot_agent_thread(
                 &command.source.instance_ref,
                 source_agent,
-                Some(command.source.sequence as i64),
+                Some(source_sequence as i64),
             )
             .map_err(HostRuntimeError::Store)?;
         let mut snapshot_bytes = b"whipplescript.home-fork-thread.v1\0".to_vec();
@@ -3142,10 +3143,10 @@ impl GovernedHostRuntime {
             source_store_incarnation: &source_store_incarnation,
             source_instance_ref: &command.source.instance_ref,
             source_observed_version_id,
-            source_sequence: command.source.sequence,
+            source_sequence,
             source_chain_digest: &source_chain.digest,
             source_thread_digest: &source_thread_digest,
-            policy: &command.policy,
+            policy: &seed_source.metadata.policy,
         };
         let source_home_operation_id = journal
             .pin_source_for_fork(&source)
@@ -3211,7 +3212,7 @@ impl GovernedHostRuntime {
             || source_runtime
                 .kernel
                 .store()
-                .chain_head_at(&command.source.instance_ref, command.source.sequence as i64)
+                .chain_head_at(&command.source.instance_ref, source_sequence as i64)
                 .map_err(HostRuntimeError::Store)?
                 != source_chain
         {
@@ -3228,14 +3229,14 @@ impl GovernedHostRuntime {
             "agent": target_package.agent,
             "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
             "source_instance_id": command.source.instance_ref,
-            "source_sequence": command.source.sequence as i64,
+            "source_sequence": source_sequence as i64,
         });
         let fork_key = idempotency_key(&[
             &target.instance_ref,
             &command.request_id,
             "host-instance-forked",
         ]);
-        let fork_payload = json!({
+        let mut fork_payload = json!({
             "request_id": command.request_id,
             "source": command.source,
             "target_request_id": command.target_request_id,
@@ -3251,6 +3252,7 @@ impl GovernedHostRuntime {
             "target_version_id": target_instance.version_id,
             "kind": kind,
         });
+        seed_source.record_on(&mut fork_payload, command);
         let existing_seed = self.exact_fork_event(
             &target.instance_ref,
             &seed_key,
@@ -3279,7 +3281,7 @@ impl GovernedHostRuntime {
                     agent: &target_package.agent,
                     messages: &messages,
                     source_instance_id: &command.source.instance_ref,
-                    source_sequence: command.source.sequence as i64,
+                    source_sequence: source_sequence as i64,
                     idempotency_key: &seed_key,
                 })
                 .map_err(HostRuntimeError::Store)?
@@ -3336,33 +3338,274 @@ impl GovernedHostRuntime {
                 instance_ref: target_instance_ref,
                 sequence: fork_sequence,
             },
+            cut: seed_source.cut.clone(),
         };
         result.validate_for(command)?;
         Ok(result)
     }
 
-    /// The shared fork tail: source position and quiescence checks, target
-    /// open (fully validated), replay short-circuit, thread seeding, and the
-    /// `host.instance.forked` record.
-    fn fork_source_metadata(
+    /// The recorded instance a fork or adoption names, with the host metadata
+    /// it was opened under.
+    fn source_instance_metadata(
         source_runtime: &GovernedHostRuntime,
         instance_ref: &str,
-        command: &ForkInstanceCommand,
     ) -> Result<(whipplescript_store::InstanceView, InstanceMetadata), HostRuntimeError> {
-        let source_instance = source_runtime
+        let found = source_runtime
             .kernel
             .store()
             .get_instance(instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
+            .map_err(HostRuntimeError::Store)?;
+        if found.is_none() {
+            return Err(HostRuntimeError::UnknownInstance(instance_ref.to_owned()));
+        }
+        let source_instance = found.expect("an unknown source instance was refused above");
         let source_metadata: InstanceMetadata =
             serde_json::from_str(&source_instance.input_json).map_err(HostRuntimeError::Json)?;
-        if source_metadata.protocol != HOST_PROTOCOL || source_metadata.policy != command.policy {
+        if source_metadata.protocol != HOST_PROTOCOL {
             return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
                 "fork source package/policy binding",
             )));
         }
         Ok((source_instance, source_metadata))
+    }
+
+    /// An ordinary fork's source: recorded under exactly the fork's policy, at
+    /// a position it has reached, with no effect running.
+    fn fork_source(
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+    ) -> Result<SeedSource, HostRuntimeError> {
+        let (instance, metadata) =
+            Self::source_instance_metadata(source_runtime, &command.source.instance_ref)?;
+        if metadata.policy != command.policy {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source package/policy binding",
+            )));
+        }
+        Self::check_source_fork_ready(source_runtime, command)?;
+        Ok(SeedSource {
+            instance,
+            metadata,
+            position: command.source.clone(),
+            cut: None,
+        })
+    }
+
+    /// An adoption's source and the agent whose thread it carries (DR-0293).
+    /// `source_runtime` holds the policy the source was recorded under, which
+    /// is this runtime's or an earlier epoch of the same authority; what the
+    /// carried thread read is re-admitted here when the epochs differ; and a
+    /// running effect cuts the thread instead of refusing it.
+    fn adoption_source(
+        &self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        missing_version: impl FnOnce() -> HostRuntimeError,
+    ) -> Result<(SeedSource, String), HostRuntimeError> {
+        let (instance, metadata) =
+            Self::source_instance_metadata(source_runtime, &command.source.instance_ref)?;
+        if source_runtime.policy != metadata.policy {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source package/policy binding",
+            )));
+        }
+        self.admit_policy_advance(source_runtime)?;
+        let agent = source_runtime
+            .kernel
+            .store()
+            .get_program_version(&instance.version_id)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(missing_version)?
+            .program_name;
+        let (position, cut) = Self::adoption_position(source_runtime, command)?;
+        if source_runtime.policy != self.policy {
+            self.readmit_carried_thread(source_runtime, &position, &agent)?;
+        }
+        Ok((
+            SeedSource {
+                instance,
+                metadata,
+                position,
+                cut,
+            },
+            agent,
+        ))
+    }
+
+    /// An adoption may carry a thread forward across policy epochs of one
+    /// authority, never back and never across authorities (DR-0293 §1). The
+    /// source runtime was opened under the source's own envelope, so both
+    /// sides are verified; the host's epoch numbers order them.
+    fn admit_policy_advance(
+        &self,
+        source_runtime: &GovernedHostRuntime,
+    ) -> Result<(), HostRuntimeError> {
+        let (source, target) = (&source_runtime.policy, &self.policy);
+        if source == target {
+            return Ok(());
+        }
+        if source.signer != target.signer
+            || source_runtime.envelope.authority() != self.envelope.authority()
+        {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "adoption source policy authority",
+            )));
+        }
+        if source.epoch >= target.epoch {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "adoption source policy epoch",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Where an adoption reads its source (DR-0293 §3): the host's position,
+    /// or, when an effect that began at or before it is still running, the
+    /// newest position before the first such effect began. The effect is
+    /// left exactly as it is.
+    fn adoption_position(
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+    ) -> Result<(EventPosition, Option<AdoptionCut>), HostRuntimeError> {
+        let instance_ref = &command.source.instance_ref;
+        let current = source_runtime.current_position(instance_ref)?;
+        if command.source.sequence > current.sequence {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source position",
+            )));
+        }
+        let running = source_runtime
+            .kernel
+            .store()
+            .list_effects(instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .filter(|effect| effect.status == "running")
+            .map(|effect| effect.effect_id)
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            return Ok((command.source.clone(), None));
+        }
+        let events = source_runtime
+            .kernel
+            .store()
+            .list_events(instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let mut first_unresolved: Option<u64> = None;
+        let mut unresolved = Vec::new();
+        for effect_id in running {
+            let began = events
+                .iter()
+                .find(|event| event_names_effect(&event.payload_json, &effect_id))
+                .map(|event| event.sequence as u64);
+            if began.is_none() {
+                return Err(HostRuntimeError::Incomplete(format!(
+                    "source instance {instance_ref} has running effect {effect_id} with no recorded start"
+                )));
+            }
+            let began = began.expect("an effect with no recorded start was refused above");
+            if began > command.source.sequence {
+                continue;
+            }
+            first_unresolved = Some(first_unresolved.map_or(began, |first| first.min(began)));
+            unresolved.push(effect_id);
+        }
+        let Some(began) = first_unresolved else {
+            return Ok((command.source.clone(), None));
+        };
+        // An effect is never named by an instance's first event, so the cut is
+        // a real position; `ForkedInstance::validate_for` refuses one that is not.
+        let sequence = began.saturating_sub(1);
+        unresolved.sort();
+        Ok((
+            EventPosition {
+                instance_ref: instance_ref.clone(),
+                sequence,
+            },
+            Some(AdoptionCut {
+                sequence,
+                unresolved_effects: unresolved,
+            }),
+        ))
+    }
+
+    /// Re-admit what a thread carried across an epoch read (DR-0293 §2). A
+    /// turn's output is labeled by the join of the resources it read, so each
+    /// resource every carried turn read — through the seed lineage too — must
+    /// be governed by this epoch and resolve to the identity it had when it
+    /// was read. Anything else would relabel recorded content, so it refuses
+    /// visibly rather than widen a label or start an empty thread.
+    fn readmit_carried_thread(
+        &self,
+        source_runtime: &GovernedHostRuntime,
+        position: &EventPosition,
+        agent: &str,
+    ) -> Result<(), HostRuntimeError> {
+        let refused = |what: String| {
+            HostRuntimeError::PolicyRejected(format!(
+                "the conversation cannot be carried from policy epoch {} into epoch {}: {what}",
+                source_runtime.policy.epoch, self.policy.epoch
+            ))
+        };
+        let store = source_runtime.kernel.store();
+        let mut pending = vec![(
+            position.instance_ref.clone(),
+            Some(agent.to_owned()),
+            position.sequence as i64,
+        )];
+        let mut answered = std::collections::BTreeSet::new();
+        while let Some((instance_ref, agent, up_to)) = pending.pop() {
+            if !answered.insert((instance_ref.clone(), up_to)) {
+                continue;
+            }
+            if store
+                .get_instance(&instance_ref)
+                .map_err(HostRuntimeError::Store)?
+                .is_none()
+            {
+                return Err(refused(format!(
+                    "it was seeded from instance {instance_ref}, which this store does not hold"
+                )));
+            }
+            let lineage = source_runtime
+                .kernel
+                .agent_thread_lineage(&instance_ref, agent.as_deref(), Some(up_to))
+                .map_err(HostRuntimeError::Store)?;
+            if !lineage.turn_effect_ids.is_empty() {
+                let effects = store
+                    .list_effects(&instance_ref)
+                    .map_err(HostRuntimeError::Store)?;
+                for effect_id in &lineage.turn_effect_ids {
+                    let turn = effects
+                        .iter()
+                        .find(|effect| effect.effect_id == *effect_id)
+                        .and_then(|effect| {
+                            serde_json::from_str::<StartTurnCommand>(&effect.input_json).ok()
+                        });
+                    if turn.is_none() {
+                        return Err(refused(format!(
+                            "turn {effect_id} recorded no host command naming what it read"
+                        )));
+                    }
+                    let turn = turn.expect("a turn with no recorded command was refused above");
+                    for read in turn.resources.iter().chain(turn.input.images.iter()) {
+                        let handle = read.handle.as_str();
+                        if !self.envelope.governs(handle)
+                            || self.envelope.resolve_handle(handle)
+                                != source_runtime.envelope.resolve_handle(handle)
+                        {
+                            return Err(refused(format!(
+                                "turn {effect_id} read `{handle}`, which the newer epoch does not admit as it was read"
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Some(seed) = lineage.seed.filter(|seed| seed.carried_messages) {
+                pending.push((seed.source_instance_id, None, seed.source_sequence));
+            }
+        }
+        Ok(())
     }
 
     fn fork_to_target<P: PackageResolver + ?Sized>(
@@ -3372,9 +3615,9 @@ impl GovernedHostRuntime {
         packages: &P,
         target_package: &ResolvedPackage,
         source_agent: &str,
+        seed_source: &SeedSource,
     ) -> Result<ForkedInstance, HostRuntimeError> {
-        Self::check_source_fork_ready(source_runtime, command)?;
-
+        let source_sequence = seed_source.position.sequence;
         let target_command = command.target_open_command();
         let target = self.open_instance(&target_command, packages)?;
         if target.instance_ref == command.source.instance_ref {
@@ -3388,7 +3631,7 @@ impl GovernedHostRuntime {
             .snapshot_agent_thread(
                 &command.source.instance_ref,
                 source_agent,
-                Some(command.source.sequence as i64),
+                Some(source_sequence as i64),
             )
             .map_err(HostRuntimeError::Store)?;
         let seed_key = idempotency_key(&[
@@ -3400,7 +3643,7 @@ impl GovernedHostRuntime {
             "agent": target_package.agent,
             "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
             "source_instance_id": command.source.instance_ref,
-            "source_sequence": command.source.sequence as i64,
+            "source_sequence": source_sequence as i64,
         });
         let seed = self.exact_fork_event(
             &target.instance_ref,
@@ -3424,19 +3667,20 @@ impl GovernedHostRuntime {
                     agent: &target_package.agent,
                     messages: &messages,
                     source_instance_id: &command.source.instance_ref,
-                    source_sequence: command.source.sequence as i64,
+                    source_sequence: source_sequence as i64,
                     idempotency_key: &seed_key,
                 })
                 .map_err(HostRuntimeError::Store)?;
         }
-        let payload = json!({
+        let mut payload = json!({
             "request_id": command.request_id,
             "source": command.source,
             "target_request_id": command.target_request_id,
             "package_version_ref": command.package_version_ref,
             "policy": command.policy,
-        })
-        .to_string();
+        });
+        seed_source.record_on(&mut payload, command);
+        let payload = payload.to_string();
         let event = self
             .kernel
             .store()
@@ -3464,6 +3708,7 @@ impl GovernedHostRuntime {
                 instance_ref: target_instance_ref,
                 sequence: positive_sequence(event.sequence)?,
             },
+            cut: seed_source.cut.clone(),
         };
         result.validate_for(command)?;
         Ok(result)
@@ -3564,6 +3809,12 @@ impl GovernedHostRuntime {
             forked_at: EventPosition {
                 instance_ref: target.instance_ref.clone(),
                 sequence: positive_sequence(event.sequence)?,
+            },
+            cut: match payload.get("cut") {
+                Some(cut) => {
+                    Some(serde_json::from_value(cut.clone()).map_err(HostRuntimeError::Json)?)
+                }
+                None => None,
             },
         };
         result.validate_for(command)?;
@@ -5075,6 +5326,49 @@ struct InstanceMetadata {
     protocol: String,
     package_version_ref: String,
     policy: PolicyEpochRef,
+}
+
+/// What a fork or an adoption seeds its target from, once the source's
+/// identity, policy binding and quiescence have been answered.
+struct SeedSource {
+    instance: whipplescript_store::InstanceView,
+    metadata: InstanceMetadata,
+    /// The coordinate the thread is read at: the host's, or an adoption's cut.
+    position: EventPosition,
+    cut: Option<AdoptionCut>,
+}
+
+impl SeedSource {
+    /// Name on the fork record what an adoption did beyond an ordinary fork:
+    /// the earlier epoch it carried the thread from, and the cut it took. An
+    /// ordinary fork's record is unchanged, so a replay of an older record
+    /// still matches it exactly.
+    fn record_on(&self, payload: &mut Value, command: &ForkInstanceCommand) {
+        if self.metadata.policy != command.policy {
+            payload["source_policy"] = json!(self.metadata.policy);
+        }
+        if let Some(cut) = &self.cut {
+            payload["cut"] = json!(cut);
+            payload["unresolved_outcome"] = json!("unknown");
+        }
+    }
+}
+
+/// Whether a recorded event's payload names `effect_id` as its own effect or
+/// as one it commits.
+fn event_names_effect(payload_json: &str, effect_id: &str) -> bool {
+    let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
+        return false;
+    };
+    payload.get("effect_id").and_then(Value::as_str) == Some(effect_id)
+        || payload
+            .get("effects")
+            .and_then(Value::as_array)
+            .is_some_and(|effects| {
+                effects.iter().any(|effect| {
+                    effect.get("effect_id").and_then(Value::as_str) == Some(effect_id)
+                })
+            })
 }
 
 fn validate_recorded_turn_input(
@@ -8763,21 +9057,41 @@ workflow UnsafeHostChat {
     }
 
     fn signed_policy_at(base_url: &str) -> String {
+        SignedEnvelope::sign_for_test(
+            &test_policy(base_url, "file:/workspace", &[])
+                .to_json()
+                .expect("policy"),
+            "gaugedesk-admin",
+        )
+        .to_json()
+    }
+
+    /// The test policy with what an epoch advance may change named: the
+    /// address `project` binds to, and further addresses governed beside it.
+    fn test_policy(
+        base_url: &str,
+        project_address: &str,
+        extra_addresses: &[&str],
+    ) -> HostGovernancePolicy {
         let labeled = |principal| ResourcePolicy {
             reader: BTreeSet::from(["Operator".to_owned()]),
             writer: BTreeSet::from(["Operator".to_owned()]),
             principal,
             internal: false,
         };
-        let policy = HostGovernancePolicy {
-            resources: BTreeMap::from([
-                ("file:/workspace".to_owned(), labeled(false)),
-                ("provider:openai".to_owned(), labeled(true)),
-                ("provider:owned".to_owned(), labeled(true)),
-                ("placement:local".to_owned(), labeled(true)),
-            ]),
+        let mut resources = BTreeMap::from([
+            (project_address.to_owned(), labeled(false)),
+            ("provider:openai".to_owned(), labeled(true)),
+            ("provider:owned".to_owned(), labeled(true)),
+            ("placement:local".to_owned(), labeled(true)),
+        ]);
+        for address in extra_addresses {
+            resources.insert((*address).to_owned(), labeled(false));
+        }
+        HostGovernancePolicy {
+            resources,
             bindings: BTreeMap::from([
-                ("project".to_owned(), "file:/workspace".to_owned()),
+                ("project".to_owned(), project_address.to_owned()),
                 ("model".to_owned(), "provider:openai".to_owned()),
                 ("owned".to_owned(), "provider:owned".to_owned()),
                 ("local".to_owned(), "placement:local".to_owned()),
@@ -8807,9 +9121,27 @@ workflow UnsafeHostChat {
             )]),
             parties: BTreeMap::from([("operator".to_owned(), "Operator".to_owned())]),
             ..HostGovernancePolicy::default()
-        };
-        SignedEnvelope::sign_for_test(&policy.to_json().expect("policy"), "gaugedesk-admin")
-            .to_json()
+        }
+    }
+
+    /// One epoch of the test policy, signed by `signer` and speaking for
+    /// `authority` when it names one.
+    fn epoch_policy(
+        project_address: &str,
+        extra_addresses: &[&str],
+        signer: &str,
+        authority: Option<&str>,
+    ) -> String {
+        let mut policy: Value = serde_json::from_str(
+            &test_policy("https://provider.invalid", project_address, extra_addresses)
+                .to_json()
+                .expect("policy"),
+        )
+        .expect("policy json");
+        if let Some(authority) = authority {
+            policy["authority"] = json!(authority);
+        }
+        SignedEnvelope::sign_for_test(&policy.to_string(), signer).to_json()
     }
 
     /// DR-0062 §4: the refusal lands at policy-load time, not at the first turn
@@ -9830,6 +10162,86 @@ workflow UnsafeHostChat {
         }
     }
 
+    /// The Home-journalled adoption carries a thread across an epoch advance
+    /// the same way (DR-0293), and records the epoch it carried it from.
+    #[test]
+    fn home_adoption_carries_a_thread_into_a_newer_epoch() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let first = epoch_policy("file:/workspace", &[], "gaugedesk-admin", None);
+        let second = epoch_policy(
+            "file:/workspace",
+            &["tracker:tasks"],
+            "gaugedesk-admin",
+            None,
+        );
+        let mut journal = TestForkJournal::default();
+        let mut source = GovernedHostRuntime::open(&source_path, 1, &first).expect("epoch 1");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            // The test journal binds the source pin under this request id.
+            request_id: "home-fork-source".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let opened = source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source admitted");
+        source
+            .open_instance_with_home_journal(&source_open, &Packages, &mut journal)
+            .expect("source retained use bound");
+        source
+            .run_turn_with_driver(
+                &turn(&opened.instance_ref, &source_open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &ScriptedDriver::new(vec![json!({
+                    "output_text": "answer recorded under epoch 1",
+                    "usage": { "input_tokens": 10, "output_tokens": 3 }
+                })]),
+            )
+            .expect("source turn");
+        let position = source
+            .current_position(&opened.instance_ref)
+            .expect("source position");
+        let mut target = GovernedHostRuntime::open(&target_path, 2, &second).expect("epoch 2");
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "home-epoch-adoption".to_owned(),
+            source: position,
+            target_request_id: "home-epoch-target".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        let adopted = target
+            .adopt_instance_from_with_home_journal(&source, &command, &Packages, &mut journal)
+            .expect("Home adoption across epochs");
+        assert!(journal.fork_completed.is_some());
+        let record = fork_record(&target, &adopted.target.instance_ref);
+        assert_eq!(record["kind"], "adopt");
+        assert_eq!(record["source_policy"], json!(source.policy_ref()));
+        let carried =
+            serde_json::to_string(&whipplescript_kernel::harness_loop::chat_messages_to_json(
+                &target
+                    .kernel
+                    .snapshot_agent_thread(&adopted.target.instance_ref, "assistant", None)
+                    .expect("seeded thread"),
+            ))
+            .expect("thread json");
+        assert!(
+            carried.contains("answer recorded under epoch 1"),
+            "{carried}"
+        );
+
+        drop((source, target));
+        remove_stores(&[&source_path, &target_path]);
+    }
+
     #[test]
     fn home_fork_refuses_a_source_version_move_after_pending_registration() {
         let source_path = temp_store();
@@ -10334,6 +10746,539 @@ workflow UnsafeHostChat {
             let _ = fs::remove_file(path.with_extension("sqlite-wal"));
             let _ = fs::remove_file(path.with_extension("sqlite-shm"));
         }
+    }
+
+    /// Open a chat under `runtime`'s epoch and run one turn per answer, the
+    /// turns numbered from `first`, each reading `reads`.
+    fn chat_with_turns(
+        runtime: &mut GovernedHostRuntime,
+        request_id: &str,
+        first: usize,
+        answers: &[&str],
+        reads: &[ResourceRef],
+    ) -> OpenedInstance {
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: request_id.to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let opened = runtime.open_instance(&open, &Packages).expect("chat opens");
+        for (offset, answer) in answers.iter().enumerate() {
+            let mut command = turn(&opened.instance_ref, &open.policy, first + offset);
+            command.resources = reads.to_vec();
+            runtime
+                .run_turn_with_driver(
+                    &command,
+                    &Packages,
+                    &Secrets {
+                        calls: Cell::new(0),
+                    },
+                    &Resources {
+                        calls: Cell::new(0),
+                    },
+                    &ScriptedDriver::new(vec![json!({
+                        "output_text": answer,
+                        "usage": { "input_tokens": 10, "output_tokens": 3 }
+                    })]),
+                )
+                .expect("turn runs");
+        }
+        opened
+    }
+
+    fn read_of(handle: &str, kind: &str) -> ResourceRef {
+        ResourceRef {
+            handle: handle.to_owned(),
+            kind: kind.to_owned(),
+            selector: None,
+            writable: None,
+            presented_as: None,
+        }
+    }
+
+    fn adoption_into(
+        current: &GovernedHostRuntime,
+        source: EventPosition,
+        request_id: &str,
+    ) -> ForkInstanceCommand {
+        ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: request_id.to_owned(),
+            source,
+            target_request_id: format!("{request_id}:target"),
+            package_version_ref: "package:v1".to_owned(),
+            policy: current.policy_ref().clone(),
+        }
+    }
+
+    fn fork_record(runtime: &GovernedHostRuntime, instance_ref: &str) -> Value {
+        let event = runtime
+            .kernel
+            .store()
+            .list_events(instance_ref)
+            .expect("target events")
+            .into_iter()
+            .find(|event| event.event_type == "host.instance.forked")
+            .expect("fork record");
+        serde_json::from_str(&event.payload_json).expect("fork record json")
+    }
+
+    fn remove_stores(paths: &[&std::path::PathBuf]) {
+        for path in paths {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// DR-0293 §1 and GaugeDesk WS-660's acceptance: one turn under epoch 1,
+    /// the chat reopens under epoch 2 of the same authority, and the second
+    /// provider request contains the first turn.
+    #[test]
+    fn adoption_carries_a_thread_into_a_newer_epoch_of_the_same_authority() {
+        let path = temp_store();
+        let first = epoch_policy("file:/workspace", &[], "gaugedesk-admin", None);
+        // The epoch advances because the chat gained a tracker.
+        let second = epoch_policy(
+            "file:/workspace",
+            &["tracker:tasks"],
+            "gaugedesk-admin",
+            None,
+        );
+        let mut earlier = GovernedHostRuntime::open(&path, 1, &first).expect("epoch 1");
+        let source = chat_with_turns(
+            &mut earlier,
+            "chat-under-epoch-1",
+            1,
+            &["answer under the first epoch"],
+            &[read_of("project", "file_store")],
+        );
+        let position = earlier
+            .current_position(&source.instance_ref)
+            .expect("source position");
+        let mut current = GovernedHostRuntime::open(&path, 2, &second).expect("epoch 2");
+        let recorded = current
+            .newest_recorded_instance()
+            .expect("recorded instance")
+            .expect("the chat");
+        assert_eq!(recorded.instance_ref, source.instance_ref);
+        assert_eq!(&recorded.policy, earlier.policy_ref());
+        let command = adoption_into(&current, position, "adopt-into-epoch-2");
+
+        assert!(
+            current
+                .fork_instance_from(&earlier, &command, &Packages)
+                .is_err(),
+            "an ordinary fork keeps exact policy equality"
+        );
+        let under_current = GovernedHostRuntime::open(&path, 2, &second).expect("epoch 2 again");
+        assert!(current
+            .fork_instance_from(&under_current, &command, &Packages)
+            .expect_err("a fork refuses a source recorded under another epoch")
+            .to_string()
+            .contains("fork source package/policy binding"));
+        let unknown = ForkInstanceCommand {
+            source: EventPosition {
+                instance_ref: "ins_never_opened".to_owned(),
+                sequence: 1,
+            },
+            ..adoption_into(&current, command.source.clone(), "adopt-unknown-instance")
+        };
+        assert!(matches!(
+            current.adopt_instance_from(&earlier, &unknown, &Packages),
+            Err(HostRuntimeError::UnknownInstance(instance)) if instance == "ins_never_opened"
+        ));
+        let ahead = adoption_into(
+            &current,
+            EventPosition {
+                instance_ref: source.instance_ref.clone(),
+                sequence: command.source.sequence + 1,
+            },
+            "adopt-ahead-of-the-source",
+        );
+        assert!(current
+            .adopt_instance_from(&earlier, &ahead, &Packages)
+            .expect_err("a position the source has not reached")
+            .to_string()
+            .contains("fork source position"));
+        assert!(current
+            .adopt_instance_from(&under_current, &command, &Packages)
+            .expect_err("a runtime under epoch 2 cannot vouch for epoch 1's envelope")
+            .to_string()
+            .contains("fork source package/policy binding"));
+
+        let adopted = current
+            .adopt_instance_from(&earlier, &command, &Packages)
+            .expect("adoption across epochs");
+        adopted.validate_for(&command).expect("fork binding");
+        assert!(adopted.cut.is_none());
+        assert_eq!(
+            current
+                .adopt_instance_from(&earlier, &command, &Packages)
+                .expect("adoption replays"),
+            adopted
+        );
+        let record = fork_record(&current, &adopted.target.instance_ref);
+        assert_eq!(record["source_policy"], json!(earlier.policy_ref()));
+        assert_eq!(record["policy"], json!(current.policy_ref()));
+
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "answer under the second epoch",
+            "usage": { "input_tokens": 20, "output_tokens": 3 }
+        })]);
+        current
+            .run_turn_with_driver(
+                &turn(&adopted.target.instance_ref, &command.policy, 2),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("turn under epoch 2");
+        let request = driver
+            .requests
+            .borrow()
+            .first()
+            .expect("second provider request")
+            .to_string();
+        assert!(request.contains("turn 1"), "{request}");
+        assert!(
+            request.contains("answer under the first epoch"),
+            "{request}"
+        );
+        assert!(request.contains("turn 2"), "{request}");
+
+        drop((earlier, under_current, current));
+        remove_stores(&[&path]);
+    }
+
+    /// DR-0293 §1: a thread is carried forward within one authority only.
+    /// Another signer, another declared authority, or an epoch that is not
+    /// earlier refuses, and nothing is opened.
+    #[test]
+    fn adoption_refuses_another_authority_or_an_epoch_that_is_not_earlier() {
+        let path = temp_store();
+        let first = epoch_policy("file:/workspace", &[], "gaugedesk-admin", None);
+        let mut earlier = GovernedHostRuntime::open(&path, 1, &first).expect("epoch 1");
+        let source = chat_with_turns(
+            &mut earlier,
+            "chat-under-epoch-1",
+            1,
+            &["answer under the first epoch"],
+            &[read_of("project", "file_store")],
+        );
+        let position = earlier
+            .current_position(&source.instance_ref)
+            .expect("source position");
+        let refusal = |epoch: u64, policy: &str, request_id: &str| {
+            let mut current = GovernedHostRuntime::open(&path, epoch, policy).expect("runtime");
+            let command = adoption_into(&current, position.clone(), request_id);
+            current
+                .adopt_instance_from(&earlier, &command, &Packages)
+                .expect_err("refused")
+                .to_string()
+        };
+        let gained = ["tracker:tasks"];
+        assert!(refusal(
+            2,
+            &epoch_policy("file:/workspace", &gained, "another-admin", None),
+            "another-signer",
+        )
+        .contains("adoption source policy authority"));
+        assert!(refusal(
+            2,
+            &epoch_policy(
+                "file:/workspace",
+                &gained,
+                "gaugedesk-admin",
+                Some("home:elsewhere")
+            ),
+            "another-authority",
+        )
+        .contains("adoption source policy authority"));
+        assert!(refusal(
+            1,
+            &epoch_policy("file:/workspace", &gained, "gaugedesk-admin", None),
+            "same-epoch-number",
+        )
+        .contains("adoption source policy epoch"));
+        assert_eq!(
+            earlier
+                .kernel
+                .store()
+                .list_instances()
+                .expect("instances")
+                .len(),
+            1,
+            "a refused adoption opens no target"
+        );
+
+        drop(earlier);
+        remove_stores(&[&path]);
+    }
+
+    /// DR-0293 §2: what the carried thread read is re-admitted under the newer
+    /// epoch. A resource the epoch rebinds elsewhere, or one it no longer
+    /// governs, refuses the adoption rather than relabel what was read.
+    #[test]
+    fn adoption_across_epochs_refuses_a_read_the_newer_epoch_does_not_admit() {
+        let path = temp_store();
+        let first = epoch_policy(
+            "file:/workspace",
+            &["tracker:tasks"],
+            "gaugedesk-admin",
+            None,
+        );
+        let mut earlier = GovernedHostRuntime::open(&path, 1, &first).expect("epoch 1");
+        let source = chat_with_turns(
+            &mut earlier,
+            "chat-under-epoch-1",
+            1,
+            &["answer that read both"],
+            &[
+                read_of("project", "file_store"),
+                read_of("tracker:tasks", "tracker"),
+            ],
+        );
+        let position = earlier
+            .current_position(&source.instance_ref)
+            .expect("source position");
+        let refusal = |epoch: u64, policy: &str, request_id: &str| {
+            let mut current = GovernedHostRuntime::open(&path, epoch, policy).expect("runtime");
+            let command = adoption_into(&current, position.clone(), request_id);
+            current
+                .adopt_instance_from(&earlier, &command, &Packages)
+                .expect_err("refused")
+                .to_string()
+        };
+        let rebound = refusal(
+            2,
+            &epoch_policy(
+                "file:/elsewhere",
+                &["tracker:tasks"],
+                "gaugedesk-admin",
+                None,
+            ),
+            "project-rebound",
+        );
+        assert!(
+            rebound.contains("read `project`, which the newer epoch does not admit"),
+            "{rebound}"
+        );
+        let dropped = refusal(
+            3,
+            &epoch_policy("file:/workspace", &[], "gaugedesk-admin", None),
+            "tracker-dropped",
+        );
+        assert!(
+            dropped.contains("read `tracker:tasks`, which the newer epoch does not admit"),
+            "{dropped}"
+        );
+
+        drop(earlier);
+        remove_stores(&[&path]);
+    }
+
+    /// DR-0293 §2 again: re-admission follows a seeded thread back to the
+    /// turns it came from, and refuses when it cannot name what they read.
+    #[test]
+    fn adoption_across_epochs_refuses_history_whose_reads_it_cannot_name() {
+        let elsewhere = temp_store();
+        let here = temp_store();
+        let first = epoch_policy("file:/workspace", &[], "gaugedesk-admin", None);
+        let second = epoch_policy(
+            "file:/workspace",
+            &["tracker:tasks"],
+            "gaugedesk-admin",
+            None,
+        );
+
+        // A thread seeded from a store this one does not hold.
+        let mut origin = GovernedHostRuntime::open(&elsewhere, 1, &first).expect("origin");
+        let origin_chat = chat_with_turns(
+            &mut origin,
+            "chat-elsewhere",
+            1,
+            &["answer from another store"],
+            &[read_of("project", "file_store")],
+        );
+        let mut earlier = GovernedHostRuntime::open(&here, 1, &first).expect("epoch 1 here");
+        let fork = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "fork-from-elsewhere".to_owned(),
+            source: origin
+                .current_position(&origin_chat.instance_ref)
+                .expect("origin position"),
+            target_request_id: "chat-here".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: earlier.policy_ref().clone(),
+        };
+        let seeded = earlier
+            .fork_instance_from(&origin, &fork, &Packages)
+            .expect("cross-store fork under one epoch");
+        let mut current = GovernedHostRuntime::open(&here, 2, &second).expect("epoch 2 here");
+        let command = adoption_into(
+            &current,
+            earlier
+                .current_position(&seeded.target.instance_ref)
+                .expect("seeded position"),
+            "adopt-seeded-from-elsewhere",
+        );
+        let refused = current
+            .adopt_instance_from(&earlier, &command, &Packages)
+            .expect_err("unknown lineage")
+            .to_string();
+        assert!(
+            refused.contains("which this store does not hold"),
+            "{refused}"
+        );
+
+        // A carried turn whose effect names no host command.
+        let unnamed = chat_with_turns(
+            &mut earlier,
+            "chat-with-unnamed-reads",
+            7,
+            &["answer whose reads are lost"],
+            &[read_of("project", "file_store")],
+        );
+        rusqlite::Connection::open(&here)
+            .expect("store")
+            .execute(
+                "UPDATE effects SET input_json = '{}' WHERE effect_id = 'command-7'",
+                [],
+            )
+            .expect("lose the recorded command");
+        let command = adoption_into(
+            &current,
+            earlier
+                .current_position(&unnamed.instance_ref)
+                .expect("position"),
+            "adopt-unnamed-reads",
+        );
+        let refused = current
+            .adopt_instance_from(&earlier, &command, &Packages)
+            .expect_err("unnamed reads")
+            .to_string();
+        assert!(refused.contains("recorded no host command"), "{refused}");
+
+        drop((origin, earlier, current));
+        remove_stores(&[&elsewhere, &here]);
+    }
+
+    /// DR-0293 §3: a source whose later turn never settled is adopted from
+    /// the newest position before that turn began. The effect is left as it
+    /// is, the result names the cut, and the carried thread does not contain
+    /// the unresolved turn. A fork still refuses the same source.
+    #[test]
+    fn adoption_cuts_before_an_effect_that_never_settled() {
+        let path = temp_store();
+        let policy = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 9, &policy).expect("runtime");
+        let source = chat_with_turns(
+            &mut runtime,
+            "chat-with-orphan",
+            1,
+            &["settled answer", "answer nobody saw"],
+            &[read_of("project", "file_store")],
+        );
+        rusqlite::Connection::open(&path)
+            .expect("store")
+            .execute(
+                "UPDATE effects SET status = 'running' WHERE effect_id = 'command-2'",
+                [],
+            )
+            .expect("orphan the second turn");
+        let source_runtime = GovernedHostRuntime::open(&path, 9, &policy).expect("source");
+        let position = source_runtime
+            .current_position(&source.instance_ref)
+            .expect("position");
+        let command = adoption_into(&runtime, position.clone(), "adopt-around-orphan");
+
+        assert!(runtime
+            .fork_instance_from(&source_runtime, &command, &Packages)
+            .expect_err("a fork still needs a quiescent source")
+            .to_string()
+            .contains("is not quiescent"));
+        let adopted = runtime
+            .adopt_instance_from(&source_runtime, &command, &Packages)
+            .expect("adoption cuts instead of refusing");
+        let cut = adopted.cut.clone().expect("the cut is reported");
+        assert_eq!(cut.unresolved_effects, ["command-2"]);
+        assert!(cut.sequence < position.sequence);
+        assert_eq!(
+            runtime
+                .adopt_instance_from(&source_runtime, &command, &Packages)
+                .expect("adoption replays"),
+            adopted
+        );
+        let effects = runtime
+            .kernel
+            .store()
+            .list_effects(&source.instance_ref)
+            .expect("source effects");
+        assert_eq!(
+            effects
+                .iter()
+                .find(|effect| effect.effect_id == "command-2")
+                .expect("orphan")
+                .status,
+            "running",
+            "the unresolved effect is never settled"
+        );
+        let carried =
+            serde_json::to_string(&whipplescript_kernel::harness_loop::chat_messages_to_json(
+                &runtime
+                    .kernel
+                    .snapshot_agent_thread(&adopted.target.instance_ref, "assistant", None)
+                    .expect("seeded thread"),
+            ))
+            .expect("thread json");
+        assert!(carried.contains("settled answer"), "{carried}");
+        assert!(!carried.contains("answer nobody saw"), "{carried}");
+        assert!(!carried.contains("turn 2"), "{carried}");
+        let record = fork_record(&runtime, &adopted.target.instance_ref);
+        assert_eq!(record["cut"], json!(cut));
+        assert_eq!(record["unresolved_outcome"], "unknown");
+        assert!(record.get("source_policy").is_none());
+
+        // Asked for a position before the orphan began, there is nothing to cut.
+        let before = adoption_into(
+            &runtime,
+            EventPosition {
+                instance_ref: source.instance_ref.clone(),
+                sequence: cut.sequence,
+            },
+            "adopt-before-orphan",
+        );
+        assert!(runtime
+            .adopt_instance_from(&source_runtime, &before, &Packages)
+            .expect("an earlier position is already quiescent")
+            .cut
+            .is_none());
+
+        // A running effect with no recorded start has no position to cut at.
+        rusqlite::Connection::open(&path)
+            .expect("store")
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, created_by_rule, idempotency_key) \
+                 VALUES ('orphan-without-start', ?1, 'agent.tell', 'running', 'host.turn', 'orphan-without-start')",
+                [&source.instance_ref],
+            )
+            .expect("an effect nothing recorded starting");
+        let unknown_start = adoption_into(&runtime, position, "adopt-unknown-start");
+        let refused = runtime
+            .adopt_instance_from(&source_runtime, &unknown_start, &Packages)
+            .expect_err("no start, no cut")
+            .to_string();
+        assert!(refused.contains("with no recorded start"), "{refused}");
+
+        drop((runtime, source_runtime));
+        remove_stores(&[&path]);
     }
 
     #[test]

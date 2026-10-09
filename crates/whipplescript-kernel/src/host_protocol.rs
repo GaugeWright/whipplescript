@@ -213,6 +213,21 @@ pub struct ForkedInstance {
     pub source: EventPosition,
     pub target: OpenedInstance,
     pub forked_at: EventPosition,
+    /// Present only when an adoption seeded from earlier than `source`
+    /// because the source had an effect still running there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<AdoptionCut>,
+}
+
+/// Where an adoption cut a source whose effect had not settled (DR-0293 §3).
+/// The target's thread is the source's as it stood at `sequence`, the newest
+/// position before the first unresolved effect began. That turn was left
+/// unresolved: the runtime did not settle, cancel or guess it, and its outcome
+/// is unknown, so nothing the target carries may imply the model received it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdoptionCut {
+    pub sequence: u64,
+    pub unresolved_effects: Vec<String>,
 }
 
 impl ForkedInstance {
@@ -233,6 +248,14 @@ impl ForkedInstance {
             return Err(ProtocolError::Invalid(
                 "instance-fork event position must be nonzero",
             ));
+        }
+        if let Some(cut) = &self.cut {
+            if cut.sequence == 0
+                || cut.sequence >= self.source.sequence
+                || cut.unresolved_effects.is_empty()
+            {
+                return Err(ProtocolError::Mismatch("adoption cut"));
+            }
         }
         Ok(())
     }
@@ -639,8 +662,43 @@ mod tests {
                 instance_ref: "whip:instance:target".to_owned(),
                 sequence: 3,
             },
+            cut: None,
         };
         forked.validate_for(&command).expect("bound fork");
+
+        // An adoption cut lies strictly before the source position it was
+        // asked for, at a real position, and names what it left unresolved.
+        let cut_at = |sequence: u64, unresolved: &[&str]| ForkedInstance {
+            cut: Some(AdoptionCut {
+                sequence,
+                unresolved_effects: unresolved.iter().map(|id| (*id).to_owned()).collect(),
+            }),
+            ..forked.clone()
+        };
+        let before = command.source.sequence - 1;
+        cut_at(before, &["effect-2"])
+            .validate_for(&command)
+            .expect("a cut before the source position");
+        for (sequence, unresolved) in [
+            (0, &["effect-2"][..]),
+            (command.source.sequence, &["effect-2"][..]),
+            (before, &[][..]),
+        ] {
+            assert_eq!(
+                cut_at(sequence, unresolved).validate_for(&command),
+                Err(ProtocolError::Mismatch("adoption cut")),
+                "cut at {sequence} naming {unresolved:?}"
+            );
+        }
+
+        let mut unplaced = forked.clone();
+        unplaced.forked_at.sequence = 0;
+        assert_eq!(
+            unplaced.validate_for(&command),
+            Err(ProtocolError::Invalid(
+                "instance-fork event position must be nonzero"
+            ))
+        );
 
         let mut mixed = forked;
         mixed.source.sequence += 1;

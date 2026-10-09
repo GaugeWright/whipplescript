@@ -1349,6 +1349,7 @@ pub fn host_import_fork(
                         JsValue::from_str("fork receipt event position must be positive")
                     })?,
             },
+            cut: None,
         };
         return serde_json::to_string(&replay)
             .map_err(|error| JsValue::from_str(&error.to_string()));
@@ -1406,6 +1407,7 @@ pub fn host_import_fork(
                 .filter(|sequence| *sequence > 0)
                 .ok_or_else(|| JsValue::from_str("fork receipt event position must be positive"))?,
         },
+        cut: None,
     };
     result
         .validate_for(&command)

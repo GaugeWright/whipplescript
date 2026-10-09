@@ -562,6 +562,44 @@ fn restore_marker_target_of(payload_json: &str) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+/// The events a thread read can see at `up_to_sequence` (inclusive), with every
+/// `context.restored` marker folded so an abandoned branch is gone.
+fn live_thread_events(events: &[EventView], up_to_sequence: Option<i64>) -> Vec<&EventView> {
+    let mut live: Vec<&EventView> = Vec::new();
+    for event in events {
+        if up_to_sequence.is_some_and(|sequence| event.sequence > sequence) {
+            break;
+        }
+        if event.event_type == "context.restored" {
+            if let Some(target) = restore_marker_target_of(&event.payload_json) {
+                live.retain(|folded| folded.sequence <= target);
+            }
+        } else {
+            live.push(event);
+        }
+    }
+    live
+}
+
+/// What a live agent thread was built from ([`RuntimeKernel::agent_thread_lineage`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentThreadLineage {
+    /// The effects of the completed turns the thread carries, oldest first.
+    pub turn_effect_ids: Vec<String>,
+    /// The seed the thread continues, when it began as one.
+    pub seed: Option<AgentThreadSeedOrigin>,
+}
+
+/// The source coordinate an `agent.thread.seeded` event recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentThreadSeedOrigin {
+    pub source_instance_id: String,
+    pub source_sequence: i64,
+    /// Whether the seed carried any conversation. An empty seed has no
+    /// history whose reads need answering for.
+    pub carried_messages: bool,
+}
+
 impl<S: RuntimeStore> RuntimeKernel<S> {
     pub fn new(store: S) -> Self {
         Self {
@@ -1042,19 +1080,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         up_to_sequence: Option<i64>,
     ) -> StoreResult<(Vec<crate::harness_loop::ChatMessage>, Option<String>)> {
         let events = self.store.list_events(instance_id)?;
-        let mut live: Vec<&EventView> = Vec::new();
-        for event in &events {
-            if up_to_sequence.is_some_and(|sequence| event.sequence > sequence) {
-                break;
-            }
-            if event.event_type == "context.restored" {
-                if let Some(target) = restore_marker_target_of(&event.payload_json) {
-                    live.retain(|folded| folded.sequence <= target);
-                }
-            } else {
-                live.push(event);
-            }
-        }
+        let live = live_thread_events(&events, up_to_sequence);
 
         for event in live.iter().rev() {
             let payload = match serde_json::from_str::<Value>(&event.payload_json) {
@@ -1101,6 +1127,57 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             }
         }
         Ok((Vec::new(), None))
+    }
+
+    /// Where the live thread that [`Self::snapshot_agent_thread`] returns came
+    /// from: every completed turn of `agent` it carries, oldest first, and the
+    /// seed it continues when it began as one. A thread accumulates, so each
+    /// live completed turn contributed to it; restore markers are folded the
+    /// same way, so an abandoned turn is not counted. An adoption that carries
+    /// the thread into a newer policy epoch re-admits what these turns read.
+    pub fn agent_thread_lineage(
+        &self,
+        instance_id: &str,
+        agent: Option<&str>,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<AgentThreadLineage> {
+        let events = self.store.list_events(instance_id)?;
+        let mut lineage = AgentThreadLineage::default();
+        for event in live_thread_events(&events, up_to_sequence) {
+            if event.event_type != "agent.thread.seeded"
+                && event.event_type != "agent.turn.completed"
+            {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                continue;
+            };
+            if agent
+                .is_some_and(|agent| payload.get("agent").and_then(Value::as_str) != Some(agent))
+            {
+                continue;
+            }
+            if event.event_type == "agent.thread.seeded" {
+                lineage.seed = Some(AgentThreadSeedOrigin {
+                    source_instance_id: payload
+                        .get("source_instance_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    source_sequence: payload
+                        .get("source_sequence")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                    carried_messages: payload
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .is_some_and(|messages| !messages.is_empty()),
+                });
+            } else if let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) {
+                lineage.turn_effect_ids.push(effect_id.to_owned());
+            }
+        }
+        Ok(lineage)
     }
 
     /// Seed a newly opened instance with an exported thread snapshot. The

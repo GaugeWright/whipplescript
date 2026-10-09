@@ -3958,6 +3958,14 @@ impl VerifiedEnvelope {
         self.envelope.governs(resource)
     }
 
+    /// The canonical `kind:address` identity `handle` names under this
+    /// verified envelope's bindings; a handle with no binding is its own
+    /// identity. Two epochs that resolve a handle alike label what was read
+    /// through it alike, which is what an adoption across epochs relies on.
+    pub fn resolve_handle<'a>(&'a self, handle: &'a str) -> &'a str {
+        self.envelope.resolve(handle)
+    }
+
     /// The minimum MCP trust rung this verified policy requires, if any
     /// (`spec/mcp-support-design-note.md` section 6).
     pub fn mcp_min_rung(&self) -> Option<crate::mcp::McpRung> {
