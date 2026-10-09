@@ -9,12 +9,12 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-core = { version = "0.10.0", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.11.0", path = "../whipplescript-core" }
 rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 # Parse complete governance source bytes on native and hosted admission alike.
-deser-hjson = { package = "whipplescript-hjson", version = "0.10.0", path = "../whipplescript-hjson" }
+deser-hjson = { package = "whipplescript-hjson", version = "0.11.0", path = "../whipplescript-hjson" }
 sha2 = "0.11"
 # SHA-256 for the tracker event Merkle-DAG (ADR-0002 phase B1): content-hash
 # event ids make a tampered issue detectable, an adversarial-integrity property

@@ -19,6 +19,234 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-07
+
+A minor release because tracker query setup behavior, embedding-host admission
+and published crates' public interfaces break compatibility with 0.10.0:
+
+- **Tracker command line.** Queries no longer create or migrate a tracker
+  store, enroll the current checkout or repair generated discovery views. A
+  missing store is refused. Run `whip issue bootstrap` with the same store
+  selection and working directory used by your tracker commands for initial
+  plain native setup, checkout enrollment and recovery. Writes still enroll
+  checkouts and publish synchronously. Protected tracker stores keep their
+  existing custody requirements; bootstrap is not a plaintext conversion.
+- `whipplescript-store`: `RetargetOutcome` gained `ParentFlowingSource`, and
+  `CreateBranchOutcome` gained `ParentAdmissionDisabled` and
+  `ParentFlowingTopology`. `FlowingFence` gained three required methods:
+  `open_flowing_member`, `flowing_source_opening` and
+  `flowing_member_opening`. Implementors must provide atomic member/source
+  opening and reads of the original immutable opening receipts.
+  `source_review::ReviewError` gained `Stale(String)` for evidence tied to a
+  superseded revision; exhaustive matches must handle it. The exported
+  `flowing_fence::SCHEMA` array now has five entries instead of two.
+  `FlowingGateCertificate` and `NativeGatePlan` gained a required Rust
+  `coverage` field. `FlowingAdmissions` gained required
+  `record_flowing_coverage_premises` and `flowing_coverage_premises` methods.
+  Implementors must provide the trusted premise writer and current-premise
+  reader. `FlowingAdmissionRefusal` gained `CoverageUnavailable`,
+  `CoverageStale`, `CoverageScopeUnknown` and `CoverageOwnerUnvalidated`,
+  changing the discriminants of later variants. The exported
+  `flowing_admission::SCHEMA` array now has twelve entries instead of nine.
+- `whipplescript-kernel`: `ResultExplanation` gained `support`; `ReasonCode`
+  gained `WaitingCapacity`, `WaitingBackoff`, `MissingConfiguration`,
+  `MissingAuthority`, `StaleSupport`, `InadequateSupport` and
+  `ConflictedSupport`; `NextActionCode` gained `InspectOperationBlock`.
+  These enum insertions change later discriminants, and `ReasonCode`'s
+  derived ordering changes with its variant positions.
+
+- Breaking for embedding hosts: `GovernedHostFacade` now refuses hosted
+  program opens, changed-IR re-attestation, and ordinary and materialized
+  host-action admission unless the host's shipped standard registry is
+  configured, with "... requires the host's shipped standard registry". Before,
+  an unconfigured facade admitted with no construct witness. An embedding host
+  must call
+  `.with_embedded_std_manifests(whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS)`
+  on its facade, or pass an explicit empty set if it ships no standard
+  vocabulary. This needs a middle-number release.
+
+Dependents constructing `ResultExplanation` literals must supply `support`.
+Struct literals for `FlowingGateCertificate` and `NativeGatePlan` must supply
+`coverage`; deserialization of older data still defaults it to `None`, which
+does not satisfy the new admission requirement.
+Exhaustive matches on these enums must handle the new variants; code relying
+on their numeric casts or `ReasonCode` ordering must follow the new layout.
+Automation that relied on query side effects must invoke bootstrap explicitly
+before querying a missing store, or when enrolling a checkout or repairing
+discovery.
+
+Embedding hosts must declare their actual shipped registry before admission;
+`.with_embedded_std_manifests(&[])` is only a truthful declaration for a host
+that ships no standard vocabulary. It does not supply registrations required
+by a program using the standard library. The exact compiler artifact digest
+remains required. Existing retained witnesses are not rewritten to invent
+classes that were never examined.
+
+The native branch satellite schema advances from 11 to 18, and the source
+review satellite schema from 3 to 4. Opening these authorities through their
+normal writable APIs migrates them to retain immutable flowing opening
+receipts, carried-cut roots, pending-close fences, parked-member and final-close
+receipts, complete abandonment indexes, and content-bound review findings and
+approvals. Older binaries
+refuse the newer satellite schema; use the upgraded version for those
+migrated authorities.
+
+- Flowing member creation and source-fence opening commit in one authority
+  transaction. Exact retries read immutable member and source opening
+  receipts, so later head, authority or fence changes do not alter the
+  original result. Sources opened before immutable receipts were introduced
+  retain their established current-state retry fallback. Native and Durable
+  Object realizations share this behavior. New body-free host readers expose
+  source/member opening and parking evidence without disclosing unit bodies.
+
+- Flowing admission now checks the reference-coverage premise vector against
+  the gate plan before checks, before issuing a certificate, and again in the
+  native or hosted ref transaction. Missing coverage on prior certificates,
+  or absent recorded premises, refuses admission. Coverage-bearing
+  certificates use the v4 handle domain; legacy handle identities are retained
+  for older certificates without coverage. A trusted coverage authority must
+  record current premises and supply a matching candidate-specific basis;
+  `None` or a missing claim does not bypass this fence; a no-edge query over
+  an incomplete roster does not establish complete coverage.
+  Unknown and bounded scopes require the specified owners' validation at the
+  current graph epoch. This is the RC-5 store slice: no production RC-4 issuer
+  yet derives the vector, graph or owner set. It does not replace conservative
+  source-unit closure or the separate historical instance and bark-chip pin
+  obligations.
+
+- Native source review findings bind the exact revision, manifest, path, blob
+  digest and line range; approvals bind the exact revision and manifest.
+  A finding remains current when the latest revision retains the same blob
+  at its path; otherwise it is stale. An approval is stale after any later
+  revision. Native revisions, findings and approvals are append-only. These
+  storage APIs do not authenticate a network caller.
+
+- The unscoped versioned-save adapter now reports a reconcilable recovery
+  ceiling and exposes disposition observations backed by the actual save
+  binding. The
+  scoped adapter remains `Unverifiable` and refuses unscoped disposition
+  observations. The default `FileStore::recovery_ceiling` is `Unverifiable`;
+  wrappers must forward a qualified adapter's declaration to retain it. This does not activate a
+  consumer's capability dispatch or grant authority to perform I/O.
+
+- Obsolete release, archive smoke, crate publication and production canary
+  GitHub Actions workflows are removed. The existing fleet release and
+  scheduled canary lanes own those duties; tags do not trigger a workflow.
+
+- Tracker discovery retires obsolete views and staging directories by rename,
+  then deletes them after releasing the database writer and publication locks.
+  A slow cleanup no longer blocks another tracker writer; interrupted cleanup
+  is recovered without removing unrelated directories.
+
+- Tracker queries now read a single committed, read-only SQLite snapshot and
+  remain available while a writer publishes discovery. Queries no longer
+  initialize a missing store, enroll a checkout or repair generated views.
+  Run `whip issue bootstrap` explicitly for plain native tracker setup and
+  recovery; mutations still enroll and publish synchronously. Readiness and
+  lease overlays share one query boundary instant (DR-0196).
+
+- `whip auth set openai-generic <base-url> <key>` stores a key for one
+  OpenAI-compatible endpoint, under its base URL, and a call to that endpoint
+  uses it after `OPENAI_API_KEY` and before the stored `openai` key.
+  `whip auth status` lists each stored endpoint redacted, and the new
+  `whip auth clear` removes a stored credential (WS-297).
+
+- The hosted Durable Object runtime admits, executes and reads back governed
+  host actions through its Worker (DR-0197). Proofs verify against action
+  authorities the deployment pins in `WHIP_ACTION_TRUST`; without it every
+  action route refuses.
+
+- `GovernedHostFacade::revalidate_retained_constructs` judges retained
+  construct and declaration witnesses against the host's current shipped
+  registry and compiler artifact. Registry or provider-source drift makes an
+  edge `Unknown`; an unexamined class stays unknown. The exported
+  `construct_revalidation` module supplies the current basis and standing
+  types. This is not a complete Home-wide reference-coverage claim.
+
+- External `signal.emit` and legacy `event.emit` handlers use fresh observed
+  dispatch. An existing run-start cannot authorize another sink operation.
+  First-attempt identities are preserved; a separately admitted retry has
+  distinct run, lease, terminal and fact identities. The governed-operation
+  inventory checks each handler family's dispatch classification; families
+  still using reattachable starts continue to refuse action instances.
+
+- `SignalDeliveryAuthority` and
+  `GovernedHostFacade::execute_action_signal_effect` supply the governed
+  directed-signal execution door. It verifies current execution authority and
+  the observed effect, then authorizes the actual target instance and signal
+  before consuming the single-use dispatch grant. Target-side delivery uses
+  an attempt-independent identity. The legacy `event.emit` is not an
+  admissible action effect. This adds no automatic retry, production product
+  binding or blanket non-file migration.
+
+- **Embedding-host Rust API and action readers.** `HostActionCommand` and
+  `ActionAdmissionReceipt` gained optional `anchor` fields, and
+  `ActionResultSnapshot` gained optional `footprint`; Rust struct literals must
+  supply them. Absent fields retain the original unanchored wire/signing bytes.
+  Use the immutable host-action V7 contract and negotiate
+  `whipplescript.action-result.v4` for anchored reads and footprints. V1/V2
+  readers refuse anchored actions; V4 uses its own NUL-terminated signing domain.
+  An anchor is attribution, not proof of a currently held claim; unsigned
+  counts that decode structurally are not runtime observations.
+
+- **Flowing store implementors.** `BranchStatus` gained `Parked` and `Closed`;
+  exhaustive matches must handle both. `FlowingFence` additionally requires
+  `flowing_close_request`. `FlowingAdmissions` additionally requires
+  `configure_flowing_gate_issuer`, `flowing_gate_trusted_issuers`,
+  `record_flowing_gate_signature` and `flowing_gate_signatures`.
+  `FlowingAdmissionRefusal` and `FlowingAttemptFinishRefusal` gained `GateIssuer`,
+  and `FlowingAdmissionRefusal::SourceNotDirectTwig` is replaced by
+  `SourceKindMismatch`; update exhaustive matches and avoid old discriminants.
+  Trusted issuer configuration is operator authority, not a grant to a gate
+  worker. Signatures must verify against the current configured root again
+  under the ref CAS. New `FlowingFinalClose`, `FlowingMemberParking` and
+  `FlowingAbandonments` interfaces retain their exact immutable receipts;
+  closing or parked sources do not become writable after a retry.
+  Rust literals for `FlowingCloseUnit` must supply `handoff_op_id`,
+  `FlowingCloseMember` must supply `parked`, and `FlowingCloseRoster` must
+  supply `source_parent_branch_id`, `source_branch_point_cut_id`,
+  `close_request` and `live_attempts`; read them from actual retained history
+  rather than inventing a complete close roster.
+  Carried cuts and authenticated peer lines retain manifests and source
+  closure; a named-branch prefix still requires the actual validated gate
+  basis and does not admit an arbitrary ancestor or peer.
+
+- **Governance import and parser dependency.** The workspace now publishes
+  `whipplescript-hjson`, the owned full HJSON parser exposed under the
+  `deser_hjson` library name. The store dependency uses the Cargo alias
+  `deser-hjson` with `package = "whipplescript-hjson"`; update a direct
+  dependency by package identity rather than assuming the old third-party
+  crate. Trailing malformed input is refused. The new signed governance
+  preparation/import API pins immutable source history and mapping revisions,
+  admits and records exact retries atomically on Native and DO stores, and
+  keeps imported chronology distinct from effective authenticated evidence or
+  explicit adoption. `ImportReport` gained `concurrent_claims`; Rust literals
+  must supply it and consumers must distinguish an advisory from writer
+  authority. It does not automatically adopt Company governance.
+
+- **Checkpoint adapters.** The new paired capture API returns the retained
+  cut and original position payload together. Existing unpaired callers stay
+  supported; wrappers supporting paired capture must forward the atomic bridge,
+  since unsupported adapters refuse instead of appending a position first.
+  Coordinate read failures refuse before capture. Historical orphan events are
+  retained as history rather than projected as completed checkpoint pairs.
+
+- **Admission and compiler migration.** Native signal, resident ingress and
+  local-message delivery now run the settled authority-only admission check,
+  including for legacy retained instances. Current import/construct basis
+  includes the actual shipped registry and provider-source identity.
+  `CurrentImportBasis` replaces `constructs` and `declarations` with
+  `construct_basis`; update Rust literals and supply the independently current
+  `CurrentConstructBasis`, not copied retained declarations. Do not
+  invent missing retained witnesses or reuse an old run-start as a new grant.
+  The provider wire contract is declared data shared by native and Worker
+  clients; custom callers must select an actually supported declared wire.
+  Programs relying on omitted optional fields being treated as present must
+  handle `None`; coerce calls require the declared argument types and arity.
+  Opened plaintext remains process-local, and an opened region still requires
+  envelope identity derivation for sealing; a constant or declassified value
+  does not supply that authority.
+
 - Authored `seal ... with ... as ...` actions now wrap the resolved value and
   resume their continuation, including when the construct slots span lines.
   In an opened region, sealing requires envelope identity derivation;
@@ -58,39 +286,6 @@ next free number rather than a patch — it says so.
 - Optional-field presence proofs retain their binding or query-row identity. A proof for one row no longer authorizes another, and implicit query fields accept the same presence forms as qualified fields.
 
 - Map indexes accept fields with literal-string and literal-string-union key types, alongside ordinary strings. Invalid keys now produce one compatibility diagnostic.
-
-- Tracker discovery retires obsolete views and staging directories by rename,
-  then deletes them after releasing the database writer and publication locks.
-  A slow cleanup no longer blocks another tracker writer; interrupted cleanup
-  is recovered without removing unrelated directories.
-
-- Tracker queries now read a single committed, read-only SQLite snapshot and
-  remain available while a writer publishes discovery. Queries no longer
-  initialize a missing store, enroll a checkout or repair generated views.
-  Run `whip issue bootstrap` explicitly for plain native tracker setup and
-  recovery; mutations still enroll and publish synchronously. Readiness and
-  lease overlays share one query boundary instant (DR-0196).
-
-- `whip auth set openai-generic <base-url> <key>` stores a key for one
-  OpenAI-compatible endpoint, under its base URL, and a call to that endpoint
-  uses it after `OPENAI_API_KEY` and before the stored `openai` key.
-  `whip auth status` lists each stored endpoint redacted, and the new
-  `whip auth clear` removes a stored credential (WS-297).
-
-- The hosted Durable Object runtime admits, executes and reads back governed
-  host actions through its Worker (DR-0197). Proofs verify against action
-  authorities the deployment pins in `WHIP_ACTION_TRUST`; without it every
-  action route refuses.
-
-- Breaking for embedding hosts: `GovernedHostFacade` now refuses hosted
-  program opens, changed-IR re-attestation, and ordinary and materialized
-  host-action admission unless the host's shipped standard registry is
-  configured, with "... requires the host's shipped standard registry". Before,
-  an unconfigured facade admitted with no construct witness. An embedding host
-  must call
-  `.with_embedded_std_manifests(whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS)`
-  on its facade, or pass an explicit empty set if it ships no standard
-  vocabulary. This needs a middle-number release.
 
 - Bare builtin schema triggers now require the same real schema producer or
   workflow input as explicit fact triggers, unless the rule is `@external`.

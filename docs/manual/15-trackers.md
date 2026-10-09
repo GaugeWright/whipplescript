@@ -44,8 +44,11 @@ arm. The compiler names the arms that are absent.
 
 ## Finding work through ordinary search
 
-In a Git checkout, a native `whip issue` invocation automatically enrolls the
-checkout for discovery from its plain local store. The store then maintains
+In a Git checkout, native tracker mutation commands automatically enroll the
+checkout for discovery from its plain local store. Canonical queries read one
+committed snapshot and do not enroll or repair a checkout. Use
+`whip issue bootstrap` for explicit writable discovery setup and recovery.
+The store then maintains
 `tracker/initiatives/<id>.hjson` and `tracker/tasks/<id>.hjson` whenever native
 writers change work. Each initiative file contains its full member records;
 task files also expose work that belongs to no initiative. These are JSON,
