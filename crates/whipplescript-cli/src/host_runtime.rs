@@ -303,6 +303,29 @@ pub trait ResourceResolver {
         Ok(())
     }
 
+    /// Let the embedding Home hold its short admission exclusion while the
+    /// first turn effect is committed. The callback must invoke `start` once;
+    /// the default keeps ordinary runtime callers on the same path. No model
+    /// transport or tool work occurs inside this callback.
+    fn with_turn_start_admission(
+        &self,
+        _command: &StartTurnCommand,
+        start: &mut dyn FnMut() -> Result<(), HostRuntimeError>,
+    ) -> Result<(), HostRuntimeError> {
+        start()
+    }
+
+    /// Revalidate current embedding authority for an exact retry of a turn
+    /// whose first effect already exists. The callback may finish retained
+    /// target evidence, but model and tool work follows after it returns.
+    fn with_turn_reuse_admission(
+        &self,
+        _command: &StartTurnCommand,
+        reuse: &mut dyn FnMut() -> Result<(), HostRuntimeError>,
+    ) -> Result<(), HostRuntimeError> {
+        reuse()
+    }
+
     /// Hold embedding-owned current approval through the borrowed, one-use
     /// native send. Clamp its positive duration to the remaining authority
     /// allowance. The owner retains the response; the hook cannot fabricate it.
@@ -4256,6 +4279,7 @@ impl GovernedHostRuntime {
         let resources = access.resources;
         access.check()?;
         if let Some(execution) = self.stored_execution(command)? {
+            admit_reused_turn(command, resources, &mut || access.check())?;
             access.check()?;
             return Ok(execution);
         }
@@ -4283,49 +4307,75 @@ impl GovernedHostRuntime {
             Some(effect) => {
                 validate_recorded_turn_input(effect, command)?;
                 if is_terminal_effect(&effect.status) {
-                    let execution = self.finish_execution(command)?;
+                    let mut execution = None;
+                    admit_reused_turn(command, resources, &mut || {
+                        access.check()?;
+                        execution = Some(self.finish_execution(command)?);
+                        Ok(())
+                    })?;
                     access.check()?;
-                    return Ok(execution);
+                    return Ok(execution.expect("reuse callback completed"));
                 }
                 true
             }
             None => {
                 access.check()?;
-                self.kernel
-                    .commit_rule(RuleCommit {
-                        instance_id: &command.instance_ref,
-                        rule: "host.turn",
-                        trigger_event_id: None,
-                        facts: &[],
-                        consumed_fact_ids: &[],
-                        effects: &[NewEffect {
-                            effect_id: &command.command_id,
-                            kind: "agent.tell",
-                            target: Some(&package.agent),
-                            input_json: &command_json,
-                            status: "queued",
-                            idempotency_key: &idempotency_key(&[
+                let mut invoked = false;
+                let mut committed = false;
+                let mut duplicate = false;
+                let mut start = || {
+                    if invoked {
+                        duplicate = true;
+                        return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                            "turn start admission invoked twice",
+                        )));
+                    }
+                    invoked = true;
+                    access.check()?;
+                    self.kernel
+                        .commit_rule(RuleCommit {
+                            instance_id: &command.instance_ref,
+                            rule: "host.turn",
+                            trigger_event_id: None,
+                            facts: &[],
+                            consumed_fact_ids: &[],
+                            effects: &[NewEffect {
+                                effect_id: &command.command_id,
+                                kind: "agent.tell",
+                                target: Some(&package.agent),
+                                input_json: &command_json,
+                                status: "queued",
+                                idempotency_key: &idempotency_key(&[
+                                    &command.instance_ref,
+                                    &command.command_id,
+                                    "host-turn-effect",
+                                ]),
+                                required_capabilities_json: "[]",
+                                profile: None,
+                                correlation_id: Some(&command.run_ref),
+                                source_span_json: None,
+                                timeout_seconds: None,
+                            }],
+                            dependencies: &[],
+                            terminal: None,
+                            idempotency_key: Some(&idempotency_key(&[
                                 &command.instance_ref,
                                 &command.command_id,
-                                "host-turn-effect",
-                            ]),
-                            required_capabilities_json: "[]",
-                            profile: None,
-                            correlation_id: Some(&command.run_ref),
-                            source_span_json: None,
-                            timeout_seconds: None,
-                        }],
-                        dependencies: &[],
-                        terminal: None,
-                        idempotency_key: Some(&idempotency_key(&[
-                            &command.instance_ref,
-                            &command.command_id,
-                            "host-turn-commit",
-                        ])),
-                        marks: &[],
-                        context_json: None,
-                    })
-                    .map_err(HostRuntimeError::Store)?;
+                                "host-turn-commit",
+                            ])),
+                            marks: &[],
+                            context_json: None,
+                        })
+                        .map_err(HostRuntimeError::Store)?;
+                    committed = true;
+                    Ok(())
+                };
+                resources.with_turn_start_admission(command, &mut start)?;
+                if !committed || duplicate {
+                    return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                        "turn start admission omitted or repeated the durable effect",
+                    )));
+                }
                 false
             }
         };
@@ -4461,6 +4511,9 @@ impl GovernedHostRuntime {
             inner: driver,
             access,
         };
+        if resumed_effect {
+            admit_reused_turn(command, resources, &mut || access.check())?;
+        }
         self.kernel
             .run_brokered_agent_turn(
                 &BrokeredTurnContext {
@@ -5385,6 +5438,35 @@ fn validate_recorded_turn_input(
 }
 
 const LIVE_ACCESS_REFUSED: &str = "host turn access ended";
+
+fn admit_reused_turn<R: ResourceResolver + ?Sized>(
+    command: &StartTurnCommand,
+    resources: &R,
+    reuse: &mut dyn FnMut() -> Result<(), HostRuntimeError>,
+) -> Result<(), HostRuntimeError> {
+    let mut invoked = false;
+    let mut succeeded = false;
+    let mut duplicate = false;
+    let mut once = || {
+        if invoked {
+            duplicate = true;
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "turn reuse admission invoked twice",
+            )));
+        }
+        invoked = true;
+        reuse()?;
+        succeeded = true;
+        Ok(())
+    };
+    resources.with_turn_reuse_admission(command, &mut once)?;
+    if !succeeded || duplicate {
+        return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+            "turn reuse admission omitted or repeated exact reuse",
+        )));
+    }
+    Ok(())
+}
 
 struct LiveTurnAccess<'a, R: ResourceResolver + ?Sized> {
     resources: &'a R,
@@ -6960,6 +7042,252 @@ workflow UnsafeHostChat {
             }
             Ok("private tool result".into())
         }
+    }
+
+    #[test]
+    fn product_writer_encloses_first_durable_turn_effect_and_refusal_leaves_none() {
+        struct StartAdmission {
+            writer: rusqlite::Connection,
+            product_path: std::path::PathBuf,
+            expected_command: RefCell<String>,
+            allowed: Cell<bool>,
+            live_allowed: Cell<bool>,
+            invoke_start: Cell<bool>,
+            invoke_reuse: Cell<bool>,
+            invoke_reuse_twice: Cell<bool>,
+            invoke_twice: Cell<bool>,
+            swallow_start_error: Cell<bool>,
+            starts: Cell<usize>,
+            reuses: Cell<usize>,
+        }
+        impl ResourceResolver for StartAdmission {
+            fn check_live_access(&self) -> Result<(), String> {
+                self.live_allowed
+                    .get()
+                    .then_some(())
+                    .ok_or_else(|| "Home current access refused".into())
+            }
+
+            fn with_turn_start_admission(
+                &self,
+                command: &StartTurnCommand,
+                start: &mut dyn FnMut() -> Result<(), HostRuntimeError>,
+            ) -> Result<(), HostRuntimeError> {
+                assert_eq!(command.command_id, *self.expected_command.borrow());
+                if !self.allowed.get() {
+                    return Err(HostRuntimeError::Resolver(
+                        "Home current basis refused start".into(),
+                    ));
+                }
+                if !self.invoke_start.get() {
+                    return Ok(());
+                }
+                self.writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let competing = rusqlite::Connection::open(&self.product_path).unwrap();
+                competing.busy_timeout(Duration::ZERO).unwrap();
+                assert_eq!(
+                    competing
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                self.starts.set(self.starts.get() + 1);
+                let result = if self.swallow_start_error.get() {
+                    self.live_allowed.set(false);
+                    let _ = start();
+                    Ok(())
+                } else {
+                    start().and_then(|()| {
+                        if self.invoke_twice.get() {
+                            start()
+                        } else {
+                            Ok(())
+                        }
+                    })
+                };
+                self.writer
+                    .execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+                    .unwrap();
+                result
+            }
+            fn with_turn_reuse_admission(
+                &self,
+                command: &StartTurnCommand,
+                reuse: &mut dyn FnMut() -> Result<(), HostRuntimeError>,
+            ) -> Result<(), HostRuntimeError> {
+                assert_eq!(command.command_id, *self.expected_command.borrow());
+                if !self.allowed.get() {
+                    return Err(HostRuntimeError::Resolver(
+                        "Home current basis refused reuse".into(),
+                    ));
+                }
+                if !self.invoke_reuse.get() {
+                    return Ok(());
+                }
+                self.writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let competing = rusqlite::Connection::open(&self.product_path).unwrap();
+                competing.busy_timeout(Duration::ZERO).unwrap();
+                assert_eq!(
+                    competing
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                self.reuses.set(self.reuses.get() + 1);
+                let result = reuse().and_then(|()| {
+                    if self.invoke_reuse_twice.get() {
+                        reuse()
+                    } else {
+                        Ok(())
+                    }
+                });
+                self.writer
+                    .execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
+                    .unwrap();
+                result
+            }
+            fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+                unreachable!()
+            }
+            fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+
+        let path = temp_store();
+        let product_path = path.with_extension("start-product.sqlite");
+        let writer = rusqlite::Connection::open(&product_path).unwrap();
+        writer
+            .execute_batch("CREATE TABLE basis (version INTEGER)")
+            .unwrap();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.into(),
+            request_id: "start-admission-open".into(),
+            package_version_ref: "package:v1".into(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).unwrap();
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let resources = StartAdmission {
+            writer,
+            product_path: product_path.clone(),
+            expected_command: RefCell::new(command.command_id.clone()),
+            allowed: Cell::new(false),
+            live_allowed: Cell::new(true),
+            invoke_start: Cell::new(false),
+            invoke_reuse: Cell::new(false),
+            invoke_reuse_twice: Cell::new(false),
+            invoke_twice: Cell::new(false),
+            swallow_start_error: Cell::new(false),
+            starts: Cell::new(0),
+            reuses: Cell::new(0),
+        };
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(vec![
+            json!({"output_text":"admitted"}),
+            json!({"output_text":"resumed"}),
+        ]);
+        assert!(runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .is_err());
+        assert!(runtime
+            .kernel
+            .store()
+            .list_effects(&instance.instance_ref)
+            .unwrap()
+            .is_empty());
+        assert!(driver.requests.borrow().is_empty());
+        resources.allowed.set(true);
+        let omitted = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(omitted
+            .to_string()
+            .contains("omitted or repeated the durable effect"));
+        assert!(runtime
+            .kernel
+            .store()
+            .list_effects(&instance.instance_ref)
+            .unwrap()
+            .is_empty());
+        resources.invoke_start.set(true);
+        resources.swallow_start_error.set(true);
+        let swallowed = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(swallowed
+            .to_string()
+            .contains("omitted or repeated the durable effect"));
+        assert!(runtime
+            .kernel
+            .store()
+            .list_effects(&instance.instance_ref)
+            .unwrap()
+            .is_empty());
+        resources.live_allowed.set(true);
+        resources.swallow_start_error.set(false);
+        runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap();
+        assert_eq!(resources.starts.get(), 2);
+        assert_eq!(driver.requests.borrow().len(), 1);
+        resources.allowed.set(false);
+        let refused = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(refused.to_string().contains("refused reuse"));
+        resources.allowed.set(true);
+        let omitted = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(omitted
+            .to_string()
+            .contains("omitted or repeated exact reuse"));
+        resources.invoke_reuse.set(true);
+        runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap();
+        assert_eq!(resources.reuses.get(), 1);
+        assert_eq!(driver.requests.borrow().len(), 1);
+        resources.invoke_reuse_twice.set(true);
+        let duplicate = runtime
+            .run_turn_with_driver(&command, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("reuse admission invoked twice"));
+        resources.invoke_reuse_twice.set(false);
+        let second = turn(&instance.instance_ref, &open.policy, 2);
+        resources
+            .expected_command
+            .replace(second.command_id.clone());
+        resources.invoke_twice.set(true);
+        let error = runtime
+            .run_turn_with_driver(&second, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(error.to_string().contains("invoked twice"));
+        assert_eq!(driver.requests.borrow().len(), 1);
+        resources.invoke_twice.set(false);
+        resources.allowed.set(false);
+        let refused = runtime
+            .run_turn_with_driver(&second, &Packages, &secrets, &resources, &driver)
+            .unwrap_err();
+        assert!(refused.to_string().contains("refused reuse"));
+        assert_eq!(driver.requests.borrow().len(), 1);
+        resources.allowed.set(true);
+        runtime
+            .run_turn_with_driver(&second, &Packages, &secrets, &resources, &driver)
+            .unwrap();
+        assert_eq!(resources.reuses.get(), 3);
+        assert_eq!(driver.requests.borrow().len(), 2);
+        drop(runtime);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(product_path).unwrap();
     }
 
     #[test]
