@@ -9,6 +9,8 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde::Deserialize;
 use ureq::OrAnyStatus;
 use zeroize::Zeroizing;
@@ -16,9 +18,9 @@ use zeroize::Zeroizing;
 const API_VERSION: &str = "2025-07-01";
 const MAX_VAULT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IDENTITY_RESPONSE_BYTES: usize = 64 * 1024;
-// The backing adapter's conservative UTF-8 byte ceiling matches the hosted
-// intake adapter. It is not yet a customer-facing GaugeVault value contract.
-const MAX_SECRET_VALUE_BYTES: usize = 25 * 1024;
+// GaugeWright DR-0241: 18,750 opaque bytes encode to at most 25,000 bytes.
+const MAX_SECRET_VALUE_BYTES: usize = 18_750;
+const MAX_ENCODED_SECRET_VALUE_BYTES: usize = MAX_SECRET_VALUE_BYTES / 3 * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -35,6 +37,7 @@ pub(crate) enum Error {
     MismatchedReference,
     DisabledVersion,
     SecretTooLarge,
+    InvalidValueEncoding,
 }
 
 impl fmt::Display for Error {
@@ -58,13 +61,6 @@ impl SecretMaterial {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
-
-    fn validate_for_use(&self) -> Result<(), Error> {
-        if self.0.len() > MAX_SECRET_VALUE_BYTES {
-            return Err(Error::SecretTooLarge);
-        }
-        Ok(())
-    }
 }
 
 impl fmt::Debug for SecretMaterial {
@@ -76,6 +72,45 @@ impl fmt::Debug for SecretMaterial {
 impl<'de> Deserialize<'de> for SecretMaterial {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// Opaque credential bytes; distinct from the textual Azure bearer/header.
+pub(crate) struct SecretValue(Zeroizing<Vec<u8>>);
+
+impl SecretValue {
+    pub(crate) fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretValue(<redacted>)")
+    }
+}
+
+/// The Key Vault JSON field remains zeroizing until canonical base64 decoding.
+struct EncodedSecretValue(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for EncodedSecretValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+impl EncodedSecretValue {
+    fn decode(self) -> Result<SecretValue, Error> {
+        if self.0.len() > MAX_ENCODED_SECRET_VALUE_BYTES {
+            return Err(Error::SecretTooLarge);
+        }
+        let bytes = BASE64_STANDARD
+            .decode(self.0.as_bytes())
+            .map_err(|_| Error::InvalidValueEncoding)?;
+        // STANDARD rejects noncanonical padding and trailing bits. At most
+        // 25,000 encoded bytes can decode to at most 18,750 raw bytes, so the
+        // encoded guard above also enforces the raw-value ceiling.
+        Ok(SecretValue(Zeroizing::new(bytes)))
     }
 }
 
@@ -396,7 +431,7 @@ impl<T: VaultToken, H: VaultHttp> FinalUseReader<T, H> {
         expected_prefix: &AccountPrefix,
         name: &StorageName,
         reference: &VersionReference,
-    ) -> Result<SecretMaterial, Error> {
+    ) -> Result<SecretValue, Error> {
         if name.account_prefix() != expected_prefix.0 {
             return Err(Error::WrongAccount);
         }
@@ -416,7 +451,7 @@ impl<T: VaultToken, H: VaultHttp> FinalUseReader<T, H> {
         #[derive(Deserialize)]
         struct Reply {
             id: String,
-            value: Option<SecretMaterial>,
+            value: Option<EncodedSecretValue>,
             attributes: Attributes,
         }
         let parsed: Reply = serde_json::from_str(&body).map_err(|_| Error::MalformedResponse)?;
@@ -426,9 +461,7 @@ impl<T: VaultToken, H: VaultHttp> FinalUseReader<T, H> {
         if parsed.attributes.enabled != Some(true) {
             return Err(Error::DisabledVersion);
         }
-        let material = parsed.value.ok_or(Error::MalformedResponse)?;
-        material.validate_for_use()?;
-        Ok(material)
+        parsed.value.ok_or(Error::MalformedResponse)?.decode()
     }
 }
 
@@ -526,7 +559,7 @@ mod tests {
             "enabled" => {
                 let material = reader.read_exact(&prefix, &name, &reference).unwrap();
                 assert!(
-                    material.expose() == "synthetic-gaugevault-custodian-proof",
+                    material.expose_bytes() == b"synthetic-gaugevault-custodian-proof",
                     "synthetic material differed"
                 );
             }
@@ -551,7 +584,7 @@ mod tests {
             &id(PREFIX),
         )
         .unwrap();
-        let body = serde_json::json!({"id": id(PREFIX), "value": "synthetic-secret",
+        let body = serde_json::json!({"id": id(PREFIX), "value": BASE64_STANDARD.encode(b"synthetic-secret"),
             "attributes": {"enabled": true}})
         .to_string();
         let reader = reader(200, body);
@@ -562,8 +595,8 @@ mod tests {
                 &reference,
             )
             .unwrap();
-        assert_eq!(material.expose(), "synthetic-secret");
-        assert_eq!(format!("{material:?}"), "SecretMaterial(<redacted>)");
+        assert_eq!(material.expose_bytes(), b"synthetic-secret");
+        assert_eq!(format!("{material:?}"), "SecretValue(<redacted>)");
         assert_eq!(
             reader.http.calls.lock().unwrap().as_slice(),
             &[format!("{}?api-version={API_VERSION}", id(PREFIX))]
@@ -599,7 +632,7 @@ mod tests {
         let prefix = AccountPrefix::parse(PREFIX).unwrap();
         let wrong = reader(
             200,
-            serde_json::json!({"id": id(OTHER), "value": "synthetic-secret",
+            serde_json::json!({"id": id(OTHER), "value": BASE64_STANDARD.encode(b"synthetic-secret"),
             "attributes": {"enabled": true}})
             .to_string(),
         );
@@ -609,7 +642,7 @@ mod tests {
         ));
         let disabled = reader(
             200,
-            serde_json::json!({"id": id(PREFIX), "value": "synthetic-secret",
+            serde_json::json!({"id": id(PREFIX), "value": BASE64_STANDARD.encode(b"synthetic-secret"),
             "attributes": {"enabled": false}})
             .to_string(),
         );
@@ -620,16 +653,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_version_read_enforces_the_backing_byte_ceiling() {
+    fn exact_version_read_decodes_binary_and_enforces_the_backing_byte_ceiling() {
         let vault = VaultName::parse("gv-test").unwrap();
         let name = name(PREFIX);
         let reference = VersionReference::parse(&vault, &name, &id(PREFIX)).unwrap();
         let prefix = AccountPrefix::parse(PREFIX).unwrap();
-        let at_limit = "é".repeat(MAX_SECRET_VALUE_BYTES / 2);
-        assert_eq!(at_limit.len(), MAX_SECRET_VALUE_BYTES);
+        let at_limit = vec![0xff; MAX_SECRET_VALUE_BYTES];
         let admitted = reader(
             200,
-            serde_json::json!({"id": id(PREFIX), "value": at_limit.clone(),
+            serde_json::json!({"id": id(PREFIX), "value": BASE64_STANDARD.encode(&at_limit),
                 "attributes": {"enabled": true}})
             .to_string(),
         );
@@ -637,13 +669,12 @@ mod tests {
             admitted
                 .read_exact(&prefix, &name, &reference)
                 .unwrap()
-                .expose()
-                .len(),
-            MAX_SECRET_VALUE_BYTES
+                .expose_bytes(),
+            at_limit
         );
         let over_limit = reader(
             200,
-            serde_json::json!({"id": id(PREFIX), "value": format!("{at_limit}é"),
+            serde_json::json!({"id": id(PREFIX), "value": BASE64_STANDARD.encode(vec![0xff; MAX_SECRET_VALUE_BYTES + 1]),
                 "attributes": {"enabled": true}})
             .to_string(),
         );
@@ -653,6 +684,26 @@ mod tests {
                 .unwrap_err(),
             Error::SecretTooLarge
         );
+    }
+
+    #[test]
+    fn exact_version_read_refuses_noncanonical_and_plaintext_values() {
+        let vault = VaultName::parse("gv-test").unwrap();
+        let name = name(PREFIX);
+        let reference = VersionReference::parse(&vault, &name, &id(PREFIX)).unwrap();
+        let prefix = AccountPrefix::parse(PREFIX).unwrap();
+        for encoded in ["synthetic-secret", "Zg==\n", "Zh==", "Zg="] {
+            let response = reader(
+                200,
+                serde_json::json!({"id": id(PREFIX), "value": encoded,
+                    "attributes": {"enabled": true}})
+                .to_string(),
+            );
+            assert_eq!(
+                response.read_exact(&prefix, &name, &reference).unwrap_err(),
+                Error::InvalidValueEncoding
+            );
+        }
     }
 
     #[test]
