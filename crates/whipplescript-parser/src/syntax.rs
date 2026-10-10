@@ -3369,7 +3369,17 @@ impl Parser<'_> {
         let provider = self.expect_ident("source provider")?;
         let is_clock = provider.name == "clock";
         if !self.consume_ident("as") {
-            self.expected("`as <name>` after the source provider");
+            let binding = match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::Ident(name)) => name.as_str(),
+                _ => "<name>",
+            };
+            self.unexpected_with(
+                format!(
+                    "`as <name>` to name the binding for `source {}`",
+                    provider.name
+                ),
+                Some(format!("write `source {} as {binding}`", provider.name)),
+            );
             return None;
         }
         let name = self.expect_ident("source name")?;

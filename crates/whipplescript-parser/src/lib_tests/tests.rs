@@ -18192,6 +18192,65 @@ test "bad predicate" {
 }
 
 #[test]
+fn source_missing_as_binding_names_the_construct_and_repairs_the_header() {
+    for provider in ["clock", "http"] {
+        let recurrence = if provider == "clock" {
+            "every 5m\n"
+        } else {
+            ""
+        };
+        let source = format!("workflow Demo\nsource {provider} daily_triage {{\n{recurrence}observe as tick\nemit triage.tick {{ }}\n}}");
+        let parsed = parse_program(&source);
+        let diagnostic = parsed.diagnostics.first().expect("missing as is refused");
+        assert_eq!(diagnostic.code.as_str(), "parse.unexpected_token");
+        assert_eq!(diagnostic.message, format!(
+            "expected `as <name>` to name the binding for `source {provider}`, found identifier `daily_triage`"
+        ));
+        assert_eq!(
+            &source[diagnostic.span.start..diagnostic.span.end],
+            "daily_triage"
+        );
+        assert_eq!(
+            diagnostic.suggestion.as_deref(),
+            Some(format!("write `source {provider} as daily_triage`").as_str())
+        );
+        assert_eq!(
+            diagnostic.suggestion.as_ref().unwrap().applicability,
+            Applicability::Manual
+        );
+        let repaired = source.replacen(" daily_triage", " as daily_triage", 1);
+        let repaired = parse_program(&repaired);
+        assert!(
+            repaired.diagnostics.is_empty(),
+            "{:?}",
+            repaired.diagnostics
+        );
+    }
+}
+
+#[test]
+fn source_missing_as_binding_keeps_the_end_of_file_span() {
+    let source = "workflow Demo\nsource clock";
+    let parsed = parse_program(source);
+    let diagnostic = parsed
+        .diagnostics
+        .first()
+        .expect("missing binding is refused");
+    assert_eq!(diagnostic.code.as_str(), "parse.unexpected_token");
+    assert_eq!(
+        diagnostic.span,
+        SourceSpan {
+            start: source.len(),
+            end: source.len()
+        }
+    );
+    assert_eq!(
+        diagnostic.message,
+        "expected `as <name>` to name the binding for `source clock`, found end of file"
+    );
+}
+
+#[test]
 fn source_clock_block_lowers_to_clock_source() {
     let source = r#"
 workflow ClockSource
