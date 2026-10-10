@@ -137,6 +137,10 @@ migrated authorities.
   GitHub Actions workflows are removed. The existing fleet release and
   scheduled canary lanes own those duties; tags do not trigger a workflow.
 
+- Admitted `web_fetch` requests no longer fail DNS resolution when the transport
+  checks the pinned destination. The resolver matches the checked host and port
+  while keeping the connection pinned to its approved IP address.
+
 - Tracker discovery retires obsolete views and staging directories by rename,
   then deletes them after releasing the database writer and publication locks.
   A slow cleanup no longer blocks another tracker writer; interrupted cleanup

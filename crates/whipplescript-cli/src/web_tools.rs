@@ -255,6 +255,33 @@ impl FetchOutcome {
     }
 }
 
+fn pinned_fetch_resolver(
+    target: &GuardedTarget,
+) -> impl Fn(&str) -> std::io::Result<Vec<SocketAddr>> + Send + Sync + 'static {
+    // ureq calls Resolver with host:port, including brackets for IPv6.
+    // Match that exact authority while returning only the already-checked IP.
+    let pinned_host = format!("{}:{}", target.host, target.address.port());
+    let pinned = target.address;
+    move |netloc: &str| {
+        if netloc.eq_ignore_ascii_case(&pinned_host) {
+            Ok(vec![pinned])
+        } else {
+            Err(std::io::Error::other(
+                "connection is pinned to the guarded host",
+            ))
+        }
+    }
+}
+
+fn pinned_fetch_agent(target: &GuardedTarget, policy: &FetchPolicy) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(policy.timeout)
+        .redirects(0)
+        .user_agent("whipplescript-web-fetch")
+        .resolver(pinned_fetch_resolver(target))
+        .build()
+}
+
 /// GET one URL through the guard: manual redirect loop (each hop re-guarded,
 /// connection pinned to the checked address), body streamed up to the byte
 /// cap, HTML converted to markdown, binary reduced to a metadata line.
@@ -262,22 +289,7 @@ pub fn web_fetch(raw_url: &str, policy: &FetchPolicy) -> Result<FetchOutcome, We
     let mut current = raw_url.to_owned();
     for _hop in 0..=policy.max_redirects {
         let target = guard_url(&current, policy)?;
-        let pinned_host = target.host.clone();
-        let pinned = target.address;
-        let agent = ureq::AgentBuilder::new()
-            .timeout(policy.timeout)
-            .redirects(0)
-            .user_agent("whipplescript-web-fetch")
-            .resolver(move |host: &str| {
-                if host.eq_ignore_ascii_case(&pinned_host) {
-                    Ok(vec![pinned])
-                } else {
-                    Err(std::io::Error::other(
-                        "connection is pinned to the guarded host",
-                    ))
-                }
-            })
-            .build();
+        let agent = pinned_fetch_agent(&target, policy);
         let response = match agent.get(target.url.as_str()).call() {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
@@ -719,6 +731,112 @@ mod tests {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pinned_fetch_resolver_matches_the_checked_host_and_port() {
+        for raw in [
+            "http://example.invalid/a",
+            "https://example.invalid/a",
+            "http://example.invalid:80/a",
+            "https://example.invalid:443/a",
+            "http://[2001:4860:4860::8888]/a",
+            "https://[2001:4860:4860::8888]:443/a",
+        ] {
+            let url = url::Url::parse(raw).expect("fixture URL");
+            let host = url.host_str().expect("host").to_owned();
+            let port = url.port_or_known_default().expect("port");
+            let ip = match url.host().expect("host") {
+                url::Host::Ipv6(ip) => IpAddr::V6(ip),
+                _ => "8.8.8.8".parse().expect("fixture IP"),
+            };
+            let address = SocketAddr::new(ip, port);
+            let target = GuardedTarget {
+                url,
+                host: host.clone(),
+                address,
+            };
+            let resolve = pinned_fetch_resolver(&target);
+            assert_eq!(
+                resolve(&format!("{host}:{port}")).expect("ureq netloc is admitted"),
+                vec![address]
+            );
+            assert_eq!(
+                resolve(&format!("{}:{port}", host.to_ascii_uppercase()))
+                    .expect("case-insensitive host"),
+                vec![address]
+            );
+            for other in [
+                host.clone(),
+                format!("{host}:{}", if port == 80 { 443 } else { 80 }),
+                format!("other.invalid:{port}"),
+            ] {
+                assert_eq!(
+                    resolve(&other)
+                        .expect_err("wrong netloc must be refused")
+                        .to_string(),
+                    "connection is pinned to the guarded host",
+                    "wrong netloc: {other}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_fetch_agent_connects_ureq_to_the_selected_address() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("read timeout");
+                        let mut request = Vec::new();
+                        let mut chunk = [0; 2048];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            let n = socket.read(&mut chunk).expect("request");
+                            assert!(n > 0 && request.len() + n <= 8192, "bounded HTTP headers");
+                            request.extend_from_slice(&chunk[..n]);
+                        }
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned").expect("response");
+                        return Some(String::from_utf8_lossy(&request).into_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        });
+        // Test-private guarded target: production always obtains it from guard_url,
+        // which unconditionally refuses loopback and off-policy ports.
+        let url = url::Url::parse(&format!("http://selected.invalid:{}/proof", address.port()))
+            .expect("fixture URL");
+        let target = GuardedTarget {
+            host: "selected.invalid".to_owned(),
+            url,
+            address,
+        };
+        let result = pinned_fetch_agent(&target, &open_policy())
+            .get(target.url.as_str())
+            .call();
+        let request = server.join().expect("fixture thread");
+        let response = result.expect("ureq must connect to the selected IP without DNS");
+        assert_eq!(response.into_string().expect("body"), "pinned");
+        let request = request.expect("selected loopback listener received the request");
+        assert!(request.starts_with("GET /proof HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains(&format!("host: selected.invalid:{}\r\n", address.port())));
     }
 
     /// The guard's unconditional denials: loopback, private ranges, the
