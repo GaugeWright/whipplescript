@@ -1468,6 +1468,333 @@ describe("real WorkflowInstance hibernation", () => {
     expect(lifecycle[lifecycle.length - 1]).toBe("tornDown");
   });
 
+  // DR-0049 §6 / gaugedesk ADR 0109 §7: the provider-credential canaries
+  // (ADR 0108) extended to collection recipient material. The runtime is handed
+  // recipient PUBLIC keys and produces, inside `sealArtifact`, a fresh data key,
+  // per-recipient ECDH secrets and wrapping keys. None of that may reach the
+  // model, a tool or command result, a browser message, a public event, a
+  // diagnostic, or storage that outlives the session; the public key is held in
+  // exactly one place — the session's own policy record — until teardown, and
+  // leaves only as the wrap address of the deposited artifact. The private half
+  // is never handed to the runtime at all, so it must appear nowhere.
+  it("keeps collection recipient material out of every runtime sink", async () => {
+    const recipient = COLLECTION_RECIPIENT_PUBLIC_KEY_HEX;
+    const recipientBytes = Uint8Array.from(
+      recipient.match(/../g)!.map((pair) => Number.parseInt(pair, 16)),
+    );
+    const encodings = (bytes: Uint8Array): string[] => {
+      const hexForm = [...bytes]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      const base64 = btoa(binary);
+      return [
+        hexForm,
+        hexForm.toUpperCase(),
+        base64,
+        base64.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, ""),
+      ];
+    };
+    // The public key in every encoding a leak would plausibly take, plus its
+    // bare X coordinate, which is what a compressed re-encoding would carry.
+    const publicForms = [
+      ...encodings(recipientBytes),
+      ...encodings(recipientBytes.slice(1, 33)),
+    ];
+    const privateForms = encodings(
+      Uint8Array.from(
+        COLLECTION_RECIPIENT_PRIVATE_SEED_HEX.match(/../g)!.map((pair) =>
+          Number.parseInt(pair, 16),
+        ),
+      ),
+    );
+    const leaked = (haystack: string, forms: string[]): string[] =>
+      forms.filter((form) => haystack.includes(form));
+
+    // A turn whose model calls the workspace tools and a command that prints
+    // its environment. The epoch below offers them, so each one runs with the
+    // recipient in scope (the collection is admitted before the turn), writes
+    // the exportable path, and returns its real result to the model in the
+    // continued round.
+    const toolCalls = [
+      ["write", { path: "notes.txt", content: "ordinary content" }],
+      ["read", { path: "notes.txt" }],
+      ["grep", { pattern: "ordinary" }],
+      ["find", { pattern: "*.txt" }],
+      ["ls", {}],
+      ["bash", { command: "env" }],
+    ] as const;
+    const expectedOutputs: Record<string, string> = {
+      write: "wrote 16 bytes to notes.txt",
+      read: "ordinary content",
+      grep: "notes.txt:1:ordinary content",
+      find: "notes.txt",
+      ls: "notes.txt",
+      bash: "HOME=/workspace",
+    };
+    let attempt = 0;
+    const providerBodies: string[] = [];
+    const providerFetch = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        attempt += 1;
+        providerBodies.push(String(init?.body ?? ""));
+        if (attempt === 1) {
+          const events = toolCalls.map(([name, args], index) =>
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: `collection-tool-${index}`,
+                name,
+                arguments: JSON.stringify(args),
+              },
+            })}`
+          );
+          events.push(
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                output: [],
+                usage: {
+                  input_tokens: 3,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: 1,
+                },
+              },
+            })}`,
+          );
+          return new Response(`${events.join("\n\n")}\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return new Response(
+          [
+            'data: {"type":"response.output_text.delta","delta":"collected"}',
+            "",
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":0},"output_tokens":1}}}',
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", providerFetch);
+    const logged: string[] = [];
+    for (const level of ["log", "info", "warn", "error", "debug"] as const) {
+      vi.spyOn(console, level).mockImplementation((...values) => {
+        logged.push(values.map(String).join(" "));
+      });
+    }
+
+    // An epoch that grants the workspace and command capabilities and governs
+    // the package's `project` and `command` handles, so the tools below run.
+    const envelope = await mintSignedEnvelope(
+      ["workspace.read", "workspace.write", "command.run"],
+      {
+        bindings: { project: "file_store:project", command: "command:bash" },
+        resources: {
+          "file_store:project": { reader: [], writer: [] },
+          "command:bash": { reader: [], writer: [] },
+        },
+      },
+    );
+    const sessionId = "session-collection-recipient-canary";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, true, {
+      exportable_paths: ["notes.txt"],
+      transcript_eligible: true,
+      schema_ref: "survey.v1",
+      recipient_class: "collection:tenant",
+      max_artifact_bytes: 1_000_000,
+      recipient_public_keys: [recipient],
+    }, envelope);
+    const socket = await openSocket(stub);
+    const closed = new Promise<CloseEvent>((resolve) =>
+      socket.addEventListener("close", resolve, { once: true }),
+    );
+    expect(await nextMessage(socket)).toMatchObject({
+      type: "session_ready",
+      sequence: 0,
+    });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-collection-canary",
+      text: "exercise tools",
+    }));
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 160; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+    expect(observed.some(({ type }) => type === "error")).toBe(false);
+    expect(providerFetch).toHaveBeenCalledTimes(2);
+    for (const [name] of toolCalls) {
+      expect(providerBodies[1], `missing ${name} result in the continued round`)
+        .toContain(`"name":"${name}"`);
+    }
+    // Every tool ran: its result is the real one, not a refusal.
+    const continued = JSON.parse(providerBodies[1]) as {
+      input: { type: string; call_id?: string; output?: string }[];
+    };
+    const outputs = Object.fromEntries(
+      continued.input
+        .filter((item) => item.type === "function_call_output")
+        .map((item) => [
+          toolCalls[Number(item.call_id!.replace("collection-tool-", ""))][0],
+          String(item.output),
+        ]),
+    );
+    for (const [name] of toolCalls) {
+      expect(outputs[name], `${name} did not run`).not.toContain("not offered");
+      expect(outputs[name], `${name} result`).toContain(expectedOutputs[name]);
+    }
+    const state = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(state.status, await state.clone().text()).toBe(200);
+    const browserState = await state.text();
+
+    // Model, tool and command results (both provider rounds carry them), the
+    // browser's stream and state, and diagnostics so far: no recipient material.
+    const liveSinks = {
+      model: providerBodies.join("\n"),
+      browser: `${JSON.stringify(observed)}\n${browserState}`,
+      diagnostics: logged.join("\n"),
+    };
+    for (const [sink, text] of Object.entries(liveSinks)) {
+      expect(leaked(text, publicForms), `recipient public key reached ${sink}`)
+        .toEqual([]);
+      expect(leaked(text, privateForms), `recipient private seed reached ${sink}`)
+        .toEqual([]);
+    }
+
+    // Storage while the session lives, which includes its public event log and
+    // the runtime's workspace, package and snapshots: the public key is held by
+    // the session's policy record and by nothing else.
+    const sessionRecord = await runInDurableObject(stub, async (_instance, durable) =>
+      durable.storage.get<Record<string, unknown>>("public-session-state")
+    );
+    // The write landed in the workspace, at the collection's exportable path.
+    const written = await runInDurableObject(stub, async (_instance, durable) =>
+      (durable.storage.sql
+        .exec("SELECT key, content FROM files")
+        .toArray() as { key: string; content: string }[])
+        .filter(({ key }) => key.endsWith("/notes.txt"))
+        .map(({ content }) => content)
+    );
+    expect(written).toEqual(["ordinary content"]);
+    const liveStorage = await durableStringValues(stub);
+    expect(liveStorage.filter((value) => leaked(value, publicForms).length > 0))
+      .toEqual([JSON.stringify(sessionRecord)]);
+    expect(leaked(liveStorage.join("\n"), privateForms)).toEqual([]);
+
+    // Record the secret material the sealer derives, so its absence can be
+    // asserted rather than assumed: the 32-byte data key, each ECDH secret, and
+    // each wrapping key (the digest whose preimage opens with the collection
+    // KDF domain).
+    vi.unstubAllGlobals();
+    const derived: Uint8Array[] = [];
+    const domain = new TextEncoder().encode("gaugewright/collection/ecies/v1");
+    const getRandomValues = crypto.getRandomValues.bind(crypto);
+    vi.spyOn(crypto, "getRandomValues").mockImplementation(((
+      array: ArrayBufferView,
+    ) => {
+      const filled = getRandomValues(array as Uint8Array);
+      if (filled instanceof Uint8Array && filled.byteLength === 32) {
+        derived.push(filled.slice());
+      }
+      return filled;
+    }) as typeof crypto.getRandomValues);
+    const subtle = crypto.subtle;
+    const deriveBits = subtle.deriveBits.bind(subtle);
+    vi.spyOn(subtle, "deriveBits").mockImplementation((async (
+      ...args: Parameters<SubtleCrypto["deriveBits"]>
+    ) => {
+      const bits = await deriveBits(...args);
+      derived.push(new Uint8Array(bits).slice());
+      return bits;
+    }) as SubtleCrypto["deriveBits"]);
+    const digest = subtle.digest.bind(subtle);
+    vi.spyOn(subtle, "digest").mockImplementation((async (
+      algorithm: AlgorithmIdentifier,
+      data: BufferSource,
+    ) => {
+      const output = await digest(algorithm, data);
+      const input = ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data);
+      if (
+        input.byteLength >= domain.byteLength &&
+        domain.every((byte, index) => input[index] === byte)
+      ) {
+        derived.push(new Uint8Array(output).slice());
+      }
+      return output;
+    }) as SubtleCrypto["digest"]);
+
+    await runInDurableObject(stub, async (_instance, durable) => {
+      const session = await durable.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      await durable.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await closed).toMatchObject({ code: 1001 });
+    vi.mocked(crypto.getRandomValues).mockRestore();
+    vi.mocked(subtle.deriveBits).mockRestore();
+    vi.mocked(subtle.digest).mockRestore();
+
+    // One data key, one ECDH secret and one wrapping key for the one recipient.
+    // Fewer means the capture missed the sealer and the assertions below would
+    // prove nothing.
+    expect(derived.length).toBeGreaterThanOrEqual(3);
+    const derivedForms = derived.flatMap(encodings);
+
+    const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const deployment = deployments.get(deployments.idFromName("theory-a-test"));
+    const deposit = await runInDurableObject(deployment, async (_i, durable) =>
+      durable.storage.get<Record<string, unknown>>(`collection:${sessionId}`)
+    );
+    const artifact = deposit!.artifact as {
+      wraps: { recipient_public_key: string }[];
+    };
+    // The deposit addresses the recipient and carries nothing else of it.
+    expect(artifact.wraps.map((wrap) => wrap.recipient_public_key))
+      .toEqual([recipient]);
+    const unaddressed = JSON.stringify({
+      ...artifact,
+      wraps: artifact.wraps.map(({ recipient_public_key: _, ...wrap }) => wrap),
+    });
+    expect(leaked(unaddressed, publicForms)).toEqual([]);
+    expect(leaked(JSON.stringify(deposit), privateForms)).toEqual([]);
+    expect(leaked(JSON.stringify(deposit), derivedForms)).toEqual([]);
+
+    // After teardown nothing in the session's storage, including the lifecycle
+    // log that survives it, and nothing in any diagnostic, holds recipient
+    // material of any kind.
+    const remaining = (await durableStringValues(stub)).join("\n");
+    expect(remaining).toContain('"tornDown"');
+    const afterSinks = {
+      storage: remaining,
+      diagnostics: logged.join("\n"),
+    };
+    for (const [sink, text] of Object.entries(afterSinks)) {
+      expect(leaked(text, publicForms), `recipient public key in ${sink}`)
+        .toEqual([]);
+      expect(leaked(text, privateForms), `recipient private seed in ${sink}`)
+        .toEqual([]);
+      expect(leaked(text, derivedForms), `sealing key material in ${sink}`)
+        .toEqual([]);
+    }
+  });
+
   it("refuses an oversized artifact definitively and deposits nothing", async () => {
     const sessionId = "session-collection-oversize";
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
