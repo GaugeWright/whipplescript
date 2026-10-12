@@ -11,6 +11,9 @@ export default defineConfig({
   ],
   test: {
     ...WORKERD_TEST_POOL,
+    // A real HTTP provider on loopback, for the faults a stubbed `fetch`
+    // cannot produce. See `scripts/provider-fault-fixture.mjs`.
+    globalSetup: ["./scripts/provider-fault-fixture.mjs"],
     include: [
       "src/session.integration.test.ts",
       "src/executor-broker.integration.test.ts",

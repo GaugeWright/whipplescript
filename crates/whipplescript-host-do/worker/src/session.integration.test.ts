@@ -11,7 +11,14 @@ import {
   runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, inject, it, onTestFinished, vi } from "vitest";
+
+declare module "vitest" {
+  export interface ProvidedContext {
+    /** Origin of `scripts/provider-fault-fixture.mjs`, on loopback. */
+    providerFaultFixtureOrigin: string;
+  }
+}
 import {
   COLLECTION_RECIPIENT_PRIVATE_SEED_HEX,
   COLLECTION_RECIPIENT_PUBLIC_KEY_HEX,
@@ -50,6 +57,7 @@ async function mintSignedEnvelope(
     resources?: Record<string, unknown>;
     epoch?: number;
     credentialRef?: string;
+    providerBaseUrl?: string;
   } = {},
 ) {
   const epoch = extra.epoch ?? 1;
@@ -86,7 +94,7 @@ async function mintSignedEnvelope(
     placements: { do: { kind: "durable_object", provider_bindings: ["model"] } },
     provider_bindings: {
       model: {
-        base_url: "https://api.openai.com/v1/responses",
+        base_url: extra.providerBaseUrl ?? "https://api.openai.com/v1/responses",
         credential_ref: extra.credentialRef ?? "managed-openai",
         model: "gpt-test",
         provider: "openai",
@@ -1169,6 +1177,152 @@ describe("real WorkflowInstance hibernation", () => {
     socket.close(1000, "done");
   });
 
+  it("keeps the injected provider credential out of an admitted command environment", async () => {
+    // The fabricated-call test above pins that `bash` is refused when the turn
+    // was not granted it. This is the other half: a turn that IS granted
+    // `command.run`, whose provider round really did carry the canary
+    // credential, runs every way a shell can read its environment, and the
+    // credential appears in none of what the command produced, what went back
+    // to the model, what the visitor saw, what was logged or what was stored.
+    const canary = "canary-provider-secret-must-not-persist";
+    const probes = [
+      "env",
+      "printenv",
+      "export -p",
+      "set",
+      'echo "[$OPENAI_API_KEY][$ANTHROPIC_API_KEY][$WHIP_EXECUTOR_TOKEN][$WHIP_PUBLIC_CONTROL_TOKEN]"',
+      "cat /proc/self/environ",
+      "env > env-dump.txt; cat env-dump.txt",
+    ];
+    const envelope = await mintSignedEnvelope(
+      ["command.run", "workspace.read", "workspace.write"],
+      {
+        bindings: { project: "file_store:project", command: "command:bash" },
+        resources: {
+          "file_store:project": { reader: [], writer: [] },
+          "command:bash": { reader: [], writer: [] },
+        },
+      },
+    );
+    const providerBodies: string[] = [];
+    const providerAuthorization: (string | null)[] = [];
+    const providerFetch = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        providerBodies.push(String(init?.body ?? ""));
+        providerAuthorization.push(new Headers(init?.headers).get("authorization"));
+        if (providerBodies.length === 1) {
+          const events = probes.map((command, index) =>
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: `probe-${index}`,
+                name: "bash",
+                arguments: JSON.stringify({ command }),
+              },
+            })}`
+          );
+          events.push(`data: ${JSON.stringify({
+            type: "response.completed",
+            response: {
+              output: [],
+              usage: {
+                input_tokens: 3,
+                input_tokens_details: { cached_tokens: 0 },
+                output_tokens: 1,
+              },
+            },
+          })}`);
+          return new Response(`${events.join("\n\n")}\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return new Response(
+          [
+            'data: {"type":"response.output_text.delta","delta":"environment inspected"}',
+            "",
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":0},"output_tokens":1}}}',
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", providerFetch);
+    const logged: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...values) => {
+      logged.push(values.map(String).join(" "));
+    });
+    onTestFinished(() => log.mockRestore());
+
+    const sessionId = "session-command-env-canary";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, true, undefined, envelope);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({
+      type: "session_ready",
+      sequence: 0,
+    });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-command-env",
+      text: "inspect your environment",
+    }));
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 200; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    expect(observed.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-command-env",
+      status: 200,
+    });
+    expect(providerFetch).toHaveBeenCalledTimes(2);
+    // The canary was really injected: each provider round carried it, at the
+    // final fetch and nowhere earlier.
+    expect(providerAuthorization).toEqual([`Bearer ${canary}`, `Bearer ${canary}`]);
+    // `bash` was offered and admitted, not refused: the first round advertised
+    // it, and the continued round carries each probe's real output.
+    expect(providerBodies[0]).toContain('"name":"bash"');
+    expect(providerBodies[1]).not.toContain("was not offered");
+    for (let index = 0; index < probes.length; index += 1) {
+      expect(providerBodies[1], `missing output of probe ${index}`)
+        .toContain(`probe-${index}`);
+    }
+    expect(providerBodies[1]).toContain("HOME=/workspace");
+
+    // The command's file output reached the session's workspace, so the
+    // durable scan below covers what a command wrote as well as what it said.
+    const durable = (await durableStringValues(stub)).join("\n");
+    expect(durable).toContain("HOME=/workspace");
+    const allObservable = [
+      JSON.stringify(observed),
+      providerBodies.join("\n"),
+      durable,
+      logged.join("\n"),
+    ].join("\n");
+    expect(allObservable).not.toContain(canary);
+    expect(allObservable).not.toContain("canary-provider-secret");
+    for (const forbidden of [
+      "OPENAI_API_KEY=",
+      "ANTHROPIC_API_KEY=",
+      "WHIP_EXECUTOR_TOKEN=",
+      "WHIP_PUBLIC_CONTROL_TOKEN=",
+      "WHIP_SESSION_TOKEN=",
+      "public-control-secret",
+      "session-token",
+    ]) {
+      expect(providerBodies[1], `command environment exposed ${forbidden}`)
+        .not.toContain(forbidden);
+    }
+
+    socket.close(1000, "done");
+  });
+
   it("retries an interrupted provider stream without duplicating output or settlement", async () => {
     const encoder = new TextEncoder();
     let providerAttempt = 0;
@@ -1261,6 +1415,96 @@ describe("real WorkflowInstance hibernation", () => {
     });
 
     vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
+  it("settles once across a real mid-stream disconnect and a provider 5xx", async () => {
+    // The stubbed test above drives the retry through a ReadableStream the stub
+    // errors itself. This one sends nothing through a stub: the Session's own
+    // `fetch` reaches a provider on loopback that drops the connection after
+    // the first delta, then answers 503, then completes. What must hold is what
+    // a real provider's customer is billed against — one idempotency identity
+    // for the round however many times it is sent, one output, one usage
+    // settlement, one terminal.
+    const scenario = "disconnect-then-5xx";
+    const origin = inject("providerFaultFixtureOrigin");
+    const envelope = await mintSignedEnvelope([], {
+      providerBaseUrl: `${origin}/${scenario}/v1/responses`,
+    });
+    const sessionId = "session-provider-fault-fixture";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, false, undefined, envelope);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({
+      type: "session_ready",
+      sequence: 0,
+    });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-fault",
+      text: "hello",
+    }));
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 200; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    const attempts = await (
+      await fetch(`${origin}/${scenario}/__requests`)
+    ).json<{ path: string; headers: Record<string, string>; body: string }[]>();
+    // Three sends of one round: the disconnect, the 503, the completion.
+    expect(attempts).toHaveLength(3);
+    const keys = new Set(attempts.map(({ headers }) => headers["idempotency-key"]));
+    expect(keys.size, JSON.stringify([...keys])).toBe(1);
+    expect([...keys][0]).toMatch(/\S/);
+    // The credential is injected at the final fetch, on every attempt, and the
+    // sentinel WhippleScript built the request with never leaves the Worker.
+    for (const { headers } of attempts) {
+      expect(headers.authorization).toBe(
+        "Bearer canary-provider-secret-must-not-persist",
+      );
+    }
+    expect(JSON.stringify(attempts)).not.toContain("whipplescript-model-broker");
+
+    expect(observed.some(({ type }) => type === "error")).toBe(false);
+    expect(
+      observed.filter(
+        ({ type, delta }) => type === "text_delta" && delta === "once",
+      ),
+    ).toHaveLength(1);
+    expect(observed.filter(({ type }) => type === "usage")).toHaveLength(1);
+    expect(observed.filter(({ type }) => type === "turn_terminal")).toEqual([
+      expect.objectContaining({ request_id: "turn-fault", status: 200 }),
+    ]);
+
+    const state = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    const projection = await state.json() as {
+      transcript: { type: string; text: string }[];
+    };
+    expect(
+      projection.transcript.filter((entry) => entry.type === "assistant"),
+    ).toEqual([{ type: "assistant", text: "once" }]);
+
+    const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const deployment = deployments.get(deployments.idFromName("theory-a-test"));
+    const operations = await runInDurableObject(
+      deployment,
+      async (_instance, storage) => ({
+        admit: await storage.storage.get<number>(`operation:${sessionId}:admit`),
+        settle: await storage.storage.get<number>(`operation:${sessionId}:settle`),
+        release: await storage.storage.get<number>(`operation:${sessionId}:release`),
+      }),
+    );
+    expect(operations).toEqual({ admit: 1, settle: 1, release: undefined });
+    expect((await durableStringValues(stub)).join("\n")).not.toContain(
+      "canary-provider-secret",
+    );
+
     socket.close(1000, "done");
   });
 
