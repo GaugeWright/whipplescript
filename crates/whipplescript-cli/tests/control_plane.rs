@@ -27442,6 +27442,110 @@ fn a_carry_that_lands_on_no_rule_is_refused() {
     }
 }
 
+/// `carry_program` in the block form: the same rules nested in
+/// `workflow Rev { … }`, which `canonical_declarations` keys as one declaration.
+fn nested_carry_program(rule: &str) -> String {
+    let flat = carry_program(rule);
+    let body = flat
+        .trim_start()
+        .strip_prefix("workflow Rev\n")
+        .expect("header form");
+    let indented: String = body
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                "\n".to_owned()
+            } else {
+                format!("  {line}\n")
+            }
+        })
+        .collect();
+    format!("workflow Rev {{\n{indented}}}\n")
+}
+
+/// DR-0077's nested-rule gap (WS-284). A rule nested in `workflow Rev { … }`
+/// had no `rename_hash`, so renaming it was the executed defect all over again:
+/// the dry run said nothing while the revision was about to perform the timer a
+/// second time. The dry run now proposes the carry, and taking it suppresses
+/// the re-fire exactly as it does for a top-level rule.
+#[test]
+fn a_renamed_nested_rule_is_reported_and_its_carry_suppresses_the_refire() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("nested-carry-v1");
+    let v2 = temp_workflow_path("nested-carry-v2");
+    fs::write(&v1, nested_carry_program("work")).expect("v1 writes");
+    fs::write(&v2, nested_carry_program("work_renamed")).expect("v2 writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let instance_id = carry_instance_with_one_open_firing(bin, &store_path, &v1);
+    assert_eq!(carry_timer_count(bin, &store_path, &instance_id), 1);
+
+    let report = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store,
+            "--json",
+            "revise",
+            &instance_id,
+            v2.to_str().expect("utf-8"),
+            "--dry-run",
+        ],
+    );
+    let correspondence = &report["rule_correspondence"];
+    assert_eq!(correspondence["underivable"], false, "{report}");
+    assert_eq!(
+        correspondence["proposed_renames"],
+        json!([{
+            "removed": "rule work",
+            "added": "rule work_renamed",
+            "carry_with": "--carry work=work_renamed",
+        }]),
+        "the nested rename is reported: {report}"
+    );
+
+    let revised = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "revise",
+            &instance_id,
+            v2.to_str().expect("utf-8"),
+            "--carry",
+            "work=work_renamed",
+        ])
+        .output()
+        .expect("revise runs");
+    assert!(
+        revised.status.success(),
+        "revise failed: {}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    let stepped = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "step",
+            &instance_id,
+            "--program",
+            v2.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("step v2 runs");
+    assert!(
+        stepped.status.success(),
+        "step v2 failed: {}",
+        String::from_utf8_lossy(&stepped.stderr)
+    );
+    assert_eq!(
+        carry_timer_count(bin, &store_path, &instance_id),
+        1,
+        "the carried nested rename performs the action ONCE"
+    );
+}
+
 #[test]
 fn basics_runs_through_real_cli_worker_restarts_without_a_model() {
     let bin = env!("CARGO_BIN_EXE_whip");

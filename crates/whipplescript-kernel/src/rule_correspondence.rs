@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use whipplescript_parser::canonical_declarations;
+use whipplescript_parser::canonical_rules;
 
 /// One removed rule and one added rule whose canonical bodies agree once their
 /// names are blanked — a rename, as far as content can tell.
@@ -158,24 +158,40 @@ pub fn translate_forward(
     current
 }
 
-fn rule_declarations(source: &str) -> Option<BTreeMap<String, String>> {
-    let declarations = canonical_declarations(source)?;
-    Some(
-        declarations
-            .into_iter()
-            .filter(|declaration| declaration.identity.starts_with("rule "))
-            .map(|declaration| (declaration.identity, declaration.rename_hash))
-            .collect(),
-    )
+/// The rules a program runs under `root`, keyed by identity: every top-level
+/// rule, plus the rules nested in the `workflow root { … }` block. That is the
+/// set root selection flattens into the IR, so it is the set whose firings the
+/// rule pass records under bare names. Rules nested in a sibling workflow block
+/// belong to another workflow and are not compared.
+fn rule_declarations(source: &str, root: &str) -> Option<BTreeMap<String, String>> {
+    let rules = canonical_rules(source)?;
+    let mut in_effect = BTreeMap::new();
+    for rule in rules {
+        if rule.workflow.as_deref().is_some_and(|scope| scope != root) {
+            continue;
+        }
+        // A top-level rule and a nested one sharing a name would be one name
+        // for two rules in the flattened program; refuse rather than pick.
+        if in_effect
+            .insert(rule.canon.identity, rule.canon.rename_hash)
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(in_effect)
 }
 
 /// Derive the correspondence between the active program's rules and a
-/// candidate's. Pure: both sources in, evidence out, nothing consulted and
-/// nothing recorded.
-pub fn derive(active_source: &str, candidate_source: &str) -> RuleCorrespondence {
+/// candidate's, for the instance's `root` workflow. Pure: both sources in,
+/// evidence out, nothing consulted and nothing recorded.
+///
+/// Rules nested in `workflow root { … }` are compared as well as top-level
+/// ones, so a rename inside the block form is reported like any other.
+pub fn derive(active_source: &str, candidate_source: &str, root: &str) -> RuleCorrespondence {
     let (Some(active), Some(candidate)) = (
-        rule_declarations(active_source),
-        rule_declarations(candidate_source),
+        rule_declarations(active_source, root),
+        rule_declarations(candidate_source, root),
     ) else {
         return RuleCorrespondence {
             underivable: true,
@@ -341,7 +357,11 @@ mod tests {
 
     #[test]
     fn a_renamed_rule_is_proposed() {
-        let correspondence = derive(&program(&[("work", "a")]), &program(&[("renamed", "a")]));
+        let correspondence = derive(
+            &program(&[("work", "a")]),
+            &program(&[("renamed", "a")]),
+            "Rev",
+        );
         assert_eq!(
             correspondence.proposed,
             vec![ProposedRename {
@@ -357,7 +377,11 @@ mod tests {
         // The identity survives, so it is not a rename however the body moved.
         // It is also already suppressed by the name-keyed filter, which is
         // DR-0043's behaviour and not this module's business.
-        let correspondence = derive(&program(&[("work", "a")]), &program(&[("work", "b")]));
+        let correspondence = derive(
+            &program(&[("work", "a")]),
+            &program(&[("work", "b")]),
+            "Rev",
+        );
         assert_eq!(correspondence, RuleCorrespondence::default());
     }
 
@@ -367,7 +391,11 @@ mod tests {
         // content hash can tell this from a rename, so the derivation proposes
         // it -- which is exactly why a proposal may not suppress anything on its
         // own. The operator declines, and `audit` fires as a new rule should.
-        let correspondence = derive(&program(&[("work", "a")]), &program(&[("audit", "a")]));
+        let correspondence = derive(
+            &program(&[("work", "a")]),
+            &program(&[("audit", "a")]),
+            "Rev",
+        );
         assert_eq!(
             correspondence.proposed.len(),
             1,
@@ -383,6 +411,7 @@ mod tests {
         let correspondence = derive(
             &program(&[("a", "one"), ("b", "two")]),
             &program(&[("a", "two"), ("b", "one")]),
+            "Rev",
         );
         assert_eq!(correspondence, RuleCorrespondence::default());
     }
@@ -392,6 +421,7 @@ mod tests {
         let correspondence = derive(
             &program(&[("work", "a")]),
             &program(&[("renamed", "a"), ("extra", "a")]),
+            "Rev",
         );
         assert!(
             correspondence.proposed.is_empty(),
@@ -403,7 +433,11 @@ mod tests {
 
     #[test]
     fn a_removed_rule_matching_nothing_is_a_refire_site() {
-        let correspondence = derive(&program(&[("work", "a")]), &program(&[("other", "b")]));
+        let correspondence = derive(
+            &program(&[("work", "a")]),
+            &program(&[("other", "b")]),
+            "Rev",
+        );
         assert_eq!(correspondence.refire_sites, vec!["rule work".to_owned()]);
         assert!(correspondence.proposed.is_empty());
     }
@@ -413,10 +447,77 @@ mod tests {
         // Canonicalization refuses a program holding two declarations of one
         // identity, since it could not key them apart.
         let duplicated = program(&[("work", "a"), ("work", "b")]);
-        let correspondence = derive(&duplicated, &program(&[("work", "a")]));
+        let correspondence = derive(&duplicated, &program(&[("work", "a")]), "Rev");
         assert!(
             correspondence.underivable,
             "distinguish refusal from no matches"
         );
+    }
+
+    /// The block form: `workflow <name> { … }` holding one rule per entry.
+    fn block(name: &str, rules: &[(&str, &str)]) -> String {
+        let mut source = format!(
+            "workflow {name} {{\n  output result Done\n\n  class Job {{\n    id string\n  }}\n\n  \
+             class Done {{\n    note string\n  }}\n\n"
+        );
+        for (rule, note) in rules {
+            source.push_str(&format!(
+                "  rule {rule}\n    when Job as j\n  => {{\n    complete result {{\n      note \"{note}\"\n    }}\n  }}\n\n"
+            ));
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    #[test]
+    fn a_renamed_nested_rule_is_proposed() {
+        // DR-0077's "nested rules have no rename_hash" gap: the block form's
+        // rules are the ones the root runs, so a rename there is reported.
+        let correspondence = derive(
+            &block("Rev", &[("work", "a")]),
+            &block("Rev", &[("renamed", "a")]),
+            "Rev",
+        );
+        assert!(!correspondence.underivable);
+        assert_eq!(
+            correspondence.proposed,
+            vec![ProposedRename {
+                removed: "rule work".to_owned(),
+                added: "rule renamed".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_a_rule_into_its_workflow_block_is_not_a_rename() {
+        // The same rule, top level in one program and nested in the other, is
+        // the same rule in the flattened program the root runs.
+        let correspondence = derive(
+            &program(&[("work", "a")]),
+            &block("Rev", &[("work", "a")]),
+            "Rev",
+        );
+        assert_eq!(correspondence, RuleCorrespondence::default());
+    }
+
+    #[test]
+    fn a_sibling_workflows_rules_are_not_compared() {
+        // `Other`'s rules never run under the root `Rev`, so a rename there is
+        // not this instance's business and must not be offered as a carry.
+        let active = format!(
+            "{}\n{}",
+            block("Rev", &[("work", "a")]),
+            block("Other", &[("side", "b")])
+        );
+        let candidate = format!(
+            "{}\n{}",
+            block("Rev", &[("work", "a")]),
+            block("Other", &[("side_renamed", "b")])
+        );
+        assert_eq!(
+            derive(&active, &candidate, "Rev"),
+            RuleCorrespondence::default()
+        );
+        assert_eq!(derive(&active, &candidate, "Other").proposed.len(), 1);
     }
 }

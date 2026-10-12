@@ -19,7 +19,9 @@ pub mod execution_semantics;
 mod fact_flow;
 pub use execution_semantics::ExecutionSemantics;
 pub mod fixit;
-pub use canonical::{canonical_declarations, canonical_program_hash, DeclCanon};
+pub use canonical::{
+    canonical_declarations, canonical_program_hash, canonical_rules, DeclCanon, ScopedRuleCanon,
+};
 pub mod body;
 mod body_print;
 mod format;

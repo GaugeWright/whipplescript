@@ -129,6 +129,77 @@ pub fn canonical_declarations(source: &str) -> Option<Vec<DeclCanon>> {
     Some(declarations)
 }
 
+/// One rule's canonical identity, scoped to the `workflow X { … }` block it is
+/// nested in (`None` for a top-level rule, which includes every rule of the
+/// header form `workflow X`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedRuleCanon {
+    pub workflow: Option<String>,
+    pub canon: DeclCanon,
+}
+
+/// Canonicalize every rule of `source` individually, nested ones included.
+///
+/// [`canonical_declarations`] keys a `workflow X { … }` block as ONE
+/// declaration, because that is merge's unit, so a rule nested in it has no
+/// `rename_hash` of its own. The revision rule correspondence (DR-0077) needs
+/// one per rule: a nested rule is printed exactly as a top-level rule would be
+/// (`format_item`, with the same alpha pass), so a rule's hashes do not depend
+/// on whether it sits at the top level or inside the block it runs in.
+///
+/// `None` when the source does not parse, or when one scope declares a rule
+/// identity twice -- the same fail-closed contract as
+/// [`canonical_declarations`].
+pub fn canonical_rules(source: &str) -> Option<Vec<ScopedRuleCanon>> {
+    let stripped = strip_comments(source);
+    let parsed = parse_program(&stripped);
+    if !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let program = parsed.program;
+
+    let mut chunks: Vec<(Option<String>, String, bool)> = Vec::new();
+    for item in program.items {
+        if let Item::Rule(rule) = item {
+            let (chunk, alpha) = canonical_item_chunk(Item::Rule(rule));
+            chunks.push((None, chunk, alpha));
+        }
+    }
+    for workflow in program.workflows {
+        let scope = workflow.name.name;
+        for item in workflow.items {
+            if let Item::Rule(rule) = item {
+                let (chunk, alpha) = canonical_item_chunk(Item::Rule(rule));
+                chunks.push((Some(scope.clone()), chunk, alpha));
+            }
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut rules = Vec::with_capacity(chunks.len());
+    for (workflow, chunk, alpha) in chunks {
+        let canonical = normalize_chunk(&chunk);
+        if canonical.is_empty() {
+            continue;
+        }
+        let identity = identity_of(&canonical)?;
+        if !seen.insert((workflow.clone(), identity.clone())) {
+            return None;
+        }
+        let rename_hash = stable_hash(&name_normalized(&canonical, &identity));
+        rules.push(ScopedRuleCanon {
+            workflow,
+            canon: DeclCanon {
+                identity,
+                canon_hash: stable_hash(&canonical),
+                rename_hash,
+                alpha,
+            },
+        });
+    }
+    Some(rules)
+}
+
 /// The canonical program hash: SHA-256/128 over the sorted
 /// `(identity, canon_hash)` pairs — insensitive to formatting, comments,
 /// declaration order, and rule-binding names. `None` when the source has no
@@ -633,5 +704,73 @@ mod tests {
             .collect();
         assert!(identities.contains(&"rule triage"), "{identities:?}");
         assert!(identities.contains(&"rule close"), "{identities:?}");
+    }
+
+    /// The block form of BASE: the same rules, nested in `workflow Demo { … }`.
+    fn nested(source: &str) -> String {
+        let body = source.strip_prefix("workflow Demo\n").expect("header form");
+        let indented: String = body
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    "\n".to_owned()
+                } else {
+                    format!("  {line}\n")
+                }
+            })
+            .collect();
+        format!("workflow Demo {{\n{indented}}}\n")
+    }
+
+    fn rule<'a>(rules: &'a [ScopedRuleCanon], identity: &str) -> &'a ScopedRuleCanon {
+        rules
+            .iter()
+            .find(|rule| rule.canon.identity == identity)
+            .expect("rule present")
+    }
+
+    /// DR-0077: a rule nested in a `workflow X { … }` block gets its own
+    /// `rename_hash`, which `canonical_declarations` cannot give it because the
+    /// block is merge's unit.
+    #[test]
+    fn a_nested_rule_has_its_own_rename_hash() {
+        let source = nested(BASE);
+        let declarations = canonical_declarations(&source).expect("canonical");
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| !declaration.identity.starts_with("rule ")),
+            "merge keys the block whole; the rules are not its declarations"
+        );
+        let rules = canonical_rules(&source).expect("canonical rules");
+        assert_eq!(rules.len(), 2);
+        assert!(rules
+            .iter()
+            .all(|rule| rule.workflow.as_deref() == Some("Demo")));
+
+        let renamed = canonical_rules(&nested(&BASE.replace("rule close\n", "rule closed_out\n")))
+            .expect("canonical rules");
+        assert_eq!(
+            rule(&rules, "rule close").canon.rename_hash,
+            rule(&renamed, "rule closed_out").canon.rename_hash,
+            "a nested rename is visible"
+        );
+        assert_ne!(
+            rule(&rules, "rule close").canon.rename_hash,
+            rule(&rules, "rule triage").canon.rename_hash
+        );
+    }
+
+    /// A rule's hashes do not depend on whether it sits at the top level or
+    /// inside the block it runs in: moving it between the two forms is neither
+    /// a rename nor a body change.
+    #[test]
+    fn a_rule_hashes_the_same_nested_or_top_level() {
+        let top = canonical_rules(BASE).expect("top level");
+        let inner = canonical_rules(&nested(BASE)).expect("nested");
+        assert!(top.iter().all(|rule| rule.workflow.is_none()));
+        for identity in ["rule triage", "rule close"] {
+            assert_eq!(rule(&top, identity).canon, rule(&inner, identity).canon);
+        }
     }
 }

@@ -305,6 +305,13 @@ migrated authorities.
   `completed turn` and `has ready issue` sugar for AgentTurn and WorkItem, and
   `after <effect> fails/times out/cancels as x` for the three terminal payloads.
 
+- `whip revise --dry-run` now reports a rule renamed inside a
+  `workflow X { … }` block as a proposed carry, as it already did for a
+  top-level rule; before, a nested rename was silent and re-fired. Breaking for
+  embedders of `whipplescript-kernel`: `rule_correspondence::derive` takes the
+  instance's root workflow as a third argument, and compares only the rules
+  that root runs. `whipplescript-parser` adds `canonical_rules`.
+
 ## [0.10.0] — 2026-10-06
 
 A minor release, because three published crates changed public types that a

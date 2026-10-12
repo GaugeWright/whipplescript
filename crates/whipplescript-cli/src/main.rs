@@ -17551,8 +17551,12 @@ fn revise(options: &CliOptions) -> ExitCode {
 
     // DR-0077: derive which removed rule looks like which added one, so the
     // report can say so. Evidence only -- nothing here suppresses a firing.
-    let correspondence =
-        derive_revision_rule_correspondence(&store, &compatibility.active_version_id, &source);
+    let correspondence = derive_revision_rule_correspondence(
+        &store,
+        &compatibility.active_version_id,
+        &source,
+        &ir.workflow,
+    );
     if let Err(message) = validate_rule_carries(&revise_options.carries, &ir) {
         eprintln!("{message}");
         return ExitCode::from(2);
@@ -46791,6 +46795,7 @@ fn derive_revision_rule_correspondence(
     store: &SqliteStore,
     active_version_id: &str,
     candidate_source: &str,
+    root: &str,
 ) -> RuleCorrespondence {
     let underivable = RuleCorrespondence {
         underivable: true,
@@ -46802,7 +46807,7 @@ fn derive_revision_rule_correspondence(
     let Ok(Some(active_source)) = store.get_content(&view.source_hash) else {
         return underivable;
     };
-    whipplescript_kernel::rule_correspondence::derive(&active_source, candidate_source)
+    whipplescript_kernel::rule_correspondence::derive(&active_source, candidate_source, root)
 }
 
 #[allow(clippy::too_many_arguments)]
